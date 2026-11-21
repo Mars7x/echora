@@ -10303,6 +10303,9 @@ impl Nvn {
         // when GPU timing or the timeline is on: the clock reads were ~4%
         // of the replay thread's time.
         let timing = draw_phase_timing();
+        // Whether any of its debugging switches is set (none in normal
+        // runs: then the draw looks none of them up).
+        let switches = draw_switches_set();
         let phase = |nvn: &mut Self, name: &'static str, since: &mut Option<std::time::Instant>| {
             let Some(previous) = since.as_mut() else {
                 return;
@@ -10337,7 +10340,7 @@ impl Nvn {
         // first draw of that program is sequenced (scenes come at frames
         // that vary from run to run).
         if self.sequence_chosen.is_none()
-            && super::debug_var("ECHORA_GPU_SEQUENCE_AFTER")
+            && draw_var(switches, "ECHORA_GPU_SEQUENCE_AFTER")
                 .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1))
         {
             self.sequence_chosen = Some(self.presented_frames + 1);
@@ -10345,7 +10348,7 @@ impl Nvn {
         }
         // ECHORA_GPU_SKIP=<fragment key>[,...] (debugging): those
         // programs' draws are not rendered.
-        if super::debug_var("ECHORA_GPU_SKIP").is_ok_and(|skipped| {
+        if draw_var(switches, "ECHORA_GPU_SKIP").is_ok_and(|skipped| {
             skipped
                 .split(',')
                 .any(|key| key == format!("{:016x}", keys.1))
@@ -10354,10 +10357,10 @@ impl Nvn {
         }
         // ECHORA_GPU_SNAP=<target>: during the sequenced present, that
         // target after each draw into it, as snap-<sequence>.ppm (x/(1+x)).
-        let snap = super::debug_var("ECHORA_GPU_SNAP")
+        let snap = draw_var(switches, "ECHORA_GPU_SNAP")
             .ok()
             .and_then(|key| u64::from_str_radix(&key, 16).ok())
-            .zip(super::debug_var_os("ECHORA_GPU_DUMP"))
+            .zip(draw_var_os(switches, "ECHORA_GPU_DUMP"))
             .filter(|_| self.sequencing());
         let backend = self.gpu.as_mut().unwrap();
         // ECHORA_LOOP_TRACE: every 60 presents, each traced stage's loops
@@ -10396,11 +10399,11 @@ impl Nvn {
         }
         // ECHORA_VERTEX_TRACE_REPORT=<stage key>[,...]: every 60 presents,
         // the records a traced program's stages wrote (from earlier draws).
-        if let Ok(wanted) = super::debug_var("ECHORA_VERTEX_TRACE_REPORT")
+        if let Ok(wanted) = draw_var(switches, "ECHORA_VERTEX_TRACE_REPORT")
             && wanted
                 .split(',')
                 .any(|key| key == format!("{:016x}", keys.0) || key == format!("{:016x}", keys.1))
-            && super::debug_var("ECHORA_VERTEX_TRACE_REPORT_FROM")
+            && draw_var(switches, "ECHORA_VERTEX_TRACE_REPORT_FROM")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .is_none_or(|from| self.presented_frames >= from)
@@ -10411,7 +10414,7 @@ impl Nvn {
                     continue;
                 };
                 // ECHORA_VERTEX_TRACE_REPORT_EVERY=N presents (60).
-                let every = super::debug_var("ECHORA_VERTEX_TRACE_REPORT_EVERY")
+                let every = draw_var(switches, "ECHORA_VERTEX_TRACE_REPORT_EVERY")
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(60);
@@ -10487,10 +10490,10 @@ impl Nvn {
         // ECHORA_GPU_SKIP_DRAW_DEPTH=<storage hex> (debugging): the skip
         // applies only to draws whose depth target is that memory (a
         // shadow map's casters, not the same programs' other passes).
-        let skip_depth = super::debug_var("ECHORA_GPU_SKIP_DRAW_DEPTH")
+        let skip_depth = draw_var(switches, "ECHORA_GPU_SKIP_DRAW_DEPTH")
             .ok()
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
-        if super::debug_var("ECHORA_GPU_SKIP_DRAW").is_ok_and(|skipped| {
+        if draw_var(switches, "ECHORA_GPU_SKIP_DRAW").is_ok_and(|skipped| {
             skipped.split(',').any(|skip| {
                 skip == format!("{:016x}", keys.0) || skip == format!("{:016x}", keys.1)
             })
@@ -10661,7 +10664,7 @@ impl Nvn {
                         let used = stage.cbuf_used_sizes[descriptor.index as usize].max(16);
                         // Every draw takes this path: the note is formatted
                         // only when tracing the flow.
-                        if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                        if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
                             self.gpu.as_mut().unwrap().note(format!(
                                 "driver constant buffer {} read as zeros ({used} bytes, {:?} stage {:016x})",
                                 descriptor.index, stage.stage, keys_for_note.get(index).copied().unwrap_or(0)
@@ -10724,12 +10727,13 @@ impl Nvn {
                         // from the pool's GPU-memory copy instead, to compare
                         // the GPU's time reading system memory.
                         if descriptor.flags & 1 == 0 {
-                            let in_place =
-                                if super::debug_var_os("ECHORA_DRAW_STORAGE_RESIDENT").is_some() {
-                                    self.resident_pool_binding(core, guest, length)?
-                                } else {
-                                    self.shared_binding(guest, length)?
-                                };
+                            let in_place = if draw_var_os(switches, "ECHORA_DRAW_STORAGE_RESIDENT")
+                                .is_some()
+                            {
+                                self.resident_pool_binding(core, guest, length)?
+                            } else {
+                                self.shared_binding(guest, length)?
+                            };
                             if let Some((buffer, offset)) = in_place {
                                 storage_in_place
                                     .insert((index, descriptor.binding), (buffer, offset, length));
@@ -10821,7 +10825,7 @@ impl Nvn {
                             }
                             let source = self.through_view(source, handle);
                             if let Some(swizzle) = self.handle_swizzle(handle) {
-                                if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                                if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
                                     let note =
                                         format!("flow view swizzle {swizzle:?} on {texture:x}");
                                     self.gpu_note(note);
@@ -11107,7 +11111,7 @@ impl Nvn {
                 257..=4096 => "257-4096",
                 _ => "over 4096",
             };
-            if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+            if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
                 backend.note(format!(
                     "instanced draw {} instances {bucket} base instance {}",
                     super::without_prefix(&command.name, "nvnCommandBuffer"),
@@ -11118,7 +11122,7 @@ impl Nvn {
                     }
                 ));
             }
-            if super::debug_var_os("ECHORA_GPU_NO_INSTANCED").is_some() {
+            if draw_var_os(switches, "ECHORA_GPU_NO_INSTANCED").is_some() {
                 return Err(format!(
                     "{} is not drawn (ECHORA_GPU_NO_INSTANCED)",
                     command.name
@@ -11361,7 +11365,7 @@ impl Nvn {
         // ECHORA_FETCH_BEYOND=<stage key>[,...] (debugging): each bound
         // stream's bytes at the draw's first vertex (base vertex and first
         // index applied), whether or not they are inside the bound size.
-        if super::debug_var("ECHORA_FETCH_BEYOND").is_ok_and(|wanted| {
+        if draw_var(switches, "ECHORA_FETCH_BEYOND").is_ok_and(|wanted| {
             wanted
                 .split(',')
                 .any(|key| key == format!("{:016x}", keys.0) || key == format!("{:016x}", keys.1))
@@ -11445,7 +11449,7 @@ impl Nvn {
             });
         phase(self, "stat: draw us geometry", &mut since);
         let geometry_bytes = streams.iter().map(VertexStream::len).sum::<usize>();
-        if geometry_bytes > 1 << 20 && super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+        if geometry_bytes > 1 << 20 && draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
             let strides: Vec<(u32, u32, usize)> = streams
                 .iter()
                 .map(|stream| (stream.stride, stream.divisor, stream.len()))
@@ -11613,7 +11617,7 @@ impl Nvn {
             // programs' draws cull nothing (shows whether culling is what
             // drops a draw's triangles).
             cull: match arg(polygon, "CullFace", 0).unwrap_or(0) {
-                _ if super::debug_var("ECHORA_GPU_NO_CULL").is_ok_and(|keys| {
+                _ if draw_var(switches, "ECHORA_GPU_NO_CULL").is_ok_and(|keys| {
                     keys.split(',')
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
                 }) =>
@@ -11633,7 +11637,7 @@ impl Nvn {
             // picture).
             front_face: match (
                 arg(polygon, "FrontFace", 0).unwrap_or(1),
-                super::debug_var_os("ECHORA_GPU_INVERT_FACE").is_some(),
+                draw_var_os(switches, "ECHORA_GPU_INVERT_FACE").is_some(),
             ) {
                 (0, false) | (1.., true) => vk::FrontFace::CLOCKWISE,
                 _ => vk::FrontFace::COUNTER_CLOCKWISE,
@@ -11646,7 +11650,7 @@ impl Nvn {
             // ECHORA_GPU_NODEPTH=<fragment key>[,...] (debugging): those
             // programs draw without the depth test.
             depth_test: arg(depth_state, "DepthTestEnable", 0).unwrap_or(0) != 0
-                && !super::debug_var("ECHORA_GPU_NODEPTH").is_ok_and(|keys| {
+                && !draw_var(switches, "ECHORA_GPU_NODEPTH").is_ok_and(|keys| {
                     keys.split(',')
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
                 }),
@@ -11656,7 +11660,7 @@ impl Nvn {
             // depth that differs by rounding from one never written).
             depth_compare: match compare_op(arg(depth_state, "DepthFunc", 0).unwrap_or(8)) {
                 vk::CompareOp::EQUAL
-                    if super::debug_var("ECHORA_GPU_EQUAL_AS_LEQUAL").is_ok_and(|keys| {
+                    if draw_var(switches, "ECHORA_GPU_EQUAL_AS_LEQUAL").is_ok_and(|keys| {
                         keys.split(',')
                             .any(|key| key == format!("{:016x}", keys_for_note[1]))
                     }) =>
@@ -11667,7 +11671,7 @@ impl Nvn {
                 // the same for LESS (tells whether a pass meets depth an
                 // earlier pass already wrote exactly).
                 vk::CompareOp::LESS
-                    if super::debug_var("ECHORA_GPU_LESS_AS_LEQUAL").is_ok_and(|keys| {
+                    if draw_var(switches, "ECHORA_GPU_LESS_AS_LEQUAL").is_ok_and(|keys| {
                         keys.split(',')
                             .any(|key| key == format!("{:016x}", keys_for_note[1]))
                     }) =>
@@ -11729,7 +11733,7 @@ impl Nvn {
                 .is_some_and(|format| format.x[0] as u32 == 53),
         };
         if let Some([units, clamp, factor]) = fixed.depth_bias
-            && super::debug_var_os("ECHORA_GPU_FLOW").is_some()
+            && draw_var_os(switches, "ECHORA_GPU_FLOW").is_some()
         {
             self.gpu.as_mut().unwrap().note(format!(
                 "polygon offset units {units} factor {factor} clamp {clamp}"
@@ -11740,7 +11744,7 @@ impl Nvn {
         // masks.
         // ECHORA_GPU_NO_BLEND=<fragment key hex>[,...] (debugging): those
         // programs draw without blending.
-        let no_blend = super::debug_var("ECHORA_GPU_NO_BLEND").is_ok_and(|wanted| {
+        let no_blend = draw_var(switches, "ECHORA_GPU_NO_BLEND").is_ok_and(|wanted| {
             wanted
                 .split(',')
                 .any(|item| item.trim() == format!("{:016x}", keys.1))
@@ -11810,7 +11814,7 @@ impl Nvn {
                 keys.1
             ));
         }
-        if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+        if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
             let line = format!(
                 "flow draw {:016x}/{:016x} count {count} reads {} writes {} level {:?} layers {:?} depth layer {} viewport {:?} depth {:x?} blend {:?} masks {:?} factors {:?} constants {:?}",
                 keys.0,
@@ -11838,14 +11842,14 @@ impl Nvn {
         }
         // ECHORA_GPU_TRACE_PROGRAM=<fragment key hex>[,...]: trace those
         // programs' draws, with their fixed-function state.
-        let traced_program = super::debug_var("ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
+        let traced_program = draw_var(switches, "ECHORA_GPU_TRACE_PROGRAM").is_ok_and(|wanted| {
             wanted.split(',').any(|item| {
                 item == format!("{:016x}", keys.1) || item == format!("{:016x}", keys.0)
             })
         });
         let trace_details = traced_program
             || (self.gpu.as_ref().unwrap().traced < 40
-                && super::debug_var_os("ECHORA_GPU_LOG").is_some());
+                && draw_var_os(switches, "ECHORA_GPU_LOG").is_some());
         let depth_storage = depth.filter(|_| trace_details).map(|texture| {
             (
                 self.texture_storage(texture),
@@ -11917,11 +11921,11 @@ impl Nvn {
         // <binding>.bin (n counting draws within the present), from present
         // ECHORA_DRAW_UNIFORM_DUMP_FROM on (as ECHORA_DISPATCH_UNIFORM_DUMP).
         if let (Ok(wanted), Some(directory)) = (
-            super::debug_var("ECHORA_DRAW_UNIFORM_DUMP"),
-            super::debug_var_os("ECHORA_DUMP_DIR"),
+            draw_var(switches, "ECHORA_DRAW_UNIFORM_DUMP"),
+            draw_var_os(switches, "ECHORA_DUMP_DIR"),
         ) && wanted.split(',').any(|item| {
             item.trim() == format!("{:016x}", keys.1) || item.trim() == format!("{:016x}", keys.0)
-        }) && super::debug_var("ECHORA_DRAW_UNIFORM_DUMP_FROM")
+        }) && draw_var(switches, "ECHORA_DRAW_UNIFORM_DUMP_FROM")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .is_none_or(|from| self.presented_frames >= from)
@@ -11937,7 +11941,7 @@ impl Nvn {
                 index += 1;
             }
             // ECHORA_DRAW_UNIFORM_DUMP_MAX=N: the first N draws per present.
-            let most = super::debug_var("ECHORA_DRAW_UNIFORM_DUMP_MAX")
+            let most = draw_var(switches, "ECHORA_DRAW_UNIFORM_DUMP_MAX")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(usize::MAX);
@@ -12153,19 +12157,19 @@ impl Nvn {
         // ECHORA_DUMP_DRAW also dumps a mesh draw's task and mesh stages
         // (as dispatches, at the end): their inputs, kept here.
         // ECHORA_DUMP_DRAW_FROM=N: draws are dumped from present N on.
-        let dump_from = super::debug_var("ECHORA_DUMP_DRAW_FROM")
+        let dump_from = draw_var(switches, "ECHORA_DUMP_DRAW_FROM")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
         // ECHORA_DUMP_DRAW_BASE=N: only draws with base vertex N (the same
         // patch drawn by two programs, compared in the simulator).
-        let base_wanted = super::debug_var("ECHORA_DUMP_DRAW_BASE")
+        let base_wanted = draw_var(switches, "ECHORA_DUMP_DRAW_BASE")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
             .is_none_or(|wanted| wanted == base_vertex);
         let stage_dump = (self.presented_frames >= dump_from
             && base_wanted
-            && super::debug_var("ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
+            && draw_var(switches, "ECHORA_DUMP_DRAW").is_ok_and(|wanted| {
                 wanted
                     .split(',')
                     .any(|item| u64::from_str_radix(item.trim(), 16) == Ok(keys.1))
@@ -12189,7 +12193,7 @@ impl Nvn {
         } else {
             Vec::new()
         };
-        let program_keys = if super::debug_var("ECHORA_VERTEX_TRACE_BASE")
+        let program_keys = if draw_var(switches, "ECHORA_VERTEX_TRACE_BASE")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
             == Some(base_vertex)
@@ -12298,9 +12302,9 @@ impl Nvn {
             ]
         });
         // Only the trace switches below read it (a format per draw else).
-        let draw_label = if super::debug_var_os("ECHORA_TARGET_TRACE").is_some()
-            || super::debug_var_os("ECHORA_MEMORY_TRACE").is_some()
-            || super::debug_var_os("ECHORA_DEPTH_TRACE_TEXEL").is_some()
+        let draw_label = if draw_var_os(switches, "ECHORA_TARGET_TRACE").is_some()
+            || draw_var_os(switches, "ECHORA_MEMORY_TRACE").is_some()
+            || draw_var_os(switches, "ECHORA_DEPTH_TRACE_TEXEL").is_some()
         {
             format!("draw {:016x}/{:016x}", keys.0, keys.1)
         } else {
@@ -12310,7 +12314,7 @@ impl Nvn {
         // the uploads it samples, once, as upload-<key>-<level>.ppm (RGB)
         // and .pgm (alpha).
         if let Some(directory) =
-            super::debug_var_os("ECHORA_GPU_UPLOAD_DUMP").filter(|_| traced_program)
+            draw_var_os(switches, "ECHORA_GPU_UPLOAD_DUMP").filter(|_| traced_program)
         {
             for (source, _) in draw.textures.values() {
                 let TextureSource::Upload {
@@ -12348,7 +12352,7 @@ impl Nvn {
         }
         // ECHORA_DUMP_DRAW=<fragment key>[,...] (debugging): the first draw
         // of each listed fragment program, for the simulator (`dump_draw`).
-        if let Some(wanted) = super::debug_var_os("ECHORA_DUMP_DRAW")
+        if let Some(wanted) = draw_var_os(switches, "ECHORA_DUMP_DRAW")
             .filter(|_| self.presented_frames >= dump_from && base_wanted)
             && wanted
                 .to_string_lossy()
@@ -12393,7 +12397,7 @@ impl Nvn {
         }
         // ECHORA_GPU_PROBE=<fragment key>: the first 40 draws of that
         // program note the range of what they left in color target 0.
-        if super::debug_var("ECHORA_GPU_PROBE")
+        if draw_var(switches, "ECHORA_GPU_PROBE")
             .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1))
             && backend.probed < 40
         {
@@ -12416,7 +12420,7 @@ impl Nvn {
         // new value (finds which draw left a wrong pixel; reads the target
         // back after each draw). Watching several targets follows a pixel
         // through a chain of passes of the same size.
-        if let Ok(watch) = super::debug_var("ECHORA_GPU_PIXEL_WATCH") {
+        if let Ok(watch) = draw_var(switches, "ECHORA_GPU_PIXEL_WATCH") {
             let fields: Vec<&str> = watch.split([':', ',']).collect();
             if let [first, end, targets, x, y] = fields[..] {
                 let (first, end) = (first.parse::<u64>(), end.parse::<u64>());
@@ -12477,7 +12481,7 @@ impl Nvn {
                 core, command, keys.1, &stages, &uniforms, &textures, page_table,
             );
         }
-        if super::debug_var_os("ECHORA_DISPATCH_SOURCE_LOG").is_some() {
+        if draw_var_os(switches, "ECHORA_DISPATCH_SOURCE_LOG").is_some() {
             for key in colors_written {
                 let storage = self.texture_storage(*key).unwrap_or(0);
                 self.target_writers
@@ -12488,7 +12492,7 @@ impl Nvn {
         // ECHORA_DEPTH_TRACE_TEXEL=<x>,<y> with ECHORA_DEPTH_TRACE (debugging):
         // after each draw into the traced depth memory, that texel's depth
         // when the draw changed it (which draw put a shadow caster there).
-        if let (Some(target), Ok(texel)) = (depth, super::debug_var("ECHORA_DEPTH_TRACE_TEXEL"))
+        if let (Some(target), Ok(texel)) = (depth, draw_var(switches, "ECHORA_DEPTH_TRACE_TEXEL"))
             && self.depth_traced(target)
             && let Some((x, y)) = texel.split_once(',').and_then(|(x, y)| {
                 Some((x.trim().parse::<u32>().ok()?, y.trim().parse::<u32>().ok()?))
@@ -13067,6 +13071,84 @@ fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, Strin
 /// Whether gpu_draw measures its phases (the "stat: draw us/ns ..."
 /// lines): with ECHORA_GPU_TIME (not 0) or the timeline on, as the
 /// renderer's own GPU timing.
+/// The debugging switches `gpu_draw_with_bindings` reads.
+const DRAW_SWITCHES: &[&str] = &[
+    "ECHORA_DEPTH_TRACE_TEXEL",
+    "ECHORA_DISPATCH_SOURCE_LOG",
+    "ECHORA_DRAW_STORAGE_RESIDENT",
+    "ECHORA_DRAW_UNIFORM_DUMP",
+    "ECHORA_DRAW_UNIFORM_DUMP_FROM",
+    "ECHORA_DRAW_UNIFORM_DUMP_MAX",
+    "ECHORA_DUMP_DIR",
+    "ECHORA_DUMP_DRAW",
+    "ECHORA_DUMP_DRAW_BASE",
+    "ECHORA_DUMP_DRAW_FROM",
+    "ECHORA_FETCH_BEYOND",
+    "ECHORA_GPU_DUMP",
+    "ECHORA_GPU_EQUAL_AS_LEQUAL",
+    "ECHORA_GPU_FLOW",
+    "ECHORA_GPU_INVERT_FACE",
+    "ECHORA_GPU_LESS_AS_LEQUAL",
+    "ECHORA_GPU_LOG",
+    "ECHORA_GPU_NODEPTH",
+    "ECHORA_GPU_NO_BLEND",
+    "ECHORA_GPU_NO_CULL",
+    "ECHORA_GPU_NO_INSTANCED",
+    "ECHORA_GPU_PIXEL_WATCH",
+    "ECHORA_GPU_PROBE",
+    "ECHORA_GPU_SEQUENCE_AFTER",
+    "ECHORA_GPU_SKIP",
+    "ECHORA_GPU_SKIP_DRAW",
+    "ECHORA_GPU_SKIP_DRAW_DEPTH",
+    "ECHORA_GPU_SNAP",
+    "ECHORA_GPU_TRACE_PROGRAM",
+    "ECHORA_GPU_UPLOAD_DUMP",
+    "ECHORA_MEMORY_TRACE",
+    "ECHORA_TARGET_TRACE",
+    "ECHORA_VERTEX_TRACE_BASE",
+    "ECHORA_VERTEX_TRACE_REPORT",
+    "ECHORA_VERTEX_TRACE_REPORT_EVERY",
+    "ECHORA_VERTEX_TRACE_REPORT_FROM",
+];
+
+/// Whether any of `DRAW_SWITCHES` is set, checked once per switch
+/// generation (each draw looked ~40 of them up, ~3% of the replay thread).
+fn draw_switches_set() -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static SET: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+    }
+    let generation = super::debug_generation();
+    SET.with(|set| {
+        if let Some((known, value)) = set.get()
+            && known == generation
+        {
+            return value;
+        }
+        let value = DRAW_SWITCHES
+            .iter()
+            .any(|name| super::debug_var_os(name).is_some());
+        set.set(Some((generation, value)));
+        value
+    })
+}
+
+/// `debug_var` for a draw switch: unset when none is (`draw_switches_set`).
+fn draw_var(set: bool, name: &'static str) -> Result<String, std::env::VarError> {
+    debug_assert!(DRAW_SWITCHES.contains(&name), "{name} is not a draw switch");
+    if set {
+        super::debug_var(name)
+    } else {
+        Err(std::env::VarError::NotPresent)
+    }
+}
+
+/// `debug_var_os` for a draw switch (`draw_var`).
+fn draw_var_os(set: bool, name: &'static str) -> Option<&'static std::ffi::OsStr> {
+    debug_assert!(DRAW_SWITCHES.contains(&name), "{name} is not a draw switch");
+    if set { super::debug_var_os(name) } else { None }
+}
+
 fn draw_phase_timing() -> bool {
     static GPU_TIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GPU_TIME.get_or_init(|| std::env::var_os("ECHORA_GPU_TIME").is_some_and(|value| value != "0"))
