@@ -422,7 +422,23 @@ impl Renderer {
             }
             Err(error) => return Err(format!("vkAcquireNextImageKHR: {error}")),
         };
-        // SAFETY: the fence was submitted by the acquire above.
+        let shown = self.present_acquired(presenter, key, index, (width, height));
+        if shown.is_err() {
+            self.abandon_present(presenter);
+        }
+        shown
+    }
+
+    /// Blit target `key` into acquired swapchain image `index` and queue its
+    /// present.
+    fn present_acquired(
+        &mut self,
+        presenter: &mut Presenter,
+        key: u64,
+        index: u32,
+        size: (u32, u32),
+    ) -> Result<(), String> {
+        // SAFETY: the caller's acquire submitted the fence.
         unsafe {
             let device = &self.gpu.device;
             device
@@ -436,7 +452,7 @@ impl Renderer {
         if let Some(ready) = &mut image.ready {
             ready.wait(&self.gpu.device)?;
         }
-        self.blit_to_swapchain(key, image.image, (width, height), presenter.extent)?;
+        self.blit_to_swapchain(key, image.image, size, presenter.extent)?;
         let signal = if let Some(ready) = &image.ready {
             self.submit_for_present(ready.blitted)?;
             Some(ready.blitted)
@@ -468,14 +484,7 @@ impl Renderer {
         };
         drop(held);
         if let Some(ready) = &mut image.ready {
-            // WSI may reject a surface without cancelling the queue wait.
-            ready.pending = matches!(
-                presented,
-                Ok(_)
-                    | Err(vk::Result::ERROR_OUT_OF_DATE_KHR
-                        | vk::Result::ERROR_SURFACE_LOST_KHR
-                        | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
-            );
+            ready.pending = present_was_queued(presented);
         }
         match presented {
             Ok(suboptimal) => presenter.stale |= suboptimal,
@@ -484,12 +493,62 @@ impl Renderer {
         }
         Ok(())
     }
+
+    /// After an error that followed a successful acquire: the image stays
+    /// acquired and its semaphore may be signaled with no waiter. Rebuilding
+    /// the swapchain releases the image and replaces each image's
+    /// semaphore, which is only safe once the queue has signaled it.
+    fn abandon_present(&mut self, presenter: &mut Presenter) {
+        presenter.stale = true;
+        let _ = self.flush();
+        let _held = self
+            .queue_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the queue is externally synchronized by the held lock. An
+        // acquire fence left signaled by a failed wait must not be reused
+        // signaled by the next acquire.
+        unsafe {
+            let device = &self.gpu.device;
+            let _ = device.queue_wait_idle(self.gpu.queue);
+            if device.get_fence_status(presenter.fence) == Ok(true) {
+                let _ = device.reset_fences(&[presenter.fence]);
+            }
+        }
+    }
+}
+
+/// Whether a present operation was queued (and so waits on its semaphore
+/// and later signals its fence) given `vkQueuePresentKHR`'s result. WSI may
+/// reject a surface without cancelling the queue wait.
+fn present_was_queued(result: Result<bool, vk::Result>) -> bool {
+    matches!(
+        result,
+        Ok(_)
+            | Err(vk::Result::ERROR_OUT_OF_DATE_KHR
+                | vk::Result::ERROR_SURFACE_LOST_KHR
+                | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use vk::PresentModeKHR as Mode;
+
+    #[test]
+    fn rejected_surfaces_still_queue_the_present() {
+        assert!(present_was_queued(Ok(false)));
+        assert!(present_was_queued(Ok(true)));
+        assert!(present_was_queued(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)));
+        assert!(present_was_queued(Err(vk::Result::ERROR_SURFACE_LOST_KHR)));
+        // Other errors leave the semaphore signaled: the present is
+        // abandoned and the queue drained before the swapchain is rebuilt.
+        assert!(!present_was_queued(Err(vk::Result::ERROR_DEVICE_LOST)));
+        assert!(!present_was_queued(Err(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        )));
+    }
 
     #[test]
     fn presentation_uses_the_first_supported_preference() {
