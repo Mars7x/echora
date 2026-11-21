@@ -662,7 +662,13 @@ impl Compiler {
                     },
                 )
             }
-            Op::Imad { d, a, b, c } => {
+            Op::Imad {
+                d,
+                a,
+                b,
+                c,
+                carry_in: None,
+            } => {
                 // The shader's integer multiply reads a and b as raw
                 // words. Only the third term has a negate modifier.
                 let a = self.source(a.src, uniform);
@@ -675,6 +681,7 @@ impl Compiler {
                 let product = self.binary(a, b, Expr::Multiply);
                 (d, self.binary(product, c, Expr::Add))
             }
+            Op::Imad { d, .. } => (d, None),
             Op::ImadWide {
                 d,
                 a,
@@ -688,6 +695,7 @@ impl Compiler {
                 signed: false,
                 high: false,
                 carry_out: 7,
+                carry_in: None,
             } if guard.is_true() => {
                 let make = |state: &mut Self| -> Option<(Id, Id)> {
                     let a = state.source(a.src, uniform)?;
@@ -924,6 +932,7 @@ mod tests {
             a: operand(Src::Reg(Reg(1))),
             b: operand(Src::Imm(64)),
             c: operand(Src::Reg(Reg(2))),
+            carry_in: None,
         });
         let store = op(Op::Store {
             data: Reg(0),

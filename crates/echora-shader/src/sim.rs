@@ -4134,6 +4134,60 @@ mod tests {
         (registers, predicates)
     }
 
+    #[test]
+    fn multiply_add_extended_consumes_the_carry_predicate() {
+        // LEA R5, P0, R0, R2, 0. The following IMAD.X builds the high word
+        // of the same address from R1 and P0.
+        let lea = word(&[
+            (0, 12, 0x211),
+            (16, 8, 5),
+            (24, 8, 0),
+            (32, 8, 2),
+            (64, 8, 255),
+            (81, 3, 0),
+        ]);
+        let imad = |opcode, target, a, b, c, carry| {
+            word(&[
+                (0, 12, opcode),
+                (16, 8, target),
+                (24, 8, a),
+                (32, 8, b),
+                (64, 8, c),
+                (74, 1, 1),
+                (81, 3, 7),
+                (87, 4, carry),
+            ])
+        };
+        for (low, high, offset, a, b) in [
+            (0, 2, 8, 13, 17),
+            (u32::MAX, 2, 8, 0, 17),
+            (u32::MAX, u32::MAX, 8, 0, 17),
+            (u32::MAX, u32::MAX, 0, u32::MAX, u32::MAX),
+        ] {
+            let (r, predicates) = run(
+                &[low, high, offset, a, b],
+                &[
+                    lea,
+                    imad(0x224, 6, 255, 255, 1, 0),
+                    imad(0x224, 7, 255, 255, 1, 8),
+                    imad(0x225, 8, 3, 4, 0, 0),
+                    imad(0x227, 10, 3, 4, 0, 0),
+                ],
+            );
+            let (low_sum, carry) = low.overflowing_add(offset);
+            assert_eq!(r[&5], low_sum);
+            assert_eq!(predicates[&0], carry);
+            assert_eq!(r[&6], high.wrapping_add(u32::from(carry)));
+            assert_eq!(r[&7], high.wrapping_add(u32::from(!carry)));
+            let result = (u64::from(a) * u64::from(b))
+                .wrapping_add(u64::from(high) << 32 | u64::from(low))
+                .wrapping_add(u64::from(carry));
+            assert_eq!(r[&8], result as u32);
+            assert_eq!(r[&9], (result >> 32) as u32);
+            assert_eq!(r[&10], r[&9]);
+        }
+    }
+
     /// Deterministic test values: edge cases, then a linear congruential
     /// sequence.
     fn values(count: usize) -> Vec<u32> {

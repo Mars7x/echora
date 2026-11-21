@@ -1776,11 +1776,23 @@ impl Emitter {
                     self.carry_sum(d.0, &terms, &outputs);
                 }
             }
-            Op::Imad { d, a, b, c } => {
+            Op::Imad {
+                d,
+                a,
+                b,
+                c,
+                carry_in,
+            } => {
                 let (a, b) = (self.integer(index, a)?, self.integer(index, b)?);
                 let c = self.signed_integer(index, c)?;
                 let product = self.value(op::I_MUL, self.u32, &[a, b]);
-                let sum = self.value(op::I_ADD, self.u32, &[product, c]);
+                let mut sum = self.value(op::I_ADD, self.u32, &[product, c]);
+                if let Some(carry_in) = carry_in {
+                    let condition = self.read_predicate(carry_in);
+                    let (one, zero) = (self.constant(1), self.constant(0));
+                    let carry = self.value(op::SELECT, self.u32, &[condition, one, zero]);
+                    sum = self.value(op::I_ADD, self.u32, &[sum, carry]);
+                }
                 self.write_register(d.0, sum);
             }
             Op::Lop3 {
@@ -1972,6 +1984,7 @@ impl Emitter {
                 signed,
                 high,
                 carry_out,
+                carry_in,
             } => {
                 if carry_out != 7 {
                     return Err(unsupported(index, "IMAD.WIDE carry output"));
@@ -1981,7 +1994,11 @@ impl Emitter {
                 let c = self.pair_operand(index, c)?;
                 let (a, b) = (self.widen(a, signed), self.widen(b, signed));
                 let product = self.value(op::I_MUL, ty, &[a, b]);
-                let sum = self.value(op::I_ADD, ty, &[product, c]);
+                let mut sum = self.value(op::I_ADD, ty, &[product, c]);
+                if let Some(carry_in) = carry_in {
+                    let carry = self.carry(carry_in);
+                    sum = self.value(op::I_ADD, ty, &[sum, carry]);
+                }
                 if high {
                     let (_, high_word) = self.split(sum);
                     self.write_register(d.0, high_word);

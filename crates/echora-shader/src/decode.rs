@@ -251,16 +251,19 @@ pub enum Op {
         carry_in: [Pred; 2],
         extended: bool,
     },
-    /// IMAD d, a, b, c: the low word of a * b + c.
+    /// IMAD d, a, b, c: the low word of a * b + c. The .X form also adds
+    /// the carry predicate (bits 87–90).
     Imad {
         d: Reg,
         a: Operand,
         b: Operand,
         c: Operand,
+        carry_in: Option<Pred>,
     },
     /// IMAD.WIDE d:d+1, a, b, c:c+1: the 64-bit a * b + c, the factors
     /// `signed` (bit 73) or not; IMAD.HI (`high`) writes only its high
-    /// word to d. `carry_out` (81-83) receives the 64-bit sum's carry.
+    /// word to d. The .X form adds its carry predicate to the sum.
+    /// `carry_out` (81-83) receives the 64-bit sum's carry.
     ImadWide {
         d: Reg,
         a: Operand,
@@ -269,6 +272,7 @@ pub enum Op {
         signed: bool,
         high: bool,
         carry_out: u8,
+        carry_in: Option<Pred>,
     },
     /// POPC / FLO / BREV d, src (inverted first with `invert`, bit 63):
     /// the set-bit count, the most significant set bit (`signed`: the most
@@ -1754,6 +1758,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             a: word.a(),
             b: word.source(1)?,
             c: word.source(2)?,
+            carry_in: word.bit(74).then(|| word.pred(87, 90)),
         },
         0x012 if (1..=7).contains(&form) => Op::Lop3 {
             d,
@@ -1820,6 +1825,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
             signed: word.bit(73),
             high: opcode & 0x1ff == 0x027,
             carry_out: word.bits(81, 3) as u8,
+            carry_in: word.bit(74).then(|| word.pred(87, 90)),
         },
         0x109 if matches!(form, 1 | 4 | 5 | 6) => Op::BitCount {
             d,
@@ -2178,6 +2184,7 @@ mod tests {
                 a: reg(2),
                 b: reg(3),
                 c: reg(5),
+                carry_in: None,
             }
         );
         assert_eq!(
@@ -2191,6 +2198,7 @@ mod tests {
                     abs: false,
                     neg: false
                 },
+                carry_in: None,
             }
         );
         assert_eq!(
@@ -2204,6 +2212,7 @@ mod tests {
                     neg: false
                 },
                 c: reg(7),
+                carry_in: None,
             }
         );
     }
