@@ -7697,6 +7697,14 @@ impl Nvn {
                         "stat: draw input waits for uniforms",
                         "stat: draw input wait us for uniforms",
                     ),
+                    "rewritten indices" => (
+                        "stat: draw input waits for rewritten indices",
+                        "stat: draw input wait us for rewritten indices",
+                    ),
+                    "indices for fetched vertices" => (
+                        "stat: draw input waits for indices of fetched vertices",
+                        "stat: draw input wait us for indices of fetched vertices",
+                    ),
                     _ => (
                         "stat: draw input waits for other inputs",
                         "stat: draw input wait us for other inputs",
@@ -11281,7 +11289,12 @@ impl Nvn {
                 let guest = self.gpu_to_guest(address, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
-                let rewrites_indices = size == 1 || quads || strip && restart.is_some();
+                // A restart value that is already the type's all-ones
+                // value (Vulkan's) needs no rewriting.
+                let all_ones = if size == 2 { 0xffff } else { u32::MAX };
+                let rewrites_indices = size == 1
+                    || quads
+                    || strip && restart.is_some_and(|value| value & all_ones != all_ones);
                 // Indices GPU work is still writing (compute culling's
                 // output) are read in place, ordered after that work by its
                 // barrier, instead of waiting for it to finish to copy them
@@ -11292,7 +11305,15 @@ impl Nvn {
                     None
                 };
                 if in_place.is_none() {
-                    self.resolve_draw_input_of(core, "indices", guest, length)?;
+                    // Waits counted by why the CPU reads them.
+                    let kind = if !pulling {
+                        "indices for fetched vertices"
+                    } else if rewrites_indices {
+                        "rewritten indices"
+                    } else {
+                        "indices"
+                    };
+                    self.resolve_draw_input_of(core, kind, guest, length)?;
                 }
                 let indices = if let Some((buffer, offset)) = in_place {
                     self.gpu
@@ -11737,6 +11758,8 @@ impl Nvn {
                 }
                 true
             }
+            // Kept as they are: the restart value is already all ones.
+            (Some(_), Indices::Guest { .. } | Indices::Shared { .. }) if strip => true,
             _ => false,
         };
         let fixed = Fixed {
