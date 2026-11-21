@@ -710,7 +710,7 @@ struct Emitter {
     /// What the last coop32 multiply loaded, for the next to reuse.
     matrix_reuse: matrix::Reuse,
     /// Texture pool arrays by binding, and the bindings used (bit n).
-    pool_arrays: BTreeMap<u32, u32>,
+    pool_arrays: BTreeMap<(u32, u32), u32>,
     pool_bindings: u32,
     /// The texture pool's capacity (a specialization constant), once
     /// declared.

@@ -624,7 +624,7 @@ impl Gpu {
             dynamic_uniform_limit: properties.limits.max_descriptor_set_uniform_buffers_dynamic,
             spare_texture_pool: properties12.max_update_after_bind_descriptors_in_all_pools
                 >= 2 * (TEXTURE_POOL_CAPACITY * (echora_shader_abi::texture_pool::COUNT - 2)
-                    + SAMPLER_POOL_CAPACITY
+                    + echora_shader_abi::texture_pool::SAMPLER_DESCRIPTORS
                     + 1),
             cooperative_matrix,
             host_import,
@@ -840,7 +840,7 @@ fn texture_pool_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, 
                 .binding(binding)
                 .descriptor_type(kind(binding))
                 .descriptor_count(match binding {
-                    pool::SAMPLERS => SAMPLER_POOL_CAPACITY,
+                    pool::SAMPLERS => pool::SAMPLER_DESCRIPTORS,
                     pool::FLAGS => 1,
                     _ => TEXTURE_POOL_CAPACITY,
                 })

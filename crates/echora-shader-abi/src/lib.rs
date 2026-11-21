@@ -424,13 +424,15 @@ pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 /// `SpecMeaning::TexturePoolCapacity`. Pools this size cover every pool
 /// the game makes.
 pub const TEXTURE_POOL_CAPACITY: u32 = 1 << 16;
-/// Entries in the sampler array: every 12-bit sampler index.
+/// Guest sampler indices in each numeric class of the sampler array.
 pub const SAMPLER_POOL_CAPACITY: u32 = 1 << 12;
 
 /// Set-1 bindings (`TEXTURE_POOL_SET`).
 pub mod texture_pool {
-    /// VkSampler array (`OpTypeSampler`).
+    /// VkSampler array (`OpTypeSampler`). Integer border colors use the
+    /// second half at `SAMPLER_POOL_CAPACITY + sampler index`.
     pub const SAMPLERS: u32 = 0;
+    pub const SAMPLER_DESCRIPTORS: u32 = 2 * super::SAMPLER_POOL_CAPACITY;
     /// Sampled-image arrays, float results, by view type.
     pub const SAMPLED_1D: u32 = 1;
     pub const SAMPLED_1D_ARRAY: u32 = 2;
@@ -444,14 +446,14 @@ pub mod texture_pool {
     /// Storage images, format Unknown (typeless).
     pub const STORAGE_2D: u32 = 9;
     pub const STORAGE_3D: u32 = 10;
-    /// Sampled-image arrays, uint results.
+    /// Sampled-image arrays for signed and unsigned integer formats.
     pub const UINT_2D: u32 = 11;
     pub const UINT_2D_ARRAY: u32 = 12;
     pub const UINT_3D: u32 = 13;
-    /// A storage buffer of one u32 per texture index (`uint flags[]`):
-    /// bit 0 set when the entry is integer, so programs read it through
-    /// the `UINT_*` view (only 2D, 2D array and 3D have one).
+    /// An array of numeric flags, indexed by the texture index.
     pub const FLAGS: u32 = 14;
+    pub const FLAG_INTEGER: u32 = 1;
+    pub const FLAG_SIGNED: u32 = 2;
     pub const COUNT: u32 = 15;
 }
 

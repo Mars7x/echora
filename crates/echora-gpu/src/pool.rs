@@ -15,8 +15,9 @@ use ash::vk::Handle;
 use echora_shader_abi::texture_pool as binding;
 
 use crate::draw::{ImageShape, Sampler, TextureSource};
-use crate::fast_map::{FastMap, FastSet};
-use crate::renderer::{HostBuffer, Renderer, integer_format};
+use crate::fast_map::FastMap;
+use crate::renderer::{HostBuffer, Renderer, sampled_texture_type};
+use crate::shader::SampleType;
 use crate::vulkan::{SAMPLER_POOL_CAPACITY, TEXTURE_POOL_CAPACITY};
 
 /// One texture pool entry a draw or dispatch may read: the texture at
@@ -38,23 +39,22 @@ impl PoolEntry {
 }
 
 /// A pool entry of an upload as `bind_pool` resolved it: the entry, its
-/// (binding, index, sampler or view) descriptors and its integer flag.
+/// (binding, index, sampler or view) descriptors and its numeric flags.
 /// Valid while no view it names is destroyed (`forget_pool_views`).
 pub(crate) struct ResolvedEntry {
     source: TextureSource,
     sampler_state: Sampler,
     wanted: Vec<(u32, u32, u64)>,
-    integer: bool,
+    numeric: u32,
 }
 
 pub(crate) struct TexturePool {
     descriptor_pool: vk::DescriptorPool,
     pub(crate) set: vk::DescriptorSet,
-    /// `texture_pool::FLAGS`: one word per texture index, bit 0 set when
-    /// the entry is integer (read through the uint arrays).
+    /// `texture_pool::FLAGS`: one numeric class word per texture index.
     flags: HostBuffer,
-    /// Indices whose flag is set.
-    integer: FastSet<u32>,
+    numeric: FastMap<u32, u32>,
+    default_samplers: [vk::Sampler; 2],
     /// What each written (binding, index) holds: a view's or sampler's
     /// raw handle.
     written: FastMap<(u32, u32), u64>,
@@ -74,9 +74,14 @@ impl TexturePool {
         }
         let infos: Vec<[vk::DescriptorImageInfo; 1]> = changes
             .iter()
-            .map(|&(array, _, handle)| {
+            .map(|&(array, index, handle)| {
                 [if array == binding::SAMPLERS {
-                    vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(handle))
+                    let sampler = if handle == 0 {
+                        self.default_samplers[usize::from(index >= SAMPLER_POOL_CAPACITY)]
+                    } else {
+                        vk::Sampler::from_raw(handle)
+                    };
+                    vk::DescriptorImageInfo::default().sampler(sampler)
                 } else if handle != 0 {
                     vk::DescriptorImageInfo::default()
                         .image_view(vk::ImageView::from_raw(handle))
@@ -134,7 +139,7 @@ impl TexturePool {
 
 /// The pool arrays a texture of `shape` is read through (the recompiler's
 /// texture types: 0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D, 5 cube, 6 cube
-/// array), with the binding of each; integer textures through the uint
+/// array), with the binding of each; integer textures through the integer
 /// arrays only (sampling them as float is undefined).
 fn arrays(shape: ImageShape, integer: bool) -> impl Iterator<Item = (u32, u32)> {
     let types: &[u32] = match shape {
@@ -166,11 +171,14 @@ impl Renderer {
             .gpu
             .texture_pool_layout
             .ok_or("the device cannot hold the texture pool")?;
-        let sampler = self.sampler(&Sampler::default(), false)?;
+        let default_samplers = [
+            self.sampler(&Sampler::default(), false)?,
+            self.sampler(&Sampler::default(), true)?,
+        ];
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: SAMPLER_POOL_CAPACITY,
+                descriptor_count: binding::SAMPLER_DESCRIPTORS,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
@@ -229,13 +237,15 @@ impl Renderer {
             offset: 0,
             range: flags_size,
         }];
-        let samplers = vec![
-            vk::DescriptorImageInfo {
-                sampler,
-                ..Default::default()
-            };
-            SAMPLER_POOL_CAPACITY as usize
-        ];
+        let samplers: Vec<_> = default_samplers
+            .iter()
+            .flat_map(|&sampler| {
+                std::iter::repeat_n(
+                    vk::DescriptorImageInfo::default().sampler(sampler),
+                    SAMPLER_POOL_CAPACITY as usize,
+                )
+            })
+            .collect();
         let images = vec![vk::DescriptorImageInfo::default(); TEXTURE_POOL_CAPACITY as usize];
         let buffers = vec![vk::BufferView::null(); TEXTURE_POOL_CAPACITY as usize];
         let writes: Vec<_> = (0..binding::COUNT)
@@ -269,7 +279,8 @@ impl Renderer {
             descriptor_pool,
             set,
             flags,
-            integer: FastSet::default(),
+            numeric: FastMap::default(),
+            default_samplers,
             written: FastMap::default(),
             view_slots: FastMap::default(),
             last_use: 0,
@@ -302,13 +313,19 @@ impl Renderer {
             }
         }
         spare.write_entries(&self.gpu.device, &changes);
-        for &index in active.integer.difference(&spare.integer) {
-            spare.flags.write(index as usize * 4, &1u32.to_le_bytes());
+        for (&index, &numeric) in &active.numeric {
+            if spare.numeric.get(&index) != Some(&numeric) {
+                spare
+                    .flags
+                    .write(index as usize * 4, &numeric.to_le_bytes());
+            }
         }
-        for &index in spare.integer.difference(&active.integer) {
-            spare.flags.write(index as usize * 4, &0u32.to_le_bytes());
+        for &index in spare.numeric.keys() {
+            if !active.numeric.contains_key(&index) {
+                spare.flags.write(index as usize * 4, &0u32.to_le_bytes());
+            }
         }
-        spare.integer.clone_from(&active.integer);
+        spare.numeric.clone_from(&active.numeric);
         std::mem::swap(&mut self.texture_pool, &mut self.spare_texture_pool);
         self.stat("stat: texture pool rotations", 1);
         self.stat(
@@ -350,7 +367,7 @@ impl Renderer {
         // (binding, index, view or sampler) for every entry, resolved
         // before the set is touched (views can upload).
         let mut wanted: Vec<(u32, u32, u64)> = Vec::new();
-        let mut kinds: Vec<(u32, bool)> = Vec::new();
+        let mut kinds: Vec<(u32, u32)> = Vec::new();
         let mut targets = Vec::new();
         for entry in entries.iter() {
             if entry.texture >= TEXTURE_POOL_CAPACITY || entry.sampler >= SAMPLER_POOL_CAPACITY {
@@ -367,7 +384,7 @@ impl Renderer {
                 && memo.source.same_as(&entry.source)
             {
                 wanted.extend_from_slice(&memo.wanted);
-                kinds.push((entry.texture, memo.integer));
+                kinds.push((entry.texture, memo.numeric));
                 self.stat("stat: texture pool entries reused", 1);
                 continue;
             }
@@ -375,11 +392,22 @@ impl Renderer {
             let sampler = self.sampler(&entry.sampler_state, false)?;
             wanted.push((binding::SAMPLERS, entry.sampler, sampler.as_raw()));
             let (shape, format) = self.source_shape(&entry.source)?;
-            let integer = integer_format(format);
+            let numeric = match sampled_texture_type(format) {
+                SampleType::Float => 0,
+                SampleType::Unsigned => binding::FLAG_INTEGER,
+                SampleType::Signed => binding::FLAG_INTEGER | binding::FLAG_SIGNED,
+            };
+            let integer = numeric != 0;
             if integer {
+                let sampler = self.sampler(&entry.sampler_state, true)?;
+                wanted.push((
+                    binding::SAMPLERS,
+                    entry.sampler + SAMPLER_POOL_CAPACITY,
+                    sampler.as_raw(),
+                ));
                 self.stat("stat: texture pool integer entries", 1);
             }
-            kinds.push((entry.texture, integer));
+            kinds.push((entry.texture, numeric));
             for (kind, array) in arrays(shape, integer) {
                 // A type the texture has no view of stays null.
                 let Ok(view) =
@@ -394,7 +422,7 @@ impl Renderer {
                     source: entry.source.clone(),
                     sampler_state: entry.sampler_state,
                     wanted: wanted[first..].to_vec(),
-                    integer,
+                    numeric,
                 };
                 self.pool_entry_memo
                     .insert((entry.texture, entry.sampler), resolved);
@@ -412,9 +440,11 @@ impl Renderer {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let flips: Vec<(u32, bool)> = kinds
+        let flips: Vec<(u32, u32)> = kinds
             .into_iter()
-            .filter(|(index, integer)| pool.integer.contains(index) != *integer)
+            .filter(|(index, numeric)| {
+                pool.numeric.get(index).copied().unwrap_or_default() != *numeric
+            })
             .collect();
         let rewrites = !flips.is_empty()
             || changed
@@ -477,8 +507,8 @@ impl Renderer {
                         );
                     }
                 }
-                for (index, integer) in &flips {
-                    eprintln!("pool rewrite flag index {index}: integer -> {integer}");
+                for (index, numeric) in &flips {
+                    eprintln!("pool rewrite flag index {index}: numeric -> {numeric}");
                 }
             }
             if !self.rotate_texture_pool() {
@@ -495,13 +525,12 @@ impl Renderer {
         self.order_after_rendering(&targets)?;
         let pool = self.texture_pool.as_mut().unwrap();
         let set = pool.set;
-        for (index, integer) in flips {
-            pool.flags
-                .write(index as usize * 4, &u32::from(integer).to_le_bytes());
-            if integer {
-                pool.integer.insert(index);
+        for (index, numeric) in flips {
+            pool.flags.write(index as usize * 4, &numeric.to_le_bytes());
+            if numeric != 0 {
+                pool.numeric.insert(index, numeric);
             } else {
-                pool.integer.remove(&index);
+                pool.numeric.remove(&index);
             }
         }
         pool.write_entries(&self.gpu.device, &changed);
@@ -597,6 +626,189 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bindless_integer_and_float_views_can_share_a_guest_sampler() {
+        use crate::compute::{Dispatch, StorageImage};
+        use crate::shader::{self, DescriptorKind, Parameters};
+        use crate::vulkan::Gpu;
+        use std::sync::Arc;
+
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        if !renderer.supports_storage(vk::Format::R32_UINT) {
+            return;
+        }
+        let word =
+            |fields: &[(u32, u128)]| fields.iter().fold(7 << 12, |w, &(at, val)| w | val << at);
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let sampler_idx = 1u32;
+        let tex_idx = 6u32;
+        let handle = u128::from(sampler_idx << 20 | tex_idx);
+        let parameters = Parameters {
+            workgroup_size: [3, 1, 1],
+            ..Default::default()
+        };
+        let sampler = Sampler {
+            min_filter: vk::Filter::NEAREST,
+            mag_filter: vk::Filter::NEAREST,
+            base_level_only: true,
+            address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
+            border: [1.0f32.to_bits(); 4],
+            ..Default::default()
+        };
+        let inputs = [10u64, 11, 12];
+        for (key, format, value) in [
+            (
+                inputs[0],
+                vk::Format::R16G16_UINT,
+                vk::ClearColorValue {
+                    uint32: [24, 0, 0, 0],
+                },
+            ),
+            (
+                inputs[1],
+                vk::Format::R16G16_SINT,
+                vk::ClearColorValue {
+                    int32: [-11, 0, 0, 0],
+                },
+            ),
+            (
+                inputs[2],
+                vk::Format::R16G16_UNORM,
+                vk::ClearColorValue { float32: [0.0; 4] },
+            ),
+        ] {
+            renderer.target(key, 1, 1, format).unwrap();
+            renderer.clear_color(key, None, value).unwrap();
+        }
+        for (name, position, expected) in [
+            ("interior", 0.5f32, [24u32, (-11i32) as u32, 0]),
+            ("border", 1.75f32, [1, 1, 1.0f32.to_bits()]),
+        ] {
+            let sample: Vec<u8> = [
+                mov(0, u128::from(position.to_bits())),
+                mov(1, u128::from(0.5f32.to_bits())),
+                word(&[(0, 0x919), (16, 4), (72, 0x21)]),
+                mov(5, 0),
+                mov(6, handle),
+                mov(7, 0),
+                word(&[
+                    (0, 0x210),
+                    (16, 6),
+                    (24, 6),
+                    (32, 4),
+                    (64, 255),
+                    (81, 7),
+                    (84, 7),
+                ]),
+                word(&[
+                    (0, 0x361),
+                    (16, 10),
+                    (32, 6),
+                    (59, 1),
+                    (61, 1),
+                    (64, 255),
+                    (72, 1),
+                    (81, 7),
+                    (87, 3),
+                ]),
+                word(&[(0, 0xb9b), (24, 4), (32, 10), (40, 0x12), (61, 3), (72, 1)]),
+                word(&[(0, 0x94d), (87, 7)]),
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes)
+            .collect();
+            let discovery = shader::translate_rust(&sample, &parameters).unwrap();
+            let desc = discovery
+                .descriptors
+                .iter()
+                .find(|d| d.kind() == DescriptorKind::Image)
+                .unwrap();
+            let storage = shader::BoundStorageImage {
+                bank: desc.cbuf_index,
+                offset: desc.cbuf_offset,
+                view: desc.texture_type,
+                sample_type: shader::SampleType::Unsigned,
+            };
+            let stage = shader::translate_rust_with_bound_images(
+                &sample,
+                &parameters,
+                None,
+                &[],
+                &[storage],
+            )
+            .unwrap();
+            let image = stage
+                .descriptors
+                .iter()
+                .find(|d| d.kind() == DescriptorKind::Image)
+                .unwrap()
+                .binding;
+            let program = renderer.create_program(vec![Arc::new(stage)]).unwrap();
+            let originals = [0usize, 1, 2];
+            let swapped = [2usize, 0, 1];
+            let output = [20u64, 21];
+            for (out, order) in output.into_iter().zip([originals, swapped]) {
+                renderer.target(out, 3, 1, vk::Format::R32_UINT).unwrap();
+                renderer
+                    .clear_color(out, None, vk::ClearColorValue { uint32: [0; 4] })
+                    .unwrap();
+                let pool = order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, ix)| PoolEntry {
+                        texture: tex_idx + i as u32,
+                        sampler: sampler_idx,
+                        source: TextureSource::Target(inputs[ix]),
+                        sampler_state: sampler,
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                let dispatch = Dispatch {
+                    program: &program,
+                    groups: [1; 3],
+                    uniforms: Default::default(),
+                    storage: Default::default(),
+                    storage_in_place: Default::default(),
+                    textures: Default::default(),
+                    images: std::collections::HashMap::from([(
+                        image,
+                        StorageImage {
+                            target: out,
+                            ..Default::default()
+                        },
+                    )]),
+                    image_formats: Default::default(),
+                    indirect: None,
+                    page_table: Default::default(),
+                    pool,
+                };
+                renderer.dispatch_deferred(&dispatch).unwrap();
+            }
+            let mut pixels = Vec::new();
+            for (out, order) in output.into_iter().zip([originals, swapped]) {
+                let data = renderer.read_target_bytes(out, 4).unwrap();
+                let actual: Vec<_> = data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| u32::from_le_bytes(*bytes))
+                    .collect();
+                let expected = order.map(|at| expected[at]);
+                pixels.push((actual, expected));
+            }
+            renderer.destroy_program(program).unwrap();
+            for (actual, expected) in pixels {
+                assert_eq!(actual, expected, "{name}");
+            }
+        }
+    }
 
     #[test]
     fn retiring_a_view_clears_its_aliases_after_descriptor_rewrites() {

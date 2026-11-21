@@ -886,19 +886,31 @@ impl Renderer {
                 infos[0] = infos[0].flags(vk::ShaderCreateFlagsEXT::REQUIRE_FULL_SUBGROUPS);
             }
         }
+        let mut cache_layout = format!(
+            "{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}{}",
+            if dynamic_uniforms.is_empty() {
+                ""
+            } else {
+                " dynamic uniforms"
+            },
+        );
+        if pool {
+            use std::fmt::Write as _;
+            write!(
+                cache_layout,
+                " texture pool {} {} {}",
+                echora_shader_abi::texture_pool::COUNT,
+                echora_shader_abi::texture_pool::SAMPLER_DESCRIPTORS,
+                echora_shader_abi::TEXTURE_POOL_CAPACITY,
+            )
+            .expect("writing to a String");
+        }
         let mut shaders = crate::shader_cache::create_shaders(
             objects,
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
             &infos,
-            &format!(
-                "{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}{}",
-                if dynamic_uniforms.is_empty() {
-                    ""
-                } else {
-                    " dynamic uniforms"
-                },
-            ),
+            &cache_layout,
         )?;
         let mut shader_stages: Vec<_> = stages
             .iter()

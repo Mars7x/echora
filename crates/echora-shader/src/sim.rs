@@ -6289,8 +6289,9 @@ mod tests {
         let (translated, registers, _) =
             translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
         assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
-        // The handle's sampler, float view and flag are loaded once; each
-        // sample loads the unsigned view in its integer branch.
+        // The handle's float sampler, float view and flags are loaded
+        // once. Each integer branch loads its sampler and chooses between
+        // the signed and unsigned views.
         let chains = {
             let words = &translated.spirv;
             let mut at = 5;
@@ -6301,7 +6302,7 @@ mod tests {
             }
             count
         };
-        assert_eq!(chains, 3 + 4);
+        assert_eq!(chains, 3 + 4 * 3);
         // An integer entry 3 holding x + 10 in its first component.
         let image = Image {
             width: 2,

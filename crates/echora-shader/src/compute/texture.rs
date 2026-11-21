@@ -60,27 +60,26 @@ const FLAG_READ: u32 = 2;
 const FLAG_DEPTH: u32 = 8;
 
 /// A texture's SPIR-V types: the sampled image and the image.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Types {
     sampled: u32,
     image: u32,
     component: u32,
 }
 
-/// A pool texture's float and uint views (bindings and types), its index,
-/// its sampler and whether the entry is integer. Each branch loads only
-/// its own view's descriptor (an unwritten slot of the other view is never
-/// read) and makes its sampled image, as SPIR-V wants one in the block that
-/// uses it.
+/// A pool texture's numeric views, its index, sampler and flags. Each branch
+/// loads the matching view and makes the sampled image in its own block.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PoolViews {
-    integer: u32,
+    flags: u32,
     sampler: u32,
+    sampler_index: u32,
     index: u32,
     float_binding: u32,
-    float_types: (u32, u32),
-    uint_binding: u32,
-    uint_types: (u32, u32),
+    float_types: Types,
+    integer_binding: u32,
+    uint_types: Types,
+    sint_types: Types,
     uniform: bool,
 }
 
@@ -218,39 +217,27 @@ impl Emitter {
         if !uniform {
             self.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
         }
-        // An integer entry is read through its uint view, where it has one.
-        let uint_binding = match (view.dim, view.arrayed) {
+        // Integer image arrays keep the format of the bound view.
+        let integer_binding = match (view.dim, view.arrayed) {
             (1, false) => Some(texture_pool::UINT_2D),
             (1, true) => Some(texture_pool::UINT_2D_ARRAY),
             (2, _) => Some(texture_pool::UINT_3D),
             _ => None,
         };
-        self.pool_integer = match uint_binding.filter(|_| !depth) {
-            Some(uint_binding) => {
-                let uint_image = self.module.ty(Type::Image {
-                    sampled_type: self.u32,
-                    dim: view.dim,
-                    depth: 0,
-                    arrayed: view.arrayed,
-                    multisampled: false,
-                    sampled: 1,
-                    format: 0,
-                });
-                let uint_sampled = self.module.ty(Type::SampledImage { image: uint_image });
-                let integer = self.pool_flag(texture_index);
-                Some(PoolViews {
-                    integer,
-                    sampler,
-                    index: texture_index,
-                    float_binding: binding,
-                    float_types: (types.sampled, types.image),
-                    uint_binding,
-                    uint_types: (uint_sampled, uint_image),
-                    uniform,
-                })
-            }
-            None => None,
-        };
+        self.pool_integer = integer_binding
+            .filter(|_| !depth)
+            .map(|integer_binding| PoolViews {
+                flags: self.pool_flag(texture_index),
+                sampler,
+                sampler_index,
+                index: texture_index,
+                float_binding: binding,
+                float_types: types,
+                integer_binding,
+                uint_types: self.texture_types(view, false, SampleType::Unsigned),
+                sint_types: self.texture_types(view, false, SampleType::Signed),
+                uniform,
+            });
         Ok((sampled, types))
     }
 
@@ -320,11 +307,8 @@ impl Emitter {
         let zero = self.constant(0);
         let word = self.value(op::ACCESS_CHAIN, pointer, &[variable, zero, index]);
         let word = self.value(op::LOAD, self.u32, &[word]);
-        let one = self.constant(1);
-        let bit = self.value(op::BITWISE_AND, self.u32, &[word, one]);
-        let flag = self.value(op::I_NOT_EQUAL, self.bool, &[bit, zero]);
-        self.remember(Known::PoolFlag(index), flag);
-        flag
+        self.remember(Known::PoolFlag(index), word);
+        word
     }
 
     /// The texture pool's capacity, a specialization constant
@@ -361,7 +345,10 @@ impl Emitter {
                 .capability(capability::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING);
         }
         let array_type = self.module.ty(Type::RuntimeArray { element });
-        let variable = match self.pool_arrays.get(&binding) {
+        // The signed and unsigned variables can share an array of sampled
+        // image descriptors. Each is read only for its matching format.
+        let array = (binding, element);
+        let variable = match self.pool_arrays.get(&array) {
             Some(&variable) => variable,
             None => {
                 let pointer = self.module.pointer(storage::UNIFORM_CONSTANT, array_type);
@@ -373,7 +360,7 @@ impl Emitter {
                 self.module
                     .decorate(variable, decoration::BINDING, &[binding]);
                 self.interface.push(variable);
-                self.pool_arrays.insert(binding, variable);
+                self.pool_arrays.insert(array, variable);
                 self.pool_bindings |= 1 << binding;
                 variable
             }
@@ -787,14 +774,9 @@ impl Emitter {
             }
             return Ok(taps);
         }
-        // A pool entry that may be integer: its uint view where the flag
-        // says so, the float view otherwise.
+        // Match a bindless sample to its bound format and border color.
         let integer = self.pool_integer.take().filter(|_| reference.is_none());
         if let Some(views) = integer {
-            let uvec4 = self.module.ty(Type::Vector {
-                component: self.u32,
-                count: 4,
-            });
             let words: Vec<u32> = (0..4)
                 .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
                 .collect();
@@ -818,20 +800,19 @@ impl Emitter {
                 }
                 level
             });
-            self.choose(views.integer, |e, integer| {
-                let (binding, (sampled_type, image_type), ty) = if integer {
-                    (views.uint_binding, views.uint_types, uvec4)
-                } else {
-                    (views.float_binding, views.float_types, vec4)
-                };
-                let image = e.pool_entry(binding, image_type, views.index, views.uniform);
-                let sampled = e.value(op::SAMPLED_IMAGE, sampled_type, &[image, views.sampler]);
+            let sample = |e: &mut Self, binding: u32, types: Types, sampler: u32| {
+                let ty = e.module.ty(Type::Vector {
+                    component: types.component,
+                    count: 4,
+                });
+                let image = e.pool_entry(binding, types.image, views.index, views.uniform);
+                let sampled = e.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
                 if !views.uniform {
                     e.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
                 }
                 let result = match texture.op {
                     TextureOp::Fetch => {
-                        let image = e.value(op::IMAGE, image_type, &[sampled]);
+                        let image = e.value(op::IMAGE, types.image, &[sampled]);
                         e.value(
                             op::IMAGE_FETCH,
                             ty,
@@ -864,14 +845,39 @@ impl Emitter {
                     },
                 };
                 for (n, &word) in words.iter().enumerate() {
-                    let value = if integer {
-                        e.value(op::COMPOSITE_EXTRACT, e.u32, &[result, n as u32])
-                    } else {
-                        let value = e.value(op::COMPOSITE_EXTRACT, e.f32, &[result, n as u32]);
-                        e.value(op::BITCAST, e.u32, &[value])
-                    };
+                    let value = e.texel_bits(types, result, n as u32);
                     e.function.emit(op::STORE, &[word, value]);
                 }
+            };
+            let zero = self.constant(0);
+            let integer_bit = self.constant(texture_pool::FLAG_INTEGER);
+            let integer = self.value(op::BITWISE_AND, self.u32, &[views.flags, integer_bit]);
+            let integer = self.value(op::I_NOT_EQUAL, self.bool, &[integer, zero]);
+            self.choose(integer, |e, integer| {
+                if !integer {
+                    sample(e, views.float_binding, views.float_types, views.sampler);
+                    return;
+                }
+                let offset = e.constant(echora_shader_abi::SAMPLER_POOL_CAPACITY);
+                let sampler_index = e.value(op::I_ADD, e.u32, &[views.sampler_index, offset]);
+                let sampler_type = e.module.ty(Type::Sampler);
+                let sampler = e.pool_entry(
+                    texture_pool::SAMPLERS,
+                    sampler_type,
+                    sampler_index,
+                    views.uniform,
+                );
+                let signed_bit = e.constant(texture_pool::FLAG_SIGNED);
+                let signed = e.value(op::BITWISE_AND, e.u32, &[views.flags, signed_bit]);
+                let signed = e.value(op::I_NOT_EQUAL, e.bool, &[signed, zero]);
+                e.choose(signed, |e, signed| {
+                    let types = if signed {
+                        views.sint_types
+                    } else {
+                        views.uint_types
+                    };
+                    sample(e, views.integer_binding, types, sampler);
+                });
             });
             return Ok(words
                 .into_iter()
