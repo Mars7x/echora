@@ -37,6 +37,10 @@ pub struct Program {
     /// Each texture binding's (in descriptor order) last guest texture
     /// upload and its resolved descriptor (`TextureMemo`).
     texture_memo: std::sync::Mutex<Vec<Option<TextureMemo>>>,
+    /// The descriptor set last written for this program, while the
+    /// submission it was allocated for is recorded: a draw with the same
+    /// descriptors binds it again.
+    last_set: std::sync::Mutex<Option<DynamicSet>>,
 }
 
 /// A texture binding's upload, sampler state and the descriptor they
@@ -188,8 +192,6 @@ pub(crate) struct GraphicsState {
     program: Option<vk::PipelineLayout>,
     raster: Option<RasterState>,
     blends: Vec<Blend>,
-    // Valid for the current command buffer and program. Submitting resets it.
-    dynamic_set: Option<DynamicSet>,
     pool_set: Option<vk::DescriptorSet>,
     // Dynamic vertex input remains set across shader object bindings.
     vertex_input: Option<VertexInput>,
@@ -218,7 +220,6 @@ impl GraphicsState {
     }
 
     fn reset_program_bindings(&mut self) {
-        self.dynamic_set = None;
         self.pool_set = None;
     }
 }
@@ -230,6 +231,8 @@ struct VertexInput {
 }
 
 struct DynamicSet {
+    /// The submission (`Renderer::flushes`) whose descriptor pool holds it.
+    flush: u64,
     set: vk::DescriptorSet,
     bindings: Vec<(u32, DescriptorSource)>,
 }
@@ -1011,6 +1014,7 @@ impl Renderer {
             pool,
             dynamic_uniforms,
             texture_memo: Default::default(),
+            last_set: Default::default(),
         })
     }
 
@@ -1472,23 +1476,22 @@ impl Renderer {
         }
         drop(textures);
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
-        let matching = if !dynamic_offsets.is_empty()
-            && self.graphics.program == Some(program.pipeline_layout)
-        {
-            self.graphics.dynamic_set.as_ref().filter(|previous| {
-                previous.bindings.len() == writes.len()
+        let matching = program
+            .last_set
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|previous| {
+                previous.flush == self.flushes
+                    && previous.bindings.len() == writes.len()
                     && previous.bindings.iter().zip(&writes).all(
                         |((old_binding, old), (binding, source))| {
                             binding == old_binding && source.same_as(old)
                         },
                     )
             })
-        } else {
-            None
-        };
-        let reused = matching.is_some();
-        let set = if let Some(previous) = matching {
-            let set = previous.set;
+            .map(|previous| previous.set);
+        let set = if let Some(set) = matching {
             self.stat("stat: dynamic graphics descriptor sets reused", 1);
             set
         } else {
@@ -1499,6 +1502,16 @@ impl Renderer {
                 .collect();
             // SAFETY: the allocated set and its resources are live.
             unsafe { self.gpu.device.update_descriptor_sets(&updates, &[]) };
+            drop(updates);
+            // The replaced set's list is the next draw's to fill.
+            let replaced = program.last_set.lock().unwrap().replace(DynamicSet {
+                flush: self.flushes,
+                set,
+                bindings: std::mem::take(&mut writes),
+            });
+            if let Some(old) = replaced {
+                writes = old.bindings;
+            }
             set
         };
         self.lap("stat: renderer ns descriptor set", &mut since);
@@ -1741,15 +1754,6 @@ impl Renderer {
                 &[set],
                 &dynamic_offsets,
             );
-            if !reused && !dynamic_offsets.is_empty() {
-                // The replaced set's list is the next draw's to fill.
-                if let Some(old) = self.graphics.dynamic_set.replace(DynamicSet {
-                    set,
-                    bindings: std::mem::take(&mut writes),
-                }) {
-                    writes = old.bindings;
-                }
-            }
             if let Some(pool) = pool
                 && self.graphics.pool_set != Some(pool)
             {
