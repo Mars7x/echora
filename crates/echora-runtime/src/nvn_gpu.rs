@@ -7948,22 +7948,28 @@ impl Nvn {
                 );
             }
             let backend = self.gpu.as_mut().unwrap();
-            backend.stat("stat: page table pools mapped", 1);
             if built_pools.contains_key(&pool) {
-                backend.stat("stat: page table pools mapped again", 1);
-                backend.stat("stat: page table bytes mapped again", pool.size);
+                backend.stat("stat: page table pool remap attempts", 1);
+                backend.stat("stat: page table bytes considered for remapping", pool.size);
             }
             let pages = pool.pages(first, count);
-            let complete = if let Some(range) = entries.get_mut(pages.clone()) {
+            let (complete, has_pages) = if let Some(range) = entries.get_mut(pages.clone()) {
                 range.fill(0);
                 self.map_pool_pages(core, pool, first + pages.start as u64, range)?;
                 if let Some(modified) = &mut modified {
                     modified.push(pages.start as u64..pages.end as u64);
                 }
-                range.iter().all(|&entry| entry != 0)
+                let complete = !range.is_empty() && !range.contains(&0);
+                (complete, complete || range.iter().any(|&entry| entry != 0))
             } else {
-                false
+                (false, false)
             };
+            let result = match (complete, has_pages) {
+                (true, _) => "stat: page table pools mapped",
+                (false, true) => "stat: page table pools partially mapped",
+                (false, false) => "stat: page table pools with no mapped pages",
+            };
+            self.gpu.as_mut().unwrap().stat(result, 1);
             // A pool with unmapped pages, mapped without the guest's page
             // table, is mapped again by a build that has it.
             // Its signature after mapping (a GPU-only pool's resident
@@ -8138,16 +8144,8 @@ impl Nvn {
                     }
                     page += 1;
                 }
-                let backend = self.gpu.as_mut().unwrap();
-                if runs.is_empty() {
-                    let known = backend.shared_pools.get(&base).map(|&(shared, ..)| shared);
-                    backend.note(format!(
-                        "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped ({}), guest {base:#x}, recorded size {known:x?}",
-                        if recorded_span { "its recorded span did not import" } else { "no shared span" }
-                    ));
-                } else {
-                    backend.stat("stat: page table chunks mapped in runs", 1);
-                }
+                let has_runs = !runs.is_empty();
+                let mut mapped_in_runs = false;
                 for (at, run_length, file, file_at) in runs {
                     let mapped = self
                         .gpu
@@ -8162,9 +8160,24 @@ impl Nvn {
                                 entries.get_mut((first_page + page - first) as usize)
                             {
                                 *entry = mapped + page * PAGE_SIZE;
+                                mapped_in_runs = true;
                             }
                         }
                     }
+                }
+                let backend = self.gpu.as_mut().unwrap();
+                if mapped_in_runs {
+                    backend.stat("stat: page table chunks mapped in runs", 1);
+                } else {
+                    let known = backend.shared_pools.get(&base).map(|&(shared, ..)| shared);
+                    let reason = match (recorded_span, has_runs) {
+                        (_, true) => "its backing runs did not import",
+                        (true, false) => "its recorded span did not import",
+                        (false, false) => "no shared span",
+                    };
+                    backend.note(format!(
+                        "page table: pool at GPU {gpu:#x} (+{size:#x}) flags {flags:#x} not mapped ({reason}), guest {base:#x}, recorded size {known:x?}"
+                    ));
                 }
                 offset += length;
                 continue;
@@ -15037,6 +15050,80 @@ mod pool_tests {
                 .unwrap(),
             rendered
         );
+    }
+
+    #[test]
+    fn page_table_counts_only_pools_with_valid_device_addresses_as_mapped() {
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.gpu.buffer_device_address {
+            return;
+        }
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        use echora_shader_abi::PAGE_SIZE;
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let mut memory = Memory::new(1 << 39);
+        let resident = 0x10_0000;
+        memory
+            .map(
+                resident,
+                PAGE_SIZE,
+                READ | WRITE,
+                STATE_NORMAL,
+                "resident pool",
+            )
+            .unwrap();
+        for (object, base, flags, gpu) in [
+            (0x20_0000, resident, 0x21, 0x10_0000_0000),
+            (
+                0x20_0100,
+                resident + PAGE_SIZE,
+                0x22,
+                0x10_0000_0000 + PAGE_SIZE,
+            ),
+        ] {
+            let args = |x| Args {
+                x,
+                ..Default::default()
+            };
+            nvn.initialize(
+                object,
+                "MemoryPool",
+                BTreeMap::from([
+                    ("Storage".into(), args([base, PAGE_SIZE, 0, 0])),
+                    ("Flags".into(), args([flags, 0, 0, 0])),
+                ]),
+            )
+            .unwrap();
+            nvn.objects
+                .get_mut(&object)
+                .unwrap()
+                .state
+                .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
+        }
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        nvn.page_table(&mut guest).unwrap();
+        let backend = nvn.gpu.as_ref().unwrap();
+        let entries = backend.renderer.page_table_entries();
+        assert_ne!(entries[0], 0);
+        assert_eq!(entries[1], 0);
+        let notes = backend.notes_with_stats();
+        assert_eq!(notes.get("stat: page table pools mapped"), Some(&1));
+        assert_eq!(
+            notes.get("stat: page table pools with no mapped pages"),
+            Some(&1)
+        );
+        assert!(!notes.contains_key("stat: page table pools partially mapped"));
     }
 
     #[test]
