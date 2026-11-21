@@ -2127,12 +2127,16 @@ impl Nvn {
 
     /// Discard guest texture uploads whose virtual storage may change.
     pub(super) fn invalidate_virtual_texture_uploads(&mut self, pool: u64, mappings: &[[u64; 4]]) {
-        let Some(backend) = self.gpu.as_ref() else {
-            return;
-        };
-        if mappings.is_empty() {
+        if self.gpu.is_none() || mappings.is_empty() {
             return;
         }
+        // Memoized bindings keep the physical backing their texture had
+        // (render targets' included, which have no cached upload): every
+        // binding resolves anew after a remap (rare).
+        let backend = {
+            self.bump_binding_serial("stat: binding serial by virtual texture remapping");
+            self.gpu.as_ref().unwrap()
+        };
         let mut affected: Vec<_> = backend
             .textures
             .keys()
@@ -2143,7 +2147,6 @@ impl Nvn {
         if !affected.is_empty() {
             affected.sort_unstable();
             affected.dedup();
-            self.bump_binding_serial("stat: binding serial by virtual texture remapping");
             for texture in affected {
                 self.gpu_forget_texture(texture);
             }
