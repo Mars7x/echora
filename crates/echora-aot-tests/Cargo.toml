@@ -90,6 +90,10 @@ split-ticks = []
 # A BL to a block of the caller's region calls its window directly
 # (EmitOptions::direct_calls).
 direct-calls = []
+# A BL to a target with a window-call summary calls its window directly,
+# storing and reloading only what the callee may touch
+# (EmitOptions::window_calls).
+window-calls = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

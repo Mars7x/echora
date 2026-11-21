@@ -62,6 +62,7 @@ fn options() -> EmitOptions {
         float_runs: std::env::var_os("CARGO_FEATURE_FLOAT_RUNS").is_some(),
         float_run_loads: std::env::var_os("CARGO_FEATURE_FLOAT_RUN_LOADS").is_some(),
         deferred_charges: std::env::var_os("CARGO_FEATURE_DEFERRED_CHARGES").is_some(),
+        window_calls: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS").is_some(),
         stub_windows: false,
     }
 }
@@ -157,6 +158,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("q_pair", q_pair_code),
     ("vector_run", vector_run_code),
     ("rounded_up", rounded_up_code),
+    ("window_call", window_call_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -2301,6 +2303,39 @@ fn call_code(out: &mut String) {
         }
         writeln!(out, "{root}\n}}").expect("write");
     }
+    // With window calls (`EmitOptions::window_calls`), in one 64 KiB
+    // region and in 1 KiB regions (calls across windows through the
+    // window-call table). Not in the golden hashes' emissions.
+    if MODE.get().is_none() {
+        for (name, bits) in [("call_window_code", 16), ("call_window_table_code", 10)] {
+            LIFTED.set(LIFTED.get() + translation.instructions.len());
+            let (root, regions) = emit_rust_split_with(
+                &translation,
+                bits,
+                EmitOptions {
+                    window_calls: true,
+                    ..options()
+                },
+            );
+            let summarized = regions
+                .iter()
+                .map(|(_, source)| {
+                    source.matches("= enter_window_").count()
+                        + source.matches("= window_call_at(").count()
+                })
+                .sum::<usize>();
+            writeln!(out, "pub mod {name} {{").expect("write");
+            writeln!(
+                out,
+                "/// Summarized window calls.\npub const SUMMARIZED_CALLS: usize = {summarized};"
+            )
+            .expect("write");
+            for (region, source) in regions {
+                writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+            }
+            writeln!(out, "{root}\n}}").expect("write");
+        }
+    }
     // Mixed: every other 1 KiB region with functions, the table and
     // (transitive) summaries, the others with the base options, so calls
     // cross between regions with and without them both ways.
@@ -3637,6 +3672,388 @@ fn svc_wrapper_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "/// Calls of leaves with an effect summary.\npub const SUMMARIZED_CALLS: usize = {summarized};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/window_calls.rs`, shaped as game code calls: 40
+/// functions packed several to a 1 KiB window between NOP padding, and 60
+/// callers, each a run of random instructions with BL or BLR X26 to a
+/// function in about half its slots, ending in SVC #7. A function is a
+/// leaf (some skipping instructions behind a CBZ), keeps a frame (X29/X30
+/// and X19/X20 on the stack) and calls later functions by BL or BLR, runs
+/// a two-way jump through ADR and BR, can reach a UDF (a fault), makes an
+/// SVC #3, returns elsewhere (X30 pointed at a block in another window,
+/// which branches back through X25), or recurses X24 times; and one
+/// caller whose callee's callee returns elsewhere, to code reading a
+/// register the caller held across both calls. Lifted with
+/// the build's options, with window calls in one 64 KiB region, with
+/// window calls in 1 KiB regions (every call across windows through the
+/// window-call table), and with window calls in every other 1 KiB region.
+fn window_call_code(out: &mut String) {
+    use echora_lift::defuse::effects;
+
+    const BASE: u64 = 0xb0_0000;
+    const FUNCTIONS: usize = 40;
+    const CALLERS: usize = 60;
+    const NOP: u32 = 0xd503_201f;
+    const RET: u32 = 0xd65f_03c0;
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    // X24 counts recursion, X25 holds an early exit's return address, X26
+    // BLR targets and jump targets, X27/X28 the data index and base, X30
+    // the return address; SP is the stack.
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = effects(instruction).writes;
+        [24, 25, 26, 27, 28, 30].iter().any(|&n| writes.has_gpr(n)) || writes.sp
+    };
+    let offset = |from: usize, to: usize| (to as i64 - from as i64) as u32;
+    let b = |from: usize, to: usize| 0x1400_0000 | (offset(from, to) & 0x03ff_ffff);
+    let cbz =
+        |from: usize, to: usize, rt: u32| 0xb400_0000 | ((offset(from, to) & 0x7_ffff) << 5) | rt;
+    let tbz = |from: usize, to: usize, rt: u32, bit: u32| {
+        ((bit >> 5) << 31)
+            | 0x3600_0000
+            | ((bit & 31) << 19)
+            | ((offset(from, to) & 0x3fff) << 5)
+            | rt
+    };
+    let adr = |from: u64, to: u64, rd: u32| {
+        let delta = to.wrapping_sub(from) as u32;
+        0x1000_0000 | ((delta & 3) << 29) | (((delta >> 2) & 0x7_ffff) << 5) | rd
+    };
+
+    /// A word to patch once every piece has its address.
+    enum Fix {
+        /// BL to a function.
+        Bl(usize),
+        /// MOVZ/MOVK X26 with a function's address (the BLR follows).
+        Blr(usize),
+        /// ADR X30 to a piece (an early exit's other return).
+        Adr30(usize),
+    }
+    // Pieces: functions 0..FUNCTIONS, then the early exits' other returns,
+    // then the callers. Each is its words (relative branches inside it
+    // already encoded, in words), fixes, and extra discovery entries (word
+    // indices).
+    struct Piece {
+        words: Vec<u32>,
+        fixes: Vec<(usize, Fix)>,
+        entries: Vec<usize>,
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut others: Vec<Piece> = Vec::new();
+    let body = |words: &mut Vec<u32>, count: u32, next: &mut dyn FnMut() -> u32| {
+        for _ in 0..count {
+            words.push(body_instruction(next, &reserved));
+        }
+    };
+    for function in 0..FUNCTIONS {
+        let mut piece = Piece {
+            words: Vec::new(),
+            fixes: Vec::new(),
+            entries: Vec::new(),
+        };
+        let last = function + 1 == FUNCTIONS;
+        let kind = if last { 0 } else { next() % 12 };
+        let words = &mut piece.words;
+        match kind {
+            // A frame and calls of later functions.
+            4..=7 => {
+                words.push(0xa9bf_7bfd); // stp x29, x30, [sp, #-16]!
+                let saves = next() % 2 == 0;
+                if saves {
+                    words.push(0xa9bf_53f3); // stp x19, x20, [sp, #-16]!
+                }
+                for _ in 0..1 + next() % 3 {
+                    body(words, next() % 3, &mut next);
+                    let callee = function + 1 + next() as usize % (FUNCTIONS - function - 1);
+                    if next() % 5 == 0 {
+                        piece.fixes.push((words.len(), Fix::Blr(callee)));
+                        words.extend([0, 0, 0xd63f_0000 | (26 << 5)]);
+                    } else {
+                        piece.fixes.push((words.len(), Fix::Bl(callee)));
+                        words.push(0);
+                    }
+                }
+                body(words, next() % 3, &mut next);
+                if saves {
+                    words.push(0xa8c1_53f3); // ldp x19, x20, [sp], #16
+                }
+                words.push(0xa8c1_7bfd); // ldp x29, x30, [sp], #16
+                words.push(RET);
+            }
+            // A two-way jump: ADR X26, case 0; TBZ over an ADD of 8 to it;
+            // BR X26; two cases of an instruction and a branch to the end.
+            8 => {
+                body(words, next() % 3, &mut next);
+                let at = words.len();
+                let register = next() % 24;
+                let bit = next() % 64;
+                // adr x26, case0 (at + 4); tbz; add x26, x26, #8; br x26
+                words.push(adr(0, 4 * 4, 26));
+                words.push(tbz(1, 3, register, bit));
+                words.push(0x9100_235a); // add x26, x26, #8
+                words.push(0xd61f_0000 | (26 << 5));
+                let case0 = at + 4;
+                for case in 0..2 {
+                    body(words, 1, &mut next);
+                    words.push(0);
+                    piece.entries.push(case0 + 2 * case);
+                }
+                let end = words.len();
+                words[case0 + 1] = b(case0 + 1, end);
+                words[case0 + 3] = b(case0 + 3, end);
+                body(words, 1 + next() % 2, &mut next);
+                words.push(RET);
+            }
+            // A UDF behind a bit test: a fault on some states.
+            9 => {
+                body(words, next() % 3, &mut next);
+                let at = words.len();
+                words.push(tbz(at, at + 2, next() % 24, next() % 64));
+                words.push(0); // udf #0
+                body(words, 1 + next() % 3, &mut next);
+                words.push(RET);
+            }
+            // An SVC #3 the host completes, in a leaf.
+            10 => {
+                body(words, 1 + next() % 2, &mut next);
+                words.push(0xd400_0061);
+                body(words, next() % 3, &mut next);
+                words.push(RET);
+            }
+            // Returns elsewhere (X30 pointed at a block in another window,
+            // which goes back through X25), or recurses X24 times.
+            11 => {
+                if next() % 2 == 0 {
+                    words.push(0xaa1e_03f9); // mov x25, x30
+                    body(words, 1 + next() % 3, &mut next);
+                    piece
+                        .fixes
+                        .push((words.len(), Fix::Adr30(FUNCTIONS + others.len())));
+                    words.push(0);
+                    words.push(RET);
+                    let mut other = Piece {
+                        words: Vec::new(),
+                        fixes: Vec::new(),
+                        entries: Vec::new(),
+                    };
+                    body(&mut other.words, 1 + next() % 3, &mut next);
+                    other.words.push(0xd61f_0000 | (25 << 5)); // br x25
+                    others.push(other);
+                } else {
+                    // cbz x24, out; sub x24, x24, #1; stp; bl self; ldp; out: ret
+                    words.push(0);
+                    words.push(0xd100_0718);
+                    words.push(0xa9bf_7bfd);
+                    piece.fixes.push((words.len(), Fix::Bl(function)));
+                    words.push(0);
+                    words.push(0xa8c1_7bfd);
+                    body(words, next() % 2, &mut next);
+                    let out = words.len();
+                    words[0] = cbz(0, out, 24);
+                    words.push(RET);
+                }
+            }
+            // A leaf, some with instructions skipped behind a CBZ.
+            _ => {
+                body(words, next() % 3, &mut next);
+                if next() % 2 == 0 {
+                    let at = words.len();
+                    let skipped = 1 + next() as usize % 2;
+                    words.push(cbz(at, at + 1 + skipped, next() % 24));
+                    body(words, skipped as u32, &mut next);
+                }
+                body(words, 1 + next() % 3, &mut next);
+                words.push(RET);
+            }
+        }
+        pieces.push(piece);
+    }
+    pieces.extend(others);
+    let callers_from = pieces.len();
+    for _ in 0..CALLERS {
+        let mut piece = Piece {
+            words: Vec::new(),
+            fixes: Vec::new(),
+            entries: Vec::new(),
+        };
+        for _ in 0..4 + next() % 9 {
+            if next() % 2 == 0 {
+                let callee = next() as usize % FUNCTIONS;
+                if next() % 6 == 0 {
+                    piece.fixes.push((piece.words.len(), Fix::Blr(callee)));
+                    piece.words.extend([0, 0, 0xd63f_0000 | (26 << 5)]);
+                } else {
+                    piece.fixes.push((piece.words.len(), Fix::Bl(callee)));
+                    piece.words.push(0);
+                }
+            } else {
+                piece.words.push(body_instruction(&mut next, &reserved));
+            }
+        }
+        piece.words.push(0xd400_00e1);
+        pieces.push(piece);
+    }
+    // Two levels with an early return: a caller sets X9 and calls F, which
+    // keeps a frame and calls E, which returns to a block in another
+    // window reading X9 (held by the caller across both calls: neither
+    // touches it) before going back to F through X25.
+    let other = pieces.len();
+    let early = other + 1;
+    let frame = other + 2;
+    let chain_caller = other + 3;
+    pieces.push(Piece {
+        // add x10, x9, #1; br x25
+        words: vec![0x9100_052a, 0xd61f_0000 | (25 << 5)],
+        fixes: Vec::new(),
+        entries: Vec::new(),
+    });
+    pieces.push(Piece {
+        // mov x25, x30; adr x30, other; ret
+        words: vec![0xaa1e_03f9, 0, RET],
+        fixes: vec![(1, Fix::Adr30(other))],
+        entries: Vec::new(),
+    });
+    pieces.push(Piece {
+        // stp x29, x30, [sp, #-16]!; bl early; ldp x29, x30, [sp], #16; ret
+        words: vec![0xa9bf_7bfd, 0, 0xa8c1_7bfd, RET],
+        fixes: vec![(1, Fix::Bl(early))],
+        entries: Vec::new(),
+    });
+    pieces.push(Piece {
+        // movz x9, #0x1234; bl frame; svc #7
+        words: vec![0xd282_4689, 0, 0xd400_00e1],
+        fixes: vec![(1, Fix::Bl(frame))],
+        entries: Vec::new(),
+    });
+    // Layout: the pieces shuffled, with NOP padding of 0 to 63 words
+    // between them.
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    for index in (1..order.len()).rev() {
+        order.swap(index, next() as usize % (index + 1));
+    }
+    let mut addresses = vec![0u64; pieces.len()];
+    let mut words: Vec<u32> = Vec::new();
+    for &piece in &order {
+        let padding = if next() % 3 == 0 { next() % 64 } else { 0 };
+        words.extend(std::iter::repeat_n(NOP, padding as usize));
+        addresses[piece] = BASE + 4 * words.len() as u64;
+        words.extend(&pieces[piece].words);
+    }
+    let mut entries: Vec<u64> = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        let start = ((addresses[index] - BASE) / 4) as usize;
+        entries.push(addresses[index]);
+        for &at in &piece.entries {
+            entries.push(addresses[index] + 4 * at as u64);
+        }
+        for (at, fix) in &piece.fixes {
+            let pc = addresses[index] + 4 * *at as u64;
+            let word = start + at;
+            match *fix {
+                Fix::Bl(callee) => {
+                    let delta = (addresses[callee].wrapping_sub(pc) as i64 / 4) as u32;
+                    words[word] = 0x9400_0000 | (delta & 0x03ff_ffff);
+                }
+                Fix::Blr(callee) => {
+                    let target = addresses[callee];
+                    words[word] = 0xd280_0000 | (((target & 0xffff) as u32) << 5) | 26;
+                    words[word + 1] = 0xf2a0_0000 | (((target >> 16) as u32) << 5) | 26;
+                }
+                Fix::Adr30(other) => words[word] = adr(pc, addresses[other], 30),
+            }
+        }
+    }
+    // Jump cases were encoded relative to their function: ADR X26 points 4
+    // words past itself already.
+    let mut callers: Vec<u64> = addresses[callers_from..callers_from + CALLERS].to_vec();
+    callers.push(addresses[chain_caller]);
+    let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "window calls".into(),
+        base: BASE,
+        bytes: image,
+    };
+    let translation = discover(&[region], &entries, words.len() + 64).expect("window calls");
+    let report = translation.report();
+    // (Indirect branches' targets count as unresolved: they are entries.)
+    assert!(
+        report.unsupported.is_empty(),
+        "window-call programs must lift completely: {:?}",
+        report.unsupported
+    );
+    let calling = EmitOptions {
+        window_calls: true,
+        ..options()
+    };
+    let active = !calling.structured && !calling.functions;
+    let lifts: Vec<(&str, String, Vec<(u64, String)>)> = {
+        let mut lifts = Vec::new();
+        for (name, bits, options) in [
+            ("window_call_base", 16, options()),
+            ("window_call_on", 16, calling),
+            ("window_call_table", 10, calling),
+        ] {
+            LIFTED.set(LIFTED.get() + translation.instructions.len());
+            let (root, regions) = emit_rust_split_with(&translation, bits, options);
+            lifts.push((name, root, regions));
+        }
+        let listed: std::collections::BTreeSet<u64> = translation
+            .blocks
+            .iter()
+            .map(|block| block.start >> 10)
+            .filter(|region| region % 2 == 0)
+            .collect();
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let mut regions = Vec::new();
+        let root = echora_lift::codegen::emit_rust_split_to_regions(
+            &translation,
+            10,
+            options(),
+            calling,
+            &listed,
+            &mut |region, source, _| {
+                regions.push((region, source));
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .expect("no sink errors");
+        lifts.push(("window_call_mixed", root, regions));
+        lifts
+    };
+    writeln!(out, "pub mod window_call_program {{").expect("write");
+    writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+    writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+    writeln!(out, "pub const CALLERS: &[u64] = &{callers:#x?};").expect("write");
+    writeln!(out, "/// Whether the build's options allow window calls (not structured, no lifted functions).\npub const ACTIVE: bool = {active};").expect("write");
+    writeln!(out, "}}").expect("write");
+    for (name, root, regions) in lifts {
+        let count = |pattern: &str| {
+            regions
+                .iter()
+                .map(|(_, source)| source.matches(pattern).count())
+                .sum::<usize>()
+        };
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(
+            out,
+            "/// Summarized window calls, directly and through the table, and the windows they enter.\n\
+             pub const DIRECT_CALLS: usize = {};\npub const TABLE_CALLS: usize = {};\npub const ENTERED_WINDOWS: usize = {};",
+            count("= enter_window_"),
+            count("= window_call_at("),
+            count("pub fn enter_window_")
+        )
+        .expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

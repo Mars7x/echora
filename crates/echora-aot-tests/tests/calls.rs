@@ -31,7 +31,7 @@ mod lifted {
 use echora_lift::aarch64::{Instruction, decode};
 use lifted::{
     call_code, call_function_code, call_function_table_code, call_mixed_code, call_summary_code,
-    call_summary_table_code, call_transitive_code,
+    call_summary_table_code, call_transitive_code, call_window_code, call_window_table_code,
 };
 
 const STATES_PER_CALLER: usize = 16;
@@ -241,6 +241,36 @@ fn lifted_functions_in_some_regions_match_the_reference() {
     const { assert!(call_mixed_code::UNLISTED_FUNCTIONS == 0) };
     call_mixed_code::install();
     check(call_mixed_code::dispatch);
+}
+
+/// The callers with window calls (`EmitOptions::window_calls`): a BL to a
+/// target with a summary runs its window directly, storing and reloading
+/// only what the summary says it may touch; in one region, and through
+/// the window-call table across 1 KiB regions.
+#[test]
+fn window_calls_match_the_reference() {
+    window_check(
+        call_window_code::SUMMARIZED_CALLS,
+        call_window_code::dispatch,
+        call_window_code::install,
+    );
+}
+
+#[test]
+fn window_calls_through_the_table_match_the_reference() {
+    window_check(
+        call_window_table_code::SUMMARIZED_CALLS,
+        call_window_table_code::dispatch,
+        call_window_table_code::install,
+    );
+}
+
+fn window_check(summarized: usize, dispatch: fn(&mut Core) -> Result<(), Trap>, install: fn()) {
+    // Structured emission and lifted functions turn window calls off.
+    let off = cfg!(feature = "structured") || cfg!(feature = "functions");
+    assert!(off || summarized > 0, "no summarized window calls");
+    install();
+    check(dispatch);
 }
 
 fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
