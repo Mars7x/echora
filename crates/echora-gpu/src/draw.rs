@@ -540,6 +540,10 @@ pub struct Draw<'a> {
     /// Storage buffers shared with the GPU in place instead (see
     /// `Renderer::import_file`): buffer, offset and length.
     pub storage_in_place: crate::FastMap<(usize, u32), (vk::Buffer, u64, u64)>,
+    /// Uniform buffer bindings the GPU reads in place, as (buffer, offset,
+    /// length): guest memory that GPU work recorded before the draw writes
+    /// (the offset a multiple of `uniform_offset_alignment`).
+    pub uniforms_in_place: crate::FastMap<(usize, u32), (vk::Buffer, u64, u64)>,
     pub fixed: Fixed,
     pub blends: &'a [Blend],
     /// A task/mesh pipeline's workgroups (the program's first stages are
@@ -1125,6 +1129,7 @@ impl Renderer {
             textures: &crate::FastMap::default(),
             storage: crate::FastMap::default(),
             storage_in_place: crate::FastMap::default(),
+            uniforms_in_place: crate::FastMap::default(),
             fixed: Fixed {
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 primitive_restart: false,
@@ -1225,11 +1230,13 @@ impl Renderer {
                         descriptors[2] += 1;
                     }
                     _ => {
-                        let length = match draw.uniforms.get(&key) {
-                            Some(bytes) => bytes.len(),
-                            None => draw.guest_uniforms.get(&key).map_or(16, |read| read.1),
-                        };
-                        bytes += descriptor_buffer_range(length) + 256;
+                        if !draw.uniforms_in_place.contains_key(&key) {
+                            let length = match draw.uniforms.get(&key) {
+                                Some(bytes) => bytes.len(),
+                                None => draw.guest_uniforms.get(&key).map_or(16, |read| read.1),
+                            };
+                            bytes += descriptor_buffer_range(length) + 256;
+                        }
                         descriptors[0] += 1;
                     }
                 }
@@ -1268,6 +1275,11 @@ impl Renderer {
                             draw.guest_uniforms.get(&key),
                             draw.read_guest,
                         ) {
+                            _ if let Some(&(buffer, offset, length)) =
+                                draw.uniforms_in_place.get(&key) =>
+                            {
+                                (buffer, offset, length.max(16).next_multiple_of(16))
+                            }
                             (Some(bytes), ..) => self.ring_upload_padded(bytes)?,
                             (None, Some(&(guest, length)), Some(read)) => {
                                 let range = descriptor_buffer_range(length);
@@ -2131,6 +2143,7 @@ pub(crate) mod tests {
             pool: Default::default(),
             storage: crate::FastMap::default(),
             storage_in_place: crate::FastMap::default(),
+            uniforms_in_place: crate::FastMap::default(),
             fixed: Fixed {
                 topology: vk::PrimitiveTopology::TRIANGLE_STRIP,
                 primitive_restart: false,

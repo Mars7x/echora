@@ -7271,6 +7271,41 @@ impl Nvn {
             .max()
     }
 
+    /// Whether a draw's uniform buffer at guest `range` is read by the GPU
+    /// in place rather than copied when the draw is recorded: GPU work
+    /// recorded before it may still store there through the page table, and
+    /// in place the GPU reads those stores in queue order, as the console
+    /// does, while a copy would wait for that work first. Only guest memory
+    /// shared with the GPU qualifies (`shared_binding`), with no other GPU
+    /// results waiting to be copied into it (`gpu_writes_pending`).
+    /// ECHORA_UNIFORMS_IN_PLACE=0 copies them all, waiting; =all reads
+    /// every shared uniform buffer in place, GPU-written or not.
+    fn uniform_in_place(&self, range: std::ops::Range<u64>) -> bool {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| {
+            match super::debug_var_os("ECHORA_UNIFORMS_IN_PLACE")
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+            {
+                Some("0") => 0,
+                Some("all") => 2,
+                _ => 1,
+            }
+        });
+        let Some(backend) = self.gpu.as_ref() else {
+            return false;
+        };
+        mode != 0
+            && (mode == 2
+                || self
+                    .draw_input_write_serial(range.clone())
+                    .is_some_and(|serial| serial > backend.renderer.completed_serial()))
+            && !self.gpu_writes_pending(&range)
+            && self
+                .shared_guest_range(range.start, range.end - range.start)
+                .is_some()
+    }
+
     fn uniform_write_serial(&self, stages: &[Arc<Translated>]) -> u64 {
         let mut serial = 0;
         for stage in stages {
@@ -7290,6 +7325,7 @@ impl Nvn {
                 }
                 if let Ok(guest) = self.gpu_to_guest(bind.x[3], size)
                     && let Some(end) = guest.checked_add(size)
+                    && !self.uniform_in_place(guest..end)
                     && let Some(writes) = self.draw_input_write_serial(guest..end)
                 {
                     serial = serial.max(writes);
@@ -10302,6 +10338,7 @@ impl Nvn {
         let mut fragment_constants = None;
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
+        let mut uniforms_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
         // address, by (stage index, binding).
         let mut storage_written = HashMap::default();
@@ -10374,6 +10411,18 @@ impl Nvn {
                         let guest = self.gpu_to_guest(address, size)?;
                         if let Some(started) = started {
                             uniform_time += started.elapsed();
+                        }
+                        if let Some(end) = guest.checked_add(size)
+                            && self.uniform_in_place(guest..end)
+                            && let Some((buffer, offset)) = self.shared_binding(guest, size)?
+                        {
+                            let backend = self.gpu.as_mut().unwrap();
+                            if offset % backend.renderer.uniform_offset_alignment() == 0 {
+                                uniforms_in_place
+                                    .insert((index, descriptor.binding), (buffer, offset, size));
+                                backend.stat("stat: draw uniforms read in place", 1);
+                                continue;
+                            }
                         }
                         self.resolve_draw_input(core, guest, size)?;
                         uniform_bytes += size;
@@ -11976,6 +12025,7 @@ impl Nvn {
             textures,
             storage,
             storage_in_place,
+            uniforms_in_place,
             fixed,
             page_table,
             vertex_fetch,

@@ -88,6 +88,9 @@ pub struct Gpu {
     /// Descriptor indexing budget for two versions of the texture pool.
     pub(crate) spare_texture_pool: bool,
     pub(crate) dynamic_uniform_limit: u32,
+    /// minUniformBufferOffsetAlignment: a uniform buffer bound in place
+    /// starts at a multiple of it.
+    pub uniform_offset_alignment: u64,
 
     /// The driver's shaderBinaryUUID and shaderBinaryVersion: shader object
     /// binaries it wrote load again only while both are unchanged.
@@ -656,6 +659,7 @@ impl Gpu {
             buffer_device_address,
             texture_pool_layout,
             dynamic_uniform_limit: properties.limits.max_descriptor_set_uniform_buffers_dynamic,
+            uniform_offset_alignment: properties.limits.min_uniform_buffer_offset_alignment.max(1),
             spare_texture_pool: properties12.max_update_after_bind_descriptors_in_all_pools
                 >= 2 * (TEXTURE_POOL_CAPACITY * (echora_shader_abi::texture_pool::COUNT - 2)
                     + echora_shader_abi::texture_pool::SAMPLER_DESCRIPTORS

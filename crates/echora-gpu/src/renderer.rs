@@ -4555,7 +4555,10 @@ impl Renderer {
             .size(span)
             .usage(addressed_usage(
                 // INDIRECT_BUFFER: dispatches read their group counts here.
+                // UNIFORM_BUFFER: draws read uniforms GPU work wrote here
+                // in place.
                 vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
@@ -5282,6 +5285,11 @@ impl Renderer {
 
     /// Reconstitute an image before a command refers to it. Keep the
     /// archive until recording the upload has succeeded.
+    /// The alignment of a uniform buffer bound in place (`Draw::uniforms_in_place`).
+    pub fn uniform_offset_alignment(&self) -> u64 {
+        self.gpu.uniform_offset_alignment
+    }
+
     pub fn restore_archived_target(&mut self, key: u64) -> Result<(), String> {
         let Some(archived) = self.archived_targets.get(&key) else {
             return Ok(());
