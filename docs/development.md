@@ -111,7 +111,8 @@ read.
 | `ECHORA_MOVIE_RATE=1` | Every 60 movie pictures, print how many have been decoded, the rate per second and the time since boot. This is the speed measure for the movie; presented frames per second are not comparable there, because loading presents black frames at a load-dependent rate. In the 3D scene, use `ECHORA_PRESENT_RATE`. |
 | `ECHORA_PRESENT_RATE=N` | Every N presents, print the count and the rate over those N. |
 | `ECHORA_TIMELINE=file` | Write each thread's guest runs, lock waits, NVN calls and replay pieces as spans over a few presents (debugging). |
-| `ECHORA_GPU_TIME=1` | Print GPU busy time against elapsed time and CPU wait time. Include per-phase draw recording timings in the run report. |
+| `ECHORA_GPU_TIME=1` | Compare time covered by GPU submission intervals with wall time and CPU fence waits. Include per-phase draw recording timings in the run report. |
+| `ECHORA_GPU_TIME=items` | Also rank draw and dispatch timestamp intervals. Intervals can overlap and include waits for earlier commands. |
 | `ECHORA_PROFILE_FROM=N` | Reset runtime and GPU statistics at present N to measure a specific part of a run. |
 | `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |
 | `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |

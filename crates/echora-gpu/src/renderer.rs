@@ -3672,6 +3672,7 @@ impl Renderer {
             timer.finished(
                 &self.gpu.device,
                 self.slot.fence,
+                self.slot.serial,
                 self.flush_wait_microseconds,
             );
         }

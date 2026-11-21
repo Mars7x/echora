@@ -1,11 +1,11 @@
 //! GPU time per submission (ECHORA_GPU_TIME=1): a timestamp at the start
 //! and end of each batch, and every few seconds a line on stderr with the
-//! time the GPU was busy, against wall time and against the time the CPU
-//! waited for it. Tells whether a phase is limited by the GPU or the CPU.
-//! ECHORA_GPU_TIME=items also times each draw and dispatch, named by its
-//! submission label, and lists the most expensive ones in each line.
+//! elapsed time covered by submissions, against wall time and CPU waits.
+//! ECHORA_GPU_TIME=items adds a ranking of draw and dispatch intervals,
+//! which may overlap and include time waiting for earlier commands.
 
 use ash::vk;
+use std::collections::BTreeMap;
 
 /// How often a summary line is written.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -24,18 +24,64 @@ struct ItemTimes {
     totals: std::collections::HashMap<String, (f64, u64)>,
 }
 
+struct BatchTimes {
+    mask: u64,
+    last_end: Option<u64>,
+    next_serial: u64,
+    /// A fence can be collected out of submission order. Account for a
+    /// batch once the previous batches have been collected.
+    pending: BTreeMap<u64, Option<[u64; 2]>>,
+    ticks: u64,
+    submits: u64,
+}
+
+impl BatchTimes {
+    fn new(valid_bits: u32) -> Self {
+        Self {
+            mask: u64::MAX >> (64 - valid_bits),
+            last_end: None,
+            next_serial: 1,
+            pending: BTreeMap::new(),
+            ticks: 0,
+            submits: 0,
+        }
+    }
+
+    fn record(&mut self, serial: u64, interval: Option<[u64; 2]>) {
+        if serial != self.next_serial {
+            self.pending.insert(serial, interval);
+            return;
+        }
+        self.count(interval);
+        while let Some(interval) = self.pending.remove(&self.next_serial) {
+            self.count(interval);
+        }
+    }
+
+    fn count(&mut self, interval: Option<[u64; 2]>) {
+        self.next_serial += 1;
+        let Some([start, end]) = interval else {
+            return;
+        };
+        let duration = end.wrapping_sub(start) & self.mask;
+        // Count only the part beyond the previous end if batches overlap.
+        // The elapsed time between compared samples must fit the counter.
+        let advance = self
+            .last_end
+            .map_or(duration, |last| end.wrapping_sub(last) & self.mask);
+        self.ticks += duration.min(advance);
+        self.last_end = Some(end);
+        self.submits += 1;
+    }
+}
+
 pub(crate) struct GpuTimer {
     pool: vk::QueryPool,
     /// Nanoseconds per timestamp tick.
     period: f64,
     /// The fence of each submission slot: slot `i` owns queries 2i, 2i+1.
     fences: [vk::Fence; crate::renderer::SLOTS],
-    /// End of the last batch counted, in ticks: batches finish in order,
-    /// and one may start before the previous one ends, so busy time is
-    /// the union of the intervals.
-    last_end: u64,
-    busy_ns: f64,
-    submits: u64,
+    batches: BatchTimes,
     since: std::time::Instant,
     waited_at_start: u64,
     items: Option<ItemTimes>,
@@ -76,9 +122,7 @@ impl GpuTimer {
             pool,
             period: f64::from(period),
             fences,
-            last_end: 0,
-            busy_ns: 0.0,
-            submits: 0,
+            batches: BatchTimes::new(valid_bits),
             since: std::time::Instant::now(),
             waited_at_start: 0,
             items,
@@ -197,7 +241,13 @@ impl GpuTimer {
 
     /// After the slot's fence signaled: count its batch, and report when
     /// due. `waited_us` is the renderer's running total of fence waits.
-    pub(crate) fn finished(&mut self, device: &ash::Device, fence: vk::Fence, waited_us: u64) {
+    pub(crate) fn finished(
+        &mut self,
+        device: &ash::Device,
+        fence: vk::Fence,
+        serial: u64,
+        waited_us: u64,
+    ) {
         let Some(first) = self.first_query(fence) else {
             return;
         };
@@ -211,14 +261,7 @@ impl GpuTimer {
                 vk::QueryResultFlags::TYPE_64,
             )
         };
-        if read.is_ok() && ticks[1] >= ticks[0] {
-            let start = ticks[0].max(self.last_end);
-            if ticks[1] > start {
-                self.busy_ns += (ticks[1] - start) as f64 * self.period;
-            }
-            self.last_end = self.last_end.max(ticks[1]);
-            self.submits += 1;
-        }
+        self.batches.record(serial, read.ok().map(|()| ticks));
         if let Some(items) = self.items.as_mut() {
             let slot = (first / 2) as usize;
             let names = std::mem::take(&mut items.names[slot]);
@@ -238,7 +281,8 @@ impl GpuTimer {
                 if read.is_ok() {
                     for (name, pair) in names.iter().zip(ticks.chunks_exact(2)) {
                         let total = items.totals.entry(name.clone()).or_default();
-                        total.0 += pair[1].saturating_sub(pair[0]) as f64 * self.period;
+                        let duration = pair[1].wrapping_sub(pair[0]) & self.batches.mask;
+                        total.0 += duration as f64 * self.period;
                         total.1 += 1;
                     }
                 }
@@ -254,19 +298,17 @@ impl GpuTimer {
                     .take(10)
                     .map(|(name, (ns, count))| format!("{name} {:.1} ms/{count}", ns / 1e6))
                     .collect();
-                eprintln!("gpu items: {}", top.join(", "));
+                eprintln!("gpu items: overlapping intervals: {}", top.join(", "));
             }
             let wall_ms = elapsed.as_secs_f64() * 1e3;
-            let busy_ms = self.busy_ns / 1e6;
+            let busy_ms = std::mem::take(&mut self.batches.ticks) as f64 * self.period / 1e6;
+            let submits = std::mem::take(&mut self.batches.submits);
             let waited_ms = waited_us.saturating_sub(self.waited_at_start) as f64 / 1e3;
             eprintln!(
-                "gpu time: busy {busy_ms:.0} ms of {wall_ms:.0} ms ({:.0}%), {} submits, CPU waited {waited_ms:.0} ms",
-                busy_ms * 100.0 / wall_ms,
-                self.submits
+                "gpu time: busy {busy_ms:.0} ms of {wall_ms:.0} ms ({:.0}%), {submits} submits, CPU waited {waited_ms:.0} ms",
+                busy_ms * 100.0 / wall_ms
             );
             self.since = std::time::Instant::now();
-            self.busy_ns = 0.0;
-            self.submits = 0;
             self.waited_at_start = waited_us;
         }
     }
@@ -279,5 +321,29 @@ impl GpuTimer {
                 device.destroy_query_pool(items.pool, None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchTimes;
+
+    #[test]
+    fn batch_time_follows_queue_order_across_a_timestamp_wrap() {
+        let mut times = BatchTimes::new(8);
+        times.record(2, Some([252, 6]));
+        assert_eq!(times.ticks, 0);
+        times.record(1, Some([240, 254]));
+        assert_eq!(times.ticks, 22);
+        assert_eq!(times.submits, 2);
+
+        // A report can start while the following submission overlaps it.
+        times.ticks = 0;
+        times.record(3, Some([4, 12]));
+        times.record(5, Some([20, 25]));
+        // Advance past a submission whose query results were unavailable.
+        times.record(4, None);
+        assert_eq!(times.ticks, 11);
+        assert_eq!(times.submits, 4);
     }
 }
