@@ -4415,11 +4415,11 @@ impl Nvn {
         let shape = self.render_shape(texture);
         let levels = self.texture_levels(texture);
         let size = (width.div_ceil(4), height.div_ceil(4));
-        self.gpu
-            .as_mut()
-            .unwrap()
-            .renderer
-            .shaped_target(alias, size.0, size.1, shape, view, levels)?;
+        // Texels of the alias are blocks of the texture: both stay at guest
+        // size, so the copy between them maps one block to one texel.
+        let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        renderer.keep_unscaled(texture)?;
+        renderer.guest_sized_target(alias, size.0, size.1, shape, view, levels)?;
         self.block_aliases.insert(texture, alias);
         Ok(Some((alias, size)))
     }

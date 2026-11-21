@@ -4837,6 +4837,9 @@ impl Renderer {
         format: vk::Format,
         levels: u32,
     ) -> Result<(), String> {
+        // An archived image comes back first: it is the key's image, so the
+        // pending mark would otherwise wait for a later one.
+        self.restore_archived_target(key)?;
         if !self.targets.contains_key(&key) {
             self.pending_unscaled.insert(key);
         }
@@ -6640,7 +6643,9 @@ impl Renderer {
         format: vk::Format,
     ) -> Result<(), String> {
         use crate::draw::ImageShape;
-        self.shaped_target(
+        // At guest size, as the volume itself (volumes are never scaled):
+        // the copy below maps texels one to one.
+        self.guest_sized_target(
             alias,
             width,
             height,
@@ -6670,9 +6675,11 @@ impl Renderer {
                 layer_count: depth,
             },
             dst_offset: vk::Offset3D::default(),
+            // The images' own sizes bound the copy (a scaled image is not
+            // its guest size).
             extent: vk::Extent3D {
-                width: from.width.min(to.width),
-                height: from.height.min(to.height),
+                width: from.extent(0).0.min(to.extent(0).0),
+                height: from.extent(0).1.min(to.extent(0).1),
                 depth,
             },
         };
@@ -6735,16 +6742,19 @@ impl Renderer {
                     layer_count: layers,
                 };
                 // The destination level's blocks bound the copy (a level
-                // smaller than a block still holds one).
-                let blocks = |extent: u32| (extent >> level).max(1).div_ceil(4);
+                // smaller than a block still holds one), and so does the
+                // source level: both in the images' own sizes, which a
+                // scaled image does not share with the guest.
+                let (source_width, source_height) = source.extent(level);
+                let (destination_width, destination_height) = destination.extent(level);
                 vk::ImageCopy {
                     src_subresource: subresource(source.format),
                     src_offset: vk::Offset3D::default(),
                     dst_subresource: subresource(destination.format),
                     dst_offset: vk::Offset3D::default(),
                     extent: vk::Extent3D {
-                        width: blocks(destination.width).min((source.width >> level).max(1)),
-                        height: blocks(destination.height).min((source.height >> level).max(1)),
+                        width: destination_width.div_ceil(4).min(source_width),
+                        height: destination_height.div_ceil(4).min(source_height),
                         depth: (source.shape.depth() >> level)
                             .max(1)
                             .min((destination.shape.depth() >> level).max(1)),
