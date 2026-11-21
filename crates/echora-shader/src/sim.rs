@@ -6126,6 +6126,60 @@ mod tests {
     }
 
     #[test]
+    fn bindless_queries_read_the_selected_numeric_view() {
+        use echora_shader_abi::{TEXTURE_POOL_SET, texture_pool};
+
+        // TXQ.B R4, R0 (handle), R1 (level 0), xyzw.
+        let query = word(&[
+            (0, 12, 0x370),
+            (16, 8, 4),
+            (24, 8, 0),
+            (59, 1, 1),
+            (64, 8, 255),
+            (72, 4, 0xf),
+        ]);
+        let program = [mov(0, 1), mov(1, 0), query, EXIT];
+        let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
+        let (translated, registers, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
+        let image = |width, height| Image {
+            width,
+            height,
+            depth: 1,
+            layers: 1,
+            texels: vec![[0; 4]; (width * height) as usize].into(),
+        };
+        let image_arrays = HashMap::from([
+            ((TEXTURE_POOL_SET, texture_pool::SAMPLED_2D, 1), image(6, 8)),
+            ((TEXTURE_POOL_SET, texture_pool::UINT_2D, 1), image(12, 16)),
+        ]);
+        for (flags, expected) in [
+            (0, [6, 8, 1, 1]),
+            (texture_pool::FLAG_INTEGER, [12, 16, 1, 1]),
+            (
+                texture_pool::FLAG_INTEGER | texture_pool::FLAG_SIGNED,
+                [12, 16, 1, 1],
+            ),
+        ] {
+            let uniforms = HashMap::from([(
+                (TEXTURE_POOL_SET, texture_pool::FLAGS),
+                [0, flags].into_iter().flat_map(u32::to_le_bytes).collect(),
+            )]);
+            let report = Machine::new(&translated.spirv).simulate(&Inputs {
+                workgroup_count: [1; 3],
+                image_arrays: image_arrays.clone(),
+                uniforms,
+                ..Inputs::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            let actual =
+                std::array::from_fn(|n| report.invocations[0][&registers[&(4 + n as u8)]][0]);
+            assert_eq!(actual, expected, "numeric flags {flags}");
+        }
+    }
+
+    #[test]
     fn bindless_samples_read_the_texture_pool_entry_their_handle_names() {
         use echora_shader_abi::{
             SAMPLER_INDEX_SHIFT, TEXTURE_POOL_CAPACITY_SPEC_ID, TEXTURE_POOL_SET, texture_pool,

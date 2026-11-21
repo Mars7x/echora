@@ -800,9 +800,6 @@ impl Emitter {
         // Match a bindless sample to its bound format and border color.
         let integer = self.pool_integer.take().filter(|_| reference.is_none());
         if let Some(views) = integer {
-            let words: Vec<u32> = (0..4)
-                .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
-                .collect();
             // Biased reads still use the explicit-level lowering.
             // Grad samples use the selected view to compute LOD.
             let level =
@@ -822,89 +819,47 @@ impl Emitter {
                     }
                     level
                 });
-            let sample = |e: &mut Self, binding: u32, types: Types, sampler: u32| {
-                let ty = e.module.ty(Type::Vector {
-                    component: types.component,
-                    count: 4,
-                });
-                let image = e.pool_entry(binding, types.image, views.index, views.uniform);
-                let sampled = e.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
-                if !views.uniform {
-                    e.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
-                }
-                let result = match texture.op {
-                    TextureOp::Fetch => {
-                        let image = e.value(op::IMAGE, types.image, &[sampled]);
+            return Ok(self
+                .read_numeric_pool(views, !fetch, |e, image, types, sampler| {
+                    let ty = e.module.ty(Type::Vector {
+                        component: types.component,
+                        count: 4,
+                    });
+                    let result = if let Some(sampler) = sampler {
+                        let sampled = e.value(op::SAMPLED_IMAGE, types.sampled, &[image, sampler]);
+                        if !views.uniform {
+                            e.module.decorate(sampled, decoration::NON_UNIFORM, &[]);
+                        }
+                        if let TextureOp::Gather { component } = texture.op {
+                            let component = e.constant(u32::from(component));
+                            e.value(
+                                op::IMAGE_GATHER,
+                                ty,
+                                &image_operands(vec![sampled, coordinate, component]),
+                            )
+                        } else if let Some(level) = level {
+                            e.value(
+                                op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                                ty,
+                                &[sampled, coordinate, OPERAND_LOD, level],
+                            )
+                        } else {
+                            e.value(
+                                op::IMAGE_SAMPLE_EXPLICIT_LOD,
+                                ty,
+                                &image_operands(vec![sampled, coordinate]),
+                            )
+                        }
+                    } else {
                         e.value(
                             op::IMAGE_FETCH,
                             ty,
                             &image_operands(vec![image, coordinate]),
                         )
-                    }
-                    TextureOp::Gather { component } => {
-                        let component = e.constant(u32::from(component));
-                        e.value(
-                            op::IMAGE_GATHER,
-                            ty,
-                            &image_operands(vec![sampled, coordinate, component]),
-                        )
-                    }
-                    _ => match level {
-                        Some(level) => e.value(
-                            op::IMAGE_SAMPLE_EXPLICIT_LOD,
-                            ty,
-                            &[sampled, coordinate, OPERAND_LOD, level],
-                        ),
-                        None => e.value(
-                            if implicit && gradients.is_none() {
-                                op::IMAGE_SAMPLE_IMPLICIT_LOD
-                            } else {
-                                op::IMAGE_SAMPLE_EXPLICIT_LOD
-                            },
-                            ty,
-                            &image_operands(vec![sampled, coordinate]),
-                        ),
-                    },
-                };
-                for (n, &word) in words.iter().enumerate() {
-                    let value = e.texel_bits(types, result, n as u32);
-                    e.function.emit(op::STORE, &[word, value]);
-                }
-            };
-            let zero = self.constant(0);
-            let integer_bit = self.constant(texture_pool::FLAG_INTEGER);
-            let integer = self.value(op::BITWISE_AND, self.u32, &[views.flags, integer_bit]);
-            let integer = self.value(op::I_NOT_EQUAL, self.bool, &[integer, zero]);
-            self.choose(integer, |e, integer| {
-                if !integer {
-                    sample(e, views.float_binding, views.float_types, views.sampler);
-                    return;
-                }
-                let offset = e.constant(echora_shader_abi::SAMPLER_POOL_CAPACITY);
-                let sampler_index = e.value(op::I_ADD, e.u32, &[views.sampler_index, offset]);
-                let sampler_type = e.module.ty(Type::Sampler);
-                let sampler = e.pool_entry(
-                    texture_pool::SAMPLERS,
-                    sampler_type,
-                    sampler_index,
-                    views.uniform,
-                );
-                let signed_bit = e.constant(texture_pool::FLAG_SIGNED);
-                let signed = e.value(op::BITWISE_AND, e.u32, &[views.flags, signed_bit]);
-                let signed = e.value(op::I_NOT_EQUAL, e.bool, &[signed, zero]);
-                e.choose(signed, |e, signed| {
-                    let types = if signed {
-                        views.sint_types
-                    } else {
-                        views.uint_types
                     };
-                    sample(e, views.integer_binding, types, sampler);
-                });
-            });
-            return Ok(words
-                .into_iter()
-                .map(|word| self.value(op::LOAD, self.u32, &[word]))
-                .collect());
+                    std::array::from_fn(|n| e.texel_bits(types, result, n as u32))
+                })
+                .into());
         }
         let result = match (texture.op, reference) {
             (TextureOp::Fetch, _) => {
@@ -956,6 +911,62 @@ impl Emitter {
             }
         };
         Ok((0..4).map(|n| self.texel_bits(types, result, n)).collect())
+    }
+
+    /// Resolve the format at the access. The sampler is only needed when
+    /// the instruction filters texels.
+    fn read_numeric_pool(
+        &mut self,
+        views: PoolViews,
+        with_sampler: bool,
+        read: impl Fn(&mut Self, u32, Types, Option<u32>) -> [u32; 4],
+    ) -> [u32; 4] {
+        let words = [(); 4].map(|()| self.function.variable(&mut self.module, self.u32_ptr, None));
+        let access = |e: &mut Self, binding: u32, types: Types, sampler: Option<u32>| {
+            let image = e.pool_entry(binding, types.image, views.index, views.uniform);
+            let result = read(e, image, types, sampler);
+            for (word, value) in words.into_iter().zip(result) {
+                e.function.emit(op::STORE, &[word, value]);
+            }
+        };
+        let zero = self.constant(0);
+        let integer_bit = self.constant(texture_pool::FLAG_INTEGER);
+        let integer = self.value(op::BITWISE_AND, self.u32, &[views.flags, integer_bit]);
+        let integer = self.value(op::I_NOT_EQUAL, self.bool, &[integer, zero]);
+        self.choose(integer, |e, integer| {
+            if !integer {
+                access(
+                    e,
+                    views.float_binding,
+                    views.float_types,
+                    with_sampler.then_some(views.sampler),
+                );
+                return;
+            }
+            let sampler = with_sampler.then(|| {
+                let offset = e.constant(echora_shader_abi::SAMPLER_POOL_CAPACITY);
+                let sampler_index = e.value(op::I_ADD, e.u32, &[views.sampler_index, offset]);
+                let sampler_type = e.module.ty(Type::Sampler);
+                e.pool_entry(
+                    texture_pool::SAMPLERS,
+                    sampler_type,
+                    sampler_index,
+                    views.uniform,
+                )
+            });
+            let signed_bit = e.constant(texture_pool::FLAG_SIGNED);
+            let signed = e.value(op::BITWISE_AND, e.u32, &[views.flags, signed_bit]);
+            let signed = e.value(op::I_NOT_EQUAL, e.bool, &[signed, zero]);
+            e.choose(signed, |e, signed| {
+                let types = if signed {
+                    views.sint_types
+                } else {
+                    views.uint_types
+                };
+                access(e, views.integer_binding, types, sampler);
+            });
+        });
+        words.map(|word| self.value(op::LOAD, self.u32, &[word]))
     }
 
     fn texel_bits(&mut self, types: Types, result: u32, component: u32) -> u32 {
@@ -1118,7 +1129,6 @@ impl Emitter {
         };
         let (sampled, types) = self.sampled_image(index, texture, &view, false, handle)?;
         let level = value(self, level_register);
-        let image = self.value(op::IMAGE, types.image, &[sampled]);
         // textureSize's components: 1D 1, 1D array and 2D and cube 2, the
         // rest 3.
         let count = match (view.dim, view.arrayed) {
@@ -1134,17 +1144,22 @@ impl Emitter {
                 count,
             })
         };
-        let size = self.value(op::IMAGE_QUERY_SIZE_LOD, size_type, &[image, level]);
-        let one = self.constant(1);
-        let mut results: Vec<u32> = (0..3)
-            .map(|n| match (n < count, count) {
-                (false, _) => one,
-                (true, 1) => size,
-                (true, _) => self.value(op::COMPOSITE_EXTRACT, self.u32, &[size, n]),
+        let query = |e: &mut Self, image| {
+            let size = e.value(op::IMAGE_QUERY_SIZE_LOD, size_type, &[image, level]);
+            let one = e.constant(1);
+            std::array::from_fn(|n| match (n == 3, n < count as usize, count) {
+                (true, _, _) => e.value(op::IMAGE_QUERY_LEVELS, e.u32, &[image]),
+                (false, false, _) => one,
+                (false, true, 1) => size,
+                (false, true, _) => e.value(op::COMPOSITE_EXTRACT, e.u32, &[size, n as u32]),
             })
-            .collect();
-        let levels = self.value(op::IMAGE_QUERY_LEVELS, self.u32, &[image]);
-        results.push(levels);
-        Ok(results)
+        };
+        let result = if let Some(views) = self.pool_integer.take() {
+            self.read_numeric_pool(views, false, |e, image, _, _| query(e, image))
+        } else {
+            let image = self.value(op::IMAGE, types.image, &[sampled]);
+            query(self, image)
+        };
+        Ok(result.into())
     }
 }
