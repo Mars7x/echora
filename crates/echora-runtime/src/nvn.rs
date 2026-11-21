@@ -599,6 +599,9 @@ pub struct Nvn {
     /// Each recording command buffer's recording (see `Recorder`).
     #[serde(skip)]
     recording: Recordings,
+    /// Initialized command buffers (see `CommandBufferObject`).
+    #[serde(skip)]
+    command_buffers: CommandBuffers,
     /// Devices, memory pools, buffers and events as workers query them
     /// without the NVN state's lock (see `Registry`). Buffers live only here.
     #[serde(skip)]
@@ -1674,6 +1677,322 @@ pub struct Recording {
 type RecordingMap = std::sync::RwLock<FastMap<u64, std::sync::Arc<std::sync::Mutex<Recording>>>>;
 type Recordings = std::sync::Arc<RecordingMap>;
 
+/// One kind of a command buffer's memory (command or control) as its
+/// management calls track it: the last chunk added, its size and the
+/// amount the host counts as used. None until first set, as the object
+/// properties these were kept as before.
+#[derive(Clone, Copy, Debug, Default)]
+struct CommandMemory {
+    /// AddCommandMemory's (pool, offset, size, 0) or AddControlMemory's
+    /// (address, size, 0, 0).
+    chunk: Option<[u64; 4]>,
+    size: Option<u64>,
+    used: Option<u64>,
+}
+
+impl CommandMemory {
+    /// Count `bytes` as used, up to the memory added.
+    fn use_bytes(&mut self, bytes: u64) {
+        let size = self.size.unwrap_or(0);
+        self.used = Some((self.used.unwrap_or(0) + bytes).min(size));
+    }
+}
+
+/// An initialized command buffer's own state: its memory, callbacks,
+/// recording mode and copy strides. It lives apart from the NVN state,
+/// each buffer behind its own lock, so the game's management calls on its
+/// many command buffers (AddCommandMemory, BeginRecording, the used-memory
+/// queries...) run on any worker without the NVN state's lock, which the
+/// replay holds. Only EndRecording, which hands the list to the NVN state,
+/// takes that lock (see `command_buffer_call`).
+#[derive(Debug, Default)]
+pub struct CommandBufferObject {
+    /// Command memory, then control memory.
+    memory: [CommandMemory; 2],
+    /// Properties its other setters stored (MemoryCallback,
+    /// MemoryCallbackData, DebugLabel, RecordingMode...), by name.
+    properties: BTreeMap<&'static str, Args>,
+    /// SetCopyRowStride's and SetCopyImageStride's arguments.
+    copy_strides: [Option<Args>; 2],
+    /// Set by Finalize: a handle to it someone still holds is stale.
+    finalized: bool,
+}
+
+impl CommandBufferObject {
+    /// The value its generic getter (nvnCommandBufferGet<Prop>) returns for
+    /// `property`, under the names it had as an object property.
+    fn property(&self, property: &str) -> Option<Args> {
+        let word = |value: u64| Args {
+            x: [value, 0, 0, 0],
+            v: [0; 2],
+        };
+        for (index, key) in ["CommandMemory", "ControlMemory"].into_iter().enumerate() {
+            let memory = &self.memory[index];
+            if let Some(suffix) = property.strip_prefix(key) {
+                return match suffix {
+                    "" => memory.size.map(word),
+                    "Chunk" => memory.chunk.map(|x| Args { x, v: [0; 2] }),
+                    "Used" => memory.used.map(word),
+                    _ => self.properties.get(property).copied(),
+                };
+            }
+        }
+        if let Some(slot) = COPY_STRIDE_KEYS.iter().position(|key| *key == property) {
+            return self.copy_strides[slot];
+        }
+        self.properties.get(property).copied()
+    }
+}
+
+type CommandBufferEntry = std::sync::Arc<std::sync::Mutex<CommandBufferObject>>;
+/// Initialized command buffers by guest address.
+type CommandBufferMap = std::sync::RwLock<FastMap<u64, CommandBufferEntry>>;
+type CommandBuffers = std::sync::Arc<CommandBufferMap>;
+
+/// What the command buffer objects, the recordings and the registry let a
+/// management call see: the parts of the NVN state that
+/// `command_buffer_call` needs, all shared.
+#[derive(Clone, Copy)]
+struct CommandBufferState<'a> {
+    buffers: &'a CommandBufferMap,
+    recordings: &'a RecordingMap,
+    registry: &'a std::sync::RwLock<Registry>,
+}
+
+/// Command buffer management calls `command_buffer_call` makes without
+/// the NVN state (all but EndRecording, which hands the finished list to
+/// it).
+fn command_buffer_unlocked(rest: &str) -> bool {
+    COMMAND_BUFFER_MANAGEMENT.contains(&rest) && rest != "EndRecording"
+}
+
+impl CommandBufferState<'_> {
+    /// The command buffer at `address`, if initialized.
+    fn buffer(&self, address: u64) -> Result<CommandBufferEntry, String> {
+        read_shared(self.buffers)
+            .get(&address)
+            .cloned()
+            .ok_or_else(|| format!("CommandBuffer {address:#x} is not initialized"))
+    }
+
+    /// Fold the command memory a recording on `buffer` used so far into
+    /// its object (before a management call reads or resets it).
+    fn fold(&self, address: u64, object: &mut CommandBufferObject) {
+        let recording = read_shared(self.recordings).get(&address).cloned();
+        if let Some(recording) = recording {
+            let used = std::mem::take(&mut lock_shared(&recording).command_memory);
+            if used != 0 {
+                object.memory[0].use_bytes(used);
+            }
+        }
+    }
+}
+
+/// Make command buffer management call `name` (nvnCommandBuffer<rest>,
+/// one `command_buffer_unlocked` names, or a generic getter) on the shared
+/// command buffer state, as the NVN state made it when command buffers
+/// were its objects: the same results, errors and recordings. Ok(false)
+/// when it is no such call, or a getter finds nothing (the caller then
+/// goes on as `Nvn::call` does).
+fn command_buffer_call(
+    state: CommandBufferState<'_>,
+    name: &str,
+    rest: &str,
+    core: &mut Guest,
+) -> Result<bool, Trap> {
+    let invalid = |message: String| Trap::InvalidState {
+        message: format!("{name}: {message}"),
+    };
+    let x = core.cpu.regs;
+    let this = x[0];
+    let args = Args {
+        x: [x[1], x[2], x[3], x[4]],
+        v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
+    };
+    match rest {
+        // nvnCommandBufferInitialize(NVNcommandBuffer*, NVNdevice*) ->
+        // NVNboolean. Host command buffers record calls, not GPU words, so
+        // the command and control memory the application adds is tracked
+        // for its size queries but never consumed.
+        "Initialize" => {
+            {
+                let registry = read_shared(state.registry);
+                if registry.objects.get(&x[1]) != Some(&"Device") {
+                    return Err(invalid(format!("Device {:#x} is not initialized", x[1])));
+                }
+                // Checked again below under the map's lock: objects of other
+                // kinds are initialized under the NVN state's lock only.
+                if registry.objects.contains_key(&this) {
+                    return Err(invalid(format!(
+                        "CommandBuffer {this:#x} is already initialized"
+                    )));
+                }
+            }
+            let mut buffers = write_shared(state.buffers);
+            let std::collections::hash_map::Entry::Vacant(slot) = buffers.entry(this) else {
+                return Err(invalid(format!(
+                    "CommandBuffer {this:#x} is already initialized"
+                )));
+            };
+            // Claimed in the registry with the map locked, so an object of
+            // another kind initialized meanwhile is seen by one of the two.
+            {
+                let mut registry = write_shared(state.registry);
+                if registry.objects.contains_key(&this) {
+                    return Err(invalid(format!(
+                        "CommandBuffer {this:#x} is already initialized"
+                    )));
+                }
+                registry.objects.insert(this, "CommandBuffer");
+            }
+            slot.insert(Default::default());
+            core.cpu.regs[0] = 1;
+            Ok(true)
+        }
+        "Finalize" => {
+            let buffer = write_shared(state.buffers)
+                .remove(&this)
+                .ok_or_else(|| invalid(format!("CommandBuffer {this:#x} is not initialized")))?;
+            lock_shared(&buffer).finalized = true;
+            write_shared(state.registry).objects.remove(&this);
+            if let Some(recording) = write_shared(state.recordings).remove(&this) {
+                // A recorder's cached handle to it is stale now.
+                lock_shared(&recording).ended = true;
+            }
+            Ok(true)
+        }
+        // AddCommandMemory(cmd, pool, offset, size) and
+        // AddControlMemory(cmd, void* memory, size).
+        "AddCommandMemory" | "AddControlMemory" => {
+            let buffer = state.buffer(this).map_err(invalid)?;
+            let (slot, size, chunk) = if rest == "AddCommandMemory" {
+                if read_shared(state.registry).objects.get(&x[1]) != Some(&"MemoryPool") {
+                    return Err(invalid(format!(
+                        "MemoryPool {:#x} is not initialized",
+                        x[1]
+                    )));
+                }
+                (0, x[3], [x[1], x[2], x[3], 0])
+            } else {
+                (1, x[2], [x[1], x[2], 0, 0])
+            };
+            let mut object = lock_shared(&buffer);
+            state.fold(this, &mut object);
+            // Lists recorded into memory this overlaps are kept: the
+            // application calls lists whose memory the host's model says it
+            // added again (the host's used amounts are not the driver's, so
+            // the model cannot say what the GPU would read). A list keeps
+            // its commands until it is finalized or the resource cap drops
+            // it.
+            let memory = &mut object.memory[slot];
+            memory.chunk = Some(chunk);
+            memory.size = Some(size);
+            // New memory starts unused.
+            memory.used = None;
+            Ok(true)
+        }
+        "GetCommandMemorySize"
+        | "GetControlMemorySize"
+        | "GetCommandMemoryFree"
+        | "GetControlMemoryFree"
+        | "GetCommandMemoryUsed"
+        | "GetControlMemoryUsed" => {
+            let buffer = state.buffer(this).map_err(invalid)?;
+            let mut object = lock_shared(&buffer);
+            state.fold(this, &mut object);
+            let memory = object.memory[usize::from(rest.starts_with("GetControl"))];
+            let size = memory.size.unwrap_or(0);
+            let used = memory.used.unwrap_or(0);
+            core.cpu.regs[0] = if rest.ends_with("Used") {
+                used
+            } else if rest.ends_with("Free") {
+                size - used
+            } else {
+                size
+            };
+            Ok(true)
+        }
+        // Memory callbacks are recorded; the host never runs out of command
+        // memory, so they are never invoked.
+        "SetMemoryCallback"
+        | "SetMemoryCallbackData"
+        | "SetCommandMemoryCallbackEnabled"
+        | "SetControlMemoryCallbackEnabled"
+        | "SetDebugLabel"
+        // SetRecordingMode(cmd, mode): how the driver writes command memory
+        // (inferred). Host command buffers record calls either way.
+        | "SetRecordingMode" => {
+            let buffer = state.buffer(this).map_err(invalid)?;
+            let mut object = lock_shared(&buffer);
+            state.fold(this, &mut object);
+            let property = intern(&rest["Set".len()..]);
+            object.properties.insert(property, args);
+            Ok(true)
+        }
+        // Copy strides belong to the command buffer. Both copies snapshot
+        // them while recording, without emitting a setter.
+        "SetCopyRowStride" | "SetCopyImageStride" | "GetCopyRowStride" | "GetCopyImageStride" => {
+            let slot = usize::from(rest.ends_with("ImageStride"));
+            let buffer = state.buffer(this).map_err(invalid)?;
+            let mut object = lock_shared(&buffer);
+            state.fold(this, &mut object);
+            if rest.starts_with("Get") {
+                core.cpu.regs[0] = object.copy_strides[slot].map_or(0, |stride| stride.x[0]);
+            } else {
+                object.copy_strides[slot] = Some(args);
+                if let Some(recording) = read_shared(state.recordings).get(&this) {
+                    lock_shared(recording).copy_strides[slot] = x[1];
+                }
+            }
+            Ok(true)
+        }
+        "BeginRecording" => {
+            let buffer = state.buffer(this).map_err(invalid)?;
+            let object = lock_shared(&buffer);
+            let control = object.memory[1];
+            let control_start = (
+                control.chunk.map_or(0, |chunk| chunk[0]),
+                control.used.unwrap_or(0),
+            );
+            let copy_strides = object
+                .copy_strides
+                .map(|stride| stride.map_or(0, |stride| stride.x[0]));
+            let mut recordings = write_shared(state.recordings);
+            let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this) else {
+                return Err(invalid("command buffer is already recording".into()));
+            };
+            slot.insert(std::sync::Arc::new(std::sync::Mutex::new(Recording {
+                control_start,
+                copy_strides,
+                ..Recording::default()
+            })));
+            Ok(true)
+        }
+        "IsRecording" => {
+            state.buffer(this).map_err(invalid)?;
+            core.cpu.regs[0] = u64::from(read_shared(state.recordings).contains_key(&this));
+            Ok(true)
+        }
+        // Generic getters: what the matching setter stored.
+        _ => {
+            let Some(property) = rest.strip_prefix("Get") else {
+                return Ok(false);
+            };
+            let Some(buffer) = read_shared(state.buffers).get(&this).cloned() else {
+                return Ok(false);
+            };
+            let mut object = lock_shared(&buffer);
+            state.fold(this, &mut object);
+            let Some(value) = object.property(property) else {
+                return Ok(false);
+            };
+            core.cpu.regs[0] = value.x[0];
+            core.cpu.vectors[0] = u128::from(value.v[0]);
+            Ok(true)
+        }
+    }
+}
+
 fn read_shared<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1697,6 +2016,7 @@ fn lock_shared<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct Recorder {
     bags: Bags,
     recordings: Recordings,
+    command_buffers: CommandBuffers,
     registry: SharedRegistry,
 }
 
@@ -1709,6 +2029,10 @@ pub struct Recorder {
 #[derive(Debug, Default)]
 pub struct Registry {
     devices: FastSet<u64>,
+    /// The kind of each initialized object by guest address, command
+    /// buffers included: command buffers are initialized without the NVN
+    /// state (`command_buffer_call`), so both check an address here.
+    objects: FastMap<u64, &'static str>,
     pools: FastMap<u64, RegisteredPool>,
     buffers: FastMap<u64, RegisteredBuffer>,
     /// Each event's guest address (its u32), by event object.
@@ -1786,10 +2110,18 @@ pub fn front_call(name: &str) -> bool {
 /// copying newly published thunks.
 #[derive(Clone, Copy)]
 pub(crate) enum RecordedCall<'a> {
+    /// A command on a recording buffer; None for its management calls the
+    /// NVN state makes (EndRecording).
     Command(Option<&'a str>),
+    /// A command buffer management call made on the buffer's own state
+    /// (`command_buffer_call`).
+    Management(&'a str),
     SyncWait,
     Registry,
-    Property { kind: &'static str, rest: &'a str },
+    Property {
+        kind: &'static str,
+        rest: &'a str,
+    },
 }
 
 impl<'a> RecordedCall<'a> {
@@ -1799,6 +2131,9 @@ impl<'a> RecordedCall<'a> {
 
     fn command(name: &'a str) -> Option<Self> {
         let rest = name.strip_prefix("nvnCommandBuffer")?;
+        if command_buffer_unlocked(rest) {
+            return Some(Self::Management(rest));
+        }
         Some(Self::Command(
             (!COMMAND_BUFFER_MANAGEMENT.contains(&rest)).then_some(rest),
         ))
@@ -1847,7 +2182,19 @@ impl Recorder {
         match call {
             RecordedCall::Command(Some(rest)) => self.record_known(name, rest, core),
             RecordedCall::Command(None) => Ok(false),
+            RecordedCall::Management(rest) => {
+                call_watch(name, core);
+                command_buffer_call(self.command_buffer_state(), name, rest, core)
+            }
             _ => self.front_known(name, call, core),
+        }
+    }
+
+    fn command_buffer_state(&self) -> CommandBufferState<'_> {
+        CommandBufferState {
+            buffers: &self.command_buffers,
+            recordings: &self.recordings,
+            registry: &self.registry,
         }
     }
 
@@ -1922,7 +2269,8 @@ impl Recorder {
     }
 
     /// Record NVN call `name` when it is a call on a recording command
-    /// buffer (X0) other than its management: Ok(true) once recorded,
+    /// buffer (X0), or make it when it is a management call on the
+    /// buffer's own state (all but EndRecording): Ok(true) once made,
     /// Ok(false) when it is not (the caller makes it with the NVN state).
     pub fn record(&self, name: &'static str, core: &mut Guest) -> Result<bool, Trap> {
         let Some(call) = RecordedCall::command(name) else {
@@ -2331,16 +2679,6 @@ fn split_name(name: &str) -> Option<(&'static str, &str)> {
 }
 
 impl Nvn {
-    /// Count `bytes` of a command buffer's command or control memory as
-    /// used, up to the memory it was given.
-    fn use_command_memory(&mut self, buffer: u64, key: &str, bytes: u64) {
-        if let Some(object) = self.objects.get_mut(&buffer) {
-            let size = object.state.get(key).map_or(0, |value| value.x[0]);
-            let used = object.state.entry(format!("{key}Used")).or_default();
-            used.x[0] = (used.x[0] + bytes).min(size);
-        }
-    }
-
     pub fn add_hook(&mut self, address: u64, entry: HostEntry) {
         self.hooks.insert(address, entry);
     }
@@ -2514,13 +2852,15 @@ impl Nvn {
         {
             return Ok(true);
         }
-        // A management call on a command buffer sees the command memory its
-        // recording used so far (recording itself counts it apart).
-        if name
+        // Command buffer management, on the buffers' own state (workers
+        // make the same calls without the NVN state, `Recorder::call`).
+        if let Some(rest) = name
             .strip_prefix("nvnCommandBuffer")
-            .is_some_and(|rest| COMMAND_BUFFER_MANAGEMENT.contains(&rest))
+            .filter(|rest| command_buffer_unlocked(rest))
         {
-            self.fold_command_memory(this);
+            if command_buffer_call(self.command_buffer_state(), name, rest, core)? {
+                return Ok(true);
+            }
         }
         match name {
             // nvnDeviceInitialize(NVNdevice*, const NVNdeviceBuilder*) ->
@@ -3024,137 +3364,15 @@ impl Nvn {
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
-            // nvnCommandBufferInitialize(NVNcommandBuffer*, NVNdevice*) ->
-            // NVNboolean. Host command buffers record calls, not GPU words,
-            // so the command and control memory the application adds is
-            // tracked for its size queries but never consumed.
-            "nvnCommandBufferInitialize" => {
-                self.object(x[1], "Device").map_err(invalid)?;
-                self.initialize(this, "CommandBuffer", BTreeMap::new())
-                    .map_err(invalid)?;
-                core.cpu.regs[0] = 1;
-                return Ok(true);
-            }
-            // AddCommandMemory(cmd, pool, offset, size) and
-            // AddControlMemory(cmd, void* memory, size).
-            "nvnCommandBufferAddCommandMemory" | "nvnCommandBufferAddControlMemory" => {
-                self.object(this, "CommandBuffer").map_err(invalid)?;
-                let (key, size) = if name.ends_with("CommandMemory") {
-                    self.object(x[1], "MemoryPool").map_err(invalid)?;
-                    ("CommandMemory", x[3])
-                } else {
-                    ("ControlMemory", x[2])
-                };
-                // Lists recorded into memory this overlaps are kept: the
-                // application calls lists whose memory the host's model says
-                // it added again (the host's used amounts are not the
-                // driver's, so the model cannot say what the GPU would
-                // read). A list keeps its commands until it is finalized or
-                // the resource cap drops it.
-                let object = self.objects.get_mut(&this).unwrap();
-                let chunk = if key == "CommandMemory" {
-                    [x[1], x[2], x[3], 0]
-                } else {
-                    [x[1], x[2], 0, 0]
-                };
-                object.state.insert(
-                    format!("{key}Chunk"),
-                    Args {
-                        x: chunk,
-                        v: [0; 2],
-                    },
-                );
-                let total = object.state.entry(key.into()).or_default();
-                total.x[0] = size;
-                // New memory starts unused.
-                object.state.remove(&format!("{key}Used"));
-                return Ok(true);
-            }
-            "nvnCommandBufferGetCommandMemorySize"
-            | "nvnCommandBufferGetControlMemorySize"
-            | "nvnCommandBufferGetCommandMemoryFree"
-            | "nvnCommandBufferGetControlMemoryFree"
-            | "nvnCommandBufferGetCommandMemoryUsed"
-            | "nvnCommandBufferGetControlMemoryUsed" => {
-                let object = self.object(this, "CommandBuffer").map_err(invalid)?;
-                let key = if name.contains("Command") && name.matches("Command").count() == 2 {
-                    "CommandMemory"
-                } else {
-                    "ControlMemory"
-                };
-                let size = object.state.get(key).map_or(0, |value| value.x[0]);
-                let used = object
-                    .state
-                    .get(&format!("{key}Used"))
-                    .map_or(0, |value| value.x[0]);
-                core.cpu.regs[0] = if name.ends_with("Used") {
-                    used
-                } else if name.ends_with("Free") {
-                    size - used
-                } else {
-                    size
-                };
-                return Ok(true);
-            }
-            // Memory callbacks are recorded; the host never runs out of
-            // command memory, so they are never invoked.
-            "nvnCommandBufferSetMemoryCallback"
-            | "nvnCommandBufferSetMemoryCallbackData"
-            | "nvnCommandBufferSetCommandMemoryCallbackEnabled"
-            | "nvnCommandBufferSetControlMemoryCallbackEnabled"
-            | "nvnCommandBufferSetDebugLabel"
-            // SetRecordingMode(cmd, mode): how the driver writes command
-            // memory (inferred). Host command buffers record calls either way.
-            | "nvnCommandBufferSetRecordingMode" => {
-                self.object(this, "CommandBuffer").map_err(invalid)?;
-                let property = without_prefix(&name, "nvnCommandBufferSet");
-                let object = self.objects.get_mut(&this).unwrap();
-                object.state.insert(property.into(), args);
-                return Ok(true);
-            }
-            // Copy strides belong to the command buffer. Both copies
-            // snapshot them while recording, without emitting a setter.
-            "nvnCommandBufferSetCopyRowStride"
-            | "nvnCommandBufferSetCopyImageStride"
-            | "nvnCommandBufferGetCopyRowStride"
-            | "nvnCommandBufferGetCopyImageStride" => {
-                let slot = usize::from(name.ends_with("ImageStride"));
-                let property = COPY_STRIDE_KEYS[slot];
-                let object = self.object(this, "CommandBuffer").map_err(invalid)?;
-                if name.starts_with("nvnCommandBufferGet") {
-                    core.cpu.regs[0] = object.state.get(property).map_or(0, |stride| stride.x[0]);
-                } else {
-                    self.objects.get_mut(&this).unwrap().state.insert(property.into(), args);
-                    if let Some(recording) = read_shared(&self.recording).get(&this) {
-                        lock_shared(recording).copy_strides[slot] = x[1];
-                    }
-                }
-                return Ok(true);
-            }
-            "nvnCommandBufferBeginRecording" => {
-                let object = self.object(this, "CommandBuffer").map_err(invalid)?;
-                let first = |key| object.state.get(key).map_or(0, |args| args.x[0]);
-                let control_start = (first("ControlMemoryChunk"), first("ControlMemoryUsed"));
-                let copy_strides = COPY_STRIDE_KEYS.map(first);
-                let mut recordings = write_shared(&self.recording);
-                let std::collections::hash_map::Entry::Vacant(slot) = recordings.entry(this)
-                else {
-                    return Err(invalid("command buffer is already recording".into()));
-                };
-                slot.insert(std::sync::Arc::new(std::sync::Mutex::new(Recording {
-                    control_start,
-                    copy_strides,
-                    ..Recording::default()
-                })));
-                return Ok(true);
-            }
-            "nvnCommandBufferIsRecording" => {
-                self.object(this, "CommandBuffer").map_err(invalid)?;
-                core.cpu.regs[0] = u64::from(read_shared(&self.recording).contains_key(&this));
-                return Ok(true);
-            }
             // EndRecording(cmd) -> NVNcommandHandle: a nonzero host handle.
             "nvnCommandBufferEndRecording" => {
+                let state = self.command_buffer_state();
+                // Recording needs an initialized buffer (Finalize ends it).
+                let buffer = state
+                    .buffer(this)
+                    .map_err(|_| invalid("command buffer is not recording".into()))?;
+                let mut object = lock_shared(&buffer);
+                state.fold(this, &mut object);
                 let recording = write_shared(&self.recording)
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
@@ -3167,7 +3385,7 @@ impl Nvn {
                     )
                 };
                 if !commands.is_empty() {
-                    self.use_command_memory(this, "ControlMemory", CONTROL_MEMORY_PER_LIST);
+                    object.memory[1].use_bytes(CONTROL_MEMORY_PER_LIST);
                 }
                 // NVN's handle is the list's place in control memory: a list
                 // recorded at the same place later has the same handle, and
@@ -3176,11 +3394,8 @@ impl Nvn {
                 // used when the recording began (from the chunk's start when
                 // memory was added during it), by the host's used amounts,
                 // which are the ones the application allocates by.
-                let control_chunk = self
-                    .objects
-                    .get(&this)
-                    .and_then(|object| object.state.get("ControlMemoryChunk"))
-                    .map_or(0, |args| args.x[0]);
+                let control_chunk = object.memory[1].chunk.map_or(0, |chunk| chunk[0]);
+                drop(object);
                 let place = if control_chunk == 0 {
                     None
                 } else if start_chunk == control_chunk {
@@ -3448,7 +3663,7 @@ impl Nvn {
             "nvnSamplerFinalize" | "nvnTexturePoolFinalize" | "nvnSamplerPoolFinalize" => {
                 let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
-                self.objects.remove(&this);
+                self.forget_object(this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
                 match kind {
@@ -3751,17 +3966,13 @@ impl Nvn {
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
-            "nvnTextureFinalize" | "nvnWindowFinalize" | "nvnCommandBufferFinalize" => {
-                // A command buffer holds no texture: the caches keyed by
-                // the texture epoch stay.
-                if name != "nvnCommandBufferFinalize" {
-                    self.texture_epoch += 1;
-                    match self.texture_storage(this) {
-                        Some(base) if name == "nvnTextureFinalize" => {
-                            self.binding_evictions.push((this, [base, 0]));
-                        }
-                        _ => self.binding_epoch += 1,
+            "nvnTextureFinalize" | "nvnWindowFinalize" => {
+                self.texture_epoch += 1;
+                match self.texture_storage(this) {
+                    Some(base) if name == "nvnTextureFinalize" => {
+                        self.binding_evictions.push((this, [base, 0]));
                     }
+                    _ => self.binding_epoch += 1,
                 }
                 let kind = without_prefix(&name, "nvn").trim_end_matches("Finalize");
                 self.object(this, kind).map_err(invalid)?;
@@ -3776,14 +3987,10 @@ impl Nvn {
                 if kind == "Window" {
                     self.window_timing.remove(&this);
                 }
-                self.objects.remove(&this);
+                self.forget_object(this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
                 self.images.remove(&this);
-                if let Some(recording) = write_shared(&self.recording).remove(&this) {
-                    // A recorder's cached handle to it is stale now.
-                    lock_shared(&recording).ended = true;
-                }
                 return Ok(true);
             }
             // nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*) ->
@@ -4093,7 +4300,7 @@ impl Nvn {
                     registry.unsignaled.remove(&this);
                     registry.signaled.remove(&this);
                 }
-                self.objects.remove(&this);
+                self.forget_object(this);
                 self.memory_pools.remove(&this);
                 self.object_changed(this, kind);
                 return Ok(true);
@@ -4230,6 +4437,9 @@ impl Nvn {
         }
         // Generic getters on initialized objects for properties their
         // builder set (nvn<Kind>Get<Prop> after nvn<Kind>BuilderSet<Prop>).
+        if kind == "CommandBuffer" {
+            return command_buffer_call(self.command_buffer_state(), name, rest, core);
+        }
         if let (Some(property), Some(object)) = (rest.strip_prefix("Get"), self.objects.get(&this))
         {
             if object.kind == kind {
@@ -7352,23 +7562,20 @@ impl Nvn {
 
     /// The handle workers record command buffers through without the NVN
     /// state's lock (see `Recorder`).
+    fn command_buffer_state(&self) -> CommandBufferState<'_> {
+        CommandBufferState {
+            buffers: &self.command_buffers,
+            recordings: &self.recording,
+            registry: &self.registry,
+        }
+    }
+
     pub fn recorder(&self) -> Recorder {
         Recorder {
             bags: self.bags.clone(),
             recordings: self.recording.clone(),
+            command_buffers: self.command_buffers.clone(),
             registry: self.registry.clone(),
-        }
-    }
-
-    /// Count the command memory a recording command buffer used since its
-    /// object last counted it (before a management call reads or resets it).
-    fn fold_command_memory(&mut self, buffer: u64) {
-        let recording = read_shared(&self.recording).get(&buffer).cloned();
-        if let Some(recording) = recording {
-            let used = std::mem::take(&mut lock_shared(&recording).command_memory);
-            if used != 0 {
-                self.use_command_memory(buffer, "CommandMemory", used);
-            }
         }
     }
 
@@ -7506,14 +7713,30 @@ impl Nvn {
         }
     }
 
+    /// Remove the object at `address` (see `Registry::objects`).
+    fn forget_object(&mut self, address: u64) {
+        self.objects.remove(&address);
+        write_shared(&self.registry).objects.remove(&address);
+    }
+
     fn initialize(
         &mut self,
         address: u64,
         kind: &str,
         builder: BTreeMap<String, Args>,
     ) -> Result<(), String> {
-        if self.objects.contains_key(&address) {
-            return Err(format!("{kind} {address:#x} is already initialized"));
+        {
+            // Command buffers are initialized without the NVN state: the
+            // registry's objects name them too.
+            let mut registry = write_shared(&self.registry);
+            if self.objects.contains_key(&address) || registry.objects.contains_key(&address) {
+                return Err(format!("{kind} {address:#x} is already initialized"));
+            }
+            registry.objects.insert(address, intern(kind));
+        }
+        if kind == "CommandBuffer" {
+            write_shared(&self.command_buffers).insert(address, Default::default());
+            return Ok(());
         }
         self.object_changed(address, kind);
         if kind == "MemoryPool" {
@@ -7537,7 +7760,7 @@ impl Nvn {
     pub fn report(&self) -> serde_json::Value {
         serde_json::json!({
             "model": "host_nvn_entry_points",
-            "objects": self.objects.len(),
+            "objects": self.objects.len() + read_shared(&self.command_buffers).len(),
             "devices": self.objects.values().filter(|o| o.kind == "Device").collect::<Vec<_>>(),
             "hooked_exports": self.hooks.values().collect::<Vec<_>>(),
             "entry_points_looked_up": self.thunks.len(),
@@ -9481,10 +9704,18 @@ mod tests {
             ));
         }
         for management in COMMAND_BUFFER_MANAGEMENT {
-            assert!(matches!(
-                RecordedCall::classify(&format!("nvnCommandBuffer{management}")),
-                Some(RecordedCall::Command(None))
-            ));
+            let name = format!("nvnCommandBuffer{management}");
+            if *management == "EndRecording" {
+                assert!(matches!(
+                    RecordedCall::classify(&name),
+                    Some(RecordedCall::Command(None))
+                ));
+            } else {
+                assert!(matches!(
+                    RecordedCall::classify(&name),
+                    Some(RecordedCall::Management(rest)) if rest == *management
+                ));
+            }
         }
         assert!(matches!(
             RecordedCall::classify("nvnCommandBufferDrawArrays"),
@@ -11511,5 +11742,394 @@ mod tests {
             split_name("nvnProgramBuilderSetShaders"),
             Some(("ProgramBuilder", "SetShaders"))
         );
+    }
+
+    /// Make `name` through the recorder, as a worker does without the NVN
+    /// state: its X0 result, or the error.
+    fn made_free(
+        recorder: &Recorder,
+        core: &mut Guest,
+        name: &str,
+        args: &[u64],
+    ) -> Result<u64, Trap> {
+        core.cpu.regs[..args.len()].copy_from_slice(args);
+        let name = intern(name);
+        let call = RecordedCall::classify(name).expect("a recorder call");
+        assert!(recorder.call(name, call, core)?, "{name} was not made");
+        Ok(core.cpu.regs[0])
+    }
+
+    /// One command buffer's management and recording, each call made with
+    /// the NVN state (`lock_free` false) or through the recorder: the
+    /// results of every call (an error as its message) and the lists.
+    fn command_buffer_script(
+        lock_free: bool,
+    ) -> (Vec<Result<u64, String>>, Vec<Vec<(String, Vec<u64>)>>) {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (device, pool, buffer, texture) = (0x1100, 0x1180, 0x1200, 0x1280);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        nvn.initialize(pool, "MemoryPool", BTreeMap::new()).unwrap();
+        nvn.initialize(texture, "Texture", BTreeMap::new()).unwrap();
+        let recorder = nvn.recorder();
+        let mut results = Vec::new();
+        let mut handles = Vec::new();
+        let script: &[(&str, &[u64])] = &[
+            ("nvnCommandBufferInitialize", &[buffer, pool]),
+            ("nvnCommandBufferAddControlMemory", &[buffer, 0x1600, 0x100]),
+            ("nvnCommandBufferInitialize", &[buffer, device]),
+            ("nvnCommandBufferInitialize", &[buffer, device]),
+            ("nvnCommandBufferInitialize", &[texture, device]),
+            ("nvnCommandBufferSetMemoryCallback", &[buffer, 0x7100_0000]),
+            ("nvnCommandBufferSetMemoryCallbackData", &[buffer, 0x55]),
+            ("nvnCommandBufferSetRecordingMode", &[buffer, 1]),
+            ("nvnCommandBufferGetMemoryCallback", &[buffer]),
+            ("nvnCommandBufferGetMemoryCallbackData", &[buffer]),
+            ("nvnCommandBufferGetCommandMemoryUsed", &[buffer]),
+            (
+                "nvnCommandBufferAddCommandMemory",
+                &[buffer, device, 0, 0x1000],
+            ),
+            (
+                "nvnCommandBufferAddCommandMemory",
+                &[buffer, pool, 0, 0x1000],
+            ),
+            ("nvnCommandBufferAddControlMemory", &[buffer, 0x1600, 0x100]),
+            ("nvnCommandBufferSetCopyRowStride", &[buffer, 0x40]),
+            ("nvnCommandBufferGetCopyImageStride", &[buffer]),
+            ("nvnCommandBufferIsRecording", &[buffer]),
+            ("nvnCommandBufferBeginRecording", &[buffer]),
+            ("nvnCommandBufferBeginRecording", &[buffer]),
+            ("nvnCommandBufferIsRecording", &[buffer]),
+            ("nvnCommandBufferSetScissor", &[buffer, 1, 2, 3, 4]),
+            ("nvnCommandBufferSetCopyImageStride", &[buffer, 0x400]),
+            ("nvnCommandBufferSetScissor", &[buffer, 5, 6, 7, 8]),
+            ("nvnCommandBufferGetCommandMemoryUsed", &[buffer]),
+            ("nvnCommandBufferGetCommandMemoryFree", &[buffer]),
+            ("nvnCommandBufferGetControlMemoryUsed", &[buffer]),
+            ("nvnCommandBufferEndRecording", &[buffer]),
+            ("nvnCommandBufferGetControlMemoryUsed", &[buffer]),
+            ("nvnCommandBufferGetControlMemoryFree", &[buffer]),
+            ("nvnCommandBufferGetCommandMemorySize", &[buffer]),
+            ("nvnCommandBufferGetCopyImageStride", &[buffer]),
+            // A second list after the first in control memory.
+            ("nvnCommandBufferBeginRecording", &[buffer]),
+            ("nvnCommandBufferSetScissor", &[buffer, 9, 10, 11, 12]),
+            ("nvnCommandBufferEndRecording", &[buffer]),
+            // An empty list uses no control memory.
+            ("nvnCommandBufferBeginRecording", &[buffer]),
+            ("nvnCommandBufferEndRecording", &[buffer]),
+            ("nvnCommandBufferGetControlMemoryUsed", &[buffer]),
+            ("nvnCommandBufferEndRecording", &[buffer]),
+            // Finalized while recording: the recording ends with it.
+            ("nvnCommandBufferBeginRecording", &[buffer]),
+            ("nvnCommandBufferSetScissor", &[buffer, 13, 14, 15, 16]),
+            ("nvnCommandBufferFinalize", &[buffer]),
+            ("nvnCommandBufferFinalize", &[buffer]),
+            ("nvnCommandBufferGetCommandMemoryUsed", &[buffer]),
+            ("nvnCommandBufferEndRecording", &[buffer]),
+            ("nvnCommandBufferInitialize", &[buffer, device]),
+            ("nvnCommandBufferGetControlMemoryUsed", &[buffer]),
+            ("nvnSyncInitialize", &[buffer, device]),
+        ];
+        for &(name, args) in script {
+            let locked = !lock_free
+                || name.ends_with("EndRecording")
+                || !name.starts_with("nvnCommandBuffer");
+            let result = if locked {
+                core.cpu.regs[..args.len()].copy_from_slice(args);
+                nvn.call(name, &mut core).map(|made| {
+                    assert!(made, "{name} is not implemented");
+                    core.cpu.regs[0]
+                })
+            } else {
+                made_free(&recorder, &mut core, name, args)
+            };
+            let result = result.map_err(|trap| format!("{trap:?}"));
+            if name.ends_with("EndRecording")
+                && let Ok(handle) = result
+            {
+                handles.push(handle);
+            }
+            results.push(result);
+        }
+        let lists = handles
+            .iter()
+            .map(|handle| {
+                nvn.command_lists[handle]
+                    .commands
+                    .iter()
+                    .map(|command| {
+                        let mut words = command.x.to_vec();
+                        words.extend(&command.v);
+                        words.extend(&command.captured);
+                        (command.name.to_string(), words)
+                    })
+                    .collect()
+            })
+            .collect();
+        (results, lists)
+    }
+
+    /// Management calls made without the NVN state return what they did
+    /// with it, fail as they did, and leave the same lists and handles.
+    #[test]
+    fn command_buffer_management_without_the_nvn_state_matches_it() {
+        let (locked, locked_lists) = command_buffer_script(false);
+        let (free, free_lists) = command_buffer_script(true);
+        assert_eq!(locked, free);
+        assert_eq!(locked_lists, free_lists);
+        // The script checks what it means to.
+        let ok = |index: usize| locked[index].clone().unwrap();
+        let failed = |index: usize, text: &str| {
+            assert!(
+                locked[index]
+                    .as_ref()
+                    .is_err_and(|error| error.contains(text)),
+                "call {index}: {:?}",
+                locked[index]
+            );
+        };
+        failed(0, "Device 0x1180 is not initialized");
+        failed(1, "CommandBuffer 0x1200 is not initialized");
+        assert_eq!(ok(2), 1);
+        failed(3, "CommandBuffer 0x1200 is already initialized");
+        failed(4, "CommandBuffer 0x1280 is already initialized");
+        assert_eq!((ok(8), ok(9), ok(10)), (0x7100_0000, 0x55, 0));
+        failed(11, "MemoryPool 0x1100 is not initialized");
+        assert_eq!((ok(15), ok(16)), (0, 0));
+        failed(18, "already recording");
+        assert_eq!(ok(19), 1);
+        assert_eq!((ok(23), ok(24), ok(25)), (32, 0x1000 - 32, 0));
+        assert_eq!(ok(26), 0x4e56_8000_0000_1600);
+        assert_eq!(
+            (ok(27), ok(28), ok(29), ok(30)),
+            (16, 0x100 - 16, 0x1000, 0x400)
+        );
+        assert_eq!(ok(33), 0x4e56_8000_0000_1610);
+        assert_eq!(ok(36), 32);
+        failed(37, "not recording");
+        failed(41, "CommandBuffer 0x1200 is not initialized");
+        failed(42, "CommandBuffer 0x1200 is not initialized");
+        failed(43, "not recording");
+        // Made again, it starts with no memory.
+        assert_eq!((ok(44), ok(45)), (1, 0));
+        failed(46, "already initialized");
+        // The copy strides recorded with the first list.
+        assert_eq!(locked_lists.len(), 3);
+        assert_eq!(locked_lists[0].len(), 2);
+    }
+
+    /// Several threads manage and record their own command buffers at once
+    /// without the NVN state, handing each list to it at EndRecording: each
+    /// list holds its thread's commands, at the handle its control memory
+    /// gives it.
+    #[test]
+    fn command_buffers_record_concurrently_without_the_nvn_state() {
+        const THREADS: u64 = 8;
+        const LISTS: u64 = 40;
+        let mut nvn = Nvn::default();
+        let (device, pool) = (0x1100, 0x1180);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        nvn.initialize(pool, "MemoryPool", BTreeMap::new()).unwrap();
+        let recorder = nvn.recorder();
+        let nvn = std::sync::Mutex::new(nvn);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (nvn, recorder) = (&nvn, recorder.clone());
+                scope.spawn(move || {
+                    let mut memory = Memory::new(1 << 39);
+                    let mut cpu = Cpu::default();
+                    let mut core = Guest {
+                        cpu: &mut cpu,
+                        memory: GuestMemory::Checked(&mut memory),
+                        counter: None,
+                    };
+                    let buffer = 0x10_0000 + thread * 0x100;
+                    let control = 0x100_0000 + thread * 0x10_0000;
+                    let free = |core: &mut Guest, name: &str, args: &[u64]| {
+                        made_free(&recorder, core, name, args).unwrap()
+                    };
+                    for round in 0..3 {
+                        assert_eq!(
+                            free(&mut core, "nvnCommandBufferInitialize", &[buffer, device]),
+                            1
+                        );
+                        free(
+                            &mut core,
+                            "nvnCommandBufferSetMemoryCallback",
+                            &[buffer, 0x7100_0000 + thread],
+                        );
+                        free(
+                            &mut core,
+                            "nvnCommandBufferAddCommandMemory",
+                            &[buffer, pool, thread << 16, 0x1_0000],
+                        );
+                        free(
+                            &mut core,
+                            "nvnCommandBufferAddControlMemory",
+                            &[buffer, control, 0x1_0000],
+                        );
+                        for list in 0..LISTS {
+                            let count = 1 + (list + thread) % 5;
+                            let used =
+                                free(&mut core, "nvnCommandBufferGetCommandMemoryUsed", &[buffer]);
+                            free(&mut core, "nvnCommandBufferBeginRecording", &[buffer]);
+                            for index in 0..count {
+                                free(
+                                    &mut core,
+                                    "nvnCommandBufferSetScissor",
+                                    &[buffer, thread, round, list, index],
+                                );
+                            }
+                            assert_eq!(
+                                free(&mut core, "nvnCommandBufferGetCommandMemoryUsed", &[buffer]),
+                                used + 16 * count
+                            );
+                            let control_used =
+                                free(&mut core, "nvnCommandBufferGetControlMemoryUsed", &[buffer]);
+                            assert_eq!(control_used, 16 * list);
+                            let mut nvn = lock_shared(nvn);
+                            core.cpu.regs[0] = buffer;
+                            assert!(nvn.call("nvnCommandBufferEndRecording", &mut core).unwrap());
+                            let handle = core.cpu.regs[0];
+                            assert_eq!(handle, 0x4e56_8000_0000_0000 | (control + control_used));
+                            let commands = &nvn.command_lists[&handle].commands;
+                            assert_eq!(commands.len() as u64, count);
+                            for (index, command) in commands.iter().enumerate() {
+                                assert_eq!(command.name, "nvnCommandBufferSetScissor");
+                                assert_eq!(
+                                    &command.x[..5],
+                                    &[buffer, thread, round, list, index as u64]
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            free(&mut core, "nvnCommandBufferGetMemoryCallback", &[buffer]),
+                            0x7100_0000 + thread
+                        );
+                        free(&mut core, "nvnCommandBufferFinalize", &[buffer]);
+                    }
+                });
+            }
+        });
+        let nvn = nvn.into_inner().unwrap();
+        assert!(read_shared(&nvn.command_buffers).is_empty());
+        assert!(read_shared(&nvn.recording).is_empty());
+        assert_eq!(nvn.command_lists.len() as u64, THREADS * LISTS);
+    }
+
+    /// A list recorded without the NVN state, then submitted, replays as
+    /// the one recorded with it does: the same commands and the same frame.
+    #[test]
+    fn list_recorded_without_the_nvn_state_replays_identically() {
+        fn run(lock_free: bool) -> (Vec<(String, Vec<u64>)>, Vec<[f32; 4]>) {
+            let mut memory = Memory::new(1 << 39);
+            memory
+                .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+                .unwrap();
+            let mut cpu = Cpu::default();
+            let mut core = Guest {
+                cpu: &mut cpu,
+                memory: GuestMemory::Checked(&mut memory),
+                counter: Some(0),
+            };
+            // The CPU reference path: no GPU backend, so images hold texels.
+            let mut nvn = Nvn {
+                gpu_checked: true,
+                ..Nvn::default()
+            };
+            let (device_builder, device) = (0x10_0000, 0x10_1000);
+            let (texture_builder, texture) = (0x10_2000, 0x10_3000);
+            let (queue_builder, queue) = (0x10_8000, 0x10_9000);
+            for (name, args) in [
+                ("nvnDeviceBuilderSetDefaults", vec![device_builder]),
+                ("nvnDeviceInitialize", vec![device, device_builder]),
+                ("nvnTextureBuilderSetDevice", vec![texture_builder, device]),
+                ("nvnTextureBuilderSetDefaults", vec![texture_builder]),
+                ("nvnTextureBuilderSetWidth", vec![texture_builder, 4]),
+                ("nvnTextureBuilderSetHeight", vec![texture_builder, 2]),
+                ("nvnTextureBuilderSetFormat", vec![texture_builder, 37]),
+                ("nvnTextureInitialize", vec![texture, texture_builder]),
+                ("nvnQueueBuilderSetDevice", vec![queue_builder, device]),
+                ("nvnQueueBuilderSetDefaults", vec![queue_builder]),
+                ("nvnQueueInitialize", vec![queue, queue_builder]),
+            ] {
+                call(&mut nvn, &mut core, name, &args);
+            }
+            let recorder = nvn.recorder();
+            let command_buffer = 0x10_a000;
+            core.memory.write_u64(0x10_4200, texture).unwrap();
+            for (index, value) in [0.5f32, 0.25, 1.0, 1.0].iter().enumerate() {
+                core.memory
+                    .write_u32(0x10_4300 + index as u64 * 4, value.to_bits())
+                    .unwrap();
+            }
+            for (name, args) in [
+                ("nvnCommandBufferInitialize", vec![command_buffer, device]),
+                (
+                    "nvnCommandBufferAddControlMemory",
+                    vec![command_buffer, 0x10_c000, 0x400],
+                ),
+                ("nvnCommandBufferBeginRecording", vec![command_buffer]),
+                (
+                    "nvnCommandBufferSetRenderTargets",
+                    vec![command_buffer, 1, 0x10_4200, 0, 0, 0],
+                ),
+                (
+                    "nvnCommandBufferClearColor",
+                    vec![command_buffer, 0, 0x10_4300, 0xf],
+                ),
+            ] {
+                if lock_free {
+                    made_free(&recorder, &mut core, name, &args).unwrap();
+                } else {
+                    call(&mut nvn, &mut core, name, &args);
+                }
+            }
+            // The color is captured at record time.
+            core.memory.write_u32(0x10_4300, 0).unwrap();
+            let handle = call(
+                &mut nvn,
+                &mut core,
+                "nvnCommandBufferEndRecording",
+                &[command_buffer],
+            );
+            let commands = nvn.command_lists[&handle]
+                .commands
+                .iter()
+                .map(|command| {
+                    let mut words = command.x.to_vec();
+                    words.extend(&command.v);
+                    words.extend(&command.captured);
+                    (command.name.to_string(), words)
+                })
+                .collect();
+            core.memory.write_u64(0x10_4400, handle).unwrap();
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnQueueSubmitCommands",
+                &[queue, 1, 0x10_4400],
+            );
+            while nvn.replay_paused() {
+                nvn.resume_replay(&mut core).unwrap();
+            }
+            (commands, nvn.images[&texture].texels.clone())
+        }
+        let locked = run(false);
+        let free = run(true);
+        assert_eq!(locked.0.len(), 2);
+        assert!(locked.1.iter().all(|texel| *texel == [0.5, 0.25, 1.0, 1.0]));
+        assert_eq!(locked, free);
     }
 }
