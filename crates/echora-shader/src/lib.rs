@@ -1111,6 +1111,43 @@ mod tests {
     }
 
     #[test]
+    fn vertex_programs_copy_only_proven_uniform_broadcasts() {
+        use crate::spirv::op;
+
+        let source = word(&[(0, 12, 0xa02), (32, 14, 4), (72, 4, 15)]);
+        let load = word(&[(0, 12, 0x381), (16, 8, 1), (73, 3, 4)]);
+        let vertex_id = word(&[
+            (0, 12, 0x321),
+            (16, 8, 1),
+            (24, 8, 255),
+            (32, 8, 255),
+            (40, 10, 0x2fc),
+        ]);
+        let broadcast = word(&[(0, 12, 0x3c2), (16, 6, 4), (24, 8, 1)]);
+        let recount = |instructions: &[u128]| {
+            let mut program = header(1, 1, &[]);
+            program.extend(bytes(instructions));
+            let stage = validated(&program);
+            let mut count = 0;
+            let mut at = 5;
+            while let Some(&instruction) = stage.spirv.get(at) {
+                count += usize::from(instruction as u16 == op::GROUP_NON_UNIFORM_BROADCAST_FIRST);
+                at += (instruction >> 16) as usize;
+            }
+            count
+        };
+        assert_eq!(recount(&[source, load, broadcast, EXIT]), 0);
+        assert_eq!(recount(&[source, load, vertex_id, broadcast, EXIT]), 1);
+
+        // The back edge can reach R2UR after R1 has received a vertex ID.
+        let branch = word(&[(0, 12, 0x947), (32, 50, (1u128 << 50) - 3 * 16), (87, 3, 7)]);
+        assert_eq!(
+            recount(&[source, load, broadcast, vertex_id, branch, EXIT]),
+            1
+        );
+    }
+
+    #[test]
     fn graphics_and_endless_programs_are_unsupported() {
         // A geometry program is not translated yet.
         let geometry = header(1, 4, &[]);

@@ -317,6 +317,9 @@ fn emit_blocks(
 ) -> Result<Emitter, Unsupported> {
     let mut emitter = Emitter::new(layout);
     emitter.hmma_pairs = matrix::pairs(code, blocks);
+    if layout.stage == Stage::Vertex {
+        emitter.uniform_broadcasts = uniform_prefix::broadcasts(code, blocks[0].body_end);
+    }
     emitter.mesh_begin();
     emitter.handle_words = handle_words(code);
     emitter.texture_views = texture_views(code, &emitter.handle_words);
@@ -372,6 +375,7 @@ mod memory;
 mod mesh;
 mod structure;
 mod texture;
+mod uniform_prefix;
 mod vertex_trace;
 
 /// The uniform registers that only ever hold one constant-bank word (each
@@ -749,6 +753,7 @@ struct Emitter {
     step_file: Option<u32>,
     /// Cooperative HMMA pairs: the first's index to the second's (d, b,
     /// c), and the seconds' indices (emitted with their first).
+    uniform_broadcasts: Vec<usize>,
     hmma_pairs: matrix::Pairs,
     /// More variables at a descriptor's binding (by descriptor index).
     descriptor_aliases: Vec<(usize, u32)>,
@@ -839,6 +844,7 @@ impl Emitter {
             vertex_trace_record: None,
             vertex_trace_entries: Vec::new(),
             step_file: None,
+            uniform_broadcasts: Vec::new(),
             hmma_pairs: matrix::Pairs::default(),
             matrix_scratch: BTreeMap::new(),
             matrices_used: false,
@@ -1958,6 +1964,12 @@ impl Emitter {
                 self.set_predicates(p, q, result, combine, accumulate);
             }
             Op::R2ur { d, src } => {
+                if self.uniform_broadcasts.binary_search(&index).is_ok() {
+                    let value = self.read_register(src.0);
+                    self.write_uniform(d.0.min(63), value);
+                    return Ok(());
+                }
+
                 // The first active invocation's value, the same for the
                 // whole warp (each invocation's own would make the uniform
                 // register, and the branches on it, differ across lanes).
