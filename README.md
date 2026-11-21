@@ -13,8 +13,8 @@ graphics.
 
 > [!CAUTION]
 > Echora reaches early gameplay on Linux. It runs well below full speed in
-> the forest and can hang, crash or render incorrectly. Tests cover loading
-> an existing save and playing into the village. Please do not report
+> the forest and can hang, crash or render incorrectly. Manual Linux runs
+> have loaded an existing save and played into the village. Please do not report
 > gameplay problems as bugs for now.
 
 Echora is a personal project that I build for my own enjoyment. It doesn't
@@ -37,8 +37,8 @@ What works today:
   launch builds that translation. Later launches reuse it.
 - The translated game runs. It boots through the system services, takes
   input, and gets through New Game and the opening movie into its first 3D
-  scene. Linux tests also load a save, move through the forest and enter the
-  village.
+  scene. Manual Linux runs have also loaded a save, moved through the forest
+  and entered the village.
 - Echora's own shader translator, written in Rust, translates all 6,215
   shader stages the game has used in test runs so far. The old shader
   recompiler is no longer needed. It can still be loaded as an optional

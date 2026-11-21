@@ -20,7 +20,7 @@ const CAPTION_KEYS: [u32; 6] = [
     0x5ee5_0bed,
 ];
 // Health is in quarter hearts. Both values are from caption.sav, as is the
-// length-prefixed JPEG. See the OOT-SW2SE editor and oot-sw2-save format notes.
+// length-prefixed JPEG.
 const CURRENT_LIFE: u32 = 0x1e55_ecc5;
 const MAX_LIFE: u32 = 0x74bd_05d0;
 const THUMBNAIL: u32 = 0x6369_6a32;

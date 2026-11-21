@@ -1,7 +1,8 @@
 # Known limitations
 
 Echora is in development. Runs can hang, crash or render incorrectly.
-Linux tests cover loading an existing save and reaching the village.
+Manual Linux runs have loaded an existing save and reached the village (no
+automated test covers it).
 
 ## Gameplay and graphics
 
@@ -110,8 +111,7 @@ Linux tests cover loading an existing save and reaching the village.
 - Ocarina of Time's Dynamic resolution add-on is off by default and uses
   the game's fixed-resolution path. Enable it under Game → Add-ons to
   restore the game's adaptive 3D resolution. The launcher prepares the
-  updated translation on the next launch. The build and branch match the
-  [Lichii Max Resolution add-on](https://github.com/zortos293/Lichii/blob/17baed7/src/core/file_sys/patch_manager.cpp).
+  updated translation on the next launch.
   SMAA is also off by default. Enable it under Game → Add-ons to use the
   game's edge blending. Sharpening is on by default. Turn it off under
   Game → Add-ons to zero the game's sharpening strength in both the
