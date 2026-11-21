@@ -7404,6 +7404,19 @@ impl Nvn {
         guest: u64,
         size: u64,
     ) -> Result<(), String> {
+        self.resolve_draw_input_of(core, "other", guest, size)
+    }
+
+    /// `resolve_draw_input` for one `kind` of input ("indices",
+    /// "vertices", "uniforms" or "other"), the name its waits for GPU work
+    /// are counted under.
+    pub(super) fn resolve_draw_input_of(
+        &mut self,
+        core: &mut Guest,
+        kind: &'static str,
+        guest: u64,
+        size: u64,
+    ) -> Result<(), String> {
         if size == 0 {
             return Ok(());
         }
@@ -7414,7 +7427,30 @@ impl Nvn {
         let serial = self.draw_input_write_serial(range.clone());
         if let Some(serial) = serial {
             let backend = self.gpu.as_mut().unwrap();
-            backend.renderer.wait_for(serial)?;
+            if serial > backend.renderer.completed_serial() {
+                let started = std::time::Instant::now();
+                backend.renderer.wait_for(serial)?;
+                let (count, time) = match kind {
+                    "indices" => (
+                        "stat: draw input waits for indices",
+                        "stat: draw input wait us for indices",
+                    ),
+                    "vertices" => (
+                        "stat: draw input waits for vertices",
+                        "stat: draw input wait us for vertices",
+                    ),
+                    "uniforms" => (
+                        "stat: draw input waits for uniforms",
+                        "stat: draw input wait us for uniforms",
+                    ),
+                    _ => (
+                        "stat: draw input waits for other inputs",
+                        "stat: draw input wait us for other inputs",
+                    ),
+                };
+                backend.stat(count, 1);
+                backend.stat(time, started.elapsed().as_micros() as u64);
+            }
             if backend.renderer.completed_serial() >= backend.page_table_write_serial {
                 backend.page_table_writes = false;
             }
@@ -10424,7 +10460,7 @@ impl Nvn {
                                 continue;
                             }
                         }
-                        self.resolve_draw_input(core, guest, size)?;
+                        self.resolve_draw_input_of(core, "uniforms", guest, size)?;
                         uniform_bytes += size;
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
@@ -10969,7 +11005,7 @@ impl Nvn {
                 let address = command.x[4];
                 let length = u64::from(count) * size;
                 let guest = self.gpu_to_guest(address, length)?;
-                self.resolve_draw_input(core, guest, length)?;
+                self.resolve_draw_input_of(core, "indices", guest, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
                 let rewrites_indices = size == 1 || quads || strip && restart.is_some();
@@ -11141,7 +11177,7 @@ impl Nvn {
                     };
                     let (address, size) = (bind.x[2] + skip, reach.saturating_sub(skip));
                     let guest = self.gpu_to_guest(address, size)?;
-                    self.resolve_draw_input(core, guest, size)?;
+                    self.resolve_draw_input_of(core, "vertices", guest, size)?;
                     // Read into the ring when recorded, not copied here.
                     Some((guest, size as usize))
                 }
