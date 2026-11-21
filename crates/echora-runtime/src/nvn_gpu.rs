@@ -7262,7 +7262,12 @@ impl Nvn {
     /// Submission covering possible page-table writes to a mapped input.
     fn draw_input_write_serial(&self, range: std::ops::Range<u64>) -> Option<u64> {
         let backend = self.gpu.as_ref()?;
-        if !backend.page_table_writes {
+        // Every write recorded so far has finished (the common case between
+        // a frame's compute passes): nothing to wait for, without walking
+        // the shared spans and their recorded writes.
+        if !backend.page_table_writes
+            || backend.page_table_write_serial <= backend.renderer.completed_serial()
+        {
             return None;
         }
         self.shared_guest_index()?
