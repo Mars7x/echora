@@ -7458,7 +7458,8 @@ impl Nvn {
     /// results waiting to be copied into it (`gpu_writes_pending`).
     /// ECHORA_UNIFORMS_IN_PLACE=0 copies them all, waiting; =all reads
     /// every shared uniform buffer in place, GPU-written or not.
-    fn uniform_in_place(&self, range: std::ops::Range<u64>) -> bool {
+    /// (`serial`: the range's `draw_input_write_serial`.)
+    fn uniform_in_place(&self, range: std::ops::Range<u64>, serial: Option<u64>) -> bool {
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| {
             match super::debug_var_os("ECHORA_UNIFORMS_IN_PLACE")
@@ -7475,9 +7476,7 @@ impl Nvn {
         };
         mode != 0
             && (mode == 2
-                || self
-                    .draw_input_write_serial(range.clone())
-                    .is_some_and(|serial| serial > backend.renderer.completed_serial()))
+                || serial.is_some_and(|serial| serial > backend.renderer.completed_serial()))
             && !self.gpu_writes_pending(&range)
             && self
                 .shared_guest_range(range.start, range.end - range.start)
@@ -7539,8 +7538,9 @@ impl Nvn {
                 }
                 if let Ok(guest) = self.gpu_to_guest(bind.x[3], size)
                     && let Some(end) = guest.checked_add(size)
-                    && !self.uniform_in_place(guest..end)
-                    && let Some(writes) = self.draw_input_write_serial(guest..end)
+                    && let writes = self.draw_input_write_serial(guest..end)
+                    && !self.uniform_in_place(guest..end, writes)
+                    && let Some(writes) = writes
                 {
                     serial = serial.max(writes);
                 }
@@ -7631,6 +7631,19 @@ impl Nvn {
         guest: u64,
         size: u64,
     ) -> Result<(), String> {
+        self.resolve_draw_input_after(core, kind, guest, size, None)
+    }
+
+    /// `resolve_draw_input_of` with the range's `draw_input_write_serial`
+    /// already known (`Some`) or not (`None`).
+    fn resolve_draw_input_after(
+        &mut self,
+        core: &mut Guest,
+        kind: &'static str,
+        guest: u64,
+        size: u64,
+        serial: Option<Option<u64>>,
+    ) -> Result<(), String> {
         if size == 0 {
             return Ok(());
         }
@@ -7638,7 +7651,7 @@ impl Nvn {
             ..guest
                 .checked_add(size)
                 .ok_or("guest draw input overflows")?;
-        let serial = self.draw_input_write_serial(range.clone());
+        let serial = serial.unwrap_or_else(|| self.draw_input_write_serial(range.clone()));
         if let Some(serial) = serial {
             let backend = self.gpu.as_mut().unwrap();
             if serial > backend.renderer.completed_serial() {
@@ -10673,19 +10686,30 @@ impl Nvn {
                         if let Some(started) = started {
                             uniform_time += started.elapsed();
                         }
-                        if let Some(end) = guest.checked_add(size)
-                            && self.uniform_in_place(guest..end)
-                            && let Some((buffer, offset)) = self.shared_binding(guest, size)?
-                        {
-                            let backend = self.gpu.as_mut().unwrap();
-                            if offset % backend.renderer.uniform_offset_alignment() == 0 {
-                                uniforms_in_place
-                                    .insert((index, descriptor.binding), (buffer, offset, size));
-                                backend.stat("stat: draw uniforms read in place", 1);
-                                continue;
+                        // Computed once for both (it walks the pending
+                        // shared writes).
+                        let mut writes = None;
+                        if let Some(end) = guest.checked_add(size) {
+                            let serial = self.draw_input_write_serial(guest..end);
+                            writes = Some(serial);
+                            if self.uniform_in_place(guest..end, serial)
+                                && let Some((buffer, offset)) = self.shared_binding(guest, size)?
+                            {
+                                let backend = self.gpu.as_mut().unwrap();
+                                if offset % backend.renderer.uniform_offset_alignment() == 0 {
+                                    uniforms_in_place.insert(
+                                        (index, descriptor.binding),
+                                        (buffer, offset, size),
+                                    );
+                                    backend.stat("stat: draw uniforms read in place", 1);
+                                    continue;
+                                }
+                                // Importing the span may have changed what
+                                // the serial walked.
+                                writes = None;
                             }
                         }
-                        self.resolve_draw_input_of(core, "uniforms", guest, size)?;
+                        self.resolve_draw_input_after(core, "uniforms", guest, size, writes)?;
                         uniform_bytes += size;
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
