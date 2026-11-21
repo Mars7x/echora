@@ -8598,4 +8598,131 @@ mod tests {
         assert!(output.contains("m.cpu.strip_lr_instruction_pac(m.memory.address_space_end())?;"));
         assert!(!output.contains("pauth_disabled_hint("));
     }
+
+    /// BL from `from` to `to` (byte addresses).
+    fn bl(from: u64, to: u64) -> u32 {
+        0x9400_0000 | ((to.wrapping_sub(from) as i64 / 4) as u32 & 0x03ff_ffff)
+    }
+
+    #[test]
+    fn window_call_summaries_cover_callees_and_refuse_blr_svc_and_cycles() {
+        let at = |index: u64| 0x1000 + 4 * index;
+        let words = [
+            bl(at(0), at(4)),   // caller: A
+            bl(at(1), at(6)),   // B
+            bl(at(2), at(9)),   // C
+            0xd400_00e1,        // svc #7
+            0x9100_0421,        // A: add x1, x1, #1
+            0xd65f_03c0,        // ret
+            0xd63f_0040,        // B: blr x2
+            0xd65f_03c0,        // ret
+            0xd400_0061,        // E: svc #3 (called by nothing but F)
+            0xa9bf_7bfd,        // C: stp x29, x30, [sp, #-16]!
+            bl(at(10), at(4)),  // bl A
+            0xa8c1_7bfd,        // ldp x29, x30, [sp], #16
+            0xd65f_03c0,        // ret
+            bl(at(13), at(13)), // D: bl D
+            0xd65f_03c0,        // ret
+            bl(at(15), at(8)),  // F: bl E
+            0xd65f_03c0,        // ret
+        ];
+        let translation =
+            discover(&[region(&words)], &[at(0), at(13), at(15)], words.len()).unwrap();
+        let summaries = window_call_summaries(&translation, &|_| true);
+        let x = |n: u32| 1u64 << n;
+        assert_eq!(summaries.get(&at(4)), Some(&(x(1) | x(30), x(1))));
+        let (touched, writes) = summaries[&at(9)];
+        assert_eq!(writes, x(1) | x(29) | x(30) | DIRTY_SP);
+        assert_eq!(touched, writes);
+        // BLR, a cycle, an SVC and a call of a target without a summary.
+        for none in [at(6), at(13), at(8), at(15)] {
+            assert!(!summaries.contains_key(&none), "{none:#x}");
+        }
+        // No region with window calls: none.
+        assert!(window_call_summaries(&translation, &|_| false).is_empty());
+
+        let options = EmitOptions {
+            window_calls: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        assert!(source.contains("pub fn enter_window_4("));
+        assert!(source.contains("let called = enter_window_4(m);"));
+        assert!(source.contains("return m.finish_block();"));
+        let (_, plain) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        assert!(!plain[0].1.contains("enter_window_"));
+        assert!(!plain[0].1.contains("return m.finish_block();"));
+        // Not with structured emission or lifted functions.
+        for options in [
+            EmitOptions {
+                structured: true,
+                ..options
+            },
+            EmitOptions {
+                functions: true,
+                ..options
+            },
+        ] {
+            let (root, regions) = emit_rust_split_with(&translation, 16, options);
+            assert!(!regions[0].1.contains("enter_window_"));
+            assert!(!root.contains("WINDOW_CALL_TABLE"));
+        }
+    }
+
+    #[test]
+    fn window_call_chains_stop_at_the_depth_limit() {
+        // A caller, then 18 functions each keeping a frame and calling the
+        // next, the last a leaf.
+        const CHAIN: u64 = 18;
+        let at = |index: u64| 0x1000 + 4 * index;
+        let function = |i: u64| at(2 + 4 * i);
+        let mut words = vec![bl(at(0), function(0)), 0xd400_00e1];
+        for i in 0..CHAIN {
+            if i + 1 == CHAIN {
+                words.extend([0x9100_0421, 0xd65f_03c0, 0xd503_201f, 0xd503_201f]);
+            } else {
+                let call = function(i) + 4;
+                words.extend([
+                    0xa9bf_7bfd,
+                    bl(call, function(i + 1)),
+                    0xa8c1_7bfd,
+                    0xd65f_03c0,
+                ]);
+            }
+        }
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        let summaries = window_call_summaries(&translation, &|_| true);
+        for i in 0..CHAIN {
+            let depth = (CHAIN - i) as u32;
+            assert_eq!(
+                summaries.contains_key(&function(i)),
+                depth <= WINDOW_CALL_DEPTH_LIMIT,
+                "function {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_indirect_branch_in_a_window_call_reaches_the_whole_window() {
+        let at = |index: u64| 0x1000 + 4 * index;
+        // The caller in the next window: the BR may reach any block of
+        // A's window (one with the caller's BL to A would be a cycle).
+        let mut words = vec![0xd503_201f; 258];
+        words[0] = 0x9100_0842; // add x2, x2, #2
+        words[1] = 0xd65f_03c0; // ret
+        words[3] = 0xd61f_0060; // A: br x3
+        words[4] = 0x9100_0421; // add x1, x1, #1 (the BR's possible target)
+        words[5] = 0xd65f_03c0; // ret
+        words[256] = bl(at(256), at(3));
+        words[257] = 0xd400_00e1;
+        let translation =
+            discover(&[region(&words)], &[at(256), at(0), at(4)], words.len()).unwrap();
+        let summaries = window_call_summaries(&translation, &|_| true);
+        let (touched, writes) = summaries[&at(3)];
+        let x = |n: u32| 1u64 << n;
+        // X1 and X2 from the blocks the BR may reach, X3 from the BR.
+        assert_eq!(writes, x(1) | x(2));
+        assert_eq!(touched, x(1) | x(2) | x(3) | x(30));
+    }
 }
