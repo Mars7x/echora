@@ -16464,6 +16464,205 @@ mod pool_tests {
         );
     }
 
+    /// A memoized binding of texture `texture` sampling `source`, over
+    /// `backing`.
+    fn memo_binding(
+        texture: u64,
+        source: TextureSource,
+        backing: Option<TextureBacking>,
+    ) -> super::super::ResolvedBinding {
+        super::super::ResolvedBinding {
+            source,
+            sampler: Sampler::default(),
+            sample_type: super::shader::SampleType::Float,
+            backing,
+            gpu_writes: 0,
+            present: 0,
+            texture,
+        }
+    }
+
+    /// A pool at guest `base` (0x1000 bytes) and a 2x1 texture over its
+    /// start.
+    fn texture_over(nvn: &mut Nvn, pool: u64, texture: u64, base: u64) {
+        let args = |x| Args { x, v: [0; 2] };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x1000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([
+                ("Target".into(), scalar(1)),
+                ("Width".into(), scalar(2)),
+                ("Height".into(), scalar(1)),
+                ("Levels".into(), scalar(1)),
+                ("Format".into(), scalar(10)),
+                ("Storage".into(), args([pool, 0, 0, 0])),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_invalidated_texture_evicts_the_bindings_that_can_see_it() {
+        let mut nvn = Nvn::default();
+        let base = 0x20_0000;
+        let texture = 4;
+        texture_over(&mut nvn, 3, texture, base);
+        let far = || Some(TextureBacking::linear(0x90_0000, 0x100));
+        let fill = |memo: &mut super::super::FastMap<u64, super::super::ResolvedBinding>| {
+            memo.clear();
+            // Of the texture itself.
+            memo.insert(
+                1,
+                memo_binding(
+                    texture,
+                    TextureSource::Upload {
+                        key: texture,
+                        generation: 0,
+                        width: 2,
+                        height: 1,
+                        shape: echora_gpu::draw::ImageShape::D2 { layers: 1 },
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        texels: Default::default(),
+                        levels: Arc::from([]),
+                    },
+                    far(),
+                ),
+            );
+            // Another object sampling it as a render target.
+            memo.insert(2, memo_binding(9, TextureSource::Target(texture), far()));
+            // Another object over the same storage (a format twin).
+            memo.insert(
+                3,
+                memo_binding(
+                    8,
+                    TextureSource::Target(8),
+                    Some(TextureBacking::linear(base + 4, 4)),
+                ),
+            );
+            // Storage unknown.
+            memo.insert(4, memo_binding(7, TextureSource::Target(7), None));
+            // Elsewhere: kept.
+            memo.insert(5, memo_binding(6, TextureSource::Target(6), far()));
+        };
+        fill(&mut nvn.binding_memo.1);
+        let mut queued = super::super::FastMap::default();
+        fill(&mut queued);
+        nvn.queue_memos.insert(77, (Default::default(), queued));
+        let (serial, inputs) = (nvn.binding_serial, nvn.pool_inputs);
+
+        nvn.evict_texture_bindings(texture);
+        let kept = |memo: &super::super::FastMap<u64, super::super::ResolvedBinding>| {
+            let mut kept: Vec<u64> = memo.keys().copied().collect();
+            kept.sort_unstable();
+            kept
+        };
+        assert_eq!(kept(&nvn.binding_memo.1), [5]);
+        // Other queues' memoized bindings go the same way.
+        assert_eq!(kept(&nvn.queue_memos[&77].1), [5]);
+        assert!(nvn.pool_inputs > inputs);
+        assert_eq!(nvn.binding_serial, serial);
+
+        // A texture whose storage is unknown: every binding resolves anew.
+        fill(&mut nvn.binding_memo.1);
+        nvn.evict_texture_bindings(0x5555);
+        assert_eq!(nvn.binding_serial, serial + 1);
+        assert_eq!(kept(&nvn.binding_memo.1), [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_pool_list_made_while_a_binding_in_it_is_evicted_is_not_reused() {
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x20_0000;
+        let (storage, texture, descriptors) = (3, 4, 6);
+        texture_over(&mut nvn, storage, texture, base);
+        let args = |x| Args { x, v: [0; 2] };
+        nvn.initialize(
+            descriptors,
+            "TexturePool",
+            BTreeMap::from([("Storage".into(), args([storage, 0x800, 16, 0]))]),
+        )
+        .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x1000, READ | WRITE, STATE_NORMAL, "pool list race")
+            .unwrap();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        // The texture is registered as handle 9 and resolves when listed.
+        core.cpu.regs[..4].copy_from_slice(&[descriptors, 9, texture, 0]);
+        assert!(
+            nvn.call("nvnTexturePoolRegisterTexture", &mut core)
+                .unwrap()
+        );
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, descriptors, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        // Handle 2, listed first, is memoized over the same bytes, which
+        // GPU work wrote in place: resolving handle 9 stores those writes
+        // and evicts handle 2's binding after it joined the list.
+        let written = TextureBacking::linear(base, 0x10);
+        nvn.binding_memo.0 = (nvn.binding_epoch, 0, nvn.binding_serial, 0);
+        nvn.binding_memo.1.insert(
+            2,
+            memo_binding(99, TextureSource::Target(99), Some(written)),
+        );
+        {
+            let backend = nvn.gpu.as_mut().unwrap();
+            backend.textures.insert(
+                99,
+                (
+                    0,
+                    TextureSource::Target(99),
+                    TextureBacking::linear(base, 0x10),
+                ),
+            );
+            backend.in_place_writes.push(base..base + 0x10);
+        }
+        nvn.render.bound_textures.insert((0, 0), 2);
+        nvn.render.bound_textures.insert((0, 1), 9);
+
+        let first = nvn.pool_entries(&mut core, 0, &[]).unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(!nvn.binding_memo.1.contains_key(&2));
+        let stats = &nvn.gpu.as_ref().unwrap().stats;
+        assert_eq!(
+            stats.get("stat: pool entry lists changed while made"),
+            Some(&1)
+        );
+        // Made again: handle 2 no longer resolves (its binding is gone).
+        let second = nvn.pool_entries(&mut core, 0, &[]).unwrap();
+        assert_eq!(
+            second.iter().map(|entry| entry.texture).collect::<Vec<_>>(),
+            [9]
+        );
+    }
+
     #[test]
     fn texel_writes_evict_only_the_bindings_over_them() {
         let mut nvn = Nvn::default();
