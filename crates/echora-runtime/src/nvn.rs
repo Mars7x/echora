@@ -1768,6 +1768,20 @@ fn command_buffer_unlocked(rest: &str) -> bool {
 
 impl CommandBufferState<'_> {
     /// The command buffer at `address`, if initialized.
+    /// Lock command buffer `buffer` at `address` for a management call:
+    /// refused once a Finalize on another thread has retired it (between
+    /// `buffer` and this lock), so no call acts on a dead buffer.
+    fn live<'b>(
+        buffer: &'b CommandBufferEntry,
+        address: u64,
+    ) -> Result<std::sync::MutexGuard<'b, CommandBufferObject>, String> {
+        let object = lock_shared(buffer);
+        if object.finalized {
+            return Err(format!("CommandBuffer {address:#x} is not initialized"));
+        }
+        Ok(object)
+    }
+
     fn buffer(&self, address: u64) -> Result<CommandBufferEntry, String> {
         read_shared(self.buffers)
             .get(&address)
@@ -1805,6 +1819,10 @@ fn command_buffer_call(
     };
     let x = core.cpu.regs;
     let this = x[0];
+    // As `Nvn::call_inner` refuses it for every object call.
+    if this == 0 {
+        return Err(invalid("null object".into()));
+    }
     let args = Args {
         x: [x[1], x[2], x[3], x[4]],
         v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
@@ -1850,11 +1868,16 @@ fn command_buffer_call(
             Ok(true)
         }
         "Finalize" => {
-            let buffer = write_shared(state.buffers)
+            // Retired, marked and unregistered with the map locked (the
+            // order Initialize takes them in), so an Initialize at this
+            // address after it sees it gone everywhere.
+            let mut buffers = write_shared(state.buffers);
+            let buffer = buffers
                 .remove(&this)
                 .ok_or_else(|| invalid(format!("CommandBuffer {this:#x} is not initialized")))?;
             lock_shared(&buffer).finalized = true;
             write_shared(state.registry).objects.remove(&this);
+            drop(buffers);
             if let Some(recording) = write_shared(state.recordings).remove(&this) {
                 // A recorder's cached handle to it is stale now.
                 lock_shared(&recording).ended = true;
@@ -1876,7 +1899,7 @@ fn command_buffer_call(
             } else {
                 (1, x[2], [x[1], x[2], 0, 0])
             };
-            let mut object = lock_shared(&buffer);
+            let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             state.fold(this, &mut object);
             // Lists recorded into memory this overlaps are kept: the
             // application calls lists whose memory the host's model says it
@@ -1898,7 +1921,7 @@ fn command_buffer_call(
         | "GetCommandMemoryUsed"
         | "GetControlMemoryUsed" => {
             let buffer = state.buffer(this).map_err(invalid)?;
-            let mut object = lock_shared(&buffer);
+            let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             state.fold(this, &mut object);
             let memory = object.memory[usize::from(rest.starts_with("GetControl"))];
             let size = memory.size.unwrap_or(0);
@@ -1923,7 +1946,7 @@ fn command_buffer_call(
         // (inferred). Host command buffers record calls either way.
         | "SetRecordingMode" => {
             let buffer = state.buffer(this).map_err(invalid)?;
-            let mut object = lock_shared(&buffer);
+            let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             state.fold(this, &mut object);
             let property = intern(&rest["Set".len()..]);
             object.properties.insert(property, args);
@@ -1934,7 +1957,7 @@ fn command_buffer_call(
         "SetCopyRowStride" | "SetCopyImageStride" | "GetCopyRowStride" | "GetCopyImageStride" => {
             let slot = usize::from(rest.ends_with("ImageStride"));
             let buffer = state.buffer(this).map_err(invalid)?;
-            let mut object = lock_shared(&buffer);
+            let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             state.fold(this, &mut object);
             if rest.starts_with("Get") {
                 core.cpu.regs[0] = object.copy_strides[slot].map_or(0, |stride| stride.x[0]);
@@ -1948,7 +1971,7 @@ fn command_buffer_call(
         }
         "BeginRecording" => {
             let buffer = state.buffer(this).map_err(invalid)?;
-            let object = lock_shared(&buffer);
+            let object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             let control = object.memory[1];
             let control_start = (
                 control.chunk.map_or(0, |chunk| chunk[0]),
@@ -1981,7 +2004,7 @@ fn command_buffer_call(
             let Some(buffer) = read_shared(state.buffers).get(&this).cloned() else {
                 return Ok(false);
             };
-            let mut object = lock_shared(&buffer);
+            let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
             state.fold(this, &mut object);
             let Some(value) = object.property(property) else {
                 return Ok(false);
@@ -3371,7 +3394,7 @@ impl Nvn {
                 let buffer = state
                     .buffer(this)
                     .map_err(|_| invalid("command buffer is not recording".into()))?;
-                let mut object = lock_shared(&buffer);
+                let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
                 state.fold(this, &mut object);
                 let recording = write_shared(&self.recording)
                     .remove(&this)
@@ -11882,6 +11905,19 @@ mod tests {
 
     /// Management calls made without the NVN state return what they did
     /// with it, fail as they did, and leave the same lists and handles.
+    #[test]
+    fn a_buffer_finalized_meanwhile_refuses_management_calls() {
+        // A call that looked the buffer up before another thread's
+        // Finalize must not act on it once it holds its lock.
+        let buffer = CommandBufferEntry::default();
+        assert!(CommandBufferState::live(&buffer, 0x1000).is_ok());
+        lock_shared(&buffer).finalized = true;
+        assert_eq!(
+            CommandBufferState::live(&buffer, 0x1000).err(),
+            Some("CommandBuffer 0x1000 is not initialized".to_string())
+        );
+    }
+
     #[test]
     fn command_buffer_management_without_the_nvn_state_matches_it() {
         let (locked, locked_lists) = command_buffer_script(false);
