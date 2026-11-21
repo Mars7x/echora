@@ -24,6 +24,7 @@ mod fault;
 pub mod fs;
 pub mod hid;
 pub mod hle;
+mod host_cores;
 pub mod host_profile;
 pub mod input;
 pub mod ipc;

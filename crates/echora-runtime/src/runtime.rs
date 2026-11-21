@@ -2864,6 +2864,12 @@ impl Machine {
             replay_failed: std::sync::Mutex::new(None),
         };
         let finished: Vec<(Core, Option<Trap>)> = std::thread::scope(|scope| {
+            // One host core is kept for the replay thread (`host_cores`): the
+            // workers and the threads they start inherit the other CPUs.
+            let kept_core = replay_core.as_ref().and(crate::host_cores::reserved());
+            if let Some(reserved) = &kept_core {
+                crate::host_cores::run_on(&reserved.others);
+            }
             let handles: Vec<_> = cores
                 .into_iter()
                 .enumerate()
@@ -2908,6 +2914,12 @@ impl Machine {
                     .stack_size(64 << 20)
                     .spawn_scoped(scope, move || replay_thread(shared, core))
                     .expect("spawn replay thread");
+            }
+            // The machine's own thread runs on every CPU again.
+            if let Some(reserved) = &kept_core {
+                let mut all = reserved.others.clone();
+                all.extend(&reserved.kept);
+                crate::host_cores::run_on(&all);
             }
             let finished = handles
                 .into_iter()
@@ -5158,6 +5170,12 @@ fn locked_nvn_call(name: &str) -> bool {
 /// run (as the console's GPU works while its CPU goes on).
 fn replay_thread(shared: &Shared, mut core: Core) {
     use std::sync::atomic::Ordering;
+    // This thread runs on the core the workers keep off (`host_cores`):
+    // allowed every CPU, the scheduler kept it beside a worker often enough
+    // to lose the gain.
+    if let Some(reserved) = crate::host_cores::reserved() {
+        crate::host_cores::run_on(&reserved.kept);
+    }
     let _watch = crate::fault::watch(&core);
     crate::fault::precise_timers();
     let mut handed = std::time::Duration::ZERO;
