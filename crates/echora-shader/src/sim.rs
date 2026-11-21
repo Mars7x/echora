@@ -21,7 +21,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::spirv::{execution, glsl, op, storage};
+use crate::spirv::{
+    execution, glsl,
+    op::{self, DPDX, DPDY},
+    storage,
+};
 
 /// Opcodes not in `op`.
 const F_CONVERT: u16 = 115;
@@ -39,8 +43,6 @@ const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
 const DECORATION_INDEX: u32 = 32;
 /// Derivatives (OpDPdx .. OpFwidthCoarse).
-const DPDX: u16 = 207;
-const DPDY: u16 = 208;
 const FWIDTH: u16 = 209;
 const DPDX_FINE: u16 = 210;
 const DPDY_FINE: u16 = 211;

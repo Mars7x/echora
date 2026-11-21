@@ -124,6 +124,8 @@ pub mod op {
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
     pub const BIT_REVERSE: u16 = 204;
     pub const BIT_COUNT: u16 = 205;
+    pub const DPDX: u16 = 207;
+    pub const DPDY: u16 = 208;
     pub const CONTROL_BARRIER: u16 = 224;
     pub const MEMORY_BARRIER: u16 = 225;
     pub const ATOMIC_EXCHANGE: u16 = 229;

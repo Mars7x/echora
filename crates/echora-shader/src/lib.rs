@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_pool_samples_take_their_level_before_the_integer_branch() {
+    fn fragment_pool_samples_take_gradients_before_the_numeric_branch() {
         // TEX.B R4, R0 (x, y), R2 (handle), 2D, 0xf, implicit level
         let mut program = header(2, 5, &[]);
         program.extend(bytes(&[
@@ -1071,15 +1071,40 @@ mod tests {
             EXIT,
         ]));
         let translated = validated(&program);
-        // OpImageQueryLod (105) once, and no implicit-level sample (87).
-        let mut opcodes = Vec::new();
+        use crate::spirv::op;
+        let mut branches = false;
+        let mut derivatives = Vec::new();
+        let mut samples = 0;
         let mut at = 5;
         while at < translated.spirv.len() {
-            opcodes.push(translated.spirv[at] & 0xffff);
-            at += ((translated.spirv[at] >> 16) as usize).max(1);
+            let word = translated.spirv[at];
+            match word as u16 {
+                op::BRANCH_CONDITIONAL => branches = true,
+                derivative @ (op::DPDX | op::DPDY) => {
+                    assert!(!branches, "derivatives must precede numeric dispatch");
+                    derivatives.push((derivative, translated.spirv[at + 2]));
+                }
+                op::IMAGE_SAMPLE_EXPLICIT_LOD => {
+                    assert_eq!(translated.spirv[at + 5], 4, "sample uses Grad");
+                    assert_eq!(translated.spirv[at + 6], derivatives[0].1);
+                    assert_eq!(translated.spirv[at + 7], derivatives[1].1);
+                    samples += 1;
+                }
+                op::IMAGE_QUERY_LOD | op::IMAGE_SAMPLE_IMPLICIT_LOD => {
+                    panic!("sample should use the typed view and shared derivatives");
+                }
+                _ => {}
+            }
+            at += (word >> 16) as usize;
         }
-        assert_eq!(opcodes.iter().filter(|&&opcode| opcode == 105).count(), 1);
-        assert!(!opcodes.contains(&87));
+        assert_eq!(
+            derivatives
+                .iter()
+                .map(|(opcode, _)| *opcode)
+                .collect::<Vec<_>>(),
+            [op::DPDX, op::DPDY]
+        );
+        assert_eq!(samples, 3);
     }
 
     #[test]

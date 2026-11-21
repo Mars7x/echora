@@ -625,6 +625,12 @@ impl Emitter {
         // Only fragment programs have derivatives for an implicit level.
         let implicit = self.stage == echora_shader_abi::Stage::Fragment
             && matches!(texture.lod, 0 | 2 | 4 | 5);
+        let pool_gradients = self.pool_integer.is_some()
+            && reference.is_none()
+            && implicit
+            && texture.op == TextureOp::Sample
+            && texture.lod == 0;
+        let mut gradients = None;
         let coordinate = if fetch {
             if let Some(offsets) = &offsets {
                 for (n, &offset) in offsets.iter().enumerate() {
@@ -645,6 +651,19 @@ impl Emitter {
                     }
                 })
                 .collect();
+            if pool_gradients {
+                // All invocations take derivatives before the type branch.
+                // The image lookup applies the offsets and array layer.
+                let spatial_coordinate = self.vector(self.f32, &floats[..spatial]);
+                let gradient_type = self.module.ty(Type::Vector {
+                    component: self.f32,
+                    count: spatial as u32,
+                });
+                gradients = Some([
+                    self.value(op::DPDX, gradient_type, &[spatial_coordinate]),
+                    self.value(op::DPDY, gradient_type, &[spatial_coordinate]),
+                ]);
+            }
             if let (false, Some(offsets)) = (gather, &offsets) {
                 self.module.capability(capability::IMAGE_QUERY);
                 let image = self.value(op::IMAGE, types.image, &[sampled]);
@@ -704,6 +723,10 @@ impl Emitter {
             }
             // A fragment program samples at the implicit level, biased.
             TextureOp::Sample if implicit => {
+                if let Some(gradients) = gradients {
+                    mask |= OPERAND_GRAD;
+                    operands.extend(gradients);
+                }
                 if matches!(texture.lod, 2 | 5) {
                     mask |= OPERAND_BIAS;
                     let bias = level_operand.unwrap_or_else(|| self.float_constant(0.0));
@@ -780,26 +803,25 @@ impl Emitter {
             let words: Vec<u32> = (0..4)
                 .map(|_| self.function.variable(&mut self.module, self.u32_ptr, None))
                 .collect();
-            // An implicit level needs derivatives, which a branch on the
-            // integer flag may not keep: the level a sample would use is
-            // queried before it (plus the bias) and both views sample at it
-            // explicitly.
-            let level = (implicit && texture.op == TextureOp::Sample).then(|| {
-                self.module.capability(capability::IMAGE_QUERY);
-                let vec2 = self.module.ty(Type::Vector {
-                    component: self.f32,
-                    count: 2,
+            // A shader bias or minimum level still uses the explicit-level
+            // lowering. Grad samples use the selected view to compute LOD.
+            let level =
+                (implicit && texture.op == TextureOp::Sample && gradients.is_none()).then(|| {
+                    self.module.capability(capability::IMAGE_QUERY);
+                    let vec2 = self.module.ty(Type::Vector {
+                        component: self.f32,
+                        count: 2,
+                    });
+                    let query = self.value(op::IMAGE_QUERY_LOD, vec2, &[sampled, coordinate]);
+                    let mut level = self.value(op::COMPOSITE_EXTRACT, self.f32, &[query, 0]);
+                    if mask & OPERAND_BIAS != 0 {
+                        level = self.value(op::F_ADD, self.f32, &[level, operands[0]]);
+                    }
+                    if let Some(least) = least_level {
+                        level = self.glsl(self.f32, glsl::N_MAX, &[level, least]);
+                    }
+                    level
                 });
-                let query = self.value(op::IMAGE_QUERY_LOD, vec2, &[sampled, coordinate]);
-                let mut level = self.value(op::COMPOSITE_EXTRACT, self.f32, &[query, 0]);
-                if mask & OPERAND_BIAS != 0 {
-                    level = self.value(op::F_ADD, self.f32, &[level, operands[0]]);
-                }
-                if let Some(least) = least_level {
-                    level = self.glsl(self.f32, glsl::N_MAX, &[level, least]);
-                }
-                level
-            });
             let sample = |e: &mut Self, binding: u32, types: Types, sampler: u32| {
                 let ty = e.module.ty(Type::Vector {
                     component: types.component,
@@ -834,7 +856,7 @@ impl Emitter {
                             &[sampled, coordinate, OPERAND_LOD, level],
                         ),
                         None => e.value(
-                            if implicit {
+                            if implicit && gradients.is_none() {
                                 op::IMAGE_SAMPLE_IMPLICIT_LOD
                             } else {
                                 op::IMAGE_SAMPLE_EXPLICIT_LOD
