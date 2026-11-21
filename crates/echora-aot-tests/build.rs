@@ -156,6 +156,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("fallback_count", fallback_count_code),
     ("q_pair", q_pair_code),
     ("vector_run", vector_run_code),
+    ("rounded_up", rounded_up_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -613,6 +614,115 @@ fn fp_status_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/rounded_up.rs`: products, quotients and fused
+/// products (scalar, vector, by element; alone and in float runs) from V1,
+/// V2 and V3 into V0, an SVC after each. Lifted with helper calls only
+/// (`rounded_up_reference`), with the inline paths checked lane by lane
+/// (`rounded_up_inline`), with whole-vector checks and the scalar and
+/// misc inline paths (`rounded_up_whole`), and with float runs and vector
+/// float runs on top (`rounded_up_runs`).
+fn rounded_up_code(out: &mut String) {
+    const BASE: u64 = 0x260_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const NOP: u32 = 0xd503_201f;
+    // Words and their disassembly, which `tests/rounded_up.rs` checks.
+    let programs: &[(&str, &[u32])] = &[
+        ("fmul v0.4s, v1.4s, v2.4s", &[0x6e22_dc20]),
+        ("fmul v0.2d, v1.2d, v2.2d", &[0x6e62_dc20]),
+        ("fdiv v0.4s, v1.4s, v2.4s", &[0x6e22_fc20]),
+        ("fdiv v0.2d, v1.2d, v2.2d", &[0x6e62_fc20]),
+        ("fmul s0, s1, s2", &[0x1e22_0820]),
+        ("fmul d0, d1, d2", &[0x1e62_0820]),
+        ("fdiv s0, s1, s2", &[0x1e22_1820]),
+        ("fdiv d0, d1, d2", &[0x1e62_1820]),
+        ("fnmul s0, s1, s2", &[0x1e22_8820]),
+        ("fmadd s0, s1, s2, s3", &[0x1f02_0c20]),
+        ("fmla v0.4s, v1.4s, v2.4s", &[0x4e22_cc20]),
+        ("fmla v0.4s, v1.4s, v2.s[1]", &[0x4fa2_1020]),
+        ("fmul v0.4s, v1.4s, v2.s[1]", &[0x4fa2_9020]),
+        ("fmulx v0.4s, v1.4s, v2.4s", &[0x4e22_dc20]),
+        // Runs (after a NOP: a run never starts a block): the product,
+        // then exact adds of a zero V3; a float run needs eight
+        // operations, a vector run two.
+        (
+            "fmul v0.4s, v1.4s, v2.4s; fadd v0.4s, v0.4s, v3.4s",
+            &[NOP, 0x6e22_dc20, 0x4e23_d400],
+        ),
+        (
+            "fmul s0, s1, s2; fadd s0, s0, s3 (7 times)",
+            &[
+                NOP,
+                0x1e22_0820,
+                0x1e23_2800,
+                0x1e23_2800,
+                0x1e23_2800,
+                0x1e23_2800,
+                0x1e23_2800,
+                0x1e23_2800,
+                0x1e23_2800,
+            ],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for (_, program) in programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+        words.resize(words.len().next_multiple_of(256), SVC_EXIT);
+    }
+    let names: Vec<&str> = programs.iter().map(|(name, _)| *name).collect();
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "rounded_up".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("rounded_up");
+    let plain = EmitOptions {
+        inline_vector: false,
+        ..options()
+    };
+    let inline = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: false,
+        ..options()
+    };
+    let whole = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        inline_fp_scalar: true,
+        inline_vector_misc: true,
+        ..options()
+    };
+    let runs = EmitOptions {
+        float_runs: true,
+        vector_float_runs: true,
+        ..whole
+    };
+    for (name, options) in [
+        ("rounded_up_reference", plain),
+        ("rounded_up_inline", inline),
+        ("rounded_up_whole", whole),
+        ("rounded_up_runs", runs),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

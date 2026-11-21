@@ -126,7 +126,14 @@ fn count_tests(line: &str, counts: &mut Census) {
     }
     text.push_str(rest);
     let line = text.as_str();
-    for test in ["usable(", "normal(", "usable_all(", "normal_all("] {
+    for test in [
+        "usable(",
+        "normal(",
+        "usable_all(",
+        "normal_all(",
+        "product_all(",
+        "smallest_normal(",
+    ] {
         counts.float_tests += line
             .match_indices(test)
             .filter(|&(at, _)| {

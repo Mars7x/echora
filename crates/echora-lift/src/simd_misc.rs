@@ -12,7 +12,9 @@
 //! lane natively when it is the helper's result with no flag raised and
 //! otherwise through the exact single-lane helper (or the whole helper).
 
-use crate::simd::{FP_MODE, FpSize, Rounding, SimdOp, VecFpOp, VecFpUnaryOp, emit_call, float_kit};
+use crate::simd::{
+    FP_MODE, FpSize, Rounding, SimdOp, VecFpOp, VecFpUnaryOp, emit_call, float_kit, result_normal,
+};
 
 thread_local! {
     /// `EmitOptions::inline_vector_misc` of the emission on this thread.
@@ -551,9 +553,10 @@ fn lanewise_binary(
         "{{ let vn = m.cpu.vectors[{rn}]; let vm = m.cpu.vectors[{rm}]; {kit} \
          if {FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 {{ let mut out = 0u128; \
          for lane in 0..{lanes}u32 {{ let x = (vn >> (lane * {width})) as {int}; let y = {y}; let raw: {int} = {value}; \
-         let raw = if usable(x) & usable(y) & (normal(raw) | (zero(raw) & ({exact}))) {{ raw }} else {{ \
+         let raw = if usable(x) & usable(y) & ({} | (zero(raw) & ({exact}))) {{ raw }} else {{ \
          let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, 0)?; exact as {int} }}; \
          out |= u128::from(raw) << (lane * {width}); }} \
-         m.cpu.vectors[{rd}] = out; }} else {{\n{call}\n}} }}"
+         m.cpu.vectors[{rd}] = out; }} else {{\n{call}\n}} }}",
+        result_normal(fp_op, "raw")
     ))
 }

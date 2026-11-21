@@ -2365,8 +2365,8 @@ fn unary_path(op: FpUnaryOp) -> String {
 }
 
 /// Bit tests on one float format for inlined code: the host float and
-/// integer types, the lane width, and closures `normal`, `zero` and
-/// `usable` (normal or zero) on raw lanes.
+/// integer types, the lane width, and closures `normal`, `zero`,
+/// `usable` (normal or zero) and `smallest_normal` on raw lanes.
 pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
     let (float, int, width, exponent, sign) = match size {
         FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
@@ -2382,9 +2382,47 @@ pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, Strin
         "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
          let zero = |value: {int}| value & !{sign} == 0; \
          let usable = |value: {int}| normal(value) | zero(value); \
-         let sign = {sign}; let _ = sign;"
+         {} let sign = {sign}; let _ = sign;",
+        smallest_normal(size)
     );
     (float, int, width, closures)
+}
+
+/// The closure `smallest_normal`: whether a raw lane's magnitude is the
+/// smallest normal, the only normal a tiny unrounded product, quotient or
+/// fused result can round up to (an underflow: FPCR.FZ flushes it, and it
+/// raises UFC), so the inline paths leave that value to the exact helper.
+fn smallest_normal(size: FpSize) -> String {
+    let (int, magnitude, least) = match size {
+        FpSize::S => ("u32", "0x7fff_ffffu32", "0x0080_0000u32"),
+        FpSize::D => (
+            "u64",
+            "0x7fff_ffff_ffff_ffffu64",
+            "0x0010_0000_0000_0000u64",
+        ),
+    };
+    format!(
+        "let smallest_normal = |value: {int}| value & {magnitude} == {least}; let _ = smallest_normal;"
+    )
+}
+
+/// Whether a normal result of `fp_op` may be a tiny one rounded up to the
+/// smallest normal (`smallest_normal`): products, quotients and fused
+/// results. A sum of normals is never tiny unless exact.
+fn rounds_up_from_tiny(fp_op: VecFpOp) -> bool {
+    matches!(
+        fp_op,
+        VecFpOp::Mul | VecFpOp::Div | VecFpOp::MulAdd | VecFpOp::MulSub | VecFpOp::MulExtended
+    )
+}
+
+/// The inline paths' test of a normal result `raw` of `fp_op`.
+pub(crate) fn result_normal(fp_op: VecFpOp, raw: &str) -> String {
+    if rounds_up_from_tiny(fp_op) {
+        format!("(normal({raw}) & !smallest_normal({raw}))")
+    } else {
+        format!("normal({raw})")
+    }
 }
 
 /// The FPCR the float helpers accept (round to nearest, no AH or FZ16):
@@ -2561,8 +2599,19 @@ pub(crate) fn set_whole_vector_checks(on: bool) -> bool {
 fn whole_vector_closures(width: u32, lanes: u32) -> String {
     format!(
         "let usable_all = echora_guest::simd::vector_fp_lanes::<{width}, {lanes}, true>; \
-         let normal_all = echora_guest::simd::vector_fp_lanes::<{width}, {lanes}, false>;"
+         let normal_all = echora_guest::simd::vector_fp_lanes::<{width}, {lanes}, false>; \
+         let product_all = echora_guest::simd::vector_fp_product_lanes::<{width}, {lanes}>; \
+         let _ = product_all;"
     )
+}
+
+/// The whole-vector test of normal results of `fp_op` (`result_normal`).
+fn result_normal_all(fp_op: VecFpOp) -> &'static str {
+    if rounds_up_from_tiny(fp_op) {
+        "product_all"
+    } else {
+        "normal_all"
+    }
 }
 
 /// One lane of an inlined vector float arithmetic operation (`x` from Vn,
@@ -2651,6 +2700,9 @@ fn vec_fp_arith(
         ),
     };
     let (value, exact) = arith_lane(fp_op, float);
+    let smallest = smallest_normal(size);
+    let raw_normal = result_normal(fp_op, "raw");
+    let all_normal = result_normal_all(fp_op);
     // A zero divisor raises DZC: only normal divisors run natively.
     let divisor = if fp_op == VecFpOp::Div {
         "normal(y)"
@@ -2690,7 +2742,7 @@ fn vec_fp_arith(
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
              let raw = ({value}).to_bits(); \
-             let native = usable(x) & {divisor}{lane_z_usable} & (normal(raw) | (zero(raw) & ({exact}))); \
+             let native = usable(x) & {divisor}{lane_z_usable} & ({raw_normal} | (zero(raw) & ({exact}))); \
              let raw = if native {{ raw }} else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
              out |= u128::from(raw) << (lane * {width}); }} \
              m.cpu.vectors[{rd}] = out;"
@@ -2719,17 +2771,17 @@ fn vec_fp_arith(
              let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
              let zero = |value: {int}| value & !{sign} == 0; \
              let infinite = |value: {int}| value & !{sign} == {exponent}; \
-             let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {closures} \
+             let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {smallest} {closures} \
              let mode = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
              && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
              let mut fast = mode && usable_all(n) && {second_usable}{d_usable}; \
              let out = {raw}; let mut overflow = false; \
-             if fast && !normal_all(out) {{ \
+             if fast && !{all_normal}(out) {{ \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
              let raw = (out >> (lane * {width})) as {int}; \
              overflow |= infinite(raw); \
-             fast &= normal(raw) | infinite(raw) | (zero(raw) & ({exact})); }} }} \
+             fast &= {raw_normal} | infinite(raw) | (zero(raw) & ({exact})); }} }} \
              let _ = d; \
              if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} \
              else if mode {{ {lanewise} }} else {{ {call} }} }}"
@@ -2740,7 +2792,7 @@ fn vec_fp_arith(
                  let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
                  let zero = |value: {int}| value & !{sign} == 0; \
                  let infinite = |value: {int}| value & !{sign} == {exponent}; \
-                 let usable = |value: {int}| normal(value) | zero(value); \
+                 let usable = |value: {int}| normal(value) | zero(value); {smallest} \
                  let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
                  && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
                  let mut out = 0u128; let mut overflow = false; \
@@ -2749,7 +2801,7 @@ fn vec_fp_arith(
                  fast &= usable(x) & {divisor}; {operand_d} \
                  let raw = ({value}).to_bits(); \
                  overflow |= infinite(raw); \
-                 fast &= normal(raw) | infinite(raw) | (zero(raw) & ({exact})); \
+                 fast &= {raw_normal} | infinite(raw) | (zero(raw) & ({exact})); \
                  out |= u128::from(raw) << (lane * {width}); }} \
                  let _ = d; \
                  if fast {{ if overflow {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_OFC | {p}::FPSR_IXC; }} m.cpu.vectors[{rd}] = out; }} else {{ {call} }} }}"
@@ -3068,12 +3120,13 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
                 | FpBinaryOp::NegMul
                 | FpBinaryOp::Div => {
                     // Arithmetic: as the vector fast path, with IXC set.
-                    let (expression, exact, divisor) = match binary {
-                        FpBinaryOp::Add => ("+", "true", "usable(y)"),
-                        FpBinaryOp::Sub => ("-", "true", "usable(y)"),
-                        FpBinaryOp::Div => ("/", "zero(x)", "normal(y)"),
-                        _ => ("*", "zero(x) | zero(y)", "usable(y)"),
+                    let (expression, exact, divisor, vector) = match binary {
+                        FpBinaryOp::Add => ("+", "true", "usable(y)", VecFpOp::Add),
+                        FpBinaryOp::Sub => ("-", "true", "usable(y)", VecFpOp::Sub),
+                        FpBinaryOp::Div => ("/", "zero(x)", "normal(y)", VecFpOp::Div),
+                        _ => ("*", "zero(x) | zero(y)", "usable(y)", VecFpOp::Mul),
                     };
+                    let raw_normal = result_normal(vector, "raw");
                     let negate = if binary == FpBinaryOp::NegMul {
                         " ^ sign"
                     } else {
@@ -3083,7 +3136,7 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
                         format!(
                             "{FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable(x) && {divisor} \
                              && {{ let raw = ({float}::from_bits(x) {expression} {float}::from_bits(y)).to_bits(); \
-                             result = raw{negate}; normal(raw) | (zero(raw) & ({exact})) }}"
+                             result = raw{negate}; {raw_normal} | (zero(raw) & ({exact})) }}"
                         ),
                         String::new(),
                     )
@@ -3127,7 +3180,7 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
                  let mut result: {int} = 0; \
                  if m.cpu.fpcr != 0 && {FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 && usable(x) && usable(y) && usable(z) \
                  && {{ result = {float}::from_bits({n}).mul_add({float}::from_bits(y), {float}::from_bits({a})).to_bits(); \
-                 normal(result) | (zero(result) & (zero(x) | zero(y)) & zero(z)) }} \
+                 (normal(result) & !smallest_normal(result)) | (zero(result) & (zero(x) | zero(y)) & zero(z)) }} \
                  {{ m.cpu.vectors[{rd}] = u128::from(result); }} else {{ {call} }} }}"
             ))
         }
@@ -3696,9 +3749,10 @@ fn run_other(
                 size,
                 format!(
                     "for lane in 0..{lanes}u32 {{ let x = ({n} >> (lane * {width})) as {int}; let y = {y}; \
-                     {} let raw: {int} = {value}; good &= normal(raw) | (zero(raw) & ({exact})); \
+                     {} let raw: {int} = {value}; good &= {} | (zero(raw) & ({exact})); \
                      out |= u128::from(raw) << (lane * {width}); }}",
-                    tests(&checks)
+                    tests(&checks),
+                    result_normal(fp_op, "raw")
                 ),
                 Some((width, lanes)),
             )
@@ -4119,9 +4173,11 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
         };
         code.push_str(&format!(
             "let o{index} = {{ {kit} {whole} {element_value}let out = {raw}; {operand_checks}\
-             if !normal_all(out) {{ for lane in 0..{lanes}u32 {{ \
+             if !{}(out) {{ for lane in 0..{lanes}u32 {{ \
              let x = ({n} >> (lane * {width})) as {int}; let y = {y}; {z}let raw = (out >> (lane * {width})) as {int}; \
-             good &= normal(raw) | (zero(raw) & ({exact})); }} }} out }}; "
+             good &= {} | (zero(raw) & ({exact})); }} }} out }}; ",
+            result_normal_all(fp_op),
+            result_normal(fp_op, "raw")
         ));
         values.insert(rd, (format!("o{index}"), Some((width, lanes))));
         if !written.contains(&rd) {
@@ -4278,11 +4334,11 @@ pub fn float_run_fast(ops: &[SimdOp]) -> (String, RegisterValues, RegisterValues
                     read(&mut code, &mut values, rn),
                     read(&mut code, &mut values, rm),
                 );
-                let (expression, exact) = match binary {
-                    FpBinaryOp::Add => ("+", "true".to_owned()),
-                    FpBinaryOp::Sub => ("-", "true".to_owned()),
-                    FpBinaryOp::Div => ("/", format!("zero({x})")),
-                    _ => ("*", format!("(zero({x}) | zero({y}))")),
+                let (expression, exact, vector) = match binary {
+                    FpBinaryOp::Add => ("+", "true".to_owned(), VecFpOp::Add),
+                    FpBinaryOp::Sub => ("-", "true".to_owned(), VecFpOp::Sub),
+                    FpBinaryOp::Div => ("/", format!("zero({x})"), VecFpOp::Div),
+                    _ => ("*", format!("(zero({x}) | zero({y}))"), VecFpOp::Mul),
                 };
                 let negate = if binary == FpBinaryOp::NegMul {
                     " ^ sign"
@@ -4290,7 +4346,8 @@ pub fn float_run_fast(ops: &[SimdOp]) -> (String, RegisterValues, RegisterValues
                     ""
                 };
                 code.push_str(&format!("let {t} = (f32::from_bits({x}) {expression} f32::from_bits({y})).to_bits(){negate}; \
-                     good &= normal({t}) | (zero({t}) & {exact}); "
+                     good &= {} | (zero({t}) & {exact}); ",
+                    result_normal(vector, &t)
                 ));
                 rd
             }
@@ -4322,7 +4379,7 @@ pub fn float_run_fast(ops: &[SimdOp]) -> (String, RegisterValues, RegisterValues
                     z.clone()
                 };
                 code.push_str(&format!("let {t} = f32::from_bits({n}).mul_add(f32::from_bits({y}), f32::from_bits({a})).to_bits(); \
-                     good &= normal({t}) | (zero({t}) & (zero({x}) | zero({y})) & zero({z})); "
+                     good &= (normal({t}) & !smallest_normal({t})) | (zero({t}) & (zero({x}) | zero({y})) & zero({z})); "
                 ));
                 rd
             }

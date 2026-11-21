@@ -72,6 +72,43 @@ pub fn vector_fp_lanes<const WIDTH: u32, const LANES: u32, const ALLOW_ZERO: boo
     vector_fp_lanes_portable::<WIDTH, LANES, ALLOW_ZERO>(bits)
 }
 
+/// Checks the low `LANES` lanes for IEEE normal values above the smallest
+/// normal in magnitude: the results of a product, quotient or fused
+/// operation the host may take. A tiny unrounded result can round up to
+/// the smallest normal, an underflow (FPCR.FZ flushes it, and it raises
+/// UFC), so that value takes the exact path.
+#[inline(always)]
+pub fn vector_fp_product_lanes<const WIDTH: u32, const LANES: u32>(bits: u128) -> bool {
+    const { assert!((WIDTH == 32 || WIDTH == 64) && LANES > 0 && LANES <= 128 / WIDTH) };
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if WIDTH == 32 && LANES > 1 {
+        use core::arch::x86_64::*;
+        // SAFETY: as `vector_fp_lanes`.
+        return unsafe {
+            let packed: __m128i = core::mem::transmute(bits);
+            let abs = _mm_and_si128(packed, _mm_set1_epi32(0x7fff_ffff));
+            let valid = _mm_and_si128(
+                _mm_cmpgt_epi32(abs, _mm_set1_epi32(0x0080_0000)),
+                _mm_cmpgt_epi32(_mm_set1_epi32(0x7f80_0000), abs),
+            );
+            let live = (1 << LANES) - 1;
+            _mm_movemask_ps(_mm_castsi128_ps(valid)) & live == live
+        };
+    }
+    vector_fp_product_lanes_portable::<WIDTH, LANES>(bits)
+}
+
+#[inline(always)]
+fn vector_fp_product_lanes_portable<const WIDTH: u32, const LANES: u32>(bits: u128) -> bool {
+    let (smallest, magnitude) = if WIDTH == 32 {
+        (0x0080_0000u128, 0x7fff_ffffu128)
+    } else {
+        (0x0010_0000_0000_0000, 0x7fff_ffff_ffff_ffff)
+    };
+    vector_fp_lanes_portable::<WIDTH, LANES, false>(bits)
+        && (0..LANES).all(|lane| (bits >> (lane * WIDTH)) & magnitude != smallest)
+}
+
 #[inline(always)]
 fn vector_fp_lanes_portable<const WIDTH: u32, const LANES: u32, const ALLOW_ZERO: bool>(
     bits: u128,
@@ -202,7 +239,8 @@ pub enum VecFpOp {
 }
 
 /// Computes a candidate 4S result in host registers. The caller checks the
-/// input and output lanes before committing the result to guest state.
+/// input and output lanes before committing the result to guest state
+/// (a product, quotient or fused result with `vector_fp_product_lanes`).
 #[inline(always)]
 pub fn vector_fp_arithmetic_4s<const BY_ELEMENT: bool>(
     op: VecFpOp,
@@ -1440,7 +1478,10 @@ pub fn load_replicate(
 
 #[cfg(test)]
 mod tests {
-    use super::{vector_fp_lanes, vector_fp_lanes_portable};
+    use super::{
+        VecFpOp, vector_fp_arithmetic_4s, vector_fp_lanes, vector_fp_lanes_portable,
+        vector_fp_product_lanes, vector_fp_product_lanes_portable,
+    };
 
     #[test]
     fn vector_fp_checks_respect_lane_boundaries_and_signed_zero() {
@@ -1458,6 +1499,15 @@ mod tests {
             let usable = classes
                 .into_iter()
                 .all(|class| matches!(class, Normal | Zero));
+            let smallest = if WIDTH == 32 { 1u128 << 23 } else { 1 << 52 };
+            let magnitude = (1u128 << (WIDTH - 1)) - 1;
+            let product =
+                normal && (0..LANES).all(|lane| (vector >> (lane * WIDTH)) & magnitude != smallest);
+            assert_eq!(vector_fp_product_lanes::<WIDTH, LANES>(vector), product);
+            assert_eq!(
+                vector_fp_product_lanes_portable::<WIDTH, LANES>(vector),
+                product
+            );
             assert_eq!(vector_fp_lanes::<WIDTH, LANES, false>(vector), normal);
             assert_eq!(vector_fp_lanes::<WIDTH, LANES, true>(vector), usable);
             assert_eq!(
@@ -1470,21 +1520,23 @@ mod tests {
             );
         }
 
-        const POSITIVE_F32: [u128; 8] = [
+        const POSITIVE_F32: [u128; 9] = [
             0,
             1,
             0x007f_ffff,
             0x0080_0000,
+            0x0080_0001,
             0x7f7f_ffff,
             0x7f80_0000,
             0x7f80_0001,
             0x7fc0_0000,
         ];
-        const POSITIVE_F64: [u128; 8] = [
+        const POSITIVE_F64: [u128; 9] = [
             0,
             1,
             0x000f_ffff_ffff_ffff,
             0x0010_0000_0000_0000,
+            0x0010_0000_0000_0001,
             0x7fef_ffff_ffff_ffff,
             0x7ff0_0000_0000_0000,
             0x7ff0_0000_0000_0001,
@@ -1513,5 +1565,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 2^-63 * (2^-63 - 2^-87) is tiny before rounding but rounds to the
+    /// smallest normal: the host's 4S product (and fused product with a
+    /// zero addend, by element) is that normal, which the product check
+    /// rejects so the exact helper decides the underflow.
+    #[test]
+    fn products_rounded_up_to_the_smallest_normal_are_rejected() {
+        let n = 0xa000_0000_2000_0000_a000_0000_2000_0000u128;
+        let m = 0x1fff_ffffu128;
+        let wide = m * 0x0000_0001_0000_0001_0000_0001_0000_0001;
+        let expected = 0x8080_0000_0080_0000_8080_0000_0080_0000u128;
+        // FMLA only where the target has FMA (otherwise `None`).
+        let results = [
+            vector_fp_arithmetic_4s::<false>(VecFpOp::Mul, n, wide, 0),
+            vector_fp_arithmetic_4s::<true>(VecFpOp::Mul, n, m, 0),
+            vector_fp_arithmetic_4s::<true>(VecFpOp::MulAdd, n, m, 0),
+        ];
+        for result in results.into_iter().flatten() {
+            assert_eq!(result, expected);
+            assert!(vector_fp_lanes::<32, 4, false>(result));
+            assert!(!vector_fp_product_lanes::<32, 4>(result));
+        }
+        // Doubles: 2^-511 * (2^-511 - 2^-563) rounds to 2^-1022.
+        let product = f64::from_bits(0x2000_0000_0000_0000) * f64::from_bits(0x1fff_ffff_ffff_ffff);
+        let bits = u128::from(product.to_bits()) * (1 + (1 << 64));
+        assert_eq!(bits as u64, 0x0010_0000_0000_0000);
+        assert!(!vector_fp_product_lanes::<64, 2>(bits));
+        assert!(!vector_fp_product_lanes::<64, 1>(bits));
     }
 }

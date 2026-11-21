@@ -127,6 +127,10 @@ impl Format {
     fn default_nan(self) -> u64 {
         self.exponent_mask() | self.quiet_bit()
     }
+    /// The only normal magnitude a tiny unrounded result can round to.
+    fn smallest_normal(self) -> u64 {
+        1 << self.fraction_bits()
+    }
 }
 
 struct Fp<'a> {
@@ -260,7 +264,8 @@ impl<'a> Fp<'a> {
                 }
             }
             FpSize::D => {
-                if raw & format.exponent_mask() != 0 {
+                let magnitude = raw & !format.sign_bit();
+                if magnitude > format.smallest_normal() {
                     return (false, false);
                 }
                 let (x, y, r) = (f64::from_bits(a), f64::from_bits(b), f64::from_bits(raw));
@@ -268,6 +273,19 @@ impl<'a> Fp<'a> {
                 // tiny), the residual of the rounding is not lost below the
                 // subnormals.
                 let scale = f64::from_bits((1023u64 + 600) << 52);
+                if magnitude == format.smallest_normal() {
+                    // Rounded to the smallest normal: tiny (and so inexact)
+                    // when the exact value is below it, which the sign of the
+                    // scaled residual tells.
+                    let (x, y, r) = (x.abs(), y.abs(), r.abs());
+                    let tiny = if divide {
+                        (r * scale).fused(y, -(x * scale)) > 0.0
+                    } else {
+                        let (small, large) = if x < y { (x, y) } else { (y, x) };
+                        (small * scale).fused(large, -(r * scale)) < 0.0
+                    };
+                    return (tiny, tiny);
+                }
                 let inexact = r == 0.0
                     || if divide {
                         r.fused(y, -x) != 0.0
@@ -544,13 +562,14 @@ pub fn fp_binary(
             _ => None,
         };
         // A tiny product or quotient of nonzero operands (a subnormal or a
-        // zero) is an inexact underflow, which raises UFC: the exact path
-        // takes it. A tiny sum or difference is exact and raises nothing.
+        // zero, or the smallest normal it rounded up to) is an inexact
+        // underflow, which raises UFC: the exact path takes it. A tiny sum
+        // or difference is exact and raises nothing.
         let format = Format::of(size);
         let zero = |value: u64| value & !format.sign_bit() == 0;
         let underflow = |raw: u64| {
             matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div)
-                && raw & format.exponent_mask() == 0
+                && raw & !format.sign_bit() <= format.smallest_normal()
                 && !(zero(a) || op == FpBinaryOp::Mul && zero(b))
         };
         if let Some(raw) = raw.filter(|raw| finite(size, *raw) && !underflow(*raw)) {
@@ -616,7 +635,11 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
             };
             let exact_zero = zero(raw)
                 && (zero(a) || zero(b) || matches!(op, FpBinaryOp::Add | FpBinaryOp::Sub));
-            if normal(raw) || exact_zero {
+            // A product or quotient rounded to the smallest normal may have
+            // been tiny before rounding (an underflow); a sum cannot be.
+            let rounded_up = matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div)
+                && raw & !format.sign_bit() == format.smallest_normal();
+            if (normal(raw) && !rounded_up) || exact_zero {
                 return raw;
             }
         }
@@ -779,11 +802,13 @@ pub fn fp_ternary(
                 .fused(f64::from_bits(m), f64::from_bits(a))
                 .to_bits(),
         };
-        // A tiny fused result may be an inexact underflow (UFC): the exact
-        // path decides, unless it is the exact zero of zero operands.
+        // A tiny fused result (or the smallest normal, which a tiny one
+        // rounds up to) may be an inexact underflow (UFC): the exact path
+        // decides, unless it is the exact zero of zero operands.
         let format = Format::of(size);
         let zero = |value: u64| value & !format.sign_bit() == 0;
-        let tiny = raw & format.exponent_mask() == 0 && !((zero(n) || zero(m)) && zero(a));
+        let tiny = raw & !format.sign_bit() <= format.smallest_normal()
+            && !((zero(n) || zero(m)) && zero(a));
         if finite(size, raw) && !tiny {
             write_fp(cpu, rd, size, raw);
             return Ok(());
@@ -1503,7 +1528,13 @@ fn fast_vec_fp_lane(
     } else {
         raw
     };
-    (normal(raw) || exact_zero).then_some(raw)
+    // A product, quotient or fused result rounded to the smallest normal
+    // may have been tiny before rounding (an underflow); a sum cannot be.
+    let rounded_up = matches!(
+        op,
+        VecFpOp::Mul | VecFpOp::Div | VecFpOp::MulAdd | VecFpOp::MulSub
+    ) && raw & !format.sign_bit() == format.smallest_normal();
+    ((normal(raw) && !rounded_up) || exact_zero).then_some(raw)
 }
 
 /// One lane of a vector whose fast path failed: natively when this lane
@@ -1908,8 +1939,13 @@ unsafe fn packed_fp_binary(
             } else {
                 (_mm_div_ps(n, m), is_zero(abs_n))
             };
-            // A zero from nonzero operands can underflow and raise UFC.
-            if !all(_mm_or_si128(exact_zero, normal(magnitude_of(result)))) {
+            // A zero from nonzero operands can underflow and raise UFC, and
+            // so can the smallest normal, which a tiny result rounds up to.
+            let above_smallest = _mm_and_si128(
+                _mm_cmpgt_epi32(magnitude_of(result), _mm_set1_epi32(0x0080_0000)),
+                _mm_cmplt_epi32(magnitude_of(result), infinity),
+            );
+            if !all(_mm_or_si128(exact_zero, above_smallest)) {
                 return None;
             }
             result
@@ -2057,7 +2093,12 @@ unsafe fn packed_fma_element(
     let abs_result = magnitude_of(result);
     let zero_product = _mm_or_si128(_mm_cmpeq_epi32(abs_a, zero), _mm_cmpeq_epi32(abs_b, zero));
     let exact_zero = _mm_and_si128(zero_product, _mm_cmpeq_epi32(abs_d, zero));
-    if !all(_mm_or_si128(normal(abs_result), exact_zero)) {
+    // The smallest normal may be a tiny result rounded up (an underflow).
+    let above_smallest = _mm_and_si128(
+        _mm_cmpgt_epi32(abs_result, _mm_set1_epi32(0x0080_0000)),
+        _mm_cmplt_epi32(abs_result, infinity),
+    );
+    if !all(_mm_or_si128(above_smallest, exact_zero)) {
         return None;
     }
     // SAFETY: same size and bit representation as the inputs.
@@ -4895,6 +4936,135 @@ mod sticky_inexact_tests {
         cpu.vectors[2] = u128::from(0.3f64.to_bits());
         fp_binary(&mut cpu, FpBinaryOp::Mul, FpSize::D, 0, 1, 2).unwrap();
         assert_eq!(cpu.fpsr, FPSR_UFC | FPSR_IXC);
+    }
+
+    /// A product, quotient or fused result whose unrounded value is tiny
+    /// but rounds up to the smallest normal underflows (tininess is
+    /// detected before rounding): with FPCR.FZ a zero of its sign, without
+    /// it the smallest normal, UFC either way. The fast paths (FPSR.IXC
+    /// set) must not take the host's normal result.
+    #[test]
+    fn results_rounded_up_to_the_smallest_normal_underflow() {
+        // 2^-63 * (2^-63 - 2^-87) and (2^-125 - 2^-149) / 2 are
+        // 2^-126 - 2^-150, rounded to even: 2^-126. The doubles alike.
+        let single = [
+            (FpBinaryOp::Mul, 0x2000_0000u64, 0x1fff_ffffu64),
+            (FpBinaryOp::Div, 0x00ff_ffff, 2.0f32.to_bits().into()),
+        ];
+        let double = [
+            (
+                FpBinaryOp::Mul,
+                0x2000_0000_0000_0000u64,
+                0x1fff_ffff_ffff_ffffu64,
+            ),
+            (FpBinaryOp::Div, 0x001f_ffff_ffff_ffff, 2.0f64.to_bits()),
+        ];
+        let expected = |size: FpSize, fpcr: u32, negative: bool| {
+            let format = Format::of(size);
+            let sign = if negative { format.sign_bit() } else { 0 };
+            let magnitude = if fpcr & FPCR_FZ != 0 {
+                0
+            } else {
+                format.smallest_normal()
+            };
+            (sign | magnitude, FPSR_UFC | FPSR_IXC)
+        };
+        for fpcr in [0, FPCR_FZ] {
+            for (size, cases) in [(FpSize::S, single), (FpSize::D, double)] {
+                let format = Format::of(size);
+                let bits = size_bits(size);
+                for (op, a, b) in cases {
+                    for negative in [false, true] {
+                        let a = if negative { a | format.sign_bit() } else { a };
+                        let want = expected(size, fpcr, negative);
+                        // Scalar, through the default-mode fast path
+                        // (FPCR 0) or the sticky-inexact one.
+                        let mut cpu = Cpu {
+                            fpcr,
+                            fpsr: FPSR_IXC,
+                            ..Cpu::default()
+                        };
+                        cpu.vectors[1] = u128::from(a);
+                        cpu.vectors[2] = u128::from(b);
+                        fp_binary(&mut cpu, op, size, 0, 1, 2).unwrap();
+                        let got = (cpu.vectors[0] as u64, cpu.fpsr);
+                        assert_eq!(got, want, "{op:?} {size:?} fpcr {fpcr:#x} {a:#x}");
+                        // Every lane of a full vector (4S takes the packed
+                        // path), and a vector of one such lane among
+                        // ordinary ones.
+                        let vec_op = if op == FpBinaryOp::Mul {
+                            VecFpOp::Mul
+                        } else {
+                            VecFpOp::Div
+                        };
+                        let lanes = 128 / bits;
+                        let one = match size {
+                            FpSize::S => u64::from(1.0f32.to_bits()),
+                            FpSize::D => 1.0f64.to_bits(),
+                        };
+                        for only_lane_zero in [false, true] {
+                            let mut cpu = Cpu {
+                                fpcr,
+                                fpsr: FPSR_IXC,
+                                ..Cpu::default()
+                            };
+                            for lane in 0..lanes {
+                                let x = if only_lane_zero && lane != 0 { one } else { a };
+                                set_lane(&mut cpu.vectors[1], bits, lane, x);
+                                set_lane(&mut cpu.vectors[2], bits, lane, b);
+                            }
+                            vec_fp(&mut cpu, vec_op, size, true, false, 0, 1, 2).unwrap();
+                            for lane in 0..lanes {
+                                let value = get_lane(cpu.vectors[0], bits, lane);
+                                if only_lane_zero && lane != 0 {
+                                    assert_ne!(value & format.exponent_mask(), 0);
+                                } else {
+                                    assert_eq!(value, want.0, "{vec_op:?} {size:?} lane {lane}");
+                                }
+                            }
+                            assert_eq!(cpu.fpsr, want.1, "{vec_op:?} {size:?} fpcr {fpcr:#x}");
+                        }
+                    }
+                }
+            }
+            // FMLA by element and FMADD with a zero addend: the fused
+            // result is the product's rounding. Single precision (the exact
+            // fused path decides tininess there).
+            for negative in [false, true] {
+                let a = 0x2000_0000u32 | if negative { 0x8000_0000 } else { 0 };
+                let want = expected(FpSize::S, fpcr, negative);
+                for op in [VecFpOp::MulAdd, VecFpOp::MulSub] {
+                    let mut cpu = Cpu {
+                        fpcr,
+                        fpsr: FPSR_IXC,
+                        ..Cpu::default()
+                    };
+                    // FMLS negates the first operand.
+                    let n = if op == VecFpOp::MulSub {
+                        a ^ 0x8000_0000
+                    } else {
+                        a
+                    };
+                    cpu.vectors[1] = from_lanes_u32([n; 4]);
+                    cpu.vectors[2] = u128::from(0x1fff_ffffu32) << 64;
+                    vec_fp_element(&mut cpu, op, FpSize::S, true, false, 0, 1, 2, 2).unwrap();
+                    assert_eq!(
+                        (cpu.vectors[0], cpu.fpsr),
+                        (from_lanes_u32([want.0 as u32; 4]), want.1),
+                        "{op:?} fpcr {fpcr:#x} {a:#x}"
+                    );
+                }
+                let mut cpu = Cpu {
+                    fpcr,
+                    fpsr: FPSR_IXC,
+                    ..Cpu::default()
+                };
+                cpu.vectors[1] = u128::from(a);
+                cpu.vectors[2] = 0x1fff_ffff;
+                fp_ternary(&mut cpu, FpTernaryOp::MulAdd, FpSize::S, 0, 1, 2, 3).unwrap();
+                assert_eq!((cpu.vectors[0] as u64, cpu.fpsr), want, "fmadd {fpcr:#x}");
+            }
+        }
     }
 
     /// FNMUL negates a NaN result too (FPNeg with FPCR.AH clear).
