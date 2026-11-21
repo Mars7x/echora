@@ -28,6 +28,9 @@ pub struct Gpu {
     /// occlusionQueryPrecise is enabled: occlusion queries count samples
     /// (QUERY_CONTROL_PRECISE) rather than only whether any passed.
     pub occlusion_query_precise: bool,
+    /// fillModeNonSolid is enabled: line and point polygon modes are valid
+    /// (without it every draw fills).
+    pub fill_mode_non_solid: bool,
     /// The depthBiasClamp feature is enabled (otherwise a polygon offset's
     /// clamp must be 0).
     pub depth_bias_clamp: bool,
@@ -419,6 +422,7 @@ impl Gpu {
             .texture_compression_astc_ldr(core.texture_compression_astc_ldr != 0)
             .robust_buffer_access(core.robust_buffer_access != 0)
             .occlusion_query_precise(core.occlusion_query_precise != 0)
+            .fill_mode_non_solid(core.fill_mode_non_solid != 0)
             .shader_int64(core.shader_int64 != 0)
             .shader_int16(core.shader_int16 != 0)
             .shader_float64(core.shader_float64 != 0)
@@ -635,6 +639,7 @@ impl Gpu {
             swapchain_maintenance,
             depth_clip_control,
             occlusion_query_precise: core.occlusion_query_precise != 0,
+            fill_mode_non_solid: core.fill_mode_non_solid != 0,
             depth_bias_clamp: core.depth_bias_clamp != 0,
             max_sampler_anisotropy: if core.sampler_anisotropy != 0 {
                 properties.limits.max_sampler_anisotropy

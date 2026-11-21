@@ -1679,6 +1679,9 @@ impl Renderer {
                 objects.cmd_set_depth_bounds_test_enable(commands, false);
                 objects.cmd_set_rasterization_samples(commands, vk::SampleCountFlags::TYPE_1);
                 objects.cmd_set_sample_mask(commands, vk::SampleCountFlags::TYPE_1, &[u32::MAX]);
+                // Shader objects need the line width set for any draw that
+                // rasterizes lines (wideLines is not enabled: always 1).
+                device.cmd_set_line_width(commands, 1.0);
             }
             if self.graphics.raster.as_ref() != Some(&raster) {
                 // Dynamic state remains set for this command buffer. Emit
@@ -1700,7 +1703,12 @@ impl Renderer {
                 if changed!(cull, front_face, polygon_mode) {
                     objects.cmd_set_cull_mode(commands, raster.cull);
                     objects.cmd_set_front_face(commands, raster.front_face);
-                    objects.cmd_set_polygon_mode(commands, raster.polygon_mode);
+                    let mode = if self.gpu.fill_mode_non_solid {
+                        raster.polygon_mode
+                    } else {
+                        vk::PolygonMode::FILL
+                    };
+                    objects.cmd_set_polygon_mode(commands, mode);
                 }
                 if self.gpu.depth_clip_control && changed!(depth_minus_one_to_one) {
                     objects.cmd_set_depth_clip_negative_one_to_one(
