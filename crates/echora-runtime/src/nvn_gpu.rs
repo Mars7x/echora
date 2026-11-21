@@ -699,7 +699,16 @@ impl Backend {
         }))
     }
 
+    pub(super) fn has_pending_mapped_writes(&self) -> bool {
+        self.renderer.supports_submission_wait()
+            && self.page_table_writes
+            && self.page_table_write_serial > self.renderer.completed_serial()
+    }
+
     fn record_page_table_write(&mut self, serial: u64, bounded: Option<BoundedWrites>) {
+        if Nvn::replay_thread() {
+            self.renderer.track_submission_wait(serial);
+        }
         self.page_table_writes = true;
         self.page_table_wrote = true;
         self.page_table_wrote_after_signal = true;
@@ -1302,6 +1311,19 @@ pub fn vertex_format(format: u32) -> Option<echora_shader_abi::VertexFormat> {
         return None;
     }
     Some(packed(channels as u32, layout, numeric))
+}
+
+fn empty_draw(command: &Command) -> bool {
+    let x = &command.x;
+    match command.name {
+        "nvnCommandBufferDrawArrays"
+        | "nvnCommandBufferDrawElements"
+        | "nvnCommandBufferDrawElementsBaseVertex" => x[3] as u32 == 0,
+        "nvnCommandBufferDrawArraysInstanced" => x[3] as u32 == 0 || x[5] as u32 == 0,
+        "nvnCommandBufferDrawElementsInstanced" => x[3] as u32 == 0 || x[7] as u32 == 0,
+        "nvnCommandBufferDrawMeshTasks" => x[2] as u32 == 0,
+        _ => false,
+    }
 }
 
 /// NVN stage index (as in BindTexture/BindUniformBuffer) of a stage.
@@ -7214,6 +7236,84 @@ impl Nvn {
         backend.resident_writes_pending(range)
     }
 
+    /// Submission covering possible page-table writes to a mapped input.
+    fn draw_input_write_serial(&self, range: std::ops::Range<u64>) -> Option<u64> {
+        let backend = self.gpu.as_ref()?;
+        if !backend.page_table_writes {
+            return None;
+        }
+        self.shared_guest_index()?
+            .overlapping(range)
+            .map(|span| backend.shared_write_serial(span))
+            .max()
+    }
+
+    fn uniform_write_serial(&self, stages: &[Arc<Translated>]) -> u64 {
+        let mut serial = 0;
+        for stage in stages {
+            let nvn = u64::from(nvn_stage(stage.stage));
+            for descriptor in &stage.descriptors {
+                let bank = descriptor.index;
+                if descriptor.kind() != DescriptorKind::UniformBuffer || bank < 3 || bank == 24 {
+                    continue;
+                }
+                let Some(bind) = self.render.bound_uniforms.get(nvn, u64::from(bank - 3)) else {
+                    continue;
+                };
+                let used = u64::from(stage.cbuf_used_sizes[bank as usize]);
+                let size = bind.x[4].min(used.max(16)).min(64 << 10);
+                if size == 0 {
+                    continue;
+                }
+                if let Ok(guest) = self.gpu_to_guest(bind.x[3], size)
+                    && let Some(end) = guest.checked_add(size)
+                    && let Some(writes) = self.draw_input_write_serial(guest..end)
+                {
+                    serial = serial.max(writes);
+                }
+            }
+        }
+        serial
+    }
+
+    /// Check for a pending mapped uniform before starting a draw. The
+    /// ordinary draw still resolves its inputs after replay reacquires the
+    /// state. This only allows it to release the lock until the fence.
+    pub(super) fn defer_draw_uniform_reads(
+        &mut self,
+        core: &Guest,
+        command: &Command,
+    ) -> Result<Option<echora_gpu::renderer::SubmissionWait>, String> {
+        if empty_draw(command)
+            || (self.render.render_enable.is_some() && !self.render.gpu_render_condition)
+        {
+            return Ok(None);
+        }
+        let program = if command.name.contains("DrawMeshTasks") {
+            self.bound_mesh_program(core)
+        } else {
+            self.bound_program(core)
+        };
+        let Ok(program) = program else {
+            return Ok(None);
+        };
+        let serial = self.uniform_write_serial(&program.stages);
+        let backend = self.gpu.as_mut().unwrap();
+        if serial <= backend.renderer.completed_serial() {
+            return Ok(None);
+        }
+        backend.renderer.submit_through(serial)?;
+        backend.renderer.poll_completed()?;
+        if serial <= backend.renderer.completed_serial() {
+            return Ok(None);
+        }
+        let wait = backend.renderer.submission_wait(serial)?;
+        if wait.is_some() {
+            backend.stat("stat: replay deferred mapped uniform reads", 1);
+        }
+        Ok(wait)
+    }
+
     /// Make a mapped rendering input current before comparing it on the
     /// CPU or copying it into the upload ring.
     pub(super) fn resolve_draw_input(
@@ -7229,15 +7329,7 @@ impl Nvn {
             ..guest
                 .checked_add(size)
                 .ok_or("guest draw input overflows")?;
-        let serial = self.gpu.as_ref().and_then(|backend| {
-            if !backend.page_table_writes {
-                return None;
-            }
-            self.shared_guest_index()?
-                .overlapping(range.clone())
-                .map(|span| backend.shared_write_serial(span))
-                .max()
-        });
+        let serial = self.draw_input_write_serial(range.clone());
         if let Some(serial) = serial {
             let backend = self.gpu.as_mut().unwrap();
             backend.renderer.wait_for(serial)?;
@@ -9863,17 +9955,7 @@ impl Nvn {
 
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
-        let x = &command.x;
-        let empty = match command.name {
-            "nvnCommandBufferDrawArrays"
-            | "nvnCommandBufferDrawElements"
-            | "nvnCommandBufferDrawElementsBaseVertex" => x[3] as u32 == 0,
-            "nvnCommandBufferDrawArraysInstanced" => x[3] as u32 == 0 || x[5] as u32 == 0,
-            "nvnCommandBufferDrawElementsInstanced" => x[3] as u32 == 0 || x[7] as u32 == 0,
-            "nvnCommandBufferDrawMeshTasks" => x[2] as u32 == 0,
-            _ => false,
-        };
-        if empty {
+        if empty_draw(command) {
             if let Some(backend) = &mut self.gpu {
                 backend.stat("stat: empty draws", 1);
             }
@@ -16680,5 +16762,224 @@ mod pool_tests {
         // There is no registered handle to rebuild this fixture's stale
         // binding. It must be resolved anew and disappear from the list.
         assert!(changed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod uniform_fence_tests {
+    use super::{Backend, BoundProgram, Guest, Nvn, SharedRange, vk};
+    use crate::nvn::{Args, Command, GuestMemory, QueueItem, program_key};
+    use echora_guest::{cpu::Cpu, memory::Memory};
+    use echora_shader_abi::{ABI_VERSION, Descriptor, DescriptorKind, Stage, Translated};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+    fn uniform_fixture() -> Option<(Nvn, Arc<Translated>, u64, u64)> {
+        let mut backend = Backend::create(None).ok()??;
+        let guest = 0x10_0000;
+        let gpu = 0x20_0000;
+        backend
+            .shared_pieces
+            .insert(guest, vec![(0, 8, 1, 0), (8, 8, 2, 48)]);
+        backend.record_pool_share(guest);
+        backend.renderer.resident_buffer(guest, 4096).unwrap();
+        backend
+            .renderer
+            .upload_resident(guest, 0, &[0x42; 16])
+            .unwrap();
+        let serial = backend.renderer.recorded_serial();
+        backend.record_page_table_write(
+            serial,
+            Some(
+                vec![SharedRange {
+                    file: 2,
+                    start: 49,
+                    end: 50,
+                }]
+                .into(),
+            ),
+        );
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let args = |x| Args {
+            x,
+            ..Default::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([guest, 0x1000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
+        let stage = Arc::new(Translated {
+            abi_version: ABI_VERSION,
+            stage: Stage::Fragment,
+            spirv: Vec::new(),
+            descriptors: [24, 4, 6]
+                .into_iter()
+                .map(|index| Descriptor {
+                    kind: DescriptorKind::UniformBuffer as u32,
+                    index,
+                    ..Default::default()
+                })
+                .collect(),
+            loaded_generics: 0,
+            stored_generics: 0,
+            stores: [0; 8],
+            frag_colors: 0,
+            cbuf_used_sizes: [0; 18],
+            spec_constants: Vec::new(),
+            push_fields: 0,
+            texture_pool_bindings: 0,
+        });
+        Some((nvn, stage, gpu, serial))
+    }
+
+    fn command(name: &'static str, x: [u64; 8]) -> Command {
+        Command {
+            name,
+            x,
+            v: [0; 8],
+            captured: Vec::new(),
+            states: Default::default(),
+        }
+    }
+
+    fn bind_uniform(nvn: &mut Nvn, address: u64, size: u64) {
+        nvn.render.bound_uniforms.insert(
+            (1, 1),
+            command(
+                "nvnCommandBufferBindUniformBuffer",
+                [0, 1, 1, address, size, 0, 0, 0],
+            ),
+        );
+    }
+
+    #[test]
+    fn only_bound_uniform_bytes_contribute_to_the_draw_fence() {
+        let Some((mut nvn, stage, gpu, serial)) = uniform_fixture() else {
+            return;
+        };
+        let mut bind = |address, size| {
+            bind_uniform(&mut nvn, address, size);
+            nvn.uniform_write_serial(std::slice::from_ref(&stage))
+        };
+        assert_eq!(bind(gpu, 8), 0);
+        assert_eq!(bind(gpu + 6, 3), 0);
+        assert_eq!(bind(gpu + 6, 5), serial);
+        assert_eq!(bind(gpu + 9, 0), 0);
+        assert_eq!(bind(gpu + 9, 1), serial);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn waiting_for_a_uniform_keeps_the_draw_at_the_queue_head() {
+        let Some((mut nvn, stage, gpu_address, serial)) = uniform_fixture() else {
+            return;
+        };
+        if !Nvn::replay_thread()
+            || !nvn
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .supports_submission_wait()
+        {
+            return;
+        }
+        bind_uniform(&mut nvn, gpu_address + 9, 1);
+        let key = (2, 3, nvn.fragment_output_types());
+        nvn.program_memo.1.insert(
+            key,
+            (
+                Default::default(),
+                Arc::new(BoundProgram::new((2, 3), [stage].into(), [].into())),
+            ),
+        );
+        for (bit, binding) in [(0, 2), (1, 3)] {
+            nvn.render.state.insert(
+                program_key(bit).into(),
+                command(
+                    "nvnCommandBufferBindProgram",
+                    [0, binding, 0, 0, 0, 0, 0, 0],
+                ),
+            );
+        }
+        let draw = command("nvnCommandBufferDrawArrays", [0, 0, 0, 3, 0, 0, 0, 0]);
+        // The fixture only exercises the draw's preflight. It uses an
+        // already-resolved program memo and does not execute shader code.
+        nvn.pending
+            .entry(5)
+            .or_default()
+            .push_back(QueueItem::List {
+                commands: Arc::new(vec![draw.clone()]),
+                next: 0,
+                descriptor_epoch: 0,
+            });
+        nvn.replay_budget = Some(1);
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+
+        let gpu = nvn.gpu.as_ref().unwrap().renderer.gpu.clone();
+        let mut gate_type =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let gate = unsafe {
+            gpu.device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut gate_type),
+                None,
+            )
+        }
+        .unwrap();
+        let gates = [gate];
+        let values = [1];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut values = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+        let block = vk::SubmitInfo::default()
+            .wait_semaphores(&gates)
+            .wait_dst_stage_mask(&stages)
+            .push_next(&mut values);
+        // Only this test has access to this device, and its submit thread
+        // has no queued work until run_queue_work hands it the upload.
+        unsafe {
+            gpu.device
+                .queue_submit(gpu.queue, &[block], vk::Fence::null())
+        }
+        .unwrap();
+        let deferred = nvn.run_queue_work(5, &mut core, false);
+        let early = nvn
+            .replay_waiting_on_uniforms()
+            .map(|wait| wait.wait(Duration::ZERO));
+        let release = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
+        unsafe { gpu.device.signal_semaphore(&release) }.unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.wait_for(serial).unwrap();
+        unsafe { gpu.device.destroy_semaphore(gate, None) };
+
+        assert!(!deferred.unwrap());
+        assert!(nvn.replay_paused());
+        assert!(matches!(
+            nvn.pending[&5].front(),
+            Some(QueueItem::List { next: 0, .. })
+        ));
+        assert!(!early.unwrap().unwrap());
+        let wait = nvn.replay_waiting_on_uniforms().unwrap();
+        assert!(wait.wait(Duration::ZERO).unwrap());
+        assert!(
+            nvn.defer_draw_uniform_reads(&core, &draw)
+                .unwrap()
+                .is_none()
+        );
     }
 }

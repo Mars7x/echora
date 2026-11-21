@@ -5185,6 +5185,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
             };
             let started = std::time::Instant::now();
             let result = nvn.resume_replay(&mut guest);
+            let waiting_on_uniforms = nvn.replay_waiting_on_uniforms();
             nvn.note_replay_thread(started.elapsed());
             crate::timeline::span(u64::MAX, "replay", started, std::time::Instant::now());
             if let Err(trap) = result {
@@ -5194,6 +5195,15 @@ fn replay_thread(shared: &Shared, mut core: Core) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trap);
             }
             drop(nvn);
+            if let Some(wait) = waiting_on_uniforms
+                && let Err(message) = wait_for_replay_uniforms(wait, u64::MAX)
+            {
+                *shared
+                    .replay_failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Trap::InvalidState { message });
+            }
             let handing = std::time::Instant::now();
             shared.hand_nvn_over();
             handed += handing.elapsed();
@@ -5212,6 +5222,25 @@ fn replay_thread(shared: &Shared, mut core: Core) {
         }
         *pending = false;
     }
+}
+
+/// Leave the NVN lock available while the GPU reaches the draw's input.
+fn wait_for_replay_uniforms(
+    wait: echora_gpu::renderer::SubmissionWait,
+    thread: u64,
+) -> Result<(), String> {
+    let started = crate::timeline::on().then(std::time::Instant::now);
+    // Recheck the queue regularly, including if the submitter stops.
+    let result = wait.wait(std::time::Duration::from_millis(1)).map(|_| ());
+    if let Some(started) = started {
+        crate::timeline::span(
+            thread,
+            "replay-uniform-wait",
+            started,
+            std::time::Instant::now(),
+        );
+    }
+    result
 }
 
 /// With a replay thread: whether NVN call `name` (arguments `regs`) needs
@@ -5758,7 +5787,14 @@ impl Worker {
             if !settle {
                 break;
             }
+            let waiting_on_uniforms = nvn.replay_waiting_on_uniforms();
             drop(nvn);
+            if let Some(wait) = waiting_on_uniforms
+                && let Err(message) = wait_for_replay_uniforms(wait, self.core.current_thread_id)
+            {
+                self.held_failed = Some(Some(Trap::InvalidState { message }));
+                return false;
+            }
             shared.hand_nvn_over();
             nvn = shared.lock_nvn();
         }

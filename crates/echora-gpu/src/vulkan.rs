@@ -16,6 +16,7 @@ pub struct Gpu {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family: u32,
+    pub(crate) timeline_semaphore: bool,
     shader_object: Option<ash::ext::shader_object::Device>,
     /// VK_KHR_swapchain is enabled (windowed presentation is possible).
     pub swapchain: bool,
@@ -601,6 +602,7 @@ impl Gpu {
             device,
             queue,
             queue_family,
+            timeline_semaphore: s12.timeline_semaphore != 0,
             shader_object,
             swapchain,
             swapchain_maintenance,

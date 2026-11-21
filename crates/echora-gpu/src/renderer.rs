@@ -339,6 +339,96 @@ struct Submission {
     commands: vk::CommandBuffer,
     fence: vk::Fence,
     signal: Option<vk::Semaphore>,
+    timeline: Option<(vk::Semaphore, u64)>,
+}
+
+impl Submission {
+    /// The queue is externally synchronized, the command buffer has ended,
+    /// and the fence and both optional signals belong to this submission.
+    unsafe fn submit(self, device: &ash::Device, queue: vk::Queue) -> Result<(), vk::Result> {
+        let buffers = [self.commands];
+        let signals = [
+            self.signal.unwrap_or_default(),
+            self.timeline
+                .map_or_else(vk::Semaphore::null, |(semaphore, _)| semaphore),
+        ];
+        let first = usize::from(self.signal.is_none());
+        let end = 1 + usize::from(self.timeline.is_some());
+        let values = [0, self.timeline.map_or(0, |(_, value)| value)];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values[first..end]);
+        let mut submit = vk::SubmitInfo::default()
+            .command_buffers(&buffers)
+            .signal_semaphores(&signals[first..end]);
+        if self.timeline.is_some() {
+            submit = submit.push_next(&mut timeline);
+        }
+        // SAFETY: the submission's caller owns the queue synchronization
+        // and keeps all command resources and signals live.
+        unsafe { device.queue_submit(queue, &[submit], self.fence) }
+    }
+}
+
+struct SubmissionTimeline {
+    gpu: std::sync::Arc<Gpu>,
+    handle: vk::Semaphore,
+}
+
+impl SubmissionTimeline {
+    fn new(gpu: std::sync::Arc<Gpu>) -> Option<Self> {
+        if !gpu.timeline_semaphore {
+            return None;
+        }
+        let mut kind =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
+        // SAFETY: the renderer checked that timeline semaphores are enabled.
+        let handle = unsafe { gpu.device.create_semaphore(&info, None) }.ok()?;
+        Some(Self { gpu, handle })
+    }
+}
+
+impl Drop for SubmissionTimeline {
+    fn drop(&mut self) {
+        // SAFETY: the renderer drains its queue and joins the submitter
+        // before dropping its reference. Any waiter owns another reference.
+        unsafe { self.gpu.device.destroy_semaphore(self.handle, None) };
+    }
+}
+
+/// A submitted serial that can be waited on without locking the renderer.
+/// It owns the timeline and its device for the duration of any host wait.
+#[derive(Clone)]
+pub struct SubmissionWait {
+    timeline: std::sync::Arc<SubmissionTimeline>,
+    serial: u64,
+}
+
+impl std::fmt::Debug for SubmissionWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubmissionWait")
+            .field("serial", &self.serial)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubmissionWait {
+    pub fn wait(&self, duration: std::time::Duration) -> Result<bool, String> {
+        let semaphores = [self.timeline.handle];
+        let values = [self.serial];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let timeout = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: the timeline and its enabled device remain live in the
+        // shared allocation. This operation does not mutate the renderer.
+        match unsafe { self.timeline.gpu.device.wait_semaphores(&info, timeout) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(vk_error("wait for submission timeline")(error)),
+        }
+    }
 }
 
 /// A batch's fence and command buffer belong to vkQueueSubmit until that call
@@ -424,23 +514,14 @@ impl Submitter {
             .spawn({
                 let (progress, submit_ns) = (progress.clone(), submit_ns.clone());
                 move || {
-                    for Submission {
-                        commands,
-                        fence,
-                        signal,
-                    } in receiver
-                    {
-                        let buffers = [commands];
-                        let submit = [vk::SubmitInfo::default()
-                            .command_buffers(&buffers)
-                            .signal_semaphores(signal.as_slice())];
+                    for submission in receiver {
                         let start = std::time::Instant::now();
                         let held = queue_lock
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         // SAFETY: the buffer was ended and is not touched
                         // again until its fence signals; the queue is held.
-                        let result = unsafe { device.queue_submit(queue, &submit, fence) };
+                        let result = unsafe { submission.submit(&device, queue) };
                         drop(held);
                         submit_ns.fetch_add(
                             start.elapsed().as_nanos() as u64,
@@ -514,7 +595,8 @@ pub struct Renderer {
     /// Graphics state remains valid across render passes in one batch.
     pub(crate) graphics: crate::draw::GraphicsState,
     pub(crate) shader_clear_programs: [Option<crate::draw::Program>; 4],
-    pub gpu: Gpu,
+    pub gpu: std::sync::Arc<Gpu>,
+    submission_timeline: Option<std::sync::Arc<SubmissionTimeline>>,
     /// Held while the queue is used (submissions, presents).
     pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
     submitter: Option<Submitter>,
@@ -746,6 +828,8 @@ struct Slot {
     handed: u64,
     /// Serial of its last submission.
     serial: u64,
+    /// This batch can have mapped writes a CPU caller will wait for.
+    signal_host_wait: bool,
     /// Markers its commands set (`mark`), freed once it completes.
     markers: Vec<u64>,
     /// The rendering pass left open after a draw. `commands` ends it.
@@ -796,6 +880,7 @@ impl Slot {
             in_flight: false,
             handed: 0,
             serial: 0,
+            signal_host_wait: false,
             markers: Vec::new(),
             open_pass: None,
             condition_active: false,
@@ -1055,6 +1140,8 @@ fn upload_copies(
 
 impl Renderer {
     pub fn new(gpu: Gpu) -> Result<Self, String> {
+        let gpu = std::sync::Arc::new(gpu);
+        let submission_timeline = SubmissionTimeline::new(gpu.clone()).map(std::sync::Arc::new);
         let queue_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let submitter =
             if std::env::var_os("ECHORA_SUBMIT_THREAD").is_some_and(|value| value == "0") {
@@ -1111,6 +1198,7 @@ impl Renderer {
             shader_cache: None,
             fatal: None,
             gpu,
+            submission_timeline,
             queue_lock,
             submitter,
             recording: false,
@@ -1259,6 +1347,7 @@ impl Renderer {
             }
             .map_err(vk_error("vkBeginCommandBuffer"))?;
             self.recording = true;
+            self.slot.signal_host_wait = false;
             if let Some(timer) = self.timer.as_mut() {
                 timer.begin(&self.gpu.device, self.slot.commands, self.slot.fence);
             }
@@ -3302,6 +3391,39 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn supports_submission_wait(&self) -> bool {
+        self.submission_timeline.is_some()
+    }
+
+    /// Request a timeline signal for a recording with mapped GPU writes.
+    pub fn track_submission_wait(&mut self, serial: u64) {
+        if self.supports_submission_wait() && self.recording && serial == self.recorded_serial() {
+            self.slot.signal_host_wait = true;
+        }
+    }
+
+    /// Give the caller a host wait for an existing batch. A driver without
+    /// timeline semaphores uses the ordinary completion polling path.
+    pub fn submission_wait(&mut self, serial: u64) -> Result<Option<SubmissionWait>, String> {
+        let Some(timeline) = self.submission_timeline.clone() else {
+            return Ok(None);
+        };
+        if serial > self.recorded_serial() {
+            return Err("cannot wait for a submission that has not been recorded".into());
+        }
+        self.submit_through(serial)?;
+        if serial <= self.completed_serial {
+            return Ok(Some(SubmissionWait {
+                timeline,
+                serial: 0,
+            }));
+        }
+        let signaled = std::iter::once(&self.slot)
+            .chain(&self.spares)
+            .any(|slot| slot.in_flight && slot.serial == serial && slot.signal_host_wait);
+        Ok(signaled.then_some(SubmissionWait { timeline, serial }))
+    }
+
     /// Start GPU work early when the CPU may need a result. Keep small
     /// recordings together so an early submission can overlap useful work.
     pub fn submit_for_cpu_dependency(&mut self) -> Result<(), String> {
@@ -3528,6 +3650,16 @@ impl Renderer {
         // SAFETY: the buffer was begun.
         unsafe { device.end_command_buffer(self.slot.commands) }
             .map_err(vk_error("vkEndCommandBuffer"))?;
+        let submission = Submission {
+            commands: self.slot.commands,
+            fence: self.slot.fence,
+            signal,
+            timeline: self
+                .submission_timeline
+                .as_ref()
+                .filter(|_| self.slot.signal_host_wait)
+                .map(|timeline| (timeline.handle, self.slot.serial)),
+        };
         if let Some(submitter) = &mut self.submitter {
             if let Some(error) = submitter.progress.failure() {
                 return Err(error);
@@ -3536,11 +3668,7 @@ impl Renderer {
                 .sender
                 .as_ref()
                 .ok_or("the submit thread has stopped")?
-                .send(Submission {
-                    commands: self.slot.commands,
-                    fence: self.slot.fence,
-                    signal,
-                })
+                .send(submission)
                 .map_err(|_| {
                     submitter
                         .progress
@@ -3560,17 +3688,13 @@ impl Renderer {
                 .submit_ns
                 .swap(0, std::sync::atomic::Ordering::Relaxed);
         } else {
-            let buffers = [self.slot.commands];
-            let submit = [vk::SubmitInfo::default()
-                .command_buffers(&buffers)
-                .signal_semaphores(signal.as_slice())];
             let held = self
                 .queue_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: the buffer was ended; the fence is unsignaled; the
             // queue is held.
-            unsafe { device.queue_submit(self.gpu.queue, &submit, self.slot.fence) }
+            unsafe { submission.submit(device, self.gpu.queue) }
                 .map_err(vk_error("vkQueueSubmit"))?;
             drop(held);
             *self
@@ -8227,13 +8351,14 @@ mod tests {
         struct HostPage([u8; 4096]);
 
         let mut page = Box::new(HostPage([0; 4096]));
-        let Some(mut renderer) = renderer() else {
+        let Ok(mut gpu) = Gpu::new() else {
             return;
         };
-        if renderer.gpu.host_import.is_none() {
+        if gpu.host_import.is_none() {
             return;
         }
-        renderer.gpu.host_import_alignment = 64 << 10;
+        gpu.host_import_alignment = 64 << 10;
+        let mut renderer = Renderer::new(gpu).unwrap();
         assert!(
             renderer
                 .import_host(page.0.as_mut_ptr(), page.0.len() as u64)
@@ -10457,5 +10582,103 @@ impl HangMarkers {
         }
         eprintln!("{}", text.lines().next().unwrap_or_default());
         let _ = std::fs::write(&self.path, text);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod submission_timeline_tests {
+    use super::{Gpu, Renderer, vk};
+    use std::time::Duration;
+
+    #[test]
+    fn submission_timeline_tracks_serials_and_can_outlive_the_renderer() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        if !renderer.supports_submission_wait() {
+            return;
+        }
+        assert!(
+            renderer
+                .submission_wait(0)
+                .unwrap()
+                .unwrap()
+                .wait(Duration::ZERO)
+                .unwrap()
+        );
+        assert!(renderer.submission_wait(1).is_err());
+        renderer.resident_buffer(1, 4096).unwrap();
+        renderer.upload_resident(1, 0, &[12; 16]).unwrap();
+        let first = renderer.recorded_serial();
+        renderer.track_submission_wait(first);
+
+        let gpu = renderer.gpu.clone();
+        let mut gate_type =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let gate = unsafe {
+            gpu.device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut gate_type),
+                None,
+            )
+        }
+        .unwrap();
+        let gates = [gate];
+        let gate_values = [1];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut gate_values =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&gate_values);
+        let block = vk::SubmitInfo::default()
+            .wait_semaphores(&gates)
+            .wait_dst_stage_mask(&stages)
+            .push_next(&mut gate_values);
+        {
+            let _queue = renderer.queue_lock.lock().unwrap();
+            unsafe {
+                gpu.device
+                    .queue_submit(gpu.queue, &[block], vk::Fence::null())
+            }
+            .unwrap();
+        }
+        let wait = renderer.submission_wait(first);
+        let signaled_early = match &wait {
+            Ok(Some(wait)) => wait.wait(Duration::ZERO),
+            _ => Ok(false),
+        };
+        // Unblock the queue before asserting, so a failing assertion can
+        // still drop the renderer and drain its submissions.
+        let release = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
+        unsafe { gpu.device.signal_semaphore(&release) }.unwrap();
+        let wait = wait.unwrap().unwrap();
+        let done = std::thread::spawn(move || wait.wait(Duration::from_secs(2)));
+        assert!(done.join().unwrap().unwrap());
+        renderer.wait_for(first).unwrap();
+        unsafe { gpu.device.destroy_semaphore(gate, None) };
+        assert!(!signaled_early.unwrap());
+
+        // Presentation keeps a separate binary signal in the same batch.
+        let binary = unsafe {
+            renderer
+                .gpu
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .unwrap();
+        renderer.upload_resident(1, 16, &[34; 16]).unwrap();
+        let second = renderer.recorded_serial();
+        assert!(second > first);
+        renderer.track_submission_wait(second);
+        renderer.submit_for_present(binary).unwrap();
+        let wait = renderer.submission_wait(second).unwrap().unwrap();
+        renderer.wait_for(second).unwrap();
+        unsafe { renderer.gpu.device.destroy_semaphore(binary, None) };
+
+        renderer.upload_resident(1, 32, &[56; 16]).unwrap();
+        let untracked = renderer.recorded_serial();
+        assert!(renderer.submission_wait(untracked).unwrap().is_none());
+        renderer.wait_for(untracked).unwrap();
+        drop(renderer);
+        assert!(wait.wait(Duration::ZERO).unwrap());
     }
 }

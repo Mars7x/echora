@@ -765,6 +765,8 @@ pub struct Nvn {
     replay_budget: Option<u32>,
     #[serde(skip)]
     replay_paused: bool,
+    #[serde(skip)]
+    replay_waiting_on_uniforms: Option<echora_gpu::renderer::SubmissionWait>,
     /// `program_memo` for mesh draws, by program handle in each graphics slot.
     #[serde(skip)]
     mesh_program_memo: (
@@ -4247,6 +4249,7 @@ impl Nvn {
     /// SignalEvent, a fence) may let it continue.
     fn pump_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
         self.replay_paused = false;
+        self.replay_waiting_on_uniforms = None;
         loop {
             let mut progressed = false;
             let queues: Vec<u64> = self.pending.keys().copied().collect();
@@ -4796,6 +4799,12 @@ impl Nvn {
         self.replay_paused
     }
 
+    pub(crate) fn replay_waiting_on_uniforms(
+        &self,
+    ) -> Option<echora_gpu::renderer::SubmissionWait> {
+        self.replay_waiting_on_uniforms.clone()
+    }
+
     /// ECHORA_ASYNC_REPLAY: nvnEventSignal returns once its replay's first
     /// piece is done; later NVN calls (any thread's) run the rest a piece
     /// at a time first, as the console's GPU runs it while the CPU goes on.
@@ -5044,7 +5053,33 @@ impl Nvn {
                         progressed = true;
                         continue;
                     }
-                    *next += 1;
+                    if !force
+                        && self.replay_budget.is_some()
+                        && rest.starts_with("Draw")
+                        && Self::replay_thread()
+                        && self
+                            .gpu
+                            .as_ref()
+                            .is_some_and(gpu::Backend::has_pending_mapped_writes)
+                    {
+                        if let Some(wait) =
+                            self.defer_draw_uniform_reads(core, command)
+                                .map_err(|message| Trap::InvalidState {
+                                    message: format!("{}: {message}", command.name),
+                                })?
+                        {
+                            self.replay_paused = true;
+                            self.replay_waiting_on_uniforms = Some(wait);
+                            return Ok(progressed);
+                        }
+                        if let QueueItem::List { next, .. } =
+                            self.pending.get_mut(&queue).unwrap().front_mut().unwrap()
+                        {
+                            *next += 1;
+                        }
+                    } else {
+                        *next += 1;
+                    }
                     progressed = true;
                     if matches!(rest, "CallCommands" | "CopyCommands") {
                         // The called lists run next, in order, ahead of
