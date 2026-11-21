@@ -6467,6 +6467,35 @@ mod tests {
                 "single {single}: {fewer} loads, {all} without reuse"
             );
 
+            // Two accumulations use disjoint registers. The intervening
+            // multiply preserves the first product and vice versa.
+            let interleaved = [
+                hmma(16, 4, 8),
+                hmma(20, 6, 12),
+                hmma(28, 4, 8),
+                hmma(32, 6, 12),
+                hmma(16, 24, 16),
+                hmma(20, 26, 20),
+                hmma(28, 24, 28),
+                hmma(32, 26, 32),
+            ];
+            let rematerialized = [
+                interleaved[0],
+                interleaved[1],
+                copy(16),
+                interleaved[2],
+                interleaved[3],
+                copy(28),
+                interleaved[4],
+                interleaved[5],
+                interleaved[6],
+                interleaved[7],
+            ];
+            let (cached, count) = run(&interleaved);
+            let (uncached, all) = run(&rematerialized);
+            assert_eq!(cached, uncached, "interleaved single {single}");
+            assert_eq!(all - count, 2, "interleaved C loads for single {single}");
+
             // Overlapping destinations leave the second product's words in
             // the shared registers. The following pair reads those words.
             let overlapping = [

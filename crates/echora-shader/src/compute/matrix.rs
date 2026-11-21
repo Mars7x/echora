@@ -299,21 +299,19 @@ impl Emitter {
         Ok(value)
     }
 
-    /// A subgroup barrier that orders workgroup memory.
     /// The write versions of `count` registers from `base` (RZ: never
     /// written).
-    fn versions(&self, base: u8, count: u8) -> Vec<u32> {
-        (0..count)
-            .map(|n| {
-                if base == 255 {
-                    0
-                } else {
-                    self.register_versions[usize::from(base.saturating_add(n))]
-                }
-            })
-            .collect()
+    fn versions(&self, base: u8, count: u8) -> impl Iterator<Item = u32> + '_ {
+        (0..count).map(move |n| {
+            if base == 255 {
+                0
+            } else {
+                self.register_versions[usize::from(base.saturating_add(n))]
+            }
+        })
     }
 
+    /// A subgroup barrier that orders workgroup memory.
     fn subgroup_barrier(&mut self) {
         let scope = self.constant(SCOPE_SUBGROUP);
         let semantics = self.constant(0x8 | 0x100);
@@ -530,10 +528,9 @@ impl Emitter {
         } else {
             (words, base, lane)
         };
-        // The last multiply's A matrix and D (as its C) are reused where
-        // their registers still hold them, in the same block (so the values
-        // dominate): the same SSA values the stores and loads would give
-        // again, bit for bit.
+        // Reuse A and the two most recent products (as C) within this
+        // block while their registers still hold them. The SSA values
+        // match what would be stored and loaded through scratch.
         let block = self.function.block();
         if self.matrix_reuse.block != Some(block) {
             self.matrix_reuse = Reuse {
@@ -543,29 +540,35 @@ impl Emitter {
         }
         let a_count = if k16 { 4 } else { 2 };
         let a_reused = match &self.matrix_reuse.a {
-            Some((base, k, versions, matrix)) if *base == a && *k == k16 => {
-                (*versions == self.versions(a, a_count)).then_some(*matrix)
-            }
+            Some((base, k, versions, matrix)) if *base == a && *k == k16 => versions
+                .iter()
+                .copied()
+                .eq(self.versions(a, a_count))
+                .then_some(*matrix),
             _ => None,
         };
         let c_count = if single { 4 } else { 2 };
-        let c_reused = match &self.matrix_reuse.d {
-            Some((registers, wide, versions, product))
-                if *wide == single
-                    && registers.len() == halves_in.len()
-                    && registers
-                        .iter()
-                        .zip(halves_in)
-                        .all(|(&d, &(_, _, c))| d == c) =>
-            {
-                let current: Vec<u32> = halves_in
+        let c_reused = self.matrix_reuse.d.iter().flatten().find_map(|cached| {
+            if cached.single != single
+                || cached.registers.len() != halves_in.len()
+                || !cached
+                    .registers
                     .iter()
-                    .flat_map(|&(_, _, c)| self.versions(c, c_count))
-                    .collect();
-                (*versions == current).then_some(*product)
+                    .zip(halves_in)
+                    .all(|(&d, &(_, _, c))| d == c)
+            {
+                return None;
             }
-            _ => None,
-        };
+            let current = halves_in
+                .iter()
+                .flat_map(|&(_, _, c)| self.versions(c, c_count));
+            cached
+                .versions
+                .iter()
+                .copied()
+                .eq(current)
+                .then_some(cached.matrix)
+        });
         // The previous multiply's lanes may still be reading D: wait
         // before writing C where it was (A and B are elsewhere).
         if c_reused.is_none() {
@@ -676,7 +679,7 @@ impl Emitter {
             ),
         };
         if a_reused.is_none() {
-            let versions = self.versions(a, a_count);
+            let versions = self.versions(a, a_count).collect();
             self.matrix_reuse.a = Some((a, k16, versions, a_matrix));
         }
         let b_matrix = self.value(
@@ -732,7 +735,8 @@ impl Emitter {
                 &registers(halves_in[0].0, c_count),
                 &registers(halves_in[1].0, c_count),
             );
-        self.matrix_reuse.d = (disjoint
+        self.matrix_reuse.d.rotate_right(1);
+        self.matrix_reuse.d[0] = (disjoint
             && halves_in
                 .iter()
                 .all(|&(d, _, _)| u16::from(d) + u16::from(c_count) <= 255))
@@ -742,7 +746,12 @@ impl Emitter {
                 .iter()
                 .flat_map(|&d| self.versions(d, c_count))
                 .collect();
-            (registers, single, versions, product)
+            CachedAccumulator {
+                registers,
+                single,
+                versions,
+                matrix: product,
+            }
         });
         Ok(())
     }
@@ -1362,12 +1371,19 @@ pub(crate) mod tests {
 }
 
 /// What the last coop32 multiply (`cooperative_multiply_packed`) loaded,
-/// for the next to reuse in the same block: A's registers, K16, their
-/// write versions and the A matrix; D's registers (one per HMMA), whether
-/// 32-bit, their versions after the write back, and the product.
+/// for later multiplies to reuse in the same block. Two result slots let
+/// alternating independent accumulations keep their previous products.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Reuse {
     block: Option<(u32, u32)>,
     a: Option<(u8, bool, Vec<u32>, u32)>,
-    d: Option<(Vec<u8>, bool, Vec<u32>, u32)>,
+    d: [Option<CachedAccumulator>; 2],
+}
+
+#[derive(Clone, Debug)]
+struct CachedAccumulator {
+    registers: Vec<u8>,
+    single: bool,
+    versions: Vec<u32>,
+    matrix: u32,
 }
