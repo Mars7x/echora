@@ -1821,10 +1821,24 @@ impl Nvn {
         {
             self.flush_epoch += 1;
         }
+        // WriteTexels names the texture: its contents changed, and so did
+        // its storage for everything else over it (a format twin, a layer
+        // view, a resident pool's copy).
+        let mut written = vec![range];
         if let Some(texture) = texture {
+            if let Some(backing) = self.texture_object_backing(texture) {
+                written.extend(backing.pieces().iter().map(|(_, piece)| piece.clone()));
+            }
             self.evict_texture_bindings(texture);
+            if let Some(backend) = self.gpu.as_mut() {
+                backend.remove_texture_upload(texture);
+            }
         }
-        if let Some(backend) = self.gpu.as_mut() {
+        let Some(backend) = self.gpu.as_mut() else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for range in written.into_iter().filter(|range| !range.is_empty()) {
             for pool in backend.resident.values_mut() {
                 let start = range.start.max(pool.base);
                 let end = range.end.min(pool.base + pool.size);
@@ -1836,13 +1850,12 @@ impl Nvn {
                     add_range(&mut pool.guest_dirty, start..end);
                 }
             }
-            // WriteTexels names the texture: its contents changed.
-            if let Some(texture) = texture {
-                backend.remove_texture_upload(texture);
-            }
             if backend.mark_texture_bytes_changed(&range) {
-                self.evict_bindings_over(std::slice::from_ref(&range));
+                changed.push(range);
             }
+        }
+        if !changed.is_empty() {
+            self.evict_bindings_over(&changed);
         }
     }
 
