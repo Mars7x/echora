@@ -354,8 +354,10 @@ pub struct Machine {
     lock_free_nvn_calls: u64,
     /// Yields returned without the machine lock (`Worker::quiet_yield`).
     lock_free_yields: u64,
-    /// Of those, calls recorded on command buffers without even the NVN
-    /// state's lock (see `Worker::recorded_nvn_call`).
+    /// Of those, calls made without even the NVN state's lock (see
+    /// `Worker::recorded_nvn_call`): commands recorded on command buffers,
+    /// command buffer management but EndRecording, and the property-bag
+    /// and registry calls.
     recorded_nvn_calls: u64,
     /// Microseconds those calls waited for the NVN state's own lock, and
     /// held it.
@@ -5685,9 +5687,11 @@ impl Worker {
     }
 
     /// Record NVN call `pc` on a recording command buffer without any lock
-    /// but that buffer's own (see `nvn::Recorder`): the game records command
-    /// buffers on several cores at once, and through the NVN state's lock
-    /// they waited for one another and for submitted work. The call returns
+    /// but that buffer's own (see `nvn::Recorder`), or manage the buffer
+    /// (memory, callbacks, BeginRecording...) on its own state: the game
+    /// records command buffers on several cores at once, and through the
+    /// NVN state's lock they waited for one another and for submitted work,
+    /// and the replay thread for them. The call returns
     /// to the link register as `held_nvn_call`'s do. False when `pc` is no
     /// such call (it is then made with the NVN state) or recording failed
     /// (reported at the next boundary, `held_failed`).
