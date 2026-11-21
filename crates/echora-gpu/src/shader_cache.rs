@@ -202,19 +202,28 @@ fn write(
     std::fs::create_dir_all(directory)?;
     // Each writer owns its staging file. Rename publishes the complete
     // entry even when two renderers compile the same program at once.
-    let mut partial = tempfile::NamedTempFile::new_in(directory)?;
+    let mut partial = tempfile::Builder::new().make_in(directory, |path| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
+    })?;
     partial.write_all(&header(binary_version))?;
     partial.write_all(&(binaries.len() as u32).to_le_bytes())?;
     for binary in binaries {
         partial.write_all(&(binary.length as u64).to_le_bytes())?;
         partial.write_all(binary.bytes())?;
     }
-    // Close the handle before publication so a subsequent Windows rename
-    // can replace the entry as soon as it becomes visible.
-    partial
-        .into_temp_path()
-        .persist(path)
-        .map_err(|error| error.error)
+    // Close the writer before publication. The standard rename can use
+    // FileRenameInfoEx on Windows so open readers keep the previous file.
+    let mut temporary = partial.into_temp_path();
+    std::fs::rename(&temporary, path)?;
+    temporary.disable_cleanup(true);
+    Ok(())
 }
 
 fn header(binary_version: ([u8; 16], u32)) -> [u8; HEADER_SIZE] {
@@ -307,6 +316,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("program.bin");
         let version = ([11; 16], 7);
+        let original = ShaderBinary::zeroed(256 * 1024).unwrap();
+        write(&path, version, std::slice::from_ref(&original)).unwrap();
+        let mut previous = std::fs::File::open(&path).unwrap();
         let barrier = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             let mut writers = Vec::new();
@@ -332,6 +344,9 @@ mod tests {
         assert_eq!(bytes.len(), 256 * 1024);
         assert!((1..=8).contains(&bytes[0]));
         assert!(bytes.iter().all(|&byte| byte == bytes[0]));
+        let mut previous_bytes = Vec::new();
+        previous.read_to_end(&mut previous_bytes).unwrap();
+        assert_eq!(&previous_bytes[HEADER_SIZE + 12..], original.bytes());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
