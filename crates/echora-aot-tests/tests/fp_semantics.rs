@@ -21,6 +21,9 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
+#[path = "common/effects.rs"]
+mod effects;
+
 use echora_aot_tests::{Machine, Trap};
 
 /// The lifts this test runs (`build.rs` writes each to its own file, so
@@ -1430,6 +1433,8 @@ fn lifted_floating_point_matches_the_reference() {
     let mut runs = 0;
     let mut known = 0;
     let mut skipped = 0;
+    let (mut effect_checks, mut effect_failures) = (0, Vec::new());
+    let mut effect_random = effects::EffectRandom(0x9b05_688c_2b3e_6c1f);
     for (index, &word) in words.iter().enumerate() {
         let entry = fp_semantic_code::BASE + STRIDE * index as u64;
         let Instruction::Simd(op) = decode(word, entry) else {
@@ -1463,6 +1468,25 @@ fn lifted_floating_point_matches_the_reference() {
                     0
                 },
             };
+            if effect_checks < effects::EFFECT_STATES * (index + 1) {
+                effect_checks += 1;
+                m.core.cpu.regs = before.x;
+                m.core.cpu.vectors = before.v;
+                m.core.cpu.nzcv = before.nzcv;
+                m.core.cpu.fpcr = before.fpcr;
+                m.core.cpu.fpsr = before.fpsr;
+                if let Err(problem) = effects::check_effects(
+                    &mut m,
+                    fp_semantic_code::dispatch,
+                    &decode(word, entry),
+                    entry,
+                    0x80_0000,
+                    0x1000,
+                    &mut effect_random,
+                ) {
+                    effect_failures.push(format!("{word:#010x}: {problem}"));
+                }
+            }
             let mut expected = before.clone();
             CONTEXT.with(|cell| {
                 cell.set(Context {
@@ -1524,6 +1548,7 @@ fn lifted_floating_point_matches_the_reference() {
         }
         _ => false,
     });
+    effects::assert_effects(effect_checks, &effect_failures);
     println!("estimates {estimates}, steps {steps}, half-precision conversions {halves}");
     assert!(estimates > 0 && steps > 0 && halves > 0);
     println!(

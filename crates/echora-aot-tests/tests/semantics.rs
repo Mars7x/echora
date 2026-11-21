@@ -15,6 +15,9 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/effects.rs"]
+mod effects;
+
 mod common;
 
 use common::*;
@@ -139,6 +142,8 @@ fn lifted_integer_and_memory_instructions_match_the_reference() {
     let memory: Vec<u8> = (0..DATA_SIZE).map(|_| random.next() as u8).collect();
     let mut failures = Vec::new();
     let mut runs = 0;
+    let (mut effect_checks, mut effect_failures) = (0, Vec::new());
+    let mut effect_random = effects::EffectRandom(0x9b05_688c_2b3e_6c1f);
     for (index, &word) in semantic_code::WORDS.iter().enumerate() {
         let entry = semantic_code::BASE + STRIDE * index as u64;
         let instruction = decode(word, entry);
@@ -148,6 +153,27 @@ fn lifted_integer_and_memory_instructions_match_the_reference() {
             let reference = interpret(&instruction, &mut expected);
             let lifted = run_lifted(&mut m, entry, &before);
             runs += 1;
+            if effect_checks < effects::EFFECT_STATES * (index + 1) {
+                effect_checks += 1;
+                m.core.cpu.regs = before.x;
+                m.core.cpu.sp = before.sp;
+                m.core.cpu.nzcv = before.nzcv;
+                m.memory
+                    .write(DATA, &before.memory)
+                    .expect("data is mapped");
+                let dispatch = semantic_code::dispatch;
+                if let Err(problem) = effects::check_effects(
+                    &mut m,
+                    dispatch,
+                    &instruction,
+                    entry,
+                    DATA,
+                    DATA_SIZE,
+                    &mut effect_random,
+                ) {
+                    effect_failures.push(format!("{word:#010x}: {problem}"));
+                }
+            }
             let problem = match (reference, lifted) {
                 (Some(branch), Ok((taken, actual))) if branch == taken && actual == expected => {
                     continue;
@@ -167,10 +193,11 @@ fn lifted_integer_and_memory_instructions_match_the_reference() {
         }
     }
     println!(
-        "{} instructions, {runs} runs, {} mismatching instructions",
+        "{} instructions, {runs} runs, {} mismatching instructions; {effect_checks} effect checks",
         semantic_code::WORDS.len(),
         failures.len()
     );
+    effects::assert_effects(effect_checks, &effect_failures);
     assert!(
         failures.is_empty(),
         "{} mismatches:\n{}",
