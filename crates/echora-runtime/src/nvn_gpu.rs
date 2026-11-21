@@ -3785,6 +3785,11 @@ impl Nvn {
         if self.binding_memo.0 != stamp {
             self.binding_memo = (stamp, Default::default());
         }
+        // Resolving a handle can evict a binding already in the list
+        // (another handle's storage resolve stores GPU writes and evicts
+        // what they touch): the list is kept under the stamp from before
+        // the loop, so any such change has it checked or made again.
+        let started = self.pool_list_stamp(nvn);
         let mut entries = Vec::with_capacity(handles.len());
         let mut resolved_handles = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -3818,11 +3823,16 @@ impl Nvn {
             });
         }
         let list: std::sync::Arc<[echora_gpu::pool::PoolEntry]> = entries.into();
-        // Resolving may have moved the memo stamp: kept under the key now.
+        if self.pool_list_stamp(nvn) != started {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: pool entry lists changed while made", 1);
+        }
         self.pool_entry_cache.insert(
             nvn,
             super::CachedPoolEntries {
-                stamp: self.pool_list_stamp(nvn),
+                stamp: started,
                 entries: list.clone(),
                 handles: resolved_handles,
                 additional: additional.to_vec(),
