@@ -10164,9 +10164,10 @@ impl Nvn {
     /// rendering holds while it equals the word 16 bytes on, mode 1 while
     /// they differ), compared on the GPU after that work
     /// (`Renderer::condition_on_word`) instead of waiting for it to read
-    /// the word on the CPU: where the word is shared with the GPU in place
-    /// and the other word is the CPU's (no GPU work writes it). The word
-    /// the condition reads, or None (the CPU compares them).
+    /// the word on the CPU: where the word is shared with the GPU in place,
+    /// and so is the other word if GPU work writes it too (else its value
+    /// is the CPU's). The word the condition reads, or None (the CPU
+    /// compares them).
     /// ECHORA_GPU_WORD_CONDITIONS=0 (debugging): the CPU always does.
     fn gpu_word_condition(
         &mut self,
@@ -10202,10 +10203,6 @@ impl Nvn {
                 "stat: word conditions refused: results to copy into the word",
             ),
             (
-                pending(self, other),
-                "stat: word conditions refused: other word written",
-            ),
-            (
                 self.gpu_writes_pending(&(other..other + 8)),
                 "stat: word conditions refused: results to copy into the other word",
             ),
@@ -10226,17 +10223,33 @@ impl Nvn {
                 .stat("stat: word conditions refused: word not shared", 1);
             return Ok(None);
         };
-        // The other word as the CPU holds it (nothing is pending there).
-        self.resolve_draw_input(core, other, 8)?;
-        let value = core
-            .memory
-            .read_u64(other)
-            .map_err(|trap| format!("{trap:?}"))?;
+        let comparand = if pending(self, other) {
+            // Written by GPU work too: read where it is, after that work.
+            let Some((buffer, offset)) = self
+                .shared_binding(other, 8)?
+                .filter(|&(_, offset)| offset.is_multiple_of(4))
+            else {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: word conditions refused: other word not shared", 1);
+                return Ok(None);
+            };
+            echora_gpu::condition::Comparand::Word(buffer, offset)
+        } else {
+            // As the CPU holds it (nothing is pending there).
+            self.resolve_draw_input(core, other, 8)?;
+            echora_gpu::condition::Comparand::Value(
+                core.memory
+                    .read_u64(other)
+                    .map_err(|trap| format!("{trap:?}"))?,
+            )
+        };
         self.gpu
             .as_mut()
             .unwrap()
             .renderer
-            .condition_on_word(bound, value, mode == 0)
+            .condition_on_word(bound, comparand, mode == 0)
     }
 
     /// Guest CPU address of the comparison operand read by `gpu_condition`.
