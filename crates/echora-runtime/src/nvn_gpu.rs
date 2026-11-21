@@ -2500,6 +2500,13 @@ impl Nvn {
                 // recompiler drops stores at constant offsets.
                 local_memory_size: compute[4],
                 native_pointers,
+                subgroup_uniform_control_flow: self
+                    .gpu
+                    .as_ref()
+                    .unwrap()
+                    .renderer
+                    .gpu
+                    .subgroup_uniform_control_flow,
                 // Instrument only these stage keys when a trace of every
                 // translated stage would be too expensive to reach the frame.
                 vertex_trace: std::env::var("ECHORA_VERTEX_TRACE_PROGRAMS")

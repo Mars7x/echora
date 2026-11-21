@@ -170,6 +170,7 @@ fn translate_with_constants(
             fragment_output_types: options.fragment_output_types,
             float64: options.float64,
             denorm_flush_32: options.denorm_flush_32,
+            subgroup_uniform_control_flow: false,
             dual_source_blend: options.dual_source_blend,
         };
         let specialized = (layout.stage == Stage::Fragment)
@@ -219,6 +220,7 @@ fn translate_with_constants(
         fragment_output_types: [0; 8],
         float64: options.float64,
         denorm_flush_32: options.denorm_flush_32,
+        subgroup_uniform_control_flow: options.subgroup_uniform_control_flow,
         dual_source_blend: false,
     };
     if let Some(constants) = constants

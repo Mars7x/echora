@@ -144,6 +144,7 @@ pub fn translate_rust_with_bound_images(
         fragment_output_types: parameters.fragment_output_types,
         denorm_flush_32: DENORM_FLUSH_32.load(std::sync::atomic::Ordering::Relaxed),
         vertex_trace: parameters.vertex_trace,
+        subgroup_uniform_control_flow: parameters.subgroup_uniform_control_flow,
         ..Default::default()
     };
     let parameters = abi_parameters(parameters);
@@ -252,6 +253,7 @@ pub struct Parameters {
     pub native_pointers: bool,
     /// Enable or disable graphics instrumentation for this stage.
     pub vertex_trace: Option<bool>,
+    pub subgroup_uniform_control_flow: bool,
 }
 
 #[repr(C)]

@@ -252,6 +252,7 @@ pub mod execution {
     pub const ORIGIN_UPPER_LEFT: u32 = 7;
     pub const DEPTH_REPLACING: u32 = 12;
     pub const LOCAL_SIZE: u32 = 17;
+    pub const SUBGROUP_UNIFORM_CONTROL_FLOW: u32 = 4421;
     pub const DENORM_FLUSH_TO_ZERO: u32 = 4460;
     pub const TASK_EXT: u32 = 5364;
     pub const MESH_EXT: u32 = 5365;

@@ -338,6 +338,31 @@ fn emit_blocks(
         emitter.program(code, blocks)?;
     }
     emitter.mesh_end()?;
+    if layout.stage == Stage::Compute
+        && layout.subgroup_uniform_control_flow
+        && emitter
+            .module
+            .capability_sites()
+            .iter()
+            .any(|&(capability, _)| {
+                matches!(
+                    capability,
+                    capability::GROUP_NON_UNIFORM_VOTE
+                        | capability::GROUP_NON_UNIFORM_ARITHMETIC
+                        | capability::GROUP_NON_UNIFORM_BALLOT
+                        | capability::GROUP_NON_UNIFORM_SHUFFLE
+                )
+            })
+    {
+        // A warp-wide vote or shuffle after a merge must see its callers
+        // together even if another warp is still following a different path.
+        emitter
+            .module
+            .extension("SPV_KHR_subgroup_uniform_control_flow");
+        emitter
+            .module
+            .execution_mode(emitter.entry, execution::SUBGROUP_UNIFORM_CONTROL_FLOW, &[]);
+    }
     if emitter.declares_flush32 {
         emitter.module.capability(capability::DENORM_FLUSH_TO_ZERO);
         let entry = emitter.entry;
@@ -530,6 +555,7 @@ pub struct Layout<'a> {
     /// The host flushes 32-bit denormals where the module declares it
     /// (`Options::denorm_flush_32`).
     pub denorm_flush_32: bool,
+    pub subgroup_uniform_control_flow: bool,
     /// Fragment programs: colour output 1 is render target 0's second blend
     /// source (Location 0, Index 1; `Options::dual_source_blend`).
     pub dual_source_blend: bool,
@@ -596,6 +622,7 @@ impl Layout<'_> {
             vertex_trace: false,
             float64: false,
             denorm_flush_32: false,
+            subgroup_uniform_control_flow: false,
             dual_source_blend: false,
         }
     }
@@ -3607,6 +3634,34 @@ mod tests {
     const EXIT: u128 = 0x94d | 7 << 12 | 7 << 87;
 
     #[test]
+    fn subgroup_reconvergence_requires_a_compute_collective_and_device_support() {
+        let redux = decode(word(&[(0, 12, 0x3c4), (16, 6, 4), (24, 8, 1), (78, 3, 3)]));
+        let exit = decode(EXIT);
+        let mut layout = Layout::workgroup([64, 1, 1]);
+        let declarations = |code: &[Instruction], layout: &Layout| {
+            let module = translate(code, layout).unwrap();
+            assert_eq!(validate(&module.spirv), None);
+            let mut at = 5;
+            let mut declaration = false;
+            while let Some(&instruction) = module.spirv.get(at) {
+                if instruction as u16 == op::EXECUTION_MODE
+                    && module.spirv[at + 2] == execution::SUBGROUP_UNIFORM_CONTROL_FLOW
+                {
+                    declaration = true;
+                }
+                at += (instruction >> 16) as usize;
+            }
+            declaration
+        };
+        assert!(!declarations(&[redux, exit], &layout));
+        layout.subgroup_uniform_control_flow = true;
+        assert!(!declarations(&[exit], &layout));
+        assert!(declarations(&[redux, exit], &layout));
+        layout.stage = Stage::Fragment;
+        assert!(!declarations(&[redux, exit], &layout));
+    }
+
+    #[test]
     fn fragment_subgroup_builtins_are_flat() {
         let code = [
             Op::S2r {
@@ -4246,6 +4301,7 @@ mod tests {
             vertex_trace: false,
             float64: false,
             denorm_flush_32: false,
+            subgroup_uniform_control_flow: false,
             dual_source_blend: false,
             fragment_output_types: [0; 8],
         };
@@ -4507,6 +4563,7 @@ mod tests {
             vertex_trace: false,
             float64: false,
             denorm_flush_32: false,
+            subgroup_uniform_control_flow: false,
             dual_source_blend: false,
             fragment_output_types: [0; 8],
         };
@@ -5409,6 +5466,7 @@ mod tests {
             vertex_trace: false,
             float64: false,
             denorm_flush_32: false,
+            subgroup_uniform_control_flow: false,
             dual_source_blend: false,
             fragment_output_types: [0; 8],
         };

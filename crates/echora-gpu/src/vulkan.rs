@@ -43,6 +43,8 @@ pub struct Gpu {
     pub compute_subgroup_32: bool,
     /// Compute shader objects can request fully active subgroups.
     pub compute_full_subgroups: bool,
+    /// This device can enforce reconvergence of individual subgroups.
+    pub subgroup_uniform_control_flow: bool,
     /// Buffers can be given device addresses (bufferDeviceAddress, core in
     /// 1.2): the GPU page table points into them.
     pub buffer_device_address: bool,
@@ -189,6 +191,8 @@ impl Gpu {
         let mut supported_clip = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut supported_robust = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
         let mut supported_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut supported_subgroup_flow =
+            vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default();
         let mut supported_clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
         let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
         let mut supported_cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
@@ -209,6 +213,7 @@ impl Gpu {
             .push_next(&mut supported_clip)
             .push_next(&mut supported_robust)
             .push_next(&mut supported_mesh)
+            .push_next(&mut supported_subgroup_flow)
             .push_next(&mut supported_clock)
             .push_next(&mut supported_atomic_float)
             .push_next(&mut supported_cooperative)
@@ -219,10 +224,12 @@ impl Gpu {
         let core = supported.features;
         // Guest programs assume 32-lane warps: compute shaders require that
         // width where the driver allows it (RADV runs 64 by default).
+        let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
         let mut size_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut object_properties = vk::PhysicalDeviceShaderObjectPropertiesEXT::default();
         let mut properties12 = vk::PhysicalDeviceVulkan12Properties::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut subgroup_properties)
             .push_next(&mut size_control)
             .push_next(&mut object_properties)
             .push_next(&mut properties12);
@@ -377,6 +384,15 @@ impl Gpu {
         }
         // The guest's clock special registers (SPV_KHR_shader_clock) and
         // float atomic adds on storage (SPV_EXT_shader_atomic_float_add).
+        let subgroup_uniform_control_flow =
+            supported_subgroup_flow.shader_subgroup_uniform_control_flow != 0
+                && subgroup_properties
+                    .supported_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE)
+                && has(ash::khr::shader_subgroup_uniform_control_flow::NAME);
+        if subgroup_uniform_control_flow {
+            enabled_extensions.push(ash::khr::shader_subgroup_uniform_control_flow::NAME.as_ptr());
+        }
         let subgroup_clock =
             supported_clock.shader_subgroup_clock != 0 && has(ash::khr::shader_clock::NAME);
         if subgroup_clock {
@@ -530,6 +546,12 @@ impl Gpu {
         if uncompressed_depth {
             device_info = device_info.push_next(&mut enable_compression);
         }
+        let mut enable_subgroup_flow =
+            vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default()
+                .shader_subgroup_uniform_control_flow(true);
+        if subgroup_uniform_control_flow {
+            device_info = device_info.push_next(&mut enable_subgroup_flow);
+        }
         let mut enable_clock =
             vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_subgroup_clock(true);
         if subgroup_clock {
@@ -620,6 +642,7 @@ impl Gpu {
             texture_compression_astc_ldr: core.texture_compression_astc_ldr != 0,
             compute_subgroup_32,
             compute_full_subgroups,
+            subgroup_uniform_control_flow,
             buffer_device_address,
             texture_pool_layout,
             dynamic_uniform_limit: properties.limits.max_descriptor_set_uniform_buffers_dynamic,

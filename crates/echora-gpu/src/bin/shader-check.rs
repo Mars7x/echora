@@ -26,6 +26,7 @@ fn main() {
     // Captures carry no dispatch parameters; allow the most shared memory.
     let compute = Parameters {
         shared_memory_size: 0xc000,
+        subgroup_uniform_control_flow: gpu.subgroup_uniform_control_flow,
         ..Default::default()
     };
     let (mut translated, mut compiled, mut total) = (0, 0, 0);
