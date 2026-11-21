@@ -38,6 +38,26 @@ pub(super) struct DrawBindings {
     stage_variants: Vec<Arc<Translated>>,
 }
 
+/// A statistic's name, hashed and compared by its address: a static
+/// string's bytes are not read per count. The same name held at two
+/// addresses makes two counters, added together in the report.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StatName(&'static str);
+
+impl PartialEq for StatName {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for StatName {}
+
+impl std::hash::Hash for StatName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.0.as_ptr() as usize ^ self.0.len() << 48);
+    }
+}
+
 /// A built page table (see `Nvn::page_table`).
 pub struct PageBuild {
     first: u64,
@@ -327,7 +347,7 @@ pub struct Backend {
     pub notes: BTreeMap<String, u64>,
     /// "stat: " counters by their static name (`stat`; merged into the
     /// notes for the report by `notes_with_stats`).
-    stats: super::FastMap<&'static str, u64>,
+    stats: super::FastMap<StatName, u64>,
     /// Draws described in ECHORA_GPU_LOG so far (the first few are).
     traced: u32,
     /// Draws probed (ECHORA_GPU_PROBE).
@@ -1015,9 +1035,18 @@ impl Backend {
     /// Add `amount` to a counter in the notes (named "stat: ..."), for
     /// the run report; nothing is logged.
     pub(super) fn stat(&mut self, name: &'static str, amount: u64) {
-        // Called dozens of times per draw: a hashed lookup of the static
-        // name (the notes are a string-ordered map thousands long).
-        *self.stats.entry(name).or_default() += amount;
+        // Called dozens of times per draw: a lookup by the static name's
+        // address (the notes are a string-ordered map thousands long).
+        *self.stats.entry(StatName(name)).or_default() += amount;
+    }
+
+    /// A counter's value (its name may be held at several addresses).
+    pub(super) fn stat_value(&self, name: &str) -> u64 {
+        self.stats
+            .iter()
+            .filter(|(key, _)| key.0 == name)
+            .map(|(_, amount)| amount)
+            .sum()
     }
 
     /// The notes with the stat counters added in.
@@ -1046,8 +1075,8 @@ impl Backend {
                 index.spans.len() as u64,
             );
         }
-        for (&name, &amount) in &self.stats {
-            *notes.entry(name.to_string()).or_default() += amount;
+        for (name, &amount) in &self.stats {
+            *notes.entry(name.0.to_string()).or_default() += amount;
         }
         notes
     }
@@ -1795,8 +1824,7 @@ impl Nvn {
     pub(super) fn gpu_draw_count(&self) -> u64 {
         self.gpu
             .as_ref()
-            .and_then(|backend| backend.stats.get("stat: draws").copied())
-            .unwrap_or(0)
+            .map_or(0, |backend| backend.stat_value("stat: draws"))
     }
 
     /// Resolve texture bindings anew (`binding_memo`), counted by `why`.
@@ -14058,7 +14086,13 @@ mod target_tests {
         };
         nvn.gpu_invalidate(base + offset..base + offset + 4, None);
         nvn.guest_texture(&guest, texture).unwrap();
-        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        assert_eq!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .stat_value("stat: texture uploads"),
+            1
+        );
         guest.memory.write(base + offset, &rgba).unwrap();
         nvn.gpu_invalidate(base + offset..base + offset + 4, None);
         let TextureSource::Upload {
@@ -14348,7 +14382,13 @@ mod target_tests {
             nvn.presented_frames += 1;
             nvn.guest_texture(&guest, texture).unwrap();
         }
-        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        assert_eq!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .stat_value("stat: texture uploads"),
+            1
+        );
         nvn.presented_frames += 1;
         let rgba = [32, 64, 128, 255];
         let offset = 256;
@@ -14388,7 +14428,13 @@ mod target_tests {
             nvn.presented_frames += 1;
             nvn.guest_texture(&guest, texture).unwrap();
         }
-        assert_eq!(nvn.gpu.as_ref().unwrap().stats["stat: texture uploads"], 1);
+        assert_eq!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .stat_value("stat: texture uploads"),
+            1
+        );
         nvn.presented_frames += 1;
         let rgba = [32, 64, 128, 255];
         let offset = 256;
@@ -16650,10 +16696,10 @@ mod pool_tests {
         let first = nvn.pool_entries(&mut core, 0, &[]).unwrap();
         assert_eq!(first.len(), 2);
         assert!(!nvn.binding_memo.1.contains_key(&2));
-        let stats = &nvn.gpu.as_ref().unwrap().stats;
+        let backend = nvn.gpu.as_ref().unwrap();
         assert_eq!(
-            stats.get("stat: pool entry lists changed while made"),
-            Some(&1)
+            backend.stat_value("stat: pool entry lists changed while made"),
+            1
         );
         // Made again: handle 2 no longer resolves (its binding is gone).
         let second = nvn.pool_entries(&mut core, 0, &[]).unwrap();
