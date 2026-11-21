@@ -766,7 +766,7 @@ pub struct Nvn {
     #[serde(skip)]
     replay_paused: bool,
     #[serde(skip)]
-    replay_waiting_on_uniforms: Option<echora_gpu::renderer::SubmissionWait>,
+    replay_waiting_on_inputs: Option<echora_gpu::renderer::SubmissionWait>,
     /// `program_memo` for mesh draws, by program handle in each graphics slot.
     #[serde(skip)]
     mesh_program_memo: (
@@ -4249,7 +4249,7 @@ impl Nvn {
     /// SignalEvent, a fence) may let it continue.
     fn pump_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
         self.replay_paused = false;
-        self.replay_waiting_on_uniforms = None;
+        self.replay_waiting_on_inputs = None;
         loop {
             let mut progressed = false;
             let queues: Vec<u64> = self.pending.keys().copied().collect();
@@ -4799,10 +4799,8 @@ impl Nvn {
         self.replay_paused
     }
 
-    pub(crate) fn replay_waiting_on_uniforms(
-        &self,
-    ) -> Option<echora_gpu::renderer::SubmissionWait> {
-        self.replay_waiting_on_uniforms.clone()
+    pub(crate) fn replay_waiting_on_inputs(&self) -> Option<echora_gpu::renderer::SubmissionWait> {
+        self.replay_waiting_on_inputs.clone()
     }
 
     /// ECHORA_ASYNC_REPLAY: nvnEventSignal returns once its replay's first
@@ -5055,7 +5053,7 @@ impl Nvn {
                     }
                     if !force
                         && self.replay_budget.is_some()
-                        && rest.starts_with("Draw")
+                        && (rest.starts_with("Draw") || rest == "SetRenderEnableConditional")
                         && Self::replay_thread()
                         && self
                             .gpu
@@ -5063,13 +5061,13 @@ impl Nvn {
                             .is_some_and(gpu::Backend::has_pending_mapped_writes)
                     {
                         if let Some(wait) =
-                            self.defer_draw_uniform_reads(core, command)
+                            self.defer_replay_input_reads(core, command)
                                 .map_err(|message| Trap::InvalidState {
                                     message: format!("{}: {message}", command.name),
                                 })?
                         {
                             self.replay_paused = true;
-                            self.replay_waiting_on_uniforms = Some(wait);
+                            self.replay_waiting_on_inputs = Some(wait);
                             return Ok(progressed);
                         }
                         if let QueueItem::List { next, .. } =

@@ -7283,28 +7283,51 @@ impl Nvn {
         serial
     }
 
-    /// Check for a pending mapped uniform before starting a draw. The
-    /// ordinary draw still resolves its inputs after replay reacquires the
-    /// state. This only allows it to release the lock until the fence.
-    pub(super) fn defer_draw_uniform_reads(
+    /// Let replay release the lock while an input the command will read
+    /// is pending. The command resolves its inputs when replay resumes.
+    pub(super) fn defer_replay_input_reads(
         &mut self,
         core: &Guest,
         command: &Command,
     ) -> Result<Option<echora_gpu::renderer::SubmissionWait>, String> {
-        if empty_draw(command)
-            || (self.render.render_enable.is_some() && !self.render.gpu_render_condition)
-        {
-            return Ok(None);
-        }
-        let program = if command.name.contains("DrawMeshTasks") {
-            self.bound_mesh_program(core)
+        let (serial, stat) = if command.name == "nvnCommandBufferSetRenderEnableConditional" {
+            if super::debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_some() {
+                return Ok(None);
+            }
+            let mode = command.x[1] & 0xffff_ffff;
+            let Some(guest) = self
+                .conditional_comparison_address(mode, command.x[2])
+                .ok()
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            let Some(end) = guest.checked_add(8) else {
+                return Ok(None);
+            };
+            (
+                self.draw_input_write_serial(guest..end).unwrap_or(0),
+                "stat: replay deferred conditional counter reads",
+            )
         } else {
-            self.bound_program(core)
+            if empty_draw(command)
+                || (self.render.render_enable.is_some() && !self.render.gpu_render_condition)
+            {
+                return Ok(None);
+            }
+            let program = if command.name.contains("DrawMeshTasks") {
+                self.bound_mesh_program(core)
+            } else {
+                self.bound_program(core)
+            };
+            let Ok(program) = program else {
+                return Ok(None);
+            };
+            (
+                self.uniform_write_serial(&program.stages),
+                "stat: replay deferred mapped uniform reads",
+            )
         };
-        let Ok(program) = program else {
-            return Ok(None);
-        };
-        let serial = self.uniform_write_serial(&program.stages);
         let backend = self.gpu.as_mut().unwrap();
         if serial <= backend.renderer.completed_serial() {
             return Ok(None);
@@ -7316,7 +7339,7 @@ impl Nvn {
         }
         let wait = backend.renderer.submission_wait(serial)?;
         if wait.is_some() {
-            backend.stat("stat: replay deferred mapped uniform reads", 1);
+            backend.stat(stat, 1);
         }
         Ok(wait)
     }
@@ -9615,13 +9638,7 @@ impl Nvn {
         mode: u64,
         address: u64,
     ) -> Result<bool, String> {
-        let backend = self.gpu.as_ref().unwrap();
-        if backend.renderer.supports_conditions()
-            && backend.samples_reports.contains(&address)
-            && !backend.samples_reports.contains(&(address + 16))
-            && mode <= 1
-        {
-            let other = self.gpu_to_guest(address + 16, 8)?;
+        if let Some(other) = self.conditional_comparison_address(mode, address)? {
             self.resolve_draw_input(core, other, 8)?;
             if core
                 .memory
@@ -9639,6 +9656,26 @@ impl Nvn {
         }
         self.gpu_clear_condition();
         Ok(false)
+    }
+
+    /// Guest CPU address of the comparison operand read by `gpu_condition`.
+    fn conditional_comparison_address(
+        &self,
+        mode: u64,
+        address: u64,
+    ) -> Result<Option<u64>, String> {
+        let backend = self.gpu.as_ref().unwrap();
+        if mode > 1
+            || !backend.renderer.supports_conditions()
+            || !backend.samples_reports.contains(&address)
+        {
+            return Ok(None);
+        }
+        let second = address.checked_add(16).ok_or("counter address overflows")?;
+        if backend.samples_reports.contains(&second) {
+            return Ok(None);
+        }
+        self.gpu_to_guest(second, 8).map(Some)
     }
 
     /// Rendering is no longer gated on the GPU.
@@ -16860,7 +16897,7 @@ mod pool_tests {
 }
 
 #[cfg(test)]
-mod uniform_fence_tests {
+mod replay_input_wait_tests {
     use super::{Backend, BoundProgram, Guest, Nvn, SharedRange, vk};
     use crate::nvn::{Args, Command, GuestMemory, QueueItem, program_key};
     use echora_guest::{cpu::Cpu, memory::Memory};
@@ -16873,7 +16910,7 @@ mod uniform_fence_tests {
         let gpu = 0x20_0000;
         backend
             .shared_pieces
-            .insert(guest, vec![(0, 8, 1, 0), (8, 8, 2, 48)]);
+            .insert(guest, vec![(0, 8, 1, 0), (8, 8, 2, 48), (16, 8, 3, 0)]);
         backend.record_pool_share(guest);
         backend.renderer.resident_buffer(guest, 4096).unwrap();
         backend
@@ -16884,11 +16921,18 @@ mod uniform_fence_tests {
         backend.record_page_table_write(
             serial,
             Some(
-                vec![SharedRange {
-                    file: 2,
-                    start: 49,
-                    end: 50,
-                }]
+                vec![
+                    SharedRange {
+                        file: 2,
+                        start: 49,
+                        end: 50,
+                    },
+                    SharedRange {
+                        file: 3,
+                        start: 0,
+                        end: 8,
+                    },
+                ]
                 .into(),
             ),
         );
@@ -16973,21 +17017,10 @@ mod uniform_fence_tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn waiting_for_a_uniform_keeps_the_draw_at_the_queue_head() {
         let Some((mut nvn, stage, gpu_address, serial)) = uniform_fixture() else {
             return;
         };
-        if !Nvn::replay_thread()
-            || !nvn
-                .gpu
-                .as_ref()
-                .unwrap()
-                .renderer
-                .supports_submission_wait()
-        {
-            return;
-        }
         bind_uniform(&mut nvn, gpu_address + 9, 1);
         let key = (2, 3, nvn.fragment_output_types());
         nvn.program_memo.1.insert(
@@ -17007,13 +17040,45 @@ mod uniform_fence_tests {
             );
         }
         let draw = command("nvnCommandBufferDrawArrays", [0, 0, 0, 3, 0, 0, 0, 0]);
-        // The fixture only exercises the draw's preflight. It uses an
-        // already-resolved program memo and does not execute shader code.
+        assert_replay_input_wait(nvn, draw, serial);
+    }
+
+    #[test]
+    fn waiting_for_a_condition_counter_keeps_the_command_at_the_queue_head() {
+        let Some((mut nvn, _, gpu_address, serial)) = uniform_fixture() else {
+            return;
+        };
+        let backend = nvn.gpu.as_mut().unwrap();
+        if !backend.renderer.supports_conditions() {
+            return;
+        }
+        // The first operand is a GPU query. The condition setup checks the
+        // second operand on the CPU before using the GPU predicate.
+        backend.samples_reports.insert(gpu_address);
+        let condition = command(
+            "nvnCommandBufferSetRenderEnableConditional",
+            [0, 1, gpu_address, 0, 0, 0, 0, 0],
+        );
+        assert_replay_input_wait(nvn, condition, serial);
+    }
+
+    #[allow(unsafe_code)]
+    fn assert_replay_input_wait(mut nvn: Nvn, command: Command, serial: u64) {
+        if !Nvn::replay_thread()
+            || !nvn
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .supports_submission_wait()
+        {
+            return;
+        }
         nvn.pending
             .entry(5)
             .or_default()
             .push_back(QueueItem::List {
-                commands: Arc::new(vec![draw.clone()]),
+                commands: Arc::new(vec![command.clone()]),
                 next: 0,
                 descriptor_epoch: 0,
             });
@@ -17051,16 +17116,37 @@ mod uniform_fence_tests {
                 .queue_submit(gpu.queue, &[block], vk::Fence::null())
         }
         .unwrap();
-        let deferred = nvn.run_queue_work(5, &mut core, false);
-        let early = nvn
-            .replay_waiting_on_uniforms()
-            .map(|wait| wait.wait(Duration::ZERO));
-        let release = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
-        unsafe { gpu.device.signal_semaphore(&release) }.unwrap();
+        let release = || {
+            let signal = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
+            unsafe { gpu.device.signal_semaphore(&signal) }.unwrap();
+        };
+        // A regression may block replay in the command instead of yielding.
+        // Release the Vulkan queue in that case so the test can fail.
+        let (deferred, early, released_by_timer) = std::thread::scope(|scope| {
+            let (done, watchdog) = std::sync::mpsc::channel();
+            let timer = scope.spawn(move || {
+                if watchdog.recv_timeout(Duration::from_secs(3)).is_err() {
+                    release();
+                    true
+                } else {
+                    false
+                }
+            });
+            let deferred = nvn.run_queue_work(5, &mut core, false);
+            let early = nvn
+                .replay_waiting_on_inputs()
+                .map(|wait| wait.wait(Duration::ZERO));
+            let _ = done.send(());
+            (deferred, early, timer.join().unwrap())
+        });
+        if !released_by_timer {
+            release();
+        }
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
         renderer.wait_for(serial).unwrap();
         unsafe { gpu.device.destroy_semaphore(gate, None) };
 
+        assert!(!released_by_timer, "replay blocked on the Vulkan queue");
         assert!(!deferred.unwrap());
         assert!(nvn.replay_paused());
         assert!(matches!(
@@ -17068,10 +17154,10 @@ mod uniform_fence_tests {
             Some(QueueItem::List { next: 0, .. })
         ));
         assert!(!early.unwrap().unwrap());
-        let wait = nvn.replay_waiting_on_uniforms().unwrap();
+        let wait = nvn.replay_waiting_on_inputs().unwrap();
         assert!(wait.wait(Duration::ZERO).unwrap());
         assert!(
-            nvn.defer_draw_uniform_reads(&core, &draw)
+            nvn.defer_replay_input_reads(&core, &command)
                 .unwrap()
                 .is_none()
         );

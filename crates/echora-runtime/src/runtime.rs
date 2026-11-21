@@ -5185,7 +5185,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
             };
             let started = std::time::Instant::now();
             let result = nvn.resume_replay(&mut guest);
-            let waiting_on_uniforms = nvn.replay_waiting_on_uniforms();
+            let waiting_on_inputs = nvn.replay_waiting_on_inputs();
             nvn.note_replay_thread(started.elapsed());
             crate::timeline::span(u64::MAX, "replay", started, std::time::Instant::now());
             if let Err(trap) = result {
@@ -5195,8 +5195,8 @@ fn replay_thread(shared: &Shared, mut core: Core) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trap);
             }
             drop(nvn);
-            if let Some(wait) = waiting_on_uniforms
-                && let Err(message) = wait_for_replay_uniforms(wait, u64::MAX)
+            if let Some(wait) = waiting_on_inputs
+                && let Err(message) = wait_for_replay_inputs(wait, u64::MAX)
             {
                 *shared
                     .replay_failed
@@ -5224,8 +5224,8 @@ fn replay_thread(shared: &Shared, mut core: Core) {
     }
 }
 
-/// Leave the NVN lock available while the GPU reaches the draw's input.
-fn wait_for_replay_uniforms(
+/// Leave the NVN lock available while the GPU produces the command's input.
+fn wait_for_replay_inputs(
     wait: echora_gpu::renderer::SubmissionWait,
     thread: u64,
 ) -> Result<(), String> {
@@ -5235,7 +5235,7 @@ fn wait_for_replay_uniforms(
     if let Some(started) = started {
         crate::timeline::span(
             thread,
-            "replay-uniform-wait",
+            "replay-input-wait",
             started,
             std::time::Instant::now(),
         );
@@ -5787,10 +5787,10 @@ impl Worker {
             if !settle {
                 break;
             }
-            let waiting_on_uniforms = nvn.replay_waiting_on_uniforms();
+            let waiting_on_inputs = nvn.replay_waiting_on_inputs();
             drop(nvn);
-            if let Some(wait) = waiting_on_uniforms
-                && let Err(message) = wait_for_replay_uniforms(wait, self.core.current_thread_id)
+            if let Some(wait) = waiting_on_inputs
+                && let Err(message) = wait_for_replay_inputs(wait, self.core.current_thread_id)
             {
                 self.held_failed = Some(Some(Trap::InvalidState { message }));
                 return false;
