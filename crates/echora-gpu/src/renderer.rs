@@ -3484,6 +3484,16 @@ impl Renderer {
     /// Note the submissions that have finished, without waiting: their
     /// slots are freed and `completed_handle` moves on.
     pub fn poll_completed(&mut self) -> Result<(), String> {
+        self.poll_completed_fences(|device, fence| {
+            // SAFETY: the fence is live and the submit call has returned.
+            unsafe { device.get_fence_status(fence) }
+        })
+    }
+
+    fn poll_completed_fences(
+        &mut self,
+        fence_status: impl Fn(&ash::Device, vk::Fence) -> Result<bool, vk::Result>,
+    ) -> Result<(), String> {
         if let Some(error) = self
             .submitter
             .as_ref()
@@ -3492,19 +3502,21 @@ impl Renderer {
             return Err(error);
         }
         let signaled = |renderer: &Self, slot: &Slot| {
-            // SAFETY: the fence is live, and no vkQueueSubmit uses it now.
-            renderer.submit_returned(slot.handed)
-                && unsafe { renderer.gpu.device.get_fence_status(slot.fence) }.unwrap_or(false)
+            if renderer.submit_returned(slot.handed) {
+                fence_status(&renderer.gpu.device, slot.fence).map_err(vk_error("vkGetFenceStatus"))
+            } else {
+                Ok(false)
+            }
         };
         for index in 0..self.spares.len() {
-            if self.spares[index].in_flight && signaled(self, &self.spares[index]) {
+            if self.spares[index].in_flight && signaled(self, &self.spares[index])? {
                 self.swap_with(index);
                 let finished = self.finish_current(true);
                 self.swap_with(index);
                 finished?;
             }
         }
-        if self.slot.in_flight && signaled(self, &self.slot) {
+        if self.slot.in_flight && signaled(self, &self.slot)? {
             self.finish_current(true)?;
         }
         Ok(())
@@ -10754,6 +10766,34 @@ impl HangMarkers {
 mod submission_timeline_tests {
     use super::{Gpu, Renderer, vk};
     use std::time::Duration;
+
+    #[test]
+    fn fence_poll_reports_device_loss() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        renderer.resident_buffer(1, 4096).unwrap();
+        renderer.upload_resident(1, 0, &[12; 16]).unwrap();
+        let serial = renderer.recorded_serial();
+        renderer.submit_through(serial).unwrap();
+        if let Some(submitter) = &renderer.submitter {
+            submitter.progress.wait(submitter.handed).unwrap();
+        }
+
+        renderer.poll_completed_fences(|_, _| Ok(false)).unwrap();
+        let error = renderer
+            .poll_completed_fences(|_, _| Err(vk::Result::ERROR_DEVICE_LOST))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("vkGetFenceStatus: {}", vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(renderer.completed_serial() < serial);
+
+        renderer.wait_for(serial).unwrap();
+        assert_eq!(renderer.completed_serial(), serial);
+    }
 
     #[test]
     fn submission_timeline_tracks_serials_and_can_outlive_the_renderer() {
