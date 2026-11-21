@@ -8782,6 +8782,54 @@ mod tests {
         }
     }
 
+    /// A traced block (`ECHORA_TRACE_PCS`, read once per process) gets no
+    /// summary, nor do its callers; checked in a child process.
+    #[test]
+    fn window_call_summaries_refuse_traced_blocks() {
+        let at = |index: u64| 0x1000 + 4 * index;
+        if std::env::var_os("ECHORA_TRACE_PCS").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "codegen::tests::window_call_summaries_refuse_traced_blocks",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env("ECHORA_TRACE_PCS", format!("{:#x}", at(7)))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(traced_pcs().contains(&at(7)));
+        let words = [
+            bl(at(0), at(3)), // caller: A
+            bl(at(1), at(5)), // B
+            0xd400_00e1,      // svc #7
+            0x9100_0421,      // A: add x1, x1, #1
+            0xd65f_03c0,      // ret
+            bl(at(5), at(7)), // B: bl C
+            0xd65f_03c0,      // ret
+            0x9100_0442,      // C (traced): add x2, x2, #1
+            0xd65f_03c0,      // ret
+        ];
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        let summaries = window_call_summaries(&translation, &|_| Some(true));
+        assert!(summaries.contains_key(&at(3)));
+        assert!(!summaries.contains_key(&at(7)), "the traced block");
+        assert!(!summaries.contains_key(&at(5)), "its caller");
+        let options = EmitOptions {
+            window_calls: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        assert!(regions[0].1.contains("m.trace_hit();"));
+    }
+
     #[test]
     fn window_call_chains_stop_at_the_depth_limit() {
         // A caller, then 18 functions each keeping a frame and calling the
