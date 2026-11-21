@@ -82,6 +82,7 @@ read.
 | `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. |
 | `ECHORA_GPU=0` | Run without the GPU backend. |
 | `ECHORA_ALLOW_OLD_RADV=1` | Run on a Mesa RADV driver older than 26.1.4, which Echora otherwise refuses at start: those versions hang the GPU on the game's task shader draws, and after the kernel resets the GPU every later run hangs until a reboot. For debugging the driver only. |
+| `ECHORA_UNBOUNDED_WRITE_WAITS=1` | CPU reads of guest memory wait for every pending shader store through the GPU page table, not only for the dispatches whose analysed write ranges overlap the read. For checking whether a stale read comes from those ranges. |
 | `ECHORA_AUDIO_THREAD=0` | Mix the game's sound on the game's own threads under the machine lock, as before, instead of on a host thread of its own. For comparing the two. |
 | `ECHORA_NO_DMA_BUF=1` | Copy draws' storage buffers for the GPU instead of sharing guest memory with it through udmabuf (Linux). Sharing is used when `/dev/udmabuf` and the driver allow it. |
 | `ECHORA_PACK_DMA_SPANS=0` | Keep individual Linux DMA-BUF imports when rebuilding the GPU page table. Packing discontiguous ranges into fewer imports is enabled by default when the kernel and driver accept them. |

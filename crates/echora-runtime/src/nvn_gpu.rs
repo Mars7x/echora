@@ -896,6 +896,10 @@ impl Backend {
             self.page_table_writes = false;
             return Ok(());
         }
+        // ECHORA_UNBOUNDED_WRITE_WAITS (debugging): every read waits for
+        // all page-table writes, not only the dispatches whose bounded write
+        // ranges overlap it, to tell a stale read caused by the bounds apart.
+        let range = range.filter(|_| super::debug_var_os("ECHORA_UNBOUNDED_WRITE_WAITS").is_none());
         let serial = range.map_or(self.page_table_write_serial, |range| {
             self.shared_write_serial(range)
         });
@@ -2071,18 +2075,25 @@ impl Nvn {
             format == target.format
                 || echora_gpu::renderer::srgb_twin(target.format) == Some(format)
         });
+        // Not read back from the target (counted in the report's notes): the
+        // copy reads guest memory instead, as before rendered targets were
+        // read back at all, rather than ending the run.
         if info.block_width != 1 || info.block_height != 1 || !exact_format {
-            return Err(format!(
-                "raw readback of rendered format {} is unsupported",
+            backend.note(format!(
+                "texel readback of rendered format {} read guest memory instead",
                 info.name
             ));
+            return Ok(false);
         }
         let planes = match target.shape {
             ImageShape::D3 { depth } if level < 32 => (depth >> level).max(1),
             shape => shape.layers(),
         };
+        // The texture has levels or layers the rendered target lacks: those
+        // were never rendered, so guest memory holds them.
         if level >= target.levels || layer.checked_add(layers).is_none_or(|end| end > planes) {
-            return Err("texture copy subresources are outside the rendered target".into());
+            backend.note("texel readback outside the rendered target read guest memory instead");
+            return Ok(false);
         }
         let combined = target.format == vk::Format::D32_SFLOAT_S8_UINT;
         let texel = info.bytes_per_block;
@@ -5513,11 +5524,16 @@ impl Nvn {
         use echora_gpu::renderer::ArchiveRequest;
         backend.renderer.finish_target_archives()?;
         let present = self.presented_frames;
+        // Targets moved or discarded since they retired leave the map.
+        let renderer = &backend.renderer;
+        backend
+            .retired_since
+            .retain(|&key, _| renderer.existing_target(key).is_some());
         let mut candidates: Vec<_> = backend
             .retired_since
             .iter()
             .filter_map(|(&key, &seen)| {
-                if present.saturating_sub(seen) < 24 {
+                if present.saturating_sub(seen) < ARCHIVE_AFTER_PRESENTS {
                     return None;
                 }
                 let target = backend.renderer.existing_target(key)?;
@@ -5526,7 +5542,7 @@ impl Nvn {
             })
             .collect();
         candidates.sort_unstable();
-        for (_, key) in candidates.into_iter().take(6) {
+        for (_, key) in candidates.into_iter().take(ARCHIVES_PER_SUBMIT) {
             match backend.renderer.queue_target_archive(key)? {
                 ArchiveRequest::Queued | ArchiveRequest::Ineligible => {
                     backend.retired_since.remove(&key);
@@ -17163,3 +17179,10 @@ mod replay_input_wait_tests {
         );
     }
 }
+
+/// Presents a retired render target stays unused before it is compressed
+/// and archived (a scene's targets come back within a few frames).
+const ARCHIVE_AFTER_PRESENTS: u64 = 24;
+/// Archives queued per submission, largest first, so one submission does
+/// not hand the compressing thread a whole scene's targets at once.
+const ARCHIVES_PER_SUBMIT: usize = 6;
