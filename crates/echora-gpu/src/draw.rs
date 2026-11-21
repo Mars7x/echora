@@ -208,6 +208,30 @@ struct DrawScratch {
     dynamic_offsets: Vec<u32>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<u64>,
+    /// Buffer bindings' sources (`BufferPlan`), emptied between draws.
+    plans: Vec<BufferPlan<'static>>,
+}
+
+/// Where a uniform or storage buffer binding's contents come from, as the
+/// draw's maps give them (looked up once per draw).
+#[derive(Clone, Copy)]
+enum BufferPlan<'a> {
+    /// Read by the GPU in place: buffer, offset and length.
+    InPlace(vk::Buffer, u64, u64),
+    /// Copied into the ring.
+    Bytes(&'a [u8]),
+    /// Read from guest memory (address, length) into the ring.
+    Guest(u64, usize),
+}
+
+/// An empty vector of another lifetime's plans, keeping the allocation
+/// (collecting a mapped vector of a same-sized type reuses it).
+fn relifetime<'b>(mut plans: Vec<BufferPlan<'_>>) -> Vec<BufferPlan<'b>> {
+    plans.clear();
+    plans
+        .into_iter()
+        .map(|_| unreachable!("the vector is empty"))
+        .collect()
 }
 
 impl GraphicsState {
@@ -1266,6 +1290,7 @@ impl Renderer {
         // written below.
         let mut scratch = std::mem::take(&mut self.graphics.scratch);
         scratch.textures.clear();
+        let mut plans: Vec<BufferPlan<'_>> = relifetime(std::mem::take(&mut scratch.plans));
         let mut bytes = 0;
         let mut descriptors = [0u32; 4];
         for (stage_index, stage) in program.stages.iter().enumerate() {
@@ -1339,20 +1364,44 @@ impl Renderer {
                         descriptors[1] += 1;
                     }
                     DescriptorKind::StorageBuffer => {
-                        if !draw.storage_in_place.contains_key(&key) {
-                            let length = draw.storage.get(&key).map_or(16, Vec::len);
-                            bytes += descriptor_buffer_range(length) + 256;
+                        let plan = match draw.storage_in_place.get(&key) {
+                            Some(&(buffer, offset, length)) => {
+                                BufferPlan::InPlace(buffer, offset, length)
+                            }
+                            None => BufferPlan::Bytes(
+                                draw.storage.get(&key).map_or(&[0; 16], Vec::as_slice),
+                            ),
+                        };
+                        if let BufferPlan::Bytes(data) = plan {
+                            bytes += descriptor_buffer_range(data.len()) + 256;
                         }
+                        plans.push(plan);
                         descriptors[2] += 1;
                     }
                     _ => {
-                        if !draw.uniforms_in_place.contains_key(&key) {
-                            let length = match draw.uniforms.get(&key) {
-                                Some(bytes) => bytes.len(),
-                                None => draw.guest_uniforms.get(&key).map_or(16, |read| read.1),
-                            };
-                            bytes += descriptor_buffer_range(length) + 256;
+                        let plan = match draw.uniforms_in_place.get(&key) {
+                            Some(&(buffer, offset, length)) => {
+                                BufferPlan::InPlace(buffer, offset, length)
+                            }
+                            None => match draw.uniforms.get(&key) {
+                                Some(data) => BufferPlan::Bytes(data),
+                                None => match draw.guest_uniforms.get(&key) {
+                                    Some(&(guest, length)) => {
+                                        bytes += descriptor_buffer_range(length) + 256;
+                                        if draw.read_guest.is_some() {
+                                            BufferPlan::Guest(guest, length)
+                                        } else {
+                                            BufferPlan::Bytes(&[])
+                                        }
+                                    }
+                                    None => BufferPlan::Bytes(&[]),
+                                },
+                            },
+                        };
+                        if let BufferPlan::Bytes(data) = plan {
+                            bytes += descriptor_buffer_range(data.len()) + 256;
                         }
+                        plans.push(plan);
                         descriptors[0] += 1;
                     }
                 }
@@ -1386,23 +1435,19 @@ impl Renderer {
         dynamic_offsets.clear();
         dynamic_offsets.resize(program.dynamic_uniforms.len(), 0);
         let mut textures = scratch.textures.drain(..);
+        let mut buffer_plans = plans.drain(..);
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
                 let source = match descriptor.kind() {
                     DescriptorKind::UniformBuffer => {
-                        let (buffer, offset, range) = match (
-                            draw.uniforms.get(&key),
-                            draw.guest_uniforms.get(&key),
-                            draw.read_guest,
-                        ) {
-                            _ if let Some(&(buffer, offset, length)) =
-                                draw.uniforms_in_place.get(&key) =>
-                            {
+                        let plan = buffer_plans.next().expect("planned with the sizes");
+                        let (buffer, offset, range) = match (plan, draw.read_guest) {
+                            (BufferPlan::InPlace(buffer, offset, length), _) => {
                                 (buffer, offset, length.max(16).next_multiple_of(16))
                             }
-                            (Some(bytes), ..) => self.ring_upload_padded(bytes)?,
-                            (None, Some(&(guest, length)), Some(read)) => {
+                            (BufferPlan::Bytes(bytes), _) => self.ring_upload_padded(bytes)?,
+                            (BufferPlan::Guest(guest, length), Some(read)) => {
                                 let range = descriptor_buffer_range(length);
                                 let (buffer, offset) =
                                     self.ring_upload_with(range, 256, |ring| {
@@ -1415,7 +1460,7 @@ impl Renderer {
                                     })?;
                                 (buffer, offset, range)
                             }
-                            _ => self.ring_upload_padded(&[])?,
+                            (BufferPlan::Guest(..), None) => self.ring_upload_padded(&[])?,
                         };
                         let mut info = vk::DescriptorBufferInfo {
                             buffer,
@@ -1439,24 +1484,22 @@ impl Renderer {
                         }
                     }
                     DescriptorKind::StorageBuffer => {
-                        let (buffer, offset, range) = if let Some(&(buffer, offset, length)) =
-                            draw.storage_in_place.get(&key)
-                        {
-                            (buffer, offset, length.max(16).next_multiple_of(16))
-                        } else {
-                            let bytes = draw
-                                .storage
-                                .get(&key)
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[0; 16]);
-                            let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
-                            // Only buffers the stage writes come back
-                            // (flags bit 0).
-                            if descriptor.flags & 1 != 0 {
-                                written.push((key, offset, bytes.len()));
-                            }
-                            (buffer, offset, range)
-                        };
+                        let plan = buffer_plans.next().expect("planned with the sizes");
+                        let (buffer, offset, range) =
+                            if let BufferPlan::InPlace(buffer, offset, length) = plan {
+                                (buffer, offset, length.max(16).next_multiple_of(16))
+                            } else {
+                                let BufferPlan::Bytes(bytes) = plan else {
+                                    unreachable!("storage is in place or copied");
+                                };
+                                let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
+                                // Only buffers the stage writes come back
+                                // (flags bit 0).
+                                if descriptor.flags & 1 != 0 {
+                                    written.push((key, offset, bytes.len()));
+                                }
+                                (buffer, offset, range)
+                            };
                         DescriptorSource::Buffer(
                             vk::DescriptorType::STORAGE_BUFFER,
                             vk::DescriptorBufferInfo {
@@ -1475,6 +1518,8 @@ impl Renderer {
             }
         }
         drop(textures);
+        drop(buffer_plans);
+        scratch.plans = relifetime(plans);
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
         let matching = program
             .last_set
