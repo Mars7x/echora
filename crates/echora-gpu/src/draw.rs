@@ -161,6 +161,19 @@ pub(crate) struct GraphicsState {
     pool_set: Option<vk::DescriptorSet>,
     // Dynamic vertex input remains set across shader object bindings.
     vertex_input: Option<VertexInput>,
+    // Per-draw working space, kept to reuse its allocations.
+    scratch: DrawScratch,
+}
+
+#[derive(Default)]
+struct DrawScratch {
+    /// The draw's descriptors by binding.
+    writes: Vec<(u32, DescriptorSource)>,
+    /// Texture and texel buffer descriptors, in the program's order.
+    textures: Vec<DescriptorSource>,
+    dynamic_offsets: Vec<u32>,
+    vertex_buffers: Vec<vk::Buffer>,
+    vertex_offsets: Vec<u64>,
 }
 
 impl GraphicsState {
@@ -1212,6 +1225,10 @@ impl Renderer {
         self.lap("stat: renderer ns texture pool", &mut since);
         // Textures first: an upload may flush. Then room for everything
         // else, so nothing flushes while this draw is recorded.
+        // Each texture's view and sampler are resolved here, once, and
+        // written below.
+        let mut scratch = std::mem::take(&mut self.graphics.scratch);
+        scratch.textures.clear();
         let mut bytes = 0;
         let mut descriptors = [0u32; 4];
         for (stage_index, stage) in program.stages.iter().enumerate() {
@@ -1219,15 +1236,35 @@ impl Renderer {
                 let key = (stage_index, descriptor.binding);
                 match descriptor.kind() {
                     DescriptorKind::Texture => {
-                        if let Some((source, _)) = draw.textures.get(&key) {
-                            self.texture_view(source, descriptor.texture_type)?;
-                        }
+                        let Some((source, sampler)) = draw.textures.get(&key) else {
+                            return Err(format!(
+                                "no texture for stage {stage_index} binding {}",
+                                descriptor.binding
+                            ));
+                        };
+                        let view =
+                            self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
+                        let sampler =
+                            self.sampler(sampler, descriptor.flags & Descriptor::INTEGER != 0)?;
+                        scratch
+                            .textures
+                            .push(DescriptorSource::Image(vk::DescriptorImageInfo {
+                                sampler,
+                                image_view: view,
+                                image_layout: vk::ImageLayout::GENERAL,
+                            }));
                         descriptors[1] += 1;
                     }
                     DescriptorKind::TextureBuffer => {
-                        if let Some((source, _)) = draw.textures.get(&key) {
-                            self.texel_buffer_view(source)?;
-                        }
+                        let Some((source, _)) = draw.textures.get(&key) else {
+                            return Err(format!(
+                                "no texel buffer for stage {stage_index} binding {}",
+                                descriptor.binding
+                            ));
+                        };
+                        scratch.textures.push(DescriptorSource::TexelBuffer(
+                            self.texel_buffer_view(source)?,
+                        ));
                         descriptors[1] += 1;
                     }
                     DescriptorKind::StorageBuffer => {
@@ -1271,9 +1308,13 @@ impl Renderer {
         self.lap("stat: renderer ns reserve", &mut since);
         // Uploads and descriptor writes first: they record copies that must
         // precede rendering.
-        let mut writes = Vec::with_capacity(descriptors.iter().sum::<u32>() as usize);
+        let mut writes = std::mem::take(&mut scratch.writes);
+        writes.clear();
         let mut written = Vec::new();
-        let mut dynamic_offsets = vec![0; program.dynamic_uniforms.len()];
+        let mut dynamic_offsets = std::mem::take(&mut scratch.dynamic_offsets);
+        dynamic_offsets.clear();
+        dynamic_offsets.resize(program.dynamic_uniforms.len(), 0);
+        let mut textures = scratch.textures.drain(..);
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
@@ -1354,37 +1395,15 @@ impl Renderer {
                             },
                         )
                     }
-                    DescriptorKind::Texture => {
-                        let Some((source, sampler)) = draw.textures.get(&key) else {
-                            return Err(format!(
-                                "no texture for stage {stage_index} binding {}",
-                                descriptor.binding
-                            ));
-                        };
-                        let view =
-                            self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
-                        let sampler =
-                            self.sampler(sampler, descriptor.flags & Descriptor::INTEGER != 0)?;
-                        DescriptorSource::Image(vk::DescriptorImageInfo {
-                            sampler,
-                            image_view: view,
-                            image_layout: vk::ImageLayout::GENERAL,
-                        })
-                    }
-                    DescriptorKind::TextureBuffer => {
-                        let Some((source, _)) = draw.textures.get(&key) else {
-                            return Err(format!(
-                                "no texel buffer for stage {stage_index} binding {}",
-                                descriptor.binding
-                            ));
-                        };
-                        DescriptorSource::TexelBuffer(self.texel_buffer_view(source)?)
-                    }
+                    DescriptorKind::Texture | DescriptorKind::TextureBuffer => textures
+                        .next()
+                        .expect("each texture was resolved before the uploads"),
                     other => return Err(format!("{other:?} bindings are not modeled")),
                 };
                 writes.push((descriptor.binding, source));
             }
         }
+        drop(textures);
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
         let matching = if !dynamic_offsets.is_empty()
             && self.graphics.program == Some(program.pipeline_layout)
@@ -1417,14 +1436,17 @@ impl Renderer {
         };
         self.lap("stat: renderer ns descriptor set", &mut since);
         // Vertex streams and indices.
-        let mut vertex_buffers = Vec::new();
+        scratch.vertex_buffers.clear();
+        scratch.vertex_offsets.clear();
         for stream in &draw.streams {
-            vertex_buffers.push(match (stream.guest, draw.read_guest) {
+            let (buffer, offset) = match (stream.guest, draw.read_guest) {
                 (Some((guest, length)), Some(read)) if length > 0 => {
                     self.ring_upload_with(length as u64, 16, |bytes| read(guest, bytes))?
                 }
                 _ => self.ring_upload(&stream.data, 16)?,
-            });
+            };
+            scratch.vertex_buffers.push(buffer);
+            scratch.vertex_offsets.push(offset);
         }
         let index = match &draw.indices {
             Indices::None => None,
@@ -1498,8 +1520,11 @@ impl Renderer {
         )?;
         self.apply_condition()?;
         let commands = self.recording_commands()?;
-        let objects = self.gpu.shader_objects()?.clone();
-        let device = self.gpu.device.clone();
+        // The device's function tables by reference (cloning them copies
+        // hundreds of pointers per draw).
+        let gpu = self.gpu.clone();
+        let objects = gpu.shader_objects()?;
+        let device = &gpu.device;
         let fixed = &draw.fixed;
         if draw.mesh.is_some() && self.gpu.mesh_shader.is_none() {
             return Err("the device has no task and mesh stages".into());
@@ -1650,10 +1675,13 @@ impl Renderer {
                 &dynamic_offsets,
             );
             if !reused && !dynamic_offsets.is_empty() {
-                self.graphics.dynamic_set = Some(DynamicSet {
+                // The replaced set's list is the next draw's to fill.
+                if let Some(old) = self.graphics.dynamic_set.replace(DynamicSet {
                     set,
-                    bindings: writes,
-                });
+                    bindings: std::mem::take(&mut writes),
+                }) {
+                    writes = old.bindings;
+                }
             }
             if let Some(pool) = pool
                 && self.graphics.pool_set != Some(pool)
@@ -1694,10 +1722,15 @@ impl Renderer {
                 );
             }
             if draw.mesh.is_none() {
-                self.set_vertex_input(commands, &objects, draw);
+                self.set_vertex_input(commands, objects, draw);
             }
-            for (index, (buffer, offset)) in vertex_buffers.iter().enumerate() {
-                device.cmd_bind_vertex_buffers(commands, index as u32, &[*buffer], &[*offset]);
+            if !scratch.vertex_buffers.is_empty() {
+                device.cmd_bind_vertex_buffers(
+                    commands,
+                    0,
+                    &scratch.vertex_buffers,
+                    &scratch.vertex_offsets,
+                );
             }
             if self.graphics.raster.is_none() {
                 objects.cmd_set_rasterizer_discard_enable(commands, false);
@@ -1862,6 +1895,9 @@ impl Renderer {
         if *PASS_PER_DRAW.get_or_init(|| std::env::var_os("ECHORA_PASS_PER_DRAW").is_some()) {
             self.end_pass();
         }
+        scratch.writes = writes;
+        scratch.dynamic_offsets = dynamic_offsets;
+        self.graphics.scratch = scratch;
         self.time_item(false);
         self.lap("stat: renderer ns commands", &mut since);
         Ok(written
