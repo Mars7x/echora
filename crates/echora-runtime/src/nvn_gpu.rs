@@ -10045,8 +10045,11 @@ impl Nvn {
         mode: u64,
         address: u64,
     ) -> Result<bool, String> {
+        // Why a condition is left to the CPU, counted.
+        let mut why = "stat: CPU conditions: not a lone samples report";
         if let Some(other) = self.conditional_comparison_address(mode, address)? {
             self.resolve_draw_input(core, other, 8)?;
+            why = "stat: CPU conditions: comparison word nonzero";
             if core
                 .memory
                 .read_u64(other)
@@ -10059,7 +10062,11 @@ impl Nvn {
                     renderer.set_condition(Some((buffer, offset, mode == 0)));
                     return Ok(true);
                 }
+                why = "stat: CPU conditions: report not in a resident pool";
             }
+        }
+        if let Some(backend) = self.gpu.as_mut() {
+            backend.stat(why, 1);
         }
         self.gpu_clear_condition();
         Ok(false)
