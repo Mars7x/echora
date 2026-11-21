@@ -246,34 +246,79 @@ fn lifted_functions_in_some_regions_match_the_reference() {
 /// The callers with window calls (`EmitOptions::window_calls`): a BL to a
 /// target with a summary runs its window directly, storing and reloading
 /// only what the summary says it may touch; in one region, and through
-/// the window-call table across 1 KiB regions.
+/// the window-call table across 1 KiB regions. Each in a child process of
+/// its own, so its window table is the one `Core::call` uses.
 #[test]
 fn window_calls_match_the_reference() {
-    window_check(
-        call_window_code::SUMMARIZED_CALLS,
-        call_window_code::dispatch,
-        call_window_code::install,
-    );
+    window_check("call_window_code", call_window_code::SUMMARIZED_CALLS);
 }
 
 #[test]
 fn window_calls_through_the_table_match_the_reference() {
     window_check(
+        "call_window_table_code",
         call_window_table_code::SUMMARIZED_CALLS,
-        call_window_table_code::dispatch,
-        call_window_table_code::install,
     );
 }
 
-fn window_check(summarized: usize, dispatch: fn(&mut Core) -> Result<(), Trap>, install: fn()) {
+/// The child's environment variable: the window-call lift to check.
+const WINDOW_CHILD: &str = "ECHORA_CALLS_WINDOW_LIFT";
+
+#[test]
+fn window_call_child() {
+    let Ok(lift) = std::env::var(WINDOW_CHILD) else {
+        return;
+    };
+    let (dispatch, install, installed): (fn(&mut Core) -> Result<(), Trap>, fn(), fn() -> bool) =
+        match lift.as_str() {
+            "call_window_code" => (
+                call_window_code::dispatch,
+                call_window_code::install,
+                call_window_code::window_calls_installed,
+            ),
+            "call_window_table_code" => (
+                call_window_table_code::dispatch,
+                call_window_table_code::install,
+                call_window_table_code::window_calls_installed,
+            ),
+            other => panic!("unknown lift {other}"),
+        };
+    install();
     // Structured emission and lifted functions turn window calls off.
     let off = cfg!(feature = "structured") || cfg!(feature = "functions");
+    assert!(off || installed(), "the window-call table is not installed");
+    check_installed(dispatch);
+}
+
+fn window_check(lift: &str, summarized: usize) {
+    let off = cfg!(feature = "structured") || cfg!(feature = "functions");
     assert!(off || summarized > 0, "no summarized window calls");
-    install();
-    check(dispatch);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "window_call_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(WINDOW_CHILD, lift)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    println!("{text}");
+    assert!(
+        output.status.success(),
+        "{lift}: {text}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
+    call_code::install();
+    check_installed(dispatch);
+}
+
+/// `check` with whatever window table the process has installed.
+fn check_installed(dispatch: fn(&mut Core) -> Result<(), Trap>) {
     let words = call_code::WORDS;
     let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
     let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -281,7 +326,6 @@ fn check(dispatch: fn(&mut Core) -> Result<(), Trap>) {
     m.memory
         .map(STACK, STACK_SIZE, READ | WRITE, STATE_NORMAL, "stack")
         .expect("map stack");
-    call_code::install();
     let mut random = Random(0x1f83_d9ab_fb41_bd6b);
     let memory: Vec<u8> = (0..DATA_SIZE).map(|_| random.next() as u8).collect();
     let stack: Vec<u8> = (0..STACK_SIZE).map(|_| random.next() as u8).collect();

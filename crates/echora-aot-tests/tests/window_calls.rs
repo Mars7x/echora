@@ -1,14 +1,21 @@
 //! Window calls (`EmitOptions::window_calls`) against the build's own
 //! emission: game-shaped callers and functions (`build.rs`'s
-//! `window_call_code`: frames, BL and BLR, jumps through BR, early
-//! returns elsewhere, SVCs the host completes, recursion, a UDF on some
-//! paths) lifted without window calls, with them in one region, with them
-//! across 1 KiB regions through the window-call table, and with them in
-//! every other 1 KiB region. Every caller runs from random states to its
-//! end, in slices (host boundaries every few instructions, resumed through
-//! the dispatcher) and against a budget; registers, SP, NZCV, the PC, the
-//! step count, the trap, the data memory and the stack must be the same
-//! for every lift.
+//! `window_call_code`: frames, BL and BLR, B tail calls, a jump through
+//! BR, BR X30 and RETAA returns, early returns to another window, SVCs the
+//! host completes, recursion, UDF faults, PLT stub calls and tail calls,
+//! float and SIMD instructions, a function falling through into the next
+//! window, a jump into a block's middle) lifted in pairs without and with
+//! window calls: the build's options (in one region, through the
+//! window-call table across 1 KiB regions, in every other region, with
+//! early exits, audited), and with deferred charges, the step count in a
+//! local, dense dispatch, direct calls and stub windows. Every caller runs
+//! from random states (registers, vectors, flags, FPCR, memory) to its
+//! end, in slices (host boundaries every few instructions, resumed
+//! through the dispatcher) and against a budget; general and vector
+//! registers, SP, NZCV, FPCR, FPSR, the PC, the step and boundary counts,
+//! the trap, the data memory and the stack must be the same with and
+//! without window calls. The runs to the end are also checked against the
+//! reference interpreter where it covers every instruction run.
 //!
 //! The window table `Core::call` uses is one per process (the first lift
 //! installed), so each lift runs in a child process of its own and prints a
@@ -20,6 +27,7 @@ mod common;
 
 use common::*;
 use echora_aot_tests::{Core, Machine, READ, STATE_NORMAL, Trap, WRITE};
+use echora_lift::aarch64::{Instruction, MemoryOp, Writeback, decode};
 
 #[allow(
     missing_debug_implementations,
@@ -32,17 +40,108 @@ use echora_aot_tests::{Core, Machine, READ, STATE_NORMAL, Trap, WRITE};
 mod lifted {
     include!(concat!(env!("OUT_DIR"), "/lifted_window_call.rs"));
 }
-use lifted::{
-    window_call_base, window_call_mixed, window_call_on, window_call_program, window_call_table,
-};
+use lifted::*;
 
 const STACK: u64 = 0xc0_0000;
 const STACK_SIZE: u64 = 0x2000;
 const STATES_PER_CALLER: usize = 12;
 /// The child's environment variable: the lift to run.
 const CHILD: &str = "ECHORA_WINDOW_CALL_LIFT";
+const SVC_EXIT: u32 = 0xd400_00e1;
 
 type Dispatch = fn(&mut Core) -> Result<(), Trap>;
+
+/// A program's code and its fixed addresses (`window_call_program` of a
+/// lift module).
+struct Program {
+    base: u64,
+    words: &'static [u32],
+    callers: &'static [u64],
+    got_slot: u64,
+    got_word: u64,
+    missing: u64,
+}
+
+macro_rules! program {
+    ($module:path) => {{
+        use $module as program;
+        Program {
+            base: program::BASE,
+            words: program::WORDS,
+            callers: program::CALLERS,
+            got_slot: program::GOT_SLOT,
+            got_word: program::GOT_WORD,
+            missing: program::MISSING,
+        }
+    }};
+}
+
+/// The program with float and SIMD bodies, and its integer twin.
+fn programs() -> (Program, Program) {
+    (
+        program!(window_call_program),
+        program!(window_call_int::window_call_program),
+    )
+}
+
+/// Every lift by name: its dispatcher, `install`, whether every region
+/// making window calls has its table, and the census and call counts.
+struct Lift {
+    name: &'static str,
+    dispatch: Dispatch,
+    install: fn(),
+    installed: fn() -> bool,
+    census: (usize, usize, usize, usize),
+    summarized: usize,
+}
+
+macro_rules! lift {
+    ($module:ident) => {
+        Lift {
+            name: stringify!($module),
+            dispatch: $module::dispatch,
+            install: $module::install,
+            installed: $module::window_calls_installed,
+            census: $module::CENSUS,
+            summarized: $module::DIRECT_CALLS + $module::TABLE_CALLS,
+        }
+    };
+}
+
+fn lifts() -> Vec<Lift> {
+    vec![
+        lift!(window_call_base),
+        lift!(window_call_on),
+        lift!(window_call_table),
+        lift!(window_call_mixed),
+        lift!(window_call_early),
+        lift!(window_call_audit),
+        lift!(window_call_deferred_base),
+        lift!(window_call_deferred_on),
+        lift!(window_call_steps_base),
+        lift!(window_call_steps_on),
+        lift!(window_call_dense_base),
+        lift!(window_call_dense_on),
+        lift!(window_call_direct_base),
+        lift!(window_call_direct_on),
+        lift!(window_call_stub_base),
+        lift!(window_call_stub_on),
+    ]
+}
+
+/// Each lift with window calls and the lift without them it must match.
+const PAIRS: &[(&str, &str)] = &[
+    ("window_call_base", "window_call_on"),
+    ("window_call_base", "window_call_table"),
+    ("window_call_base", "window_call_mixed"),
+    ("window_call_base", "window_call_early"),
+    ("window_call_base", "window_call_audit"),
+    ("window_call_deferred_base", "window_call_deferred_on"),
+    ("window_call_steps_base", "window_call_steps_on"),
+    ("window_call_dense_base", "window_call_dense_on"),
+    ("window_call_direct_base", "window_call_direct_on"),
+    ("window_call_stub_base", "window_call_stub_on"),
+];
 
 /// How a run is driven: to its end, in slices of this many instructions
 /// (rounded to blocks), or with this budget.
@@ -53,14 +152,52 @@ enum Mode {
     Budget(u64),
 }
 
-/// Runs `entry` from `state` to its SVC #7, a trap or the budget; the
-/// host completes SVC #3 (X0 gets the step count) and resumes after it.
-/// The outcome as text: the trap, PC, steps, NZCV, SP and registers, and
-/// a hash of the data memory and the stack.
-fn run(m: &mut Machine, dispatch: Dispatch, entry: u64, state: &State, mode: Mode) -> String {
+/// A run's starting state: registers, SP, NZCV and data memory, vectors,
+/// FPCR, the stack.
+#[derive(Clone)]
+struct Start {
+    state: State,
+    vectors: [u128; 32],
+    fpcr: u32,
+    stack: Vec<u8>,
+}
+
+/// What a run ends with (for the reference comparison).
+#[derive(Debug, PartialEq)]
+struct End {
+    trap: String,
+    x: [u64; 31],
+    sp: u64,
+    nzcv: u8,
+    memory: Vec<u8>,
+    stack: Vec<u8>,
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Runs `entry` from `start` to its SVC #7, a trap or the budget; the
+/// host completes SVC #3 (X0 ^= 0x5555) and resumes after it. The outcome
+/// as text (the trap, PC, steps, boundaries, NZCV, SP, FPCR, FPSR,
+/// registers, and hashes of the vectors, the data memory and the stack),
+/// and the end state.
+fn run(
+    m: &mut Machine,
+    dispatch: Dispatch,
+    entry: u64,
+    start: &Start,
+    mode: Mode,
+) -> (String, End) {
+    let state = &start.state;
     m.core.cpu.regs = state.x;
     m.core.cpu.sp = state.sp;
     m.core.cpu.nzcv = state.nzcv;
+    m.core.cpu.vectors = start.vectors;
+    m.core.cpu.fpcr = start.fpcr;
+    m.core.cpu.fpsr = 0;
     m.core.cpu.pc = entry;
     m.core.steps = 0;
     m.core.spin_polls = 0;
@@ -75,9 +212,9 @@ fn run(m: &mut Machine, dispatch: Dispatch, entry: u64, state: &State, mode: Mod
     m.core.host_check_at = next_check(0);
     m.core.rearm();
     m.memory.write(DATA, &state.memory).expect("data is mapped");
-    let mut random = Random(state.x[0] | 1);
-    let stack: Vec<u8> = (0..STACK_SIZE).map(|_| random.next() as u8).collect();
-    m.memory.write(STACK, &stack).expect("stack is mapped");
+    m.memory
+        .write(STACK, &start.stack)
+        .expect("stack is mapped");
     let mut boundaries = 0u64;
     let trap = loop {
         match dispatch(&mut m.core) {
@@ -91,7 +228,7 @@ fn run(m: &mut Machine, dispatch: Dispatch, entry: u64, state: &State, mode: Mod
             Err(Trap::SupervisorCall { number: 3 }) => {
                 m.core.settle_block_trap();
                 m.core.memory.clear_exclusive();
-                m.core.cpu.regs[0] = m.core.steps;
+                m.core.cpu.regs[0] ^= 0x5555;
                 m.core.cpu.pc += 4;
             }
             Err(trap) => break trap,
@@ -102,46 +239,54 @@ fn run(m: &mut Machine, dispatch: Dispatch, entry: u64, state: &State, mode: Mod
     m.memory.read(DATA, &mut memory).expect("data is mapped");
     let mut stack = vec![0; STACK_SIZE as usize];
     m.memory.read(STACK, &mut stack).expect("stack is mapped");
-    let fnv = |bytes: &[u8]| {
-        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    };
     let cpu = &m.core.cpu;
-    format!(
-        "{trap:?} pc {:#x} steps {} boundaries {} nzcv {:x} sp {:#x} x {:x?} memory {:016x} stack {:016x}",
+    let vectors: Vec<u8> = cpu.vectors.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let text = format!(
+        "{trap:?} pc {:#x} steps {} boundaries {} nzcv {:x} sp {:#x} fpcr {:#x} fpsr {:#x} x {:x?} vectors {:016x} memory {:016x} stack {:016x}",
         cpu.pc,
         m.core.steps,
         // Slices end at the same block boundaries in every lift.
         boundaries,
         cpu.nzcv,
         cpu.sp,
+        cpu.fpcr,
+        cpu.fpsr,
         cpu.regs,
+        fnv(&vectors),
         fnv(&memory),
         fnv(&stack)
-    )
+    );
+    let end = End {
+        trap: format!("{trap:?}"),
+        x: cpu.regs,
+        sp: cpu.sp,
+        nzcv: cpu.nzcv,
+        memory,
+        stack,
+    };
+    (text, end)
 }
 
-/// Every run of every caller with `dispatch`, one line each.
-fn runs(dispatch: Dispatch) -> Vec<String> {
-    let words = window_call_program::WORDS;
+fn machine(program: &Program) -> Machine {
+    let words = program.words;
     let code_size = (words.len() as u64 * 4).next_multiple_of(0x1000);
     let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    let mut m = Machine::with_layout(
-        window_call_program::BASE,
-        &image,
-        code_size,
-        DATA,
-        DATA_SIZE,
-    );
+    let mut m = Machine::with_layout(program.base, &image, code_size, DATA, DATA_SIZE);
     m.memory
         .map(STACK, STACK_SIZE, READ | WRITE, STATE_NORMAL, "stack")
         .expect("map stack");
+    m
+}
+
+/// Every caller's starting states, the same for every lift.
+fn starts(program: &Program) -> Vec<(usize, u64, Start, u64, u64)> {
     let mut random = Random(0x6a09_e667_f3bc_c909);
-    let memory: Vec<u8> = (0..DATA_SIZE).map(|_| random.next() as u8).collect();
-    let mut lines = Vec::new();
-    for (caller, &entry) in window_call_program::CALLERS.iter().enumerate() {
-        for index in 0..STATES_PER_CALLER {
+    let mut memory: Vec<u8> = (0..DATA_SIZE).map(|_| random.next() as u8).collect();
+    let slot = (program.got_slot - DATA) as usize;
+    memory[slot..slot + 8].copy_from_slice(&program.got_word.to_le_bytes());
+    let mut starts = Vec::new();
+    for (caller, &entry) in program.callers.iter().enumerate() {
+        for _ in 0..STATES_PER_CALLER {
             let mut state = State {
                 x: std::array::from_fn(|_| random.value()),
                 sp: STACK + STACK_SIZE - 0x100,
@@ -152,95 +297,352 @@ fn runs(dispatch: Dispatch) -> Vec<String> {
             state.x[27] = random.next() % 0x100;
             // The recursion count.
             state.x[24] = random.next() % 6;
+            let vectors = std::array::from_fn(|_| {
+                u128::from(random.value()) | u128::from(random.value()) << 64
+            });
+            // Round to nearest, plain, flush-to-zero (the game's), or with
+            // default NaNs too (other rounding modes trap).
+            let fpcr = [0, 0x0100_0000, 0x0300_0000][random.next() as usize % 3];
+            let stack: Vec<u8> = (0..STACK_SIZE).map(|_| random.next() as u8).collect();
             let slice = 1 + random.next() % 40;
             let budget = 1 + random.next() % 400;
-            for mode in [Mode::Whole, Mode::Sliced(slice), Mode::Budget(budget)] {
-                let outcome = run(&mut m, dispatch, entry, &state, mode);
-                lines.push(format!(
-                    "caller {caller} at {entry:#x} state {index} {mode:?}: {outcome}"
-                ));
+            starts.push((
+                caller,
+                entry,
+                Start {
+                    state,
+                    vectors,
+                    fpcr,
+                    stack,
+                },
+                slice,
+                budget,
+            ));
+        }
+    }
+    starts
+}
+
+/// Every run of every caller with `dispatch`, one line each; and the hash
+/// of the recent-PC ring after each run (direct window calls skip the
+/// entry's record).
+fn runs(dispatch: Dispatch) -> (Vec<String>, u64) {
+    let program = programs().0;
+    let mut m = machine(&program);
+    let mut lines = Vec::new();
+    let mut ring = 0u64;
+    for (caller, entry, start, slice, budget) in starts(&program) {
+        for mode in [Mode::Whole, Mode::Sliced(slice), Mode::Budget(budget)] {
+            let (outcome, _) = run(&mut m, dispatch, entry, &start, mode);
+            lines.push(format!("caller {caller} at {entry:#x} {mode:?}: {outcome}"));
+            let pcs: Vec<u8> = m
+                .core
+                .recent_thread_pcs()
+                .iter()
+                .flat_map(|record| record.pc.to_le_bytes())
+                .collect();
+            ring = ring.rotate_left(5) ^ fnv(&pcs);
+        }
+    }
+    (lines, ring)
+}
+
+fn word_at(program: &Program, pc: u64) -> Option<u32> {
+    let index = usize::try_from(pc.checked_sub(program.base)? / 4).ok()?;
+    program.words.get(index).copied()
+}
+
+/// SP-relative LDP/STP of X registers on the stack.
+fn stack_pair(start: &mut Start, instruction: &Instruction) -> Option<()> {
+    let Instruction::LoadStorePair {
+        rt,
+        rt2,
+        rn: 31,
+        offset,
+        writeback,
+        op,
+        ..
+    } = *instruction
+    else {
+        return None;
+    };
+    let sp = start.state.sp;
+    let moved = sp.wrapping_add(offset as u64);
+    let at = if writeback == Writeback::Post {
+        sp
+    } else {
+        moved
+    };
+    let offset = usize::try_from(at.checked_sub(STACK)?).ok()?;
+    if offset + 16 > STACK_SIZE as usize {
+        return None;
+    }
+    for (k, register) in [rt, rt2].into_iter().enumerate() {
+        let bytes = &mut start.stack[offset + 8 * k..offset + 8 * k + 8];
+        match op {
+            MemoryOp::Store => {
+                let value = if register == 31 {
+                    0
+                } else {
+                    start.state.x[register as usize]
+                };
+                bytes.copy_from_slice(&value.to_le_bytes());
+            }
+            MemoryOp::Load { .. } => {
+                if register != 31 {
+                    start.state.x[register as usize] =
+                        u64::from_le_bytes((&*bytes).try_into().unwrap());
+                }
             }
         }
     }
-    lines
+    if writeback != Writeback::None {
+        start.state.sp = moved;
+    }
+    Some(())
 }
 
-/// The child: runs one lift and prints its runs.
+/// Runs a caller with the reference interpreter: the end it reaches, or
+/// None where it runs an instruction it has no semantics for (float and
+/// SIMD) or goes astray.
+fn reference(program: &Program, entry: u64, start: &Start) -> Option<End> {
+    let mut start = start.clone();
+    let mut pc = entry;
+    let trap = 'run: {
+        for _ in 0..200_000 {
+            if pc == program.missing {
+                break 'run format!("{:?}", Trap::MissingBlock { pc });
+            }
+            let word = word_at(program, pc)?;
+            if word == SVC_EXIT {
+                break 'run format!("{:?}", Trap::SupervisorCall { number: 7 });
+            }
+            let instruction = decode(word, pc);
+            let effects = echora_lift::defuse::effects(&instruction);
+            let undefined = matches!(instruction, Instruction::Undefined);
+            if !undefined && (effects.reads.vector != 0 || effects.writes.vector != 0) {
+                return None;
+            }
+            let x = &mut start.state.x;
+            pc = match instruction {
+                Instruction::Undefined => {
+                    break 'run format!("{:?}", Trap::UndefinedInstruction { pc, word });
+                }
+                Instruction::Svc { number: 3 } => {
+                    x[0] ^= 0x5555;
+                    pc + 4
+                }
+                Instruction::Branch { target, link } => {
+                    if link {
+                        x[30] = pc + 4;
+                    }
+                    target
+                }
+                Instruction::BranchReg { rn, link } => {
+                    let target = get(&start.state, rn);
+                    if link {
+                        start.state.x[30] = pc + 4;
+                    }
+                    target
+                }
+                Instruction::PAuthDisabledReturn { .. } => x[30],
+                Instruction::PAuthDisabledHint { .. } | Instruction::Nop => pc + 4,
+                Instruction::Adr { rd, address } => {
+                    set(&mut start.state, rd, address);
+                    pc + 4
+                }
+                Instruction::LoadStorePair { rn: 31, .. } => {
+                    stack_pair(&mut start, &instruction)?;
+                    pc + 4
+                }
+                _ => {
+                    let taken = interpret(&instruction, &mut start.state)?;
+                    match instruction {
+                        Instruction::BranchCond { target, .. }
+                        | Instruction::CompareBranch { target, .. }
+                        | Instruction::TestBranch { target, .. }
+                            if taken =>
+                        {
+                            target
+                        }
+                        _ => pc + 4,
+                    }
+                }
+            };
+        }
+        return None;
+    };
+    Some(End {
+        trap,
+        x: start.state.x,
+        sp: start.state.sp,
+        nzcv: start.state.nzcv,
+        memory: start.state.memory,
+        stack: start.stack,
+    })
+}
+
+/// The child: runs one lift and prints its runs, or (`reference`) checks
+/// the window-call lift's runs to the end against the reference.
 #[test]
 fn window_call_lift_child() {
-    let Ok(lift) = std::env::var(CHILD) else {
+    let Ok(name) = std::env::var(CHILD) else {
         return;
     };
-    let (dispatch, install): (Dispatch, fn()) = match lift.as_str() {
-        "base" => (window_call_base::dispatch, window_call_base::install),
-        "on" => (window_call_on::dispatch, window_call_on::install),
-        "table" => (window_call_table::dispatch, window_call_table::install),
-        "mixed" => (window_call_mixed::dispatch, window_call_mixed::install),
-        other => panic!("unknown lift {other}"),
+    if let Some(lift) = name.strip_prefix("reference:") {
+        let (dispatch, install): (Dispatch, fn()) = match lift {
+            "base" => (
+                window_call_int::window_call_base::dispatch,
+                window_call_int::window_call_base::install,
+            ),
+            "on" => (
+                window_call_int::window_call_on::dispatch,
+                window_call_int::window_call_on::install,
+            ),
+            "table" => (
+                window_call_int::window_call_table::dispatch,
+                window_call_int::window_call_table::install,
+            ),
+            other => panic!("unknown lift {other}"),
+        };
+        install();
+        let program = programs().1;
+        let mut m = machine(&program);
+        let (mut compared, mut skipped) = (0, 0);
+        for (caller, entry, start, _, _) in starts(&program) {
+            let Some(expected) = reference(&program, entry, &start) else {
+                skipped += 1;
+                continue;
+            };
+            let (_, actual) = run(&mut m, dispatch, entry, &start, Mode::Whole);
+            compared += 1;
+            if actual != expected {
+                let state = |end: &End| State {
+                    x: end.x,
+                    sp: end.sp,
+                    nzcv: end.nzcv,
+                    memory: end.memory.clone(),
+                };
+                panic!(
+                    "caller {caller} at {entry:#x}: {} -> {} ({}); stack {}",
+                    expected.trap,
+                    actual.trap,
+                    difference(&state(&expected), &state(&actual)),
+                    if expected.stack == actual.stack {
+                        "same"
+                    } else {
+                        "differs"
+                    }
+                );
+            }
+        }
+        println!("REFERENCE compared {compared} skipped {skipped}");
+        return;
+    }
+    let (name, install) = match name.strip_suffix(",uninstalled") {
+        Some(name) => (name.to_owned(), false),
+        None => (name, true),
     };
-    install();
-    for line in runs(dispatch) {
+    let lifts = lifts();
+    let lift = lifts
+        .iter()
+        .find(|lift| lift.name == name)
+        .unwrap_or_else(|| panic!("unknown lift {name}"));
+    if install {
+        (lift.install)();
+    }
+    println!("INSTALLED {}", (lift.installed)());
+    let (lines, ring) = runs(lift.dispatch);
+    for line in lines {
         println!("RUN {line}");
+    }
+    println!("RING {ring:016x}");
+}
+
+/// A child's output: its run lines, whether it had the window-call table,
+/// and the recent-PC ring hash.
+struct Output {
+    runs: Vec<String>,
+    installed: bool,
+    ring: String,
+}
+
+fn child(lift: &str) -> Output {
+    let exe = std::env::current_exe().unwrap();
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "window_call_lift_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, lift)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the {lift} child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    // The harness's own `test ... ` can precede the first line.
+    let field = |key: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|line| Some(line[line.find(key)? + key.len()..].to_owned()))
+            .collect()
+    };
+    Output {
+        runs: field("RUN "),
+        installed: field("INSTALLED ")
+            .first()
+            .is_some_and(|value| value == "true"),
+        ring: field("RING ").first().cloned().unwrap_or_default(),
     }
 }
 
 #[test]
 fn window_calls_match_the_default_emission() {
-    if window_call_program::ACTIVE {
-        // Window calls are emitted, directly and through the table, and
-        // the base lift has none.
-        const { assert!(window_call_on::DIRECT_CALLS > 0 && window_call_on::ENTERED_WINDOWS > 0) };
-        const { assert!(window_call_table::TABLE_CALLS > 0) };
-        const { assert!(window_call_mixed::DIRECT_CALLS + window_call_mixed::TABLE_CALLS > 0) };
-    }
-    const {
-        assert!(
-            window_call_base::DIRECT_CALLS
-                + window_call_base::TABLE_CALLS
-                + window_call_base::ENTERED_WINDOWS
-                == 0
-        )
-    };
-    for (lift, (windows, spills, reloads, calls)) in [
-        ("base", window_call_base::CENSUS),
-        ("on", window_call_on::CENSUS),
-        ("table", window_call_table::CENSUS),
-        ("mixed", window_call_mixed::CENSUS),
-    ] {
+    let lifts = lifts();
+    for lift in &lifts {
+        let (windows, spills, reloads, calls) = lift.census;
         println!(
-            "{lift}: {windows} windows, {calls} calls; per window {:.1} spills, {:.1} reloads",
+            "{}: {windows} windows, {calls} calls, {} summarized; per window {:.1} spills, {:.1} reloads",
+            lift.name,
+            lift.summarized,
             spills as f64 / windows as f64,
             reloads as f64 / windows as f64
         );
+        if lift.name.ends_with("base") {
+            assert_eq!(lift.summarized, 0, "{}", lift.name);
+        } else if window_call_program::ACTIVE {
+            assert!(lift.summarized > 0, "{} has no window calls", lift.name);
+        }
     }
-    let exe = std::env::current_exe().unwrap();
-    let lines = |lift: &str| -> Vec<String> {
-        let output = std::process::Command::new(&exe)
-            .args([
-                "--exact",
-                "window_call_lift_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, lift)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "the {lift} child failed: {output:?}"
+    if window_call_program::ACTIVE {
+        assert!(window_call_table::TABLE_CALLS > 0);
+        // Early exits allow more targets.
+        assert!(window_call_early::DIRECT_CALLS > window_call_on::DIRECT_CALLS);
+    }
+    let mut outputs = std::collections::BTreeMap::new();
+    for lift in &lifts {
+        let output = child(lift.name);
+        assert_eq!(
+            output.runs.len(),
+            programs().0.callers.len() * STATES_PER_CALLER * 3,
+            "{}: runs",
+            lift.name
         );
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            // The harness's own `test ... ` can precede the first.
-            .filter_map(|line| Some(line[line.find("RUN ")? + 4..].to_owned()))
-            .collect()
-    };
-    let base = lines("base");
-    assert_eq!(
-        base.len(),
-        window_call_program::CALLERS.len() * STATES_PER_CALLER * 3
-    );
+        if window_call_program::ACTIVE && !lift.name.ends_with("base") {
+            assert!(
+                output.installed,
+                "{}: the window-call table is not installed",
+                lift.name
+            );
+        }
+        outputs.insert(lift.name, output);
+    }
+    let base = &outputs["window_call_base"].runs;
     let ended = |trap: &str| {
         base.iter()
             .filter(|line| {
@@ -250,26 +652,78 @@ fn window_calls_match_the_default_emission() {
             .count()
     };
     println!(
-        "{} runs: {} ended at SVC #7, {} by the budget, {} by a UDF",
+        "{} runs: {} ended at SVC #7, {} by the budget, {} by a UDF, {} by a missing block",
         base.len(),
         ended("SupervisorCall { number: 7 }"),
         ended("Budget"),
-        ended("UndefinedInstruction")
+        ended("UndefinedInstruction"),
+        ended("MissingBlock")
     );
-    for lift in ["on", "table", "mixed"] {
-        let other = lines(lift);
-        assert_eq!(other.len(), base.len(), "{lift}: runs");
-        let mismatches: Vec<String> = base
+    for &(plain, calling) in PAIRS {
+        let (expected, actual) = (&outputs[plain].runs, &outputs[calling].runs);
+        let mismatches: Vec<String> = expected
             .iter()
-            .zip(&other)
+            .zip(actual)
             .filter(|(a, b)| a != b)
             .take(5)
             .map(|(a, b)| format!("expected {a}\n     got {b}"))
             .collect();
         assert!(
             mismatches.is_empty(),
-            "{lift}: runs differ from the default emission:\n{}",
+            "{calling}: runs differ from {plain}:\n{}",
             mismatches.join("\n")
         );
+    }
+    if window_call_program::ACTIVE {
+        // Calls through the table enter windows as direct calls do (no
+        // entry record); without the table they would return early and
+        // the dispatcher would enter the callee, recording it.
+        assert_eq!(
+            outputs["window_call_table"].ring,
+            outputs["window_call_on"].ring
+        );
+        let uninstalled = child("window_call_table,uninstalled");
+        assert!(!uninstalled.installed);
+        assert_eq!(&uninstalled.runs, base, "uninstalled: still the same runs");
+        assert_ne!(uninstalled.ring, outputs["window_call_table"].ring);
+    }
+}
+
+/// The integer twin, without and with window calls (in one region and
+/// through the table), against the reference interpreter.
+#[test]
+fn window_calls_match_the_reference() {
+    if window_call_program::ACTIVE {
+        assert!(window_call_int::window_call_on::DIRECT_CALLS > 0);
+        assert!(window_call_int::window_call_table::TABLE_CALLS > 0);
+    }
+    for lift in ["base", "on", "table"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "window_call_lift_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, format!("reference:{lift}"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{lift}: {text}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let line = text
+            .lines()
+            .find_map(|line| Some(&line[line.find("REFERENCE ")?..]))
+            .unwrap();
+        println!("{lift}: {line}");
+        let numbers: Vec<usize> = line
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect();
+        // Every run is compared.
+        assert_eq!(numbers[1], 0, "{lift}: runs left out: {line}");
     }
 }
