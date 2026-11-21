@@ -9,7 +9,7 @@
 )]
 pub use ash;
 pub mod compute;
-mod condition;
+pub mod condition;
 pub mod draw;
 mod fast_map;
 

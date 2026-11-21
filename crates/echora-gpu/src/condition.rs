@@ -4,11 +4,11 @@
 //! NVN's SetRenderEnableConditional compares two 64-bit counters (rendering
 //! holds while they are equal, mode 0, or differ, mode 1). Vulkan's
 //! conditional rendering reads one 32-bit word. When the first counter is
-//! written by earlier GPU work (a culling pass) and the second is known on
-//! the CPU, a one-invocation compute program compares the written word with
-//! the known value after that work and stores the outcome (1: render) where
-//! the condition reads it, so the CPU need not wait for the work to finish
-//! to compare them itself.
+//! written by earlier GPU work (a culling pass), a one-invocation compute
+//! program compares it, after that work, with the second (a value the CPU
+//! knows, or another word GPU work writes) and stores the outcome (1:
+//! render) where the condition reads it, so the CPU need not wait for the
+//! work to finish to compare them itself.
 
 use ash::vk;
 use echora_shader::spirv::{self, Function, Module, Type};
@@ -20,8 +20,17 @@ use crate::renderer::{HostBuffer, Renderer, vk_error};
 const SLOTS: u64 = 1 << 14;
 const PUSH_BYTES: usize = 32;
 
+/// What a word is compared with.
+pub enum Comparand {
+    /// A value the CPU knows.
+    Value(u64),
+    /// Another word GPU work writes (a buffer and offset).
+    Word(vk::Buffer, u64),
+}
+
 pub(crate) struct WordConditions {
-    pipeline: vk::Pipeline,
+    /// Against a pushed value, and against a second word.
+    pipelines: [vk::Pipeline; 2],
     layout: vk::PipelineLayout,
     outcomes: HostBuffer,
     outcomes_address: u64,
@@ -47,42 +56,25 @@ impl WordConditions {
         // SAFETY: a valid device and create info; destroyed in `destroy`.
         let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
             .map_err(vk_error("vkCreatePipelineLayout"))?;
-        let words = compare_program();
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
-        let module = match unsafe { device.create_shader_module(&module_info, None) } {
-            Ok(module) => module,
-            Err(error) => {
-                // SAFETY: unused.
-                unsafe { device.destroy_pipeline_layout(layout, None) };
-                outcomes.destroy(device);
-                return Err(vk_error("vkCreateShaderModule")(error));
+        let mut pipelines = [vk::Pipeline::null(); 2];
+        for (index, second_word) in [false, true].into_iter().enumerate() {
+            match create_pipeline(device, layout, second_word) {
+                Ok(pipeline) => pipelines[index] = pipeline,
+                Err(error) => {
+                    // SAFETY: none has been used.
+                    unsafe {
+                        for pipeline in pipelines {
+                            device.destroy_pipeline(pipeline, None);
+                        }
+                        device.destroy_pipeline_layout(layout, None);
+                    }
+                    outcomes.destroy(device);
+                    return Err(error);
+                }
             }
-        };
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main");
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(layout);
-        // SAFETY: as above.
-        let pipelines = unsafe {
-            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        // SAFETY: the pipeline (made or not) no longer needs the module.
-        unsafe { device.destroy_shader_module(module, None) };
-        let pipeline = match pipelines {
-            Ok(pipelines) => pipelines[0],
-            Err((_, error)) => {
-                // SAFETY: unused.
-                unsafe { device.destroy_pipeline_layout(layout, None) };
-                outcomes.destroy(device);
-                return Err(vk_error("vkCreateComputePipelines")(error));
-            }
-        };
+        }
         Ok(Self {
-            pipeline,
+            pipelines,
             layout,
             outcomes,
             outcomes_address,
@@ -93,23 +85,51 @@ impl WordConditions {
     pub(crate) fn destroy(self, device: &ash::Device) {
         // SAFETY: the renderer is idle when it is destroyed.
         unsafe {
-            device.destroy_pipeline(self.pipeline, None);
+            for pipeline in self.pipelines {
+                device.destroy_pipeline(pipeline, None);
+            }
             device.destroy_pipeline_layout(self.layout, None);
         }
         self.outcomes.destroy(device);
     }
 }
 
+fn create_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    second_word: bool,
+) -> Result<vk::Pipeline, String> {
+    let words = compare_program(second_word);
+    let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
+    // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
+    let module = unsafe { device.create_shader_module(&module_info, None) }
+        .map_err(vk_error("vkCreateShaderModule"))?;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(c"main");
+    let pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(layout);
+    // SAFETY: as above.
+    let pipelines = unsafe {
+        device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    };
+    // SAFETY: the pipeline (made or not) no longer needs the module.
+    unsafe { device.destroy_shader_module(module, None) };
+    Ok(pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0])
+}
+
 impl Renderer {
     /// The word a render condition reads to hold while the 64-bit word at
-    /// `word` (a buffer and offset GPU work writes) equals `value`
+    /// `word` (a buffer and offset GPU work writes) equals `other`
     /// (`render_when_equal`) or differs from it: compared on the GPU after
     /// the work recorded so far, outside a rendering pass. None where the
     /// device cannot (no conditional rendering or buffer addresses).
     pub fn condition_on_word(
         &mut self,
         word: (vk::Buffer, u64),
-        value: u64,
+        other: Comparand,
         render_when_equal: bool,
     ) -> Result<Option<(vk::Buffer, u64)>, String> {
         if !self.supports_conditions() {
@@ -117,6 +137,14 @@ impl Renderer {
         }
         let Some(word_address) = self.buffer_address(word.0) else {
             return Ok(None);
+        };
+        // The comparand pushed: a value, or the second word's address.
+        let (second_word, comparand) = match other {
+            Comparand::Value(value) => (false, value),
+            Comparand::Word(buffer, offset) => match self.buffer_address(buffer) {
+                Some(address) => (true, address + offset),
+                None => return Ok(None),
+            },
         };
         if self.word_conditions.is_none() {
             self.word_conditions = Some(WordConditions::new(self)?);
@@ -131,9 +159,12 @@ impl Renderer {
         let mut push = [0; PUSH_BYTES];
         push[..8].copy_from_slice(&(word_address + word.1).to_le_bytes());
         push[8..16].copy_from_slice(&(conditions.outcomes_address + slot * 4).to_le_bytes());
-        push[16..24].copy_from_slice(&value.to_le_bytes());
+        push[16..24].copy_from_slice(&comparand.to_le_bytes());
         push[24..28].copy_from_slice(&u32::from(render_when_equal).to_le_bytes());
-        let (pipeline, layout) = (conditions.pipeline, conditions.layout);
+        let (pipeline, layout) = (
+            conditions.pipelines[usize::from(second_word)],
+            conditions.layout,
+        );
         let written = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -176,9 +207,10 @@ impl Renderer {
 }
 
 /// Load the 64-bit word at the first address (as two 4-byte-aligned
-/// halves), compare it with the pushed value and store 1 at the second
-/// address when rendering holds (equal == wanted), 0 otherwise.
-fn compare_program() -> Vec<u32> {
+/// halves), compare it with the pushed value (or, with `second_word`, the
+/// word at the pushed address) and store 1 at the second address when
+/// rendering holds (equal == wanted), 0 otherwise.
+fn compare_program(second_word: bool) -> Vec<u32> {
     use spirv::{capability, decoration, execution, op, storage};
     let mut module = Module::new();
     module.capability(capability::SHADER);
@@ -218,15 +250,22 @@ fn compare_program() -> Vec<u32> {
     };
     let word = field(&mut main, &mut module, 0, push_u64, u64_type);
     let outcome = field(&mut main, &mut module, 1, push_u64, u64_type);
-    let value_low = field(&mut main, &mut module, 2, push_u32, u32_type);
-    let value_high = field(&mut main, &mut module, 3, push_u32, u32_type);
     let when_equal = field(&mut main, &mut module, 4, push_u32, u32_type);
-    let high_at = main.value(&mut module, op::I_ADD, u64_type, &[word, four]);
-    // Memory operand Aligned (2), 4.
-    let low_pointer = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[word]);
-    let high_pointer = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[high_at]);
-    let low = main.value(&mut module, op::LOAD, u32_type, &[low_pointer, 2, 4]);
-    let high = main.value(&mut module, op::LOAD, u32_type, &[high_pointer, 2, 4]);
+    // A 64-bit word's halves at `at` (memory operand Aligned (2), 4).
+    let halves = |main: &mut Function, module: &mut Module, at| {
+        let high_at = main.value(module, op::I_ADD, u64_type, &[at, four]);
+        let low_pointer = main.value(module, op::CONVERT_U_TO_PTR, global_u32, &[at]);
+        let high_pointer = main.value(module, op::CONVERT_U_TO_PTR, global_u32, &[high_at]);
+        [low_pointer, high_pointer]
+            .map(|pointer| main.value(module, op::LOAD, u32_type, &[pointer, 2, 4]))
+    };
+    let [value_low, value_high] = if second_word {
+        let second = field(&mut main, &mut module, 2, push_u64, u64_type);
+        halves(&mut main, &mut module, second)
+    } else {
+        [2, 3].map(|member| field(&mut main, &mut module, member, push_u32, u32_type))
+    };
+    let [low, high] = halves(&mut main, &mut module, word);
     let low_equal = main.value(&mut module, op::I_EQUAL, bool_type, &[low, value_low]);
     let high_equal = main.value(&mut module, op::I_EQUAL, bool_type, &[high, value_high]);
     let equal = main.value(
@@ -253,10 +292,19 @@ mod tests {
     /// The program run once in the simulator: the outcome word for the
     /// 64-bit `word`, the pushed `value` and `render_when_equal`.
     fn outcome(word: u64, value: u64, render_when_equal: bool) -> u32 {
+        // Pushed, and read from a second word: the same outcome.
+        let pushed = simulate(word, value, render_when_equal, false);
+        assert_eq!(simulate(word, value, render_when_equal, true), pushed);
+        pushed
+    }
+
+    fn simulate(word: u64, value: u64, render_when_equal: bool, second_word: bool) -> u32 {
         use echora_shader::sim::{Inputs, Machine};
         const WORD: u64 = 0x1000;
         const OUTCOME: u64 = 0x2000;
-        let push: Vec<u8> = [WORD, OUTCOME, value]
+        const SECOND: u64 = 0x3000;
+        let comparand = if second_word { SECOND } else { value };
+        let push: Vec<u8> = [WORD, OUTCOME, comparand]
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .chain(u32::from(render_when_equal).to_le_bytes())
@@ -265,10 +313,11 @@ mod tests {
         let memory = [
             (WORD, word.to_le_bytes().to_vec()),
             (OUTCOME, 0xdead_beef_u32.to_le_bytes().to_vec()),
+            (SECOND, value.to_le_bytes().to_vec()),
         ]
         .into_iter()
         .collect();
-        let report = Machine::new(&super::compare_program()).simulate(&Inputs {
+        let report = Machine::new(&super::compare_program(second_word)).simulate(&Inputs {
             workgroup_count: [1, 1, 1],
             push,
             memory,
@@ -289,12 +338,22 @@ mod tests {
             .unwrap();
         word.write(0, &(7u64 << 32 | 5).to_le_bytes());
         let mut outcomes = Vec::new();
-        for (value, when_equal) in [(7u64 << 32 | 5, true), (5, true), (5, false)] {
+        let second = renderer
+            .host_buffer_with(8, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
+            .unwrap();
+        second.write(0, &5u64.to_le_bytes());
+        for (other, when_equal) in [
+            (super::Comparand::Value(7u64 << 32 | 5), true),
+            (super::Comparand::Value(5), true),
+            (super::Comparand::Value(5), false),
+            (super::Comparand::Word(second.buffer, 0), true),
+        ] {
             let Some(outcome) = renderer
-                .condition_on_word((word.buffer, 0), value, when_equal)
+                .condition_on_word((word.buffer, 0), other, when_equal)
                 .unwrap()
             else {
                 word.destroy(renderer.device());
+                second.destroy(renderer.device());
                 return;
             };
             outcomes.push(outcome);
@@ -311,10 +370,11 @@ mod tests {
             .collect();
         assert_eq!(
             outcomes.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
-            [0, 4, 8]
+            [0, 4, 8, 12]
         );
-        assert_eq!(words, [1, 0, 1]);
+        assert_eq!(words, [1, 0, 1, 0]);
         word.destroy(renderer.device());
+        second.destroy(renderer.device());
     }
 
     #[test]
