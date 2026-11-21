@@ -1,0 +1,335 @@
+//! A render condition on a 64-bit word that GPU work is still writing,
+//! evaluated on the GPU in command order.
+//!
+//! NVN's SetRenderEnableConditional compares two 64-bit counters (rendering
+//! holds while they are equal, mode 0, or differ, mode 1). Vulkan's
+//! conditional rendering reads one 32-bit word. When the first counter is
+//! written by earlier GPU work (a culling pass) and the second is known on
+//! the CPU, a one-invocation compute program compares the written word with
+//! the known value after that work and stores the outcome (1: render) where
+//! the condition reads it, so the CPU need not wait for the work to finish
+//! to compare them itself.
+
+use ash::vk;
+use echora_shader::spirv::{self, Function, Module, Type};
+
+use crate::renderer::{HostBuffer, Renderer, vk_error};
+
+/// Outcome words kept, the oldest reused (a few dozen are made a frame;
+/// at most two submissions are in flight).
+const SLOTS: u64 = 1 << 14;
+const PUSH_BYTES: usize = 32;
+
+pub(crate) struct WordConditions {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    outcomes: HostBuffer,
+    outcomes_address: u64,
+    next: u64,
+}
+
+impl WordConditions {
+    fn new(renderer: &Renderer) -> Result<Self, String> {
+        let device = renderer.device();
+        let outcomes = renderer.host_buffer_with(
+            SLOTS * 4,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT,
+            true,
+        )?;
+        let outcomes_address = renderer
+            .buffer_address(outcomes.buffer)
+            .ok_or("word conditions need buffer device addresses")?;
+        let range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(PUSH_BYTES as u32);
+        let ranges = [range];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
+        // SAFETY: a valid device and create info; destroyed in `destroy`.
+        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+            .map_err(vk_error("vkCreatePipelineLayout"))?;
+        let words = compare_program();
+        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
+        // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
+        let module = match unsafe { device.create_shader_module(&module_info, None) } {
+            Ok(module) => module,
+            Err(error) => {
+                // SAFETY: unused.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+                outcomes.destroy(device);
+                return Err(vk_error("vkCreateShaderModule")(error));
+            }
+        };
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout);
+        // SAFETY: as above.
+        let pipelines = unsafe {
+            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        // SAFETY: the pipeline (made or not) no longer needs the module.
+        unsafe { device.destroy_shader_module(module, None) };
+        let pipeline = match pipelines {
+            Ok(pipelines) => pipelines[0],
+            Err((_, error)) => {
+                // SAFETY: unused.
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+                outcomes.destroy(device);
+                return Err(vk_error("vkCreateComputePipelines")(error));
+            }
+        };
+        Ok(Self {
+            pipeline,
+            layout,
+            outcomes,
+            outcomes_address,
+            next: 0,
+        })
+    }
+
+    pub(crate) fn destroy(self, device: &ash::Device) {
+        // SAFETY: the renderer is idle when it is destroyed.
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+        }
+        self.outcomes.destroy(device);
+    }
+}
+
+impl Renderer {
+    /// The word a render condition reads to hold while the 64-bit word at
+    /// `word` (a buffer and offset GPU work writes) equals `value`
+    /// (`render_when_equal`) or differs from it: compared on the GPU after
+    /// the work recorded so far, outside a rendering pass. None where the
+    /// device cannot (no conditional rendering or buffer addresses).
+    pub fn condition_on_word(
+        &mut self,
+        word: (vk::Buffer, u64),
+        value: u64,
+        render_when_equal: bool,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        if !self.supports_conditions() {
+            return Ok(None);
+        }
+        let Some(word_address) = self.buffer_address(word.0) else {
+            return Ok(None);
+        };
+        if self.word_conditions.is_none() {
+            self.word_conditions = Some(WordConditions::new(self)?);
+        }
+        let commands = self.commands()?;
+        // A condition left active would gate the comparison as well.
+        self.end_condition();
+        let conditions = self.word_conditions.as_mut().expect("made above");
+        let slot = conditions.next % SLOTS;
+        conditions.next += 1;
+        let outcome = (conditions.outcomes.buffer, slot * 4);
+        let mut push = [0; PUSH_BYTES];
+        push[..8].copy_from_slice(&(word_address + word.1).to_le_bytes());
+        push[8..16].copy_from_slice(&(conditions.outcomes_address + slot * 4).to_le_bytes());
+        push[16..24].copy_from_slice(&value.to_le_bytes());
+        push[24..28].copy_from_slice(&u32::from(render_when_equal).to_le_bytes());
+        let (pipeline, layout) = (conditions.pipeline, conditions.layout);
+        let written = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        let compared = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
+        // SAFETY: recording, outside rendering; the buffers are live and
+        // the addresses inside them.
+        unsafe {
+            let device = &self.gpu.device;
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[written],
+                &[],
+                &[],
+            );
+            device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_push_constants(commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+            device.cmd_dispatch(commands, 1, 1, 1);
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                vk::DependencyFlags::empty(),
+                &[compared],
+                &[],
+                &[],
+            );
+        }
+        *self.stats.entry("stat: barriers in draw").or_default() += 2;
+        *self
+            .stats
+            .entry("stat: conditions compared on the GPU")
+            .or_default() += 1;
+        Ok(Some(outcome))
+    }
+}
+
+/// Load the 64-bit word at the first address (as two 4-byte-aligned
+/// halves), compare it with the pushed value and store 1 at the second
+/// address when rendering holds (equal == wanted), 0 otherwise.
+fn compare_program() -> Vec<u32> {
+    use spirv::{capability, decoration, execution, op, storage};
+    let mut module = Module::new();
+    module.capability(capability::SHADER);
+    module.capability(capability::INT64);
+    module.capability(capability::PHYSICAL_STORAGE_BUFFER_ADDRESSES);
+    module.memory_model(capability::ADDRESSING_PHYSICAL_STORAGE_BUFFER64, 1);
+    let void = module.void();
+    let bool_type = module.bool();
+    let u32_type = module.u32();
+    let u64_type = module.u64();
+    // word address, outcome address, value low, value high, render when
+    // equal, padding.
+    let block = module.ty(Type::Struct {
+        members: vec![u64_type, u64_type, u32_type, u32_type, u32_type, u32_type],
+    });
+    module.decorate(block, decoration::BLOCK, &[]);
+    for (member, offset) in [0, 8, 16, 20, 24, 28].into_iter().enumerate() {
+        module.member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
+    }
+    let push_pointer = module.pointer(storage::PUSH_CONSTANT, block);
+    let push = module.global_variable(push_pointer, storage::PUSH_CONSTANT);
+    let push_u64 = module.pointer(storage::PUSH_CONSTANT, u64_type);
+    let push_u32 = module.pointer(storage::PUSH_CONSTANT, u32_type);
+    let global_u32 = module.pointer(storage::PHYSICAL_STORAGE_BUFFER, u32_type);
+    let function_type = module.ty(Type::Function {
+        result: void,
+        parameters: Vec::new(),
+    });
+    let members = [0, 1, 2, 3, 4].map(|value| module.constant(u32_type, value));
+    let one = module.constant(u32_type, 1);
+    let zero = module.constant(u32_type, 0);
+    let four = module.constant64(u64_type, 4);
+    let mut main = Function::new(&mut module, void, function_type);
+    let field = |main: &mut Function, module: &mut Module, member: usize, pointer, ty| {
+        let at = main.value(module, op::ACCESS_CHAIN, pointer, &[push, members[member]]);
+        main.value(module, op::LOAD, ty, &[at])
+    };
+    let word = field(&mut main, &mut module, 0, push_u64, u64_type);
+    let outcome = field(&mut main, &mut module, 1, push_u64, u64_type);
+    let value_low = field(&mut main, &mut module, 2, push_u32, u32_type);
+    let value_high = field(&mut main, &mut module, 3, push_u32, u32_type);
+    let when_equal = field(&mut main, &mut module, 4, push_u32, u32_type);
+    let high_at = main.value(&mut module, op::I_ADD, u64_type, &[word, four]);
+    // Memory operand Aligned (2), 4.
+    let low_pointer = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[word]);
+    let high_pointer = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[high_at]);
+    let low = main.value(&mut module, op::LOAD, u32_type, &[low_pointer, 2, 4]);
+    let high = main.value(&mut module, op::LOAD, u32_type, &[high_pointer, 2, 4]);
+    let low_equal = main.value(&mut module, op::I_EQUAL, bool_type, &[low, value_low]);
+    let high_equal = main.value(&mut module, op::I_EQUAL, bool_type, &[high, value_high]);
+    let equal = main.value(
+        &mut module,
+        op::LOGICAL_AND,
+        bool_type,
+        &[low_equal, high_equal],
+    );
+    let wanted = main.value(&mut module, op::I_NOT_EQUAL, bool_type, &[when_equal, zero]);
+    let renders = main.value(&mut module, op::LOGICAL_EQUAL, bool_type, &[equal, wanted]);
+    let stored = main.value(&mut module, op::SELECT, u32_type, &[renders, one, zero]);
+    let outcome = main.value(&mut module, op::CONVERT_U_TO_PTR, global_u32, &[outcome]);
+    main.emit(op::STORE, &[outcome, stored, 2, 4]);
+    main.emit(op::RETURN, &[]);
+    let entry_point = main.id;
+    main.finish(&mut module);
+    module.entry_point(execution::GL_COMPUTE, entry_point, "main", &[push]);
+    module.execution_mode(entry_point, execution::LOCAL_SIZE, &[1, 1, 1]);
+    module.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The program run once in the simulator: the outcome word for the
+    /// 64-bit `word`, the pushed `value` and `render_when_equal`.
+    fn outcome(word: u64, value: u64, render_when_equal: bool) -> u32 {
+        use echora_shader::sim::{Inputs, Machine};
+        const WORD: u64 = 0x1000;
+        const OUTCOME: u64 = 0x2000;
+        let push: Vec<u8> = [WORD, OUTCOME, value]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .chain(u32::from(render_when_equal).to_le_bytes())
+            .chain([0; 4])
+            .collect();
+        let memory = [
+            (WORD, word.to_le_bytes().to_vec()),
+            (OUTCOME, 0xdead_beef_u32.to_le_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        let report = Machine::new(&super::compare_program()).simulate(&Inputs {
+            workgroup_count: [1, 1, 1],
+            push,
+            memory,
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        u32::from_le_bytes(report.memory[&OUTCOME][..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_word_condition_is_compared_after_the_work_before_it() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        let mut renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        let word = renderer
+            .host_buffer_with(8, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
+            .unwrap();
+        word.write(0, &(7u64 << 32 | 5).to_le_bytes());
+        let mut outcomes = Vec::new();
+        for (value, when_equal) in [(7u64 << 32 | 5, true), (5, true), (5, false)] {
+            let Some(outcome) = renderer
+                .condition_on_word((word.buffer, 0), value, when_equal)
+                .unwrap()
+            else {
+                word.destroy(renderer.device());
+                return;
+            };
+            outcomes.push(outcome);
+        }
+        renderer.flush().unwrap();
+        renderer.wait_for(renderer.recorded_serial()).unwrap();
+        let held = renderer.word_conditions.as_ref().unwrap();
+        let bytes = held.outcomes.read_bytes(4 * outcomes.len());
+        let words: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(
+            outcomes.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
+            [0, 4, 8]
+        );
+        assert_eq!(words, [1, 0, 1]);
+        word.destroy(renderer.device());
+    }
+
+    #[test]
+    fn a_word_condition_compares_all_64_bits() {
+        // Mode 0 (render while equal) and mode 1 (while they differ).
+        assert_eq!(outcome(0, 0, true), 1);
+        assert_eq!(outcome(5, 0, true), 0);
+        assert_eq!(outcome(0, 0, false), 0);
+        assert_eq!(outcome(5, 0, false), 1);
+        // Only the high half differs: not equal.
+        assert_eq!(outcome(1 << 32, 0, true), 0);
+        assert_eq!(outcome(1 << 32, 0, false), 1);
+        assert_eq!(
+            outcome(0x1234_5678_9abc_def0, 0x1234_5678_9abc_def0, true),
+            1
+        );
+    }
+}

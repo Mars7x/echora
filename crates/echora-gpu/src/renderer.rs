@@ -801,6 +801,8 @@ pub struct Renderer {
     /// The indirect mesh draws' bounded group counts, once used
     /// (`bounded_mesh_count`).
     pub(crate) mesh_count: Option<crate::mesh_count::MeshCount>,
+    /// Render conditions compared on the GPU (`condition_on_word`).
+    pub(crate) word_conditions: Option<crate::condition::WordConditions>,
     /// The condition draws and dispatches are gated on (`set_condition`):
     /// wanted, and active in the command buffer being recorded.
     condition: Option<(vk::Buffer, u64, bool)>,
@@ -1317,6 +1319,7 @@ impl Renderer {
             submitted_labels: Vec::new(),
             occlusion: None,
             mesh_count: None,
+            word_conditions: None,
             condition: None,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
@@ -8385,6 +8388,9 @@ impl Drop for Renderer {
         let _ = self.destroy_idle_programs(clear_programs.into_iter().flatten());
         if let Some(mesh_count) = self.mesh_count.take() {
             mesh_count.destroy(&self.gpu.device);
+        }
+        if let Some(conditions) = self.word_conditions.take() {
+            conditions.destroy(&self.gpu.device);
         }
         if let Some(timer) = self.timer.take() {
             timer.destroy(&self.gpu.device);
