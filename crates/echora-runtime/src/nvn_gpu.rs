@@ -10046,7 +10046,29 @@ impl Nvn {
         address: u64,
     ) -> Result<bool, String> {
         // Why a condition is left to the CPU, counted.
-        let mut why = "stat: CPU conditions: not a lone samples report";
+        let mut why = {
+            let backend = self.gpu.as_ref().unwrap();
+            let second = address.wrapping_add(16);
+            if mode > 1 {
+                "stat: CPU conditions: mode above 1"
+            } else if !backend.renderer.supports_conditions() {
+                "stat: CPU conditions: unsupported"
+            } else if !backend.samples_reports.contains(&address) {
+                // Written by other work, or by the CPU.
+                if self.gpu_to_guest(address, 8).is_ok_and(|guest| {
+                    self.draw_input_write_serial(guest..guest + 8)
+                        .is_some_and(|serial| serial > backend.renderer.completed_serial())
+                }) {
+                    "stat: CPU conditions: word GPU work is writing"
+                } else {
+                    "stat: CPU conditions: word not a samples report"
+                }
+            } else if backend.samples_reports.contains(&second) {
+                "stat: CPU conditions: two samples reports compared"
+            } else {
+                "stat: CPU conditions: not a lone samples report"
+            }
+        };
         if let Some(other) = self.conditional_comparison_address(mode, address)? {
             self.resolve_draw_input(core, other, 8)?;
             why = "stat: CPU conditions: comparison word nonzero";
