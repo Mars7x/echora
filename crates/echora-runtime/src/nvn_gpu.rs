@@ -6669,7 +6669,23 @@ impl Nvn {
                 &sampled_textures,
                 &storage_images,
             )?;
-            if typed.descriptors != stage.descriptors {
+            // Integer sampled textures need a different sampler but keep the
+            // same binding layout. Every other descriptor property must agree
+            // with the translation used to collect the bound resources.
+            let same_layout = typed.descriptors.len() == stage.descriptors.len()
+                && typed
+                    .descriptors
+                    .iter()
+                    .zip(&stage.descriptors)
+                    .all(|(typed, original)| {
+                        let mut expected = *original;
+                        if expected.kind() == DescriptorKind::Texture {
+                            let integer = shader::Descriptor::INTEGER;
+                            expected.flags = (expected.flags & !integer) | (typed.flags & integer);
+                        }
+                        *typed == expected
+                    });
+            if !same_layout {
                 return Err("numeric image types changed the compute descriptor layout".into());
             }
             stage = typed;
