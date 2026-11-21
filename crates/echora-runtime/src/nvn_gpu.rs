@@ -7419,6 +7419,9 @@ impl Nvn {
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat("stat: binding evictions by texture writes", 1);
         }
+        // Pool entry lists are made again even when no memoized binding
+        // goes (a list can hold a binding the memo no longer does).
+        self.pool_inputs += 1;
         let overlaps = |range: &std::ops::Range<u64>| {
             ranges
                 .iter()
@@ -7444,6 +7447,8 @@ impl Nvn {
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat("stat: binding evictions by an invalidated texture", 1);
         }
+        // (As `evict_bindings_over`.)
+        self.pool_inputs += 1;
         let ranges = backing.pieces();
         self.evict_memoized_bindings(|entry| {
             let source_key = match &entry.source {
