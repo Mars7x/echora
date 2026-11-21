@@ -2071,7 +2071,26 @@ impl RegisterLocals {
                     // address) gets the rest stored before anything else
                     // runs, through the window table.
                     let held = state & !touched;
-                    if let Some(out) = out.as_deref_mut() {
+                    if WINDOW_CALLS_AUDIT.get()
+                        && let Some(out) = out.as_deref_mut()
+                    {
+                        let early = if *propagate {
+                            "return Ok(());".to_owned()
+                        } else {
+                            format!(
+                                "let called = m.call({next:#x}); {reload}{}if let Err(trap) = called {{ return Err(trap); }}",
+                                steps_in()
+                            )
+                        };
+                        writeln!(
+                            out,
+                            "{indent}{}{}{}",
+                            self.store_dirty(state) + steps_out(),
+                            audited_call(*next, callee, *touched, *writes),
+                            format_args!("{reload}{}if let Err(trap) = called {{ return Err(trap); }} if m.cpu.pc != {next:#x} {{ {early} }}", steps_in())
+                        )
+                        .unwrap();
+                    } else if let Some(out) = out.as_deref_mut() {
                         let store = self.store_dirty(state & touched) + steps_out();
                         let reload_writes = self.reload_subset(*writes) + steps_in();
                         let store_held = self.store_dirty(held) + steps_out();
@@ -2091,7 +2110,7 @@ impl RegisterLocals {
                         .unwrap();
                     }
                     if top {
-                        state = held;
+                        state = if WINDOW_CALLS_AUDIT.get() { 0 } else { held };
                     }
                 }
                 Kind::Call(call, arguments) => {
@@ -4428,7 +4447,7 @@ pub const WINDOW_CALL_DEPTH_LIMIT: u32 = 16;
 /// returns from it too.
 pub fn window_call_summaries(
     translation: &Translation,
-    active: &dyn Fn(u64) -> bool,
+    active: &dyn Fn(u64) -> Option<bool>,
 ) -> BTreeMap<u64, (Dirty, Dirty)> {
     use Instruction::*;
     let by_start: BTreeMap<u64, &BasicBlock> = translation
@@ -4457,8 +4476,8 @@ pub fn window_call_summaries(
         .filter_map(|record| match record.instruction {
             Branch { target, link: true }
                 if by_start.contains_key(&target)
-                    && active(target)
-                    && active(record.pc)
+                    && active(target).is_some()
+                    && active(record.pc).is_some()
                     && !stubs.contains_key(&target)
                     && !inlined.contains(&target) =>
             {
@@ -4476,6 +4495,10 @@ pub fn window_call_summaries(
         let mut pending = vec![entry];
         let mut valid = true;
         let (mut whole_window, mut expanded) = (false, false);
+        // Whether the window can be left other than by a return, and
+        // whether T's region allows that.
+        let mut leaves_early = false;
+        let early_allowed = active(entry) == Some(true);
         let add = |record: &TranslatedInstruction, touched: &mut Dirty, writes: &mut Dirty| {
             let effects = crate::defuse::effects(&record.instruction);
             *touched |= bits(effects.reads) | bits(effects.writes);
@@ -4536,15 +4559,26 @@ pub fn window_call_summaries(
                 | PAuthDisabledReturn { .. } => Vec::new(),
                 BranchReg { link: false, .. } => {
                     whole_window = true;
+                    leaves_early = true;
                     Vec::new()
                 }
                 instruction if instruction.ends_block() => Vec::new(),
                 _ => vec![next],
             };
+            if whole_window {
+                // A computed target may lie outside the window.
+                leaves_early = true;
+            }
             for successor in successors {
-                if in_window(successor) && seen.insert(successor) {
+                if !in_window(successor) {
+                    leaves_early = true;
+                } else if seen.insert(successor) {
                     pending.push(successor);
                 }
+            }
+            if leaves_early && !early_allowed {
+                valid = false;
+                break;
             }
             if whole_window && !expanded {
                 expanded = true;
@@ -4622,18 +4656,34 @@ pub struct WindowCallReport {
     pub sites: usize,
     /// BL targets with a window-call summary.
     pub targets: usize,
-    /// BL sites calling such a target, and of those in its region.
+    /// Of those, targets whose window can be left other than by a return
+    /// (summarized only with `EmitOptions::window_call_early_exits`).
+    pub early_exit_targets: usize,
+    /// Targets that would have a summary with early exits allowed but
+    /// have none without (counted whatever the setting).
+    pub early_exit_only_targets: usize,
+    /// BL sites calling a summarized target, and of those in its region.
     pub summarized_sites: usize,
     pub same_region_sites: usize,
     /// Windows entered by summarized calls.
     pub windows: usize,
 }
 
-/// [`WindowCallReport`] with window calls in every region.
-pub fn window_call_report(translation: &Translation, region_bits: u32) -> WindowCallReport {
-    let summaries = window_call_summaries(translation, &|_| true);
+/// [`WindowCallReport`] where `active` says, by guest address, whether
+/// that code's region makes window calls and allows early exits (see
+/// `window_call_summaries`).
+pub fn window_call_report(
+    translation: &Translation,
+    region_bits: u32,
+    active: &dyn Fn(u64) -> Option<bool>,
+) -> WindowCallReport {
+    let summaries = window_call_summaries(translation, active);
+    let strict = window_call_summaries(translation, &|pc| active(pc).map(|_| false));
+    let early = window_call_summaries(translation, &|pc| active(pc).map(|_| true));
     let mut report = WindowCallReport {
         targets: summaries.len(),
+        early_exit_targets: summaries.keys().filter(|t| !strict.contains_key(t)).count(),
+        early_exit_only_targets: early.keys().filter(|t| !strict.contains_key(t)).count(),
         windows: summaries
             .keys()
             .map(|target| target >> SPLIT_WINDOW_BITS)
@@ -4697,6 +4747,37 @@ fn window_call(from: u64, target: u64) -> Option<(String, Dirty, Dirty)> {
     })
 }
 
+/// With `EmitOptions::window_calls_audit`: a summarized call of `callee`
+/// returning to `next`, the `Core` holding every local: the registers,
+/// SP and NZCV outside `touched` get a marker, and when the callee comes
+/// back (also with a trap) any of them outside `writes` that changed is a
+/// `Trap::InvalidState` naming the call site; then the caller's values go
+/// back. Leaves the callee's result in `called`.
+fn audited_call(next: u64, callee: &str, touched: Dirty, writes: Dirty) -> String {
+    let site = next.wrapping_sub(4);
+    format!(
+        "let saved = (m.cpu.regs, m.cpu.sp, m.cpu.nzcv); \
+         for n in 0..31 {{ if {touched:#x}u64 >> n & 1 == 0 {{ m.cpu.regs[n] = 0xa5a5_5a5a_0000_0000 | n as u64; }} }} \
+         if {touched:#x}u64 & {DIRTY_SP:#x} == 0 {{ m.cpu.sp = 0xa5a5_5a5a_ffff_fff0; }} \
+         if {touched:#x}u64 & {DIRTY_NZCV:#x} == 0 {{ m.cpu.nzcv = !saved.2 & 0xf; }} \
+         let expected = (m.cpu.regs, m.cpu.sp, m.cpu.nzcv); \
+         let called = {callee}(m); \
+         let mut changed = None; \
+         for n in 0..31 {{ if {writes:#x}u64 >> n & 1 == 0 && m.cpu.regs[n] != expected.0[n] {{ changed = Some(format!(\"x{{n}}\")); }} }} \
+         if {writes:#x}u64 & {DIRTY_SP:#x} == 0 && m.cpu.sp != expected.1 {{ changed = Some(\"sp\".to_owned()); }} \
+         if {writes:#x}u64 & {DIRTY_NZCV:#x} == 0 && m.cpu.nzcv != expected.2 {{ changed = Some(\"nzcv\".to_owned()); }} \
+         if let Some(register) = changed {{ return Err(Trap::InvalidState {{ message: format!(\"window-call audit: the call at {site:#x} ({callee}) changed {{register}}, outside its summary {touched:#x}/{writes:#x}\") }}); }} \
+         for n in 0..31 {{ if {touched:#x}u64 >> n & 1 == 0 {{ m.cpu.regs[n] = saved.0[n]; }} }} \
+         if {touched:#x}u64 & {DIRTY_SP:#x} == 0 {{ m.cpu.sp = saved.1; }} \
+         if {touched:#x}u64 & {DIRTY_NZCV:#x} == 0 {{ m.cpu.nzcv = saved.2; }} "
+    )
+}
+
+thread_local! {
+    /// `EmitOptions::window_calls_audit` of the region being emitted.
+    static WINDOW_CALLS_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// With `EmitOptions::window_calls`: every region's copy of the window-call
 /// table (the entered windows' `enter_window_<w>`), which the root's
 /// `install` fills (no table yet: a call runs nothing, and the caller
@@ -4704,7 +4785,8 @@ fn window_call(from: u64, target: u64) -> Option<(String, Dirty, Dirty)> {
 const WINDOW_CALL_HELPER: &str = "#[allow(dead_code)]\nstatic WINDOW_CALLS: std::sync::OnceLock<&'static [echora_guest::WindowFn]> = std::sync::OnceLock::new();\n\
 /// The windows summarized calls enter, by index, from the root's `install`.\npub fn install_window_calls(table: &'static [echora_guest::WindowFn]) { let _ = WINDOW_CALLS.set(table); }\n\
 #[allow(dead_code)]\n#[inline(always)]\nfn window_call_at(index: usize) -> echora_guest::WindowFn { match WINDOW_CALLS.get() { Some(table) => table[index], None => window_calls_not_installed } }\n\
-#[allow(dead_code)]\nfn window_calls_not_installed(_m: &mut Machine) -> Result<(), Trap> { Ok(()) }\n";
+#[allow(dead_code)]\nfn window_calls_not_installed(_m: &mut Machine) -> Result<(), Trap> { Ok(()) }\n\
+/// Whether the root's `install` filled the window-call table.\npub fn window_calls_installed() -> bool { WINDOW_CALLS.get().is_some_and(|table| !table.is_empty()) }\n";
 
 thread_local! {
     /// With `EmitOptions::call_summaries`: the leaf summaries
@@ -5574,6 +5656,19 @@ pub struct EmitOptions {
     /// A RET (or BR X30, RETAA, RETAB) leaves its window, so a summary
     /// covers what its window runs from the target until it returns.
     pub window_calls: bool,
+    /// With `window_calls`: also summarize targets whose window can be
+    /// left other than by a return (a branch or fallthrough out of the
+    /// window, an indirect branch, a call whose return point is outside
+    /// it). Such an exit unwinds every summarized caller to the window the
+    /// dispatcher runs, so it is off by default.
+    pub window_call_early_exits: bool,
+    /// With `window_calls`, for checking summaries in a real run: every
+    /// summarized call stores all locals, fills the registers outside the
+    /// callee's summary with a marker and, when the callee returns, traps
+    /// (`Trap::InvalidState` naming the call site) if a register outside
+    /// what it may write changed, then puts the caller's values back. Not
+    /// for speed.
+    pub window_calls_audit: bool,
 }
 
 thread_local! {
@@ -6169,6 +6264,7 @@ struct RegionSettings {
     summaries: Summaries,
     window_calls: WindowCalls,
     ret_leaves: Flag,
+    audit: Flag,
 }
 
 impl RegionSettings {
@@ -6240,6 +6336,10 @@ impl RegionSettings {
                 )),
             ),
             ret_leaves: Flag::set(&RET_LEAVES, calls_windows),
+            audit: Flag::set(
+                &WINDOW_CALLS_AUDIT,
+                calls_windows && options.window_calls_audit,
+            ),
         }
     }
 }
@@ -6247,7 +6347,7 @@ impl RegionSettings {
 /// Whether a region with `options` emits window calls
 /// (`EmitOptions::window_calls`: split windows, not structured ones nor
 /// with lifted functions).
-fn window_calls_on(options: &EmitOptions) -> bool {
+pub fn window_calls_on(options: &EmitOptions) -> bool {
     options.window_calls && !options.structured && !options.functions
 }
 
@@ -6454,7 +6554,8 @@ pub fn emit_rust_split_to_regions<E>(
     let window_calls: Option<(SummaryMap, Arc<BTreeMap<u64, usize>>)> =
         used(window_calls_on).then(|| {
             let summaries = window_call_summaries(translation, &|pc| {
-                window_calls_on(&options_of(pc >> region_bits))
+                let options = options_of(pc >> region_bits);
+                window_calls_on(&options).then_some(options.window_call_early_exits)
             });
             let windows: BTreeSet<u64> = summaries
                 .keys()
@@ -6586,7 +6687,10 @@ pub fn emit_rust_split_to_regions<E>(
             if entered {
                 // Summarized calls enter the window past the entry's
                 // diagnostics (`window_call_summaries`).
-                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    enter_window_{window:x}(m)\n}}\n\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
+                // Both entries hold the body inlined: neither pays a second
+                // call (a `Result<(), Trap>` returns through memory, so a
+                // wrapper could not jump to the other).
+                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    window_body_{window:x}(m)\n}}\n\n#[inline(never)]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    window_body_{window:x}(m)\n}}\n\n#[inline(always)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\nfn window_body_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
             } else {
                 writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
@@ -6733,6 +6837,7 @@ pub fn emit_rust_split_to_regions<E>(
         }
         root.push_str("];\n");
         let mut installs = String::new();
+        let mut checks = Vec::new();
         for region in regions_seen
             .iter()
             .filter(|region| window_calls_on(&options_of(**region)))
@@ -6742,14 +6847,15 @@ pub fn emit_rust_split_to_regions<E>(
                 "    gen_r_{region:x}::install_window_calls(WINDOW_CALL_TABLE);"
             )
             .unwrap();
+            checks.push(format!("gen_r_{region:x}::window_calls_installed()"));
         }
-        root = root.replacen(
-            &format!("    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n"),
-            &format!(
-                "    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n{installs}"
-            ),
-            1,
-        );
+        writeln!(
+            root,
+            "\n/// Whether every region making window calls has the window-call table\n/// (with at least one window: none when nothing is summarized).\npub fn window_calls_installed() -> bool {{\n    {}\n}}",
+            if checks.is_empty() || entered.is_empty() { "false".to_owned() } else { checks.join(" && ") }
+        )
+        .unwrap();
+        add_installs(&mut root, &installs);
     }
     if used(|o| o.functions && o.function_table) {
         // The lifted functions by index, which every region using the table
@@ -6775,15 +6881,21 @@ pub fn emit_rust_split_to_regions<E>(
             )
             .unwrap();
         }
-        root = root.replacen(
-            &format!("    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n"),
-            &format!(
-                "    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n{installs}"
-            ),
-            1,
-        );
+        add_installs(&mut root, &installs);
     }
     Ok(root)
+}
+
+/// `root` with `installs` (lines of the root's `install`) run after the
+/// window table's: a table nobody fills would turn every call through it
+/// into an early return, so a root without that line is a bug.
+fn add_installs(root: &mut String, installs: &str) {
+    let anchor = format!("    echora_guest::install_windows({SPLIT_WINDOW_BITS}, WINDOWS);\n");
+    assert!(
+        root.contains(&anchor),
+        "the root's install has no window table line"
+    );
+    *root = root.replacen(&anchor, &format!("{anchor}{installs}"), 1);
 }
 
 /// `source` without the indentation at the start of its lines. Nobody reads
@@ -8628,7 +8740,7 @@ mod tests {
         ];
         let translation =
             discover(&[region(&words)], &[at(0), at(13), at(15)], words.len()).unwrap();
-        let summaries = window_call_summaries(&translation, &|_| true);
+        let summaries = window_call_summaries(&translation, &|_| Some(true));
         let x = |n: u32| 1u64 << n;
         assert_eq!(summaries.get(&at(4)), Some(&(x(1) | x(30), x(1))));
         let (touched, writes) = summaries[&at(9)];
@@ -8639,7 +8751,7 @@ mod tests {
             assert!(!summaries.contains_key(&none), "{none:#x}");
         }
         // No region with window calls: none.
-        assert!(window_call_summaries(&translation, &|_| false).is_empty());
+        assert!(window_call_summaries(&translation, &|_| None).is_empty());
 
         let options = EmitOptions {
             window_calls: true,
@@ -8692,7 +8804,7 @@ mod tests {
             }
         }
         let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
-        let summaries = window_call_summaries(&translation, &|_| true);
+        let summaries = window_call_summaries(&translation, &|_| Some(true));
         for i in 0..CHAIN {
             let depth = (CHAIN - i) as u32;
             assert_eq!(
@@ -8718,11 +8830,17 @@ mod tests {
         words[257] = 0xd400_00e1;
         let translation =
             discover(&[region(&words)], &[at(256), at(0), at(4)], words.len()).unwrap();
-        let summaries = window_call_summaries(&translation, &|_| true);
+        let summaries = window_call_summaries(&translation, &|_| Some(true));
         let (touched, writes) = summaries[&at(3)];
         let x = |n: u32| 1u64 << n;
         // X1 and X2 from the blocks the BR may reach, X3 from the BR.
         assert_eq!(writes, x(1) | x(2));
         assert_eq!(touched, x(1) | x(2) | x(3) | x(30));
+        // The BR may leave the window: only with early exits allowed.
+        assert!(window_call_summaries(&translation, &|_| Some(false)).is_empty());
+        let report = window_call_report(&translation, 16, &|_| Some(false));
+        assert_eq!((report.targets, report.early_exit_only_targets), (0, 1));
+        let report = window_call_report(&translation, 16, &|_| Some(true));
+        assert_eq!((report.targets, report.early_exit_targets), (1, 1));
     }
 }
