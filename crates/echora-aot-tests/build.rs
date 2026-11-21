@@ -4011,7 +4011,9 @@ fn window_call_code(out: &mut String) {
         ..options()
     };
     let active = !calling.structured && !calling.functions;
-    let lifts: Vec<(&str, String, Vec<(u64, String)>)> = {
+    // (name, root, regions)
+    type Lift = (&'static str, String, Vec<(u64, String)>);
+    let lifts: Vec<Lift> = {
         let mut lifts = Vec::new();
         for (name, bits, options) in [
             ("window_call_base", 16, plain),
