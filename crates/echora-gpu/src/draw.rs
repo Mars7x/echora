@@ -498,6 +498,14 @@ pub enum Indices {
         bytes: u64,
         kind: vk::IndexType,
     },
+    /// Unmodified indices the GPU wrote, read where they are (a buffer
+    /// over shared guest memory): ordered after the writing work by its
+    /// barrier, so the draw does not wait for that work to finish.
+    Shared {
+        buffer: vk::Buffer,
+        offset: u64,
+        kind: vk::IndexType,
+    },
 }
 
 pub struct Draw<'a> {
@@ -1251,6 +1259,7 @@ impl Renderer {
             Indices::None => 0,
             Indices::U16(data) | Indices::U32(data) => data.len() as u64 + 16,
             Indices::Guest { bytes, .. } => bytes + 16,
+            Indices::Shared { .. } => 0,
         };
         let vertex_fetch_bytes = draw.vertex_fetch.len() as u64 * 32;
         bytes += vertex_fetch_bytes + 256;
@@ -1432,6 +1441,11 @@ impl Renderer {
                     kind,
                 ))
             }
+            &Indices::Shared {
+                buffer,
+                offset,
+                kind,
+            } => Some(((buffer, offset), kind)),
         };
 
         // Targets this draw samples were maybe rendered just before.

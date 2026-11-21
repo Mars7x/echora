@@ -7484,6 +7484,42 @@ impl Nvn {
                 .is_some()
     }
 
+    /// The shared buffer and offset to read a draw's `length` bytes of
+    /// guest indices at `guest` (`size` bytes each) from in place: when GPU
+    /// work not yet finished may write them (else they are copied, as
+    /// before) and they lie in a span the GPU shares, as for uniforms
+    /// (`uniform_in_place`). ECHORA_INDICES_IN_PLACE=0 (debugging): copied
+    /// after that work, as before.
+    fn indices_in_place(
+        &mut self,
+        guest: u64,
+        length: u64,
+        size: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            super::debug_var_os("ECHORA_INDICES_IN_PLACE").is_none_or(|value| value != "0")
+        });
+        let Some(end) = guest.checked_add(length) else {
+            return Ok(None);
+        };
+        let range = guest..end;
+        let Some(backend) = self.gpu.as_ref() else {
+            return Ok(None);
+        };
+        if !enabled
+            || !self
+                .draw_input_write_serial(range.clone())
+                .is_some_and(|serial| serial > backend.renderer.completed_serial())
+            || self.gpu_writes_pending(&range)
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .shared_binding(guest, length)?
+            .filter(|&(_, offset)| offset.is_multiple_of(size)))
+    }
+
     fn uniform_write_serial(&self, stages: &[Arc<Translated>]) -> u64 {
         let mut serial = 0;
         for stage in stages {
@@ -11191,11 +11227,36 @@ impl Nvn {
                 let address = command.x[4];
                 let length = u64::from(count) * size;
                 let guest = self.gpu_to_guest(address, length)?;
-                self.resolve_draw_input_of(core, "indices", guest, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
                 let rewrites_indices = size == 1 || quads || strip && restart.is_some();
-                let indices = if pulling && !rewrites_indices && count > 0 {
+                // Indices GPU work is still writing (compute culling's
+                // output) are read in place, ordered after that work by its
+                // barrier, instead of waiting for it to finish to copy them
+                // (~12 ms a frame of the replay thread's in the forest).
+                let in_place = if pulling && !rewrites_indices && count > 0 {
+                    self.indices_in_place(guest, length, size)?
+                } else {
+                    None
+                };
+                if in_place.is_none() {
+                    self.resolve_draw_input_of(core, "indices", guest, length)?;
+                }
+                let indices = if let Some((buffer, offset)) = in_place {
+                    self.gpu
+                        .as_mut()
+                        .unwrap()
+                        .stat("stat: draw indices read in place", 1);
+                    Indices::Shared {
+                        buffer,
+                        offset,
+                        kind: if size == 2 {
+                            vk::IndexType::UINT16
+                        } else {
+                            vk::IndexType::UINT32
+                        },
+                    }
+                } else if pulling && !rewrites_indices && count > 0 {
                     let kind = if size == 2 {
                         vk::IndexType::UINT16
                     } else {
@@ -11245,7 +11306,9 @@ impl Nvn {
                     .iter()
                     .map(|index| u32::from_le_bytes(*index))
                     .collect(),
-                Indices::Guest { .. } => unreachable!("quad indices are decoded on the CPU"),
+                Indices::Guest { .. } | Indices::Shared { .. } => {
+                    unreachable!("quad indices are decoded on the CPU")
+                }
             };
             let triangles: Vec<u8> = corners
                 .as_chunks::<4>()
@@ -11284,14 +11347,14 @@ impl Nvn {
                 .map_or(0, |max| {
                     (max as i64 + i64::from(base_vertex) + 1).max(0) as u64
                 }),
-            Indices::Guest { .. } => 0,
+            Indices::Guest { .. } | Indices::Shared { .. } => 0,
         };
         // The lowest vertex it references: meshes that share one large
         // vertex buffer read their own range only (the draw's first or base
         // vertex moves down by as much).
         let lowest_index = |indices: &Indices| -> Option<u64> {
             match indices {
-                Indices::None | Indices::Guest { .. } => None,
+                Indices::None | Indices::Guest { .. } | Indices::Shared { .. } => None,
                 Indices::U16(bytes) => bytes
                     .as_chunks::<2>()
                     .0
@@ -12124,7 +12187,8 @@ impl Nvn {
                             .collect()
                     }
                 }
-                Indices::None => Vec::new(),
+                // Still being written by the GPU.
+                Indices::None | Indices::Shared { .. } => Vec::new(),
             };
             let line = format!(
                 "trace draw {:016x}/{:016x} {polygon_trace} {:?} count {count} indices {index_sample:?} first {first} base {base_vertex} instances {instances}+{first_instance} fetch {:x?} cull {:?} {:?} blends {:?} mesh {:?} depth {:?} {depth_storage:x?} test {} write {} {:?} viewport {:?} scissor {:?} colors {:x?} attrs {:?} v0 {vertices:?} ubo {uniform_summary:?} textures {}",

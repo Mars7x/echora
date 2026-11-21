@@ -4585,10 +4585,11 @@ impl Renderer {
             .size(span)
             .usage(addressed_usage(
                 // INDIRECT_BUFFER: dispatches read their group counts here.
-                // UNIFORM_BUFFER: draws read uniforms GPU work wrote here
-                // in place.
+                // UNIFORM_BUFFER, INDEX_BUFFER: draws read uniforms and
+                // indices GPU work wrote here in place.
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::UNIFORM_BUFFER
+                    | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
