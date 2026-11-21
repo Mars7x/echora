@@ -1333,7 +1333,14 @@ impl UniformDefinitions {
         let unconditional = instruction.guard.is_true();
         match instruction.op {
             Op::Uldc { d, src, size } => {
-                self.overwrite(d.0, d.0 + u8::from(size == 5));
+                // Sizes 0-4 load one word, 5 two and 6 four; any other is
+                // taken as four, so no stale fact survives in d+1..d+3.
+                let words: u8 = match size {
+                    0..=4 => 1,
+                    5 => 2,
+                    _ => 4,
+                };
+                self.overwrite(d.0, d.0.saturating_add(words - 1));
                 if unconditional
                     && size == 5
                     && d.0 < 62
