@@ -451,16 +451,16 @@ pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault
 
 /// A texture handle's resolved binding: its source, sampler, physical
 /// backing (checked for GPU writes on reuse) and last checked generation.
-type ResolvedBinding = (
-    echora_gpu::draw::TextureSource,
-    echora_gpu::draw::Sampler,
-    Option<gpu::TextureBacking>,
-    u64,
-    // The present it was resolved or last revalidated in.
-    u64,
-    // The texture object the handle named.
-    u64,
-);
+#[derive(Debug)]
+struct ResolvedBinding {
+    source: echora_gpu::draw::TextureSource,
+    sampler: echora_gpu::draw::Sampler,
+    sample_type: echora_gpu::shader::SampleType,
+    backing: Option<gpu::TextureBacking>,
+    gpu_writes: u64,
+    present: u64,
+    texture: u64,
+}
 
 type PoolListStamp = ((u64, u64, u64, u64), u64, u64, u64);
 
@@ -8814,6 +8814,55 @@ mod tests {
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
 
+    fn numeric_texture_fixture(nvn: &mut Nvn, output: u64) {
+        use echora_gpu::ash::vk;
+
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(3, "TexturePool", BTreeMap::new()).unwrap();
+        nvn.initialize(4, "SamplerPool", BTreeMap::new()).unwrap();
+        let sampler = echora_gpu::draw::Sampler {
+            min_filter: vk::Filter::NEAREST,
+            mag_filter: vk::Filter::NEAREST,
+            base_level_only: true,
+            address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
+            border: [1.0f32.to_bits(); 4],
+            ..Default::default()
+        };
+        nvn.sampler_states.entry(4).or_default().insert(1, sampler);
+        for (texture, id, format) in [
+            (6, 20, vk::Format::R16G16_UINT),
+            (7, 21, vk::Format::R16G16_SINT),
+            (output, 11, vk::Format::R32_UINT),
+            (9, 18, vk::Format::R16G16_UNORM),
+        ] {
+            nvn.initialize(
+                texture,
+                "Texture",
+                BTreeMap::from([
+                    ("Width".into(), args([1, 0, 0, 0])),
+                    ("Height".into(), args([1, 0, 0, 0])),
+                    ("Format".into(), args([id, 0, 0, 0])),
+                ]),
+            )
+            .unwrap();
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            renderer.target(texture, 1, 1, format).unwrap();
+            renderer
+                .clear_color(texture, None, vk::ClearColorValue { uint32: [0; 4] })
+                .unwrap();
+            nvn.apply_registration(Registration {
+                pool: 3,
+                id: texture as u32,
+                sampler: None,
+                entry: args([texture, 0, 0, 0]),
+                view: None,
+            });
+        }
+    }
+
     #[test]
     fn compute_dispatch_samples_bound_integer_textures() {
         use echora_gpu::ash::vk;
@@ -8908,47 +8957,8 @@ mod tests {
             .unwrap()
             .state
             .insert("Stage0".into(), args([address, control, 0, 0]));
-        nvn.initialize(3, "TexturePool", BTreeMap::new()).unwrap();
-        nvn.initialize(4, "SamplerPool", BTreeMap::new()).unwrap();
-        let sampler = echora_gpu::draw::Sampler {
-            min_filter: vk::Filter::NEAREST,
-            mag_filter: vk::Filter::NEAREST,
-            base_level_only: true,
-            address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
-            border: [1.0f32.to_bits(); 4],
-            ..Default::default()
-        };
-        nvn.sampler_states.entry(4).or_default().insert(1, sampler);
         let output = 8;
-        for (texture, id, format) in [
-            (6, 20, vk::Format::R16G16_UINT),
-            (7, 21, vk::Format::R16G16_SINT),
-            (output, 11, vk::Format::R32_UINT),
-            (9, 18, vk::Format::R16G16_UNORM),
-        ] {
-            nvn.initialize(
-                texture,
-                "Texture",
-                BTreeMap::from([
-                    ("Width".into(), args([1, 0, 0, 0])),
-                    ("Height".into(), args([1, 0, 0, 0])),
-                    ("Format".into(), args([id, 0, 0, 0])),
-                ]),
-            )
-            .unwrap();
-            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
-            renderer.target(texture, 1, 1, format).unwrap();
-            renderer
-                .clear_color(texture, None, vk::ClearColorValue { uint32: [0; 4] })
-                .unwrap();
-            nvn.apply_registration(Registration {
-                pool: 3,
-                id: texture as u32,
-                sampler: None,
-                entry: args([texture, 0, 0, 0]),
-                view: None,
-            });
-        }
+        numeric_texture_fixture(&mut nvn, output);
         let command = |name, x| Command {
             name,
             x,
@@ -8978,6 +8988,165 @@ mod tests {
             nvn.execute(&bind, &mut guest).unwrap();
             let dispatch = command("nvnCommandBufferDispatchCompute", [0, 1, 1, 1, 0, 0, 0, 0]);
             nvn.gpu_dispatch(&mut guest, &dispatch).unwrap();
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            assert_eq!(
+                renderer.read_target_bytes(output, 4).unwrap(),
+                expected.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_draw_samples_bound_integer_textures() {
+        use echora_gpu::ash::vk;
+
+        let Ok(Some(backend)) = gpu::Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.supports_storage(vk::Format::R32_UINT) {
+            return;
+        }
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let address = 0x10_0000;
+        let fragment = address + 0x400;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([address, 4096, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([address, 0, 0, 0]));
+        let word = |fields: &[(u32, u128)]| {
+            fields
+                .iter()
+                .fold(7 << 12, |word, &(shift, value)| word | value << shift)
+        };
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let header = |tag: u32| {
+            let mut bytes = vec![0; 128];
+            bytes[..4].copy_from_slice(&tag.to_le_bytes());
+            bytes
+        };
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let ast = |offset, register, words_minus_one| {
+            word(&[
+                (0, 0x322),
+                (24, 255),
+                (32, register),
+                (40, offset),
+                (64, 255),
+                (74, words_minus_one),
+            ])
+        };
+        // A single centered point with a one-pixel size.
+        let mut vertex_code = header(1 | (1 << 10));
+        vertex_code.extend(
+            [
+                mov(0, 0),
+                mov(1, 0),
+                mov(2, 0),
+                mov(3, u128::from(1f32.to_bits())),
+                ast(0x70, 0, 3),
+                ast(0x6c, 3, 0),
+                exit,
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes),
+        );
+        // TEX R0, R4, R6, 2D, 0x1, c[2][0x20], explicit LOD0.
+        let mut fragment_code = header(2 | (5 << 10));
+        fragment_code[576 / 8] = 1;
+        fragment_code.extend(
+            [
+                mov(4, u128::from(1.75f32.to_bits())),
+                mov(5, u128::from(0.5f32.to_bits())),
+                mov(6, 0),
+                word(&[
+                    (0, 0xb60),
+                    (16, 0),
+                    (24, 4),
+                    (32, 6),
+                    (40, 8),
+                    (54, 2),
+                    (61, 1),
+                    (64, 255),
+                    (72, 1),
+                    (81, 7),
+                    (87, 3),
+                ]),
+                exit,
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes),
+        );
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(
+                address,
+                4096,
+                READ | WRITE,
+                STATE_NORMAL,
+                "graphics texture test",
+            )
+            .unwrap();
+        memory.write(address, &vertex_code).unwrap();
+        memory.write(fragment, &fragment_code).unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        nvn.initialize(2, "Program", BTreeMap::new()).unwrap();
+        nvn.objects.get_mut(&2).unwrap().state.extend([
+            ("Stage0".into(), args([address, 0, 0, 0])),
+            ("Stage1".into(), args([fragment, 0, 0, 0])),
+        ]);
+        let output = 8;
+        numeric_texture_fixture(&mut nvn, output);
+        let command = |name, x| Command {
+            name,
+            x,
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        for bind in [
+            command("nvnCommandBufferBindProgram", [0, 2, 0x03, 0, 0, 0, 0, 0]),
+            command("nvnCommandBufferSetTexturePool", [0, 3, 0, 0, 0, 0, 0, 0]),
+            command("nvnCommandBufferSetSamplerPool", [0, 4, 0, 0, 0, 0, 0, 0]),
+        ] {
+            nvn.execute(&bind, &mut guest).unwrap();
+        }
+        let mut targets = command("nvnCommandBufferSetRenderTargets", [0, 1, 0, 0, 0, 0, 0, 0]);
+        targets.captured.push(output);
+        nvn.execute(&targets, &mut guest).unwrap();
+        for (texture, expected) in [(6, 1u32), (7, 1), (9, 1.0f32.to_bits()), (6, 1)] {
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .clear_color(output, None, vk::ClearColorValue { uint32: [0; 4] })
+                .unwrap();
+            let bind = command(
+                "nvnCommandBufferBindTexture",
+                [0, 1, 0, (1 << 20) | texture, 0, 0, 0, 0],
+            );
+            nvn.execute(&bind, &mut guest).unwrap();
+            let draw = command("nvnCommandBufferDrawArrays", [0, 0, 0, 1, 0, 0, 0, 0]);
+            nvn.gpu_draw(&mut guest, &draw).unwrap();
             let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
             assert_eq!(
                 renderer.read_target_bytes(output, 4).unwrap(),

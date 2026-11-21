@@ -1002,19 +1002,31 @@ struct GraphicsProgramKey {
     traced: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct GraphicsStageLayout {
+    base: [u32; 3],
+    previous_stores: Option<[u64; 8]>,
+    generic_inputs: [u8; 32],
+    mesh: Option<MeshParameters>,
+}
+
 /// Translated stages and binding counts shared by draws of the program.
 #[derive(Debug)]
 pub(super) struct BoundProgram {
     keys: (u64, u64),
     pipeline: GraphicsProgramKey,
     stages: Box<[Arc<Translated>]>,
-    entries: Box<[super::Args]>,
+    entries: Box<[(super::Args, GraphicsStageLayout)]>,
     uniforms: usize,
     textures: usize,
 }
 
 impl BoundProgram {
-    fn new(keys: (u64, u64), stages: Box<[Arc<Translated>]>, entries: Box<[super::Args]>) -> Self {
+    fn new(
+        keys: (u64, u64),
+        stages: Box<[Arc<Translated>]>,
+        entries: Box<[(super::Args, GraphicsStageLayout)]>,
+    ) -> Self {
         let mut uniforms = 0;
         let mut textures = 0;
         for descriptor in stages.iter().flat_map(|stage| &stage.descriptors) {
@@ -1091,6 +1103,38 @@ impl ComputeJumps {
         self.last = Some((bytes, targets.clone()));
         targets
     }
+}
+
+fn typed_sampled_texture(
+    descriptor: &shader::Descriptor,
+    sample_type: shader::SampleType,
+) -> Option<shader::SampledTexture> {
+    if descriptor.kind() != DescriptorKind::Texture {
+        return None;
+    }
+    (sample_type != shader::SampleType::Float).then_some(shader::SampledTexture {
+        bank: descriptor.cbuf_index,
+        offset: descriptor.cbuf_offset,
+        view: descriptor.texture_type,
+        sample_type,
+    })
+}
+
+/// Integer sampled textures select a different sampler but keep the same
+/// binding layout used to collect the bound resources.
+fn same_typed_descriptor_layout(
+    typed: &[shader::Descriptor],
+    original: &[shader::Descriptor],
+) -> bool {
+    typed.len() == original.len()
+        && typed.iter().zip(original).all(|(typed, original)| {
+            let mut expected = *original;
+            if expected.kind() == DescriptorKind::Texture {
+                let integer = shader::Descriptor::INTEGER;
+                expected.flags = (expected.flags & !integer) | (typed.flags & integer);
+            }
+            *typed == expected
+        })
 }
 
 /// Shader input types for the bound vertex attributes.
@@ -2760,18 +2804,12 @@ impl Nvn {
             .state
             .get("BindVertexAttribState")
             .map_or([0; 32], |bind| generic_input_types(&bind.states));
-        let (vertex, vertex_key) = self.translate_stage(
-            core,
-            addresses[0],
-            [0; 3],
-            None,
-            types,
-            [0; 5],
-            None,
-            None,
-            &[],
-            &[],
-        )?;
+        let vertex_layout = GraphicsStageLayout {
+            generic_inputs: types,
+            ..Default::default()
+        };
+        let (vertex, vertex_key) =
+            self.translate_graphics_stage(core, addresses[0], vertex_layout, &[])?;
         let binding_base = vertex
             .descriptors
             .iter()
@@ -2792,18 +2830,13 @@ impl Nvn {
         ];
         // Fragment inputs the vertex stage does not write read as zero, so
         // the fragment stage is translated against the vertex stage's stores.
-        let (fragment, fragment_key) = self.translate_stage(
-            core,
-            addresses[1],
+        let fragment_layout = GraphicsStageLayout {
             base,
-            Some(vertex.stores),
-            [0; 32],
-            [0; 5],
-            None,
-            None,
-            &[],
-            &[],
-        )?;
+            previous_stores: Some(vertex.stores),
+            ..Default::default()
+        };
+        let (fragment, fragment_key) =
+            self.translate_graphics_stage(core, addresses[1], fragment_layout, &[])?;
         if vertex.stage != Stage::Vertex || fragment.stage != Stage::Fragment {
             return Err(format!(
                 "bound stages are {:?} and {:?}",
@@ -2827,7 +2860,7 @@ impl Nvn {
         let mut program = BoundProgram::new(
             (vertex_key, fragment_key),
             Box::new([vertex, fragment]),
-            Box::new(entries),
+            Box::new([(entries[0], vertex_layout), (entries[1], fragment_layout)]),
         );
         program.pipeline.vertex_formats = formats;
         Ok(program)
@@ -2990,43 +3023,31 @@ impl Nvn {
                 registers: [shader_a, shader_b, init],
                 primitive_header: None,
             };
-            let (stage, key) = self.translate_stage(
-                core,
-                task.x[0],
+            let layout = GraphicsStageLayout {
                 base,
-                None,
-                [0; 32],
-                [0; 5],
-                Some(parameters),
-                None,
-                &[],
-                &[],
-            )?;
+                mesh: Some(parameters),
+                ..Default::default()
+            };
+            let (stage, key) = self.translate_graphics_stage(core, task.x[0], layout, &[])?;
             if stage.stage != Stage::Task {
                 return Err(format!("the task program translated as {:?}", stage.stage));
             }
             base = advance(&stage, base);
             keys = key;
             translated.push(stage);
-            entries.push(task);
+            entries.push((task, layout));
         }
         let parameters = MeshParameters {
             task: false,
             registers: [shader_a, shader_b, init],
             primitive_header: geometry,
         };
-        let (stage, key) = self.translate_stage(
-            core,
-            mesh.x[0],
+        let layout = GraphicsStageLayout {
             base,
-            None,
-            [0; 32],
-            [0; 5],
-            Some(parameters),
-            None,
-            &[],
-            &[],
-        )?;
+            mesh: Some(parameters),
+            ..Default::default()
+        };
+        let (stage, key) = self.translate_graphics_stage(core, mesh.x[0], layout, &[])?;
         if stage.stage != Stage::Mesh {
             return Err(format!("the mesh program translated as {:?}", stage.stage));
         }
@@ -3034,19 +3055,14 @@ impl Nvn {
         let stores = stage.stores;
         keys = keys.rotate_left(1) ^ key;
         translated.push(stage);
-        entries.push(mesh);
-        let (stage, fragment_key) = self.translate_stage(
-            core,
-            fragment.x[0],
+        entries.push((mesh, layout));
+        let layout = GraphicsStageLayout {
             base,
-            Some(stores),
-            [0; 32],
-            [0; 5],
-            None,
-            None,
-            &[],
-            &[],
-        )?;
+            previous_stores: Some(stores),
+            ..Default::default()
+        };
+        let (stage, fragment_key) =
+            self.translate_graphics_stage(core, fragment.x[0], layout, &[])?;
         if stage.stage != Stage::Fragment {
             return Err(format!(
                 "the fragment program translated as {:?}",
@@ -3054,13 +3070,34 @@ impl Nvn {
             ));
         }
         translated.push(stage);
-        entries.push(fragment);
+        entries.push((fragment, layout));
         // Mesh programs never share a key with vertex programs' pipelines.
         Ok(BoundProgram::new(
             (keys ^ 0x6d65_7368, fragment_key),
             translated.into(),
             entries.into(),
         ))
+    }
+
+    fn translate_graphics_stage(
+        &mut self,
+        core: &Guest,
+        address: u64,
+        layout: GraphicsStageLayout,
+        sampled_textures: &[shader::SampledTexture],
+    ) -> Result<(Arc<Translated>, u64), String> {
+        self.translate_stage(
+            core,
+            address,
+            layout.base,
+            layout.previous_stores,
+            layout.generic_inputs,
+            [0; 5],
+            layout.mesh,
+            None,
+            sampled_textures,
+            &[],
+        )
     }
 
     /// A mesh draw's workgroups: DrawMeshTasks(cmd, first, count) draws
@@ -3448,7 +3485,7 @@ impl Nvn {
                     .zip(cached.entries.iter())
                     .all(|(&handle, entry)| {
                         self.with_memoized_binding(handle, |binding| {
-                            entry.matches_binding(&binding.0, &binding.1)
+                            entry.matches_binding(&binding.source, &binding.sampler)
                         }) == Some(true)
                     })
             {
@@ -3507,7 +3544,7 @@ impl Nvn {
         let mut entries = Vec::with_capacity(handles.len());
         let mut resolved_handles = Vec::with_capacity(handles.len());
         for handle in handles {
-            if let Some((source, sampler_state)) = self.memoized_binding(handle) {
+            if let Some((source, sampler_state, _)) = self.memoized_binding(handle) {
                 resolved_handles.push(handle);
                 entries.push(echora_gpu::pool::PoolEntry {
                     texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
@@ -3527,17 +3564,7 @@ impl Nvn {
             let (source, storage) = self.resolve_sampled_texture(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, texture, &source);
-            self.binding_memo.1.insert(
-                handle,
-                (
-                    source.clone(),
-                    sampler_state,
-                    storage,
-                    self.gpu_writes_now(),
-                    self.presented_frames,
-                    texture,
-                ),
-            );
+            self.remember_binding(handle, texture, source.clone(), sampler_state, storage);
             resolved_handles.push(handle);
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
@@ -6618,13 +6645,10 @@ impl Nvn {
             .filter_map(|descriptor| {
                 let (source, _) = textures.get(&descriptor.binding)?;
                 let format = self.gpu.as_ref()?.renderer.source_format(source)?;
-                let sample_type = echora_gpu::renderer::sampled_texture_type(format);
-                (sample_type != shader::SampleType::Float).then_some(shader::SampledTexture {
-                    bank: descriptor.cbuf_index,
-                    offset: descriptor.cbuf_offset,
-                    view: descriptor.texture_type,
-                    sample_type,
-                })
+                typed_sampled_texture(
+                    descriptor,
+                    echora_gpu::renderer::sampled_texture_type(format),
+                )
             })
             .collect();
         let mut storage_images = Vec::new();
@@ -6669,23 +6693,7 @@ impl Nvn {
                 &sampled_textures,
                 &storage_images,
             )?;
-            // Integer sampled textures need a different sampler but keep the
-            // same binding layout. Every other descriptor property must agree
-            // with the translation used to collect the bound resources.
-            let same_layout = typed.descriptors.len() == stage.descriptors.len()
-                && typed
-                    .descriptors
-                    .iter()
-                    .zip(&stage.descriptors)
-                    .all(|(typed, original)| {
-                        let mut expected = *original;
-                        if expected.kind() == DescriptorKind::Texture {
-                            let integer = shader::Descriptor::INTEGER;
-                            expected.flags = (expected.flags & !integer) | (typed.flags & integer);
-                        }
-                        *typed == expected
-                    });
-            if !same_layout {
+            if !same_typed_descriptor_layout(&typed.descriptors, &stage.descriptors) {
                 return Err("numeric image types changed the compute descriptor layout".into());
             }
             stage = typed;
@@ -7003,8 +7011,43 @@ impl Nvn {
     fn memoized_binding(
         &mut self,
         handle: u64,
-    ) -> Option<(echora_gpu::draw::TextureSource, echora_gpu::draw::Sampler)> {
-        self.with_memoized_binding(handle, |entry| (entry.0.clone(), entry.1))
+    ) -> Option<(TextureSource, Sampler, shader::SampleType)> {
+        self.with_memoized_binding(handle, |entry| {
+            (entry.source.clone(), entry.sampler, entry.sample_type)
+        })
+    }
+
+    fn remember_binding(
+        &mut self,
+        handle: u64,
+        texture: u64,
+        source: TextureSource,
+        sampler: Sampler,
+        backing: Option<TextureBacking>,
+    ) -> shader::SampleType {
+        let sample_type = self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .renderer
+            .source_format(&source)
+            .map_or(
+                shader::SampleType::Float,
+                echora_gpu::renderer::sampled_texture_type,
+            );
+        self.binding_memo.1.insert(
+            handle,
+            super::ResolvedBinding {
+                source,
+                sampler,
+                sample_type,
+                backing,
+                gpu_writes: self.gpu_writes_now(),
+                present: self.presented_frames,
+                texture,
+            },
+        );
+        sample_type
     }
 
     fn with_memoized_binding<T>(
@@ -7016,7 +7059,7 @@ impl Nvn {
         let frame = self.presented_frames;
         let entry = self.binding_memo.1.get(&handle)?;
         // The common case: checked at this present and GPU-write generation.
-        if entry.4 == frame && entry.3 == now {
+        if entry.present == frame && entry.gpu_writes == now {
             return Some(read(entry));
         }
         // From an earlier present: a render target's binding holds while
@@ -7024,8 +7067,8 @@ impl Nvn {
         // wait to be copied into it (`texture_source` brings those in); an
         // upload is checked against guest memory once per present, so it
         // is resolved again.
-        if entry.4 != frame {
-            let current = match &entry.0 {
+        if entry.present != frame {
+            let current = match &entry.source {
                 echora_gpu::draw::TextureSource::Target(key)
                 | echora_gpu::draw::TextureSource::TargetView { key, .. } => {
                     !self.block_aliases.contains_key(key)
@@ -7036,8 +7079,8 @@ impl Nvn {
                 return None;
             }
         }
-        if entry.3 != now
-            && entry.2.as_ref().is_some_and(|backing| {
+        if entry.gpu_writes != now
+            && entry.backing.as_ref().is_some_and(|backing| {
                 backing
                     .pieces()
                     .iter()
@@ -7047,8 +7090,8 @@ impl Nvn {
             return None;
         }
         let entry = self.binding_memo.1.get_mut(&handle)?;
-        entry.3 = now;
-        entry.4 = frame;
+        entry.gpu_writes = now;
+        entry.present = frame;
         Some(read(entry))
     }
 
@@ -7089,13 +7132,13 @@ impl Nvn {
             bases.extend(storages.into_iter().filter(|base| *base != 0));
         }
         let stale = |entry: &super::ResolvedBinding| {
-            let source_key = match &entry.0 {
+            let source_key = match &entry.source {
                 TextureSource::Target(key) | TextureSource::TargetView { key, .. } => Some(key),
                 _ => None,
             };
             source_key.is_some_and(|key| keys.contains(&key))
-                || keys.contains(&entry.5)
-                || entry.2.as_ref().is_some_and(|backing| {
+                || keys.contains(&entry.texture)
+                || entry.backing.as_ref().is_some_and(|backing| {
                     backing
                         .pieces()
                         .iter()
@@ -9523,107 +9566,45 @@ impl Nvn {
         Ok(())
     }
 
-    /// Execute a draw command on the GPU.
-    pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
-        let x = &command.x;
-        let empty = match command.name {
-            "nvnCommandBufferDrawArrays"
-            | "nvnCommandBufferDrawElements"
-            | "nvnCommandBufferDrawElementsBaseVertex" => x[3] as u32 == 0,
-            "nvnCommandBufferDrawArraysInstanced" => x[3] as u32 == 0 || x[5] as u32 == 0,
-            "nvnCommandBufferDrawElementsInstanced" => x[3] as u32 == 0 || x[7] as u32 == 0,
-            "nvnCommandBufferDrawMeshTasks" => x[2] as u32 == 0,
-            _ => false,
-        };
-        if empty {
-            if let Some(backend) = &mut self.gpu {
-                backend.stat("stat: empty draws", 1);
+    /// Translate a bound sampled texture's numeric type using the same image
+    /// the recorded draw will read. Floating-point bindings keep the
+    /// discovery translation.
+    fn typed_graphics_stages(
+        &mut self,
+        core: &Guest,
+        program: &BoundProgram,
+        sampled_textures: &[Vec<shader::SampledTexture>],
+    ) -> Result<Option<Vec<Arc<Translated>>>, String> {
+        let mut typed_stages = None;
+        for (index, (stage, numeric)) in program.stages.iter().zip(sampled_textures).enumerate() {
+            if numeric.is_empty() {
+                continue;
             }
-            return Ok(());
+            let (entry, layout) = program.entries[index];
+            let (typed, _) = self.translate_graphics_stage(core, entry.x[0], layout, numeric)?;
+            if !same_typed_descriptor_layout(&typed.descriptors, &stage.descriptors) {
+                return Err("numeric image types changed the graphics descriptor layout".into());
+            }
+            typed_stages.get_or_insert_with(|| program.stages.to_vec())[index] = typed;
         }
-        let mut bindings = std::mem::take(&mut self.draw_bindings);
-        let result = self.gpu_draw_with_bindings(core, command, &mut bindings);
-        bindings
-            .spare_uniforms
-            .extend(bindings.uniforms.drain().map(|(_, mut bytes)| {
-                bytes.clear();
-                bytes
-            }));
-        bindings.guest_uniforms.clear();
-        bindings.textures.clear();
-        self.draw_bindings = bindings;
-        result
+        Ok(typed_stages)
     }
 
-    fn gpu_draw_with_bindings(
+    fn ensure_graphics_program(
         &mut self,
-        core: &mut Guest,
-        command: &Command,
-        bindings: &mut DrawBindings,
-    ) -> Result<(), String> {
-        // Time spent in each phase (stats, microseconds), measured only
-        // when GPU timing or the timeline is on: the clock reads were ~4%
-        // of the replay thread's time.
-        let timing = draw_phase_timing();
-        let phase = |nvn: &mut Self, name: &'static str, since: &mut Option<std::time::Instant>| {
-            let Some(previous) = since.as_mut() else {
-                return;
-            };
-            let now = std::time::Instant::now();
-            nvn.gpu
-                .as_mut()
-                .unwrap()
-                .stat(name, (now - *previous).as_micros() as u64);
-            *previous = now;
-        };
-        let mut since = timing.then(std::time::Instant::now);
-        let mesh_draw = command.name.contains("DrawMeshTasks");
-        let program = if mesh_draw {
-            self.bound_mesh_program(core)?
-        } else {
-            self.bound_program(core)?
-        };
+        program: &BoundProgram,
+        typed_stages: Option<&[Arc<Translated>]>,
+    ) -> Result<(GraphicsProgramKey, GraphicsProgramKey), String> {
         let keys = program.keys;
-        let stages = &*program.stages;
-        let mesh_groups = if mesh_draw {
-            let groups = self.mesh_groups(core, command)?;
-            if matches!(groups, MeshGroups::Direct(groups) if groups.contains(&0)) {
-                return Ok(());
-            }
-            Some(groups)
-        } else {
-            None
-        };
-        phase(self, "stat: draw us program", &mut since);
-        // ECHORA_GPU_SEQUENCE_AFTER=<fragment key>: the present after the
-        // first draw of that program is sequenced (scenes come at frames
-        // that vary from run to run).
-        if self.sequence_chosen.is_none()
-            && super::debug_var("ECHORA_GPU_SEQUENCE_AFTER")
-                .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1))
-        {
-            self.sequence_chosen = Some(self.presented_frames + 1);
-            eprintln!("sequencing present {}", self.presented_frames + 1);
-        }
-        // ECHORA_GPU_SKIP=<fragment key>[,...] (debugging): those
-        // programs' draws are not rendered.
-        if super::debug_var("ECHORA_GPU_SKIP").is_ok_and(|skipped| {
-            skipped
-                .split(',')
-                .any(|key| key == format!("{:016x}", keys.1))
-        }) {
-            return Ok(());
-        }
-        // ECHORA_GPU_SNAP=<target>: during the sequenced present, that
-        // target after each draw into it, as snap-<sequence>.ppm (x/(1+x)).
-        let snap = super::debug_var("ECHORA_GPU_SNAP")
-            .ok()
-            .and_then(|key| u64::from_str_radix(&key, 16).ok())
-            .zip(super::debug_var_os("ECHORA_GPU_DUMP"))
-            .filter(|_| self.sequencing());
         // The translation identity includes the vertex input types, mesh
         // control state and any outputs the previous stage provides.
-        let built = program.pipeline;
+        let mut built = program.pipeline;
+        if let Some(stages) = typed_stages {
+            for (identity, stage) in built.stages.iter_mut().zip(stages) {
+                *identity = Arc::as_ptr(stage) as usize;
+            }
+        }
+        let stages = typed_stages.unwrap_or(&program.stages);
         let traced_variant = GraphicsProgramKey {
             traced: true,
             ..built
@@ -9753,6 +9734,108 @@ impl Nvn {
                 backend.programs.insert(traced_variant, traced);
             }
         }
+        Ok((built, traced_variant))
+    }
+
+    /// Execute a draw command on the GPU.
+    pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
+        let x = &command.x;
+        let empty = match command.name {
+            "nvnCommandBufferDrawArrays"
+            | "nvnCommandBufferDrawElements"
+            | "nvnCommandBufferDrawElementsBaseVertex" => x[3] as u32 == 0,
+            "nvnCommandBufferDrawArraysInstanced" => x[3] as u32 == 0 || x[5] as u32 == 0,
+            "nvnCommandBufferDrawElementsInstanced" => x[3] as u32 == 0 || x[7] as u32 == 0,
+            "nvnCommandBufferDrawMeshTasks" => x[2] as u32 == 0,
+            _ => false,
+        };
+        if empty {
+            if let Some(backend) = &mut self.gpu {
+                backend.stat("stat: empty draws", 1);
+            }
+            return Ok(());
+        }
+        let mut bindings = std::mem::take(&mut self.draw_bindings);
+        let result = self.gpu_draw_with_bindings(core, command, &mut bindings);
+        bindings
+            .spare_uniforms
+            .extend(bindings.uniforms.drain().map(|(_, mut bytes)| {
+                bytes.clear();
+                bytes
+            }));
+        bindings.guest_uniforms.clear();
+        bindings.textures.clear();
+        self.draw_bindings = bindings;
+        result
+    }
+
+    fn gpu_draw_with_bindings(
+        &mut self,
+        core: &mut Guest,
+        command: &Command,
+        bindings: &mut DrawBindings,
+    ) -> Result<(), String> {
+        // Time spent in each phase (stats, microseconds), measured only
+        // when GPU timing or the timeline is on: the clock reads were ~4%
+        // of the replay thread's time.
+        let timing = draw_phase_timing();
+        let phase = |nvn: &mut Self, name: &'static str, since: &mut Option<std::time::Instant>| {
+            let Some(previous) = since.as_mut() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .stat(name, (now - *previous).as_micros() as u64);
+            *previous = now;
+        };
+        let mut since = timing.then(std::time::Instant::now);
+        let mesh_draw = command.name.contains("DrawMeshTasks");
+        let program = if mesh_draw {
+            self.bound_mesh_program(core)?
+        } else {
+            self.bound_program(core)?
+        };
+        let keys = program.keys;
+        let stages = &*program.stages;
+        let mesh_groups = if mesh_draw {
+            let groups = self.mesh_groups(core, command)?;
+            if matches!(groups, MeshGroups::Direct(groups) if groups.contains(&0)) {
+                return Ok(());
+            }
+            Some(groups)
+        } else {
+            None
+        };
+        phase(self, "stat: draw us program", &mut since);
+        // ECHORA_GPU_SEQUENCE_AFTER=<fragment key>: the present after the
+        // first draw of that program is sequenced (scenes come at frames
+        // that vary from run to run).
+        if self.sequence_chosen.is_none()
+            && super::debug_var("ECHORA_GPU_SEQUENCE_AFTER")
+                .is_ok_and(|wanted| wanted == format!("{:016x}", keys.1))
+        {
+            self.sequence_chosen = Some(self.presented_frames + 1);
+            eprintln!("sequencing present {}", self.presented_frames + 1);
+        }
+        // ECHORA_GPU_SKIP=<fragment key>[,...] (debugging): those
+        // programs' draws are not rendered.
+        if super::debug_var("ECHORA_GPU_SKIP").is_ok_and(|skipped| {
+            skipped
+                .split(',')
+                .any(|key| key == format!("{:016x}", keys.1))
+        }) {
+            return Ok(());
+        }
+        // ECHORA_GPU_SNAP=<target>: during the sequenced present, that
+        // target after each draw into it, as snap-<sequence>.ppm (x/(1+x)).
+        let snap = super::debug_var("ECHORA_GPU_SNAP")
+            .ok()
+            .and_then(|key| u64::from_str_radix(&key, 16).ok())
+            .zip(super::debug_var_os("ECHORA_GPU_DUMP"))
+            .filter(|_| self.sequencing());
+        let backend = self.gpu.as_mut().unwrap();
         // ECHORA_LOOP_TRACE: every 60 presents, each traced stage's loops
         // that ran, as for dispatches.
         for index in 0..stages.len() {
@@ -9934,6 +10017,7 @@ impl Nvn {
         uniforms.reserve(program.uniforms);
         guest_uniforms.reserve(program.uniforms);
         textures.reserve(program.textures);
+        let mut sampled_textures: [Vec<shader::SampledTexture>; 3] = Default::default();
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
@@ -10016,7 +10100,7 @@ impl Nvn {
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
                         let mut bytes = spare_uniforms.pop().unwrap_or_default();
                         if self
-                            .read_stage_constants(core, program.entries[index], &mut bytes)
+                            .read_stage_constants(core, program.entries[index].0, &mut bytes)
                             .is_none()
                         {
                             bytes.clear();
@@ -10163,47 +10247,50 @@ impl Nvn {
                             }
                             self.binding_memo = (stamp, Default::default());
                         }
-                        if let Some(binding) = self.memoized_binding(handle) {
-                            textures.insert((index, descriptor.binding), binding);
+                        let (source, sampler, sample_type) = if let Some(binding) =
+                            self.memoized_binding(handle)
+                        {
                             memo_hits += 1;
-                            continue;
-                        }
-                        self.gpu
-                            .as_mut()
-                            .unwrap()
-                            .stat("stat: texture binding memo misses", 1);
-                        let started = timing.then(std::time::Instant::now);
-                        let texture = self.handle_texture(handle).map_err(|error| {
-                            format!(
-                                "{error} ({:?} stage {:016x}, binding {})",
-                                stage.stage,
-                                keys_for_note.get(index).copied().unwrap_or(0),
-                                descriptor.binding
-                            )
-                        })?;
-                        let (source, storage) = self.resolve_sampled_texture(core, texture)?;
-                        if let Some(started) = started {
-                            texture_time += started.elapsed();
-                        }
-                        let source = self.through_view(source, handle);
-                        if let Some(swizzle) = self.handle_swizzle(handle) {
-                            if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
-                                let note = format!("flow view swizzle {swizzle:?} on {texture:x}");
-                                self.gpu_note(note);
+                            binding
+                        } else {
+                            self.gpu
+                                .as_mut()
+                                .unwrap()
+                                .stat("stat: texture binding memo misses", 1);
+                            let started = timing.then(std::time::Instant::now);
+                            let texture = self.handle_texture(handle).map_err(|error| {
+                                format!(
+                                    "{error} ({:?} stage {:016x}, binding {})",
+                                    stage.stage,
+                                    keys_for_note.get(index).copied().unwrap_or(0),
+                                    descriptor.binding
+                                )
+                            })?;
+                            let (source, storage) = self.resolve_sampled_texture(core, texture)?;
+                            if let Some(started) = started {
+                                texture_time += started.elapsed();
                             }
-                        }
-                        let sampler = self.binding_sampler(handle, texture, &source);
-                        self.binding_memo.1.insert(
-                            handle,
-                            (
+                            let source = self.through_view(source, handle);
+                            if let Some(swizzle) = self.handle_swizzle(handle) {
+                                if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
+                                    let note =
+                                        format!("flow view swizzle {swizzle:?} on {texture:x}");
+                                    self.gpu_note(note);
+                                }
+                            }
+                            let sampler = self.binding_sampler(handle, texture, &source);
+                            let sample_type = self.remember_binding(
+                                handle,
+                                texture,
                                 source.clone(),
                                 sampler,
                                 storage,
-                                self.gpu_writes_now(),
-                                self.presented_frames,
-                                texture,
-                            ),
-                        );
+                            );
+                            (source, sampler, sample_type)
+                        };
+                        if let Some(sampled) = typed_sampled_texture(descriptor, sample_type) {
+                            sampled_textures[index].push(sampled);
+                        }
                         textures.insert((index, descriptor.binding), (source, sampler));
                     }
                     other => {
@@ -10234,6 +10321,11 @@ impl Nvn {
         if let Some((kind, since)) = binding_lap.take() {
             binding_times[kind] += since.elapsed();
         }
+        let typed_stages = self.typed_graphics_stages(core, &program, &sampled_textures)?;
+        let (built, traced_variant) =
+            self.ensure_graphics_program(&program, typed_stages.as_deref())?;
+        let stages = typed_stages.as_deref().unwrap_or(&program.stages);
+
         let tail_started = timing.then(std::time::Instant::now);
         // Each stage's c0 holds its bound storage buffers' addresses and
         // sizes (slot i at the stage's table + 16 * i, `c0_storage_table`),
@@ -12194,7 +12286,7 @@ fn attribute_format_size(format: vk::Format) -> u64 {
 
 #[cfg(test)]
 mod program_tests {
-    use super::{Arc, BoundProgram, Stage, Translated};
+    use super::{Arc, BoundProgram, GraphicsStageLayout, Stage, Translated};
 
     #[test]
     fn distinct_translations_of_the_same_guest_code_get_distinct_pipelines() {
@@ -12220,7 +12312,7 @@ mod program_tests {
             BoundProgram::new(
                 (4, 8),
                 Box::new([mesh, fragment.clone()]),
-                Box::new([crate::nvn::Args::default(); 2]),
+                Box::new([(crate::nvn::Args::default(), GraphicsStageLayout::default()); 2]),
             )
         };
 
@@ -16396,14 +16488,15 @@ mod pool_tests {
         nvn.render.bound_textures.insert((0, 0), handle);
         nvn.binding_memo.1.insert(
             handle,
-            (
-                TextureSource::Target(7),
-                Sampler::default(),
-                Some(TextureBacking::linear(4096, 4096)),
-                0,
-                0,
-                7,
-            ),
+            super::super::ResolvedBinding {
+                source: TextureSource::Target(7),
+                sampler: Sampler::default(),
+                sample_type: super::shader::SampleType::Float,
+                backing: Some(TextureBacking::linear(4096, 4096)),
+                gpu_writes: 0,
+                present: 0,
+                texture: 7,
+            },
         );
 
         let original = nvn.pool_entries(&mut core, 0, &[]).unwrap();
@@ -16417,7 +16510,15 @@ mod pool_tests {
         let dynamic = 20;
         nvn.binding_memo.1.insert(
             dynamic,
-            (TextureSource::Target(8), Sampler::default(), None, 1, 0, 8),
+            super::super::ResolvedBinding {
+                source: TextureSource::Target(8),
+                sampler: Sampler::default(),
+                sample_type: super::shader::SampleType::Float,
+                backing: None,
+                gpu_writes: 1,
+                present: 0,
+                texture: 8,
+            },
         );
         let including_dynamic = nvn.pool_entries(&mut core, 0, &[dynamic]).unwrap();
         assert_eq!(including_dynamic.len(), 2);

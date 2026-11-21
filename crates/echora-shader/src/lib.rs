@@ -151,7 +151,7 @@ fn translate_with_constants(
         }
         let code = program_code(&program[GRAPHICS_HEADER_SIZE.min(program.len())..])?;
         let layout = compute::Layout {
-            sampled_textures: &[],
+            sampled_textures,
             storage_images: &[],
             stage: header.stage,
             header: Some(header),
