@@ -10146,11 +10146,75 @@ impl Nvn {
                 why = "stat: CPU conditions: report not in a resident pool";
             }
         }
+        if why == "stat: CPU conditions: word GPU work is writing"
+            && let Some(outcome) = self.gpu_word_condition(core, mode, address)?
+        {
+            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            renderer.set_condition(Some((outcome.0, outcome.1, false)));
+            return Ok(true);
+        }
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat(why, 1);
         }
         self.gpu_clear_condition();
         Ok(false)
+    }
+
+    /// A condition on a counter word GPU work is still writing (mode 0:
+    /// rendering holds while it equals the word 16 bytes on, mode 1 while
+    /// they differ), compared on the GPU after that work
+    /// (`Renderer::condition_on_word`) instead of waiting for it to read
+    /// the word on the CPU: where the word is shared with the GPU in place
+    /// and the other word is the CPU's (no GPU work writes it). The word
+    /// the condition reads, or None (the CPU compares them).
+    /// ECHORA_GPU_WORD_CONDITIONS=0 (debugging): the CPU always does.
+    fn gpu_word_condition(
+        &mut self,
+        core: &mut Guest,
+        mode: u64,
+        address: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            super::debug_var_os("ECHORA_GPU_WORD_CONDITIONS").is_none_or(|value| value != "0")
+        }) {
+            return Ok(None);
+        }
+        let (Ok(word), Ok(other)) = (
+            self.gpu_to_guest(address, 8),
+            self.gpu_to_guest(address.wrapping_add(16), 8),
+        ) else {
+            return Ok(None);
+        };
+        let completed = self.gpu.as_ref().unwrap().renderer.completed_serial();
+        let pending = |nvn: &Self, guest: u64| {
+            nvn.draw_input_write_serial(guest..guest + 8)
+                .is_some_and(|serial| serial > completed)
+        };
+        if !pending(self, word)
+            || self.gpu_writes_pending(&(word..word + 8))
+            || pending(self, other)
+            || self.gpu_writes_pending(&(other..other + 8))
+        {
+            return Ok(None);
+        }
+        let Some(bound) = self
+            .shared_binding(word, 8)?
+            .filter(|&(_, offset)| offset.is_multiple_of(4))
+        else {
+            return Ok(None);
+        };
+        // The other word as the CPU holds it (nothing is pending there).
+        self.resolve_draw_input(core, other, 8)?;
+        let value = core
+            .memory
+            .read_u64(other)
+            .map_err(|trap| format!("{trap:?}"))?;
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .condition_on_word(bound, value, mode == 0)
     }
 
     /// Guest CPU address of the comparison operand read by `gpu_condition`.
