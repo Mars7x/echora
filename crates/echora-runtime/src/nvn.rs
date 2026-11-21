@@ -1321,6 +1321,7 @@ impl Nvn {
     /// A list run again (submitted or called): most recently used, and
     /// counted as reused (the resource cap's second chance).
     fn use_command_list(&mut self, handle: u64) -> Option<std::sync::Arc<Vec<Command>>> {
+        let restored = !self.command_lists.contains_key(&handle);
         let list = match self.command_lists.entry(handle) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1336,6 +1337,14 @@ impl Nvn {
         let commands = list.commands.clone();
         let small = list.small;
         self.note_command_list_use(handle, small);
+        // Restores alone (a scene that records nothing new) would grow the
+        // lists past the cap for good. They are trimmed at twice the cap,
+        // so lists used every frame are not archived and restored in turn;
+        // the one just used is the newest and stays (the caller holds its
+        // commands either way).
+        if restored {
+            self.trim_command_lists(2 * COMMAND_LIST_LIMIT, 2 * COMMAND_LIMIT);
+        }
         Some(commands)
     }
 
@@ -4732,7 +4741,6 @@ impl Nvn {
         }
     }
 
-    /// Whether a queued present has not been shown yet.
     /// A visible, synchronized window holds queued textures for the guest's
     /// requested number of display intervals. Other work can continue while
     /// those textures are owned by the display.
@@ -4774,6 +4782,7 @@ impl Nvn {
             })
     }
 
+    /// Whether a queued present has not been shown yet.
     pub fn present_pending(&self) -> bool {
         self.pending
             .values()
@@ -8261,8 +8270,10 @@ fn bag_call(
                     .props
             };
             if kind == "DepthStencilState" && stencil_property_keys(property).is_some() {
+                // FRONT_AND_BACK (3) reads the front face's setting (a
+                // setter with it wrote both faces the same).
                 let face = match x[1] as u32 {
-                    1 => 0,
+                    1 | 3 => 0,
                     2 => 1,
                     face => return Err(invalid(format!("invalid stencil face {face}"))),
                 };
