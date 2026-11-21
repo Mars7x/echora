@@ -522,6 +522,112 @@ resuming at the RET) stores the caller's X30 before the SVC trap reaches
 the host, so the cause there is not yet seen, and the rule removes such
 calls from summarized ones whatever it was.
 
+## Window calls (opt-in)
+
+`EmitOptions::window_calls` (`window-calls` in `ECHORA_LIFT_OPTIONS`; split
+windows only, ignored with `structured` or `functions`) makes calls
+between windows cheaper without lifting functions: no new copies of guest
+code, only a summary per call target and a second name for the windows
+calls enter. Nothing in `echora-guest` changes.
+
+Without it a BL stores every dirty local, runs `Core::call` (window table
+lookup, depth check, loop, indirect call), the callee's window records
+the entry (`enter_window`: alignment check and the recent-PC ring),
+dispatches the target and loads its locals, and the caller reloads every
+local it holds afterwards. With it, a BL to a target T that has a summary
+is a summarized call (the same rewrite as `call_summaries`): the caller
+stores only the dirty locals T may read or write, calls T's window
+directly (`enter_window_<w>` in its own region, `window_call_at(i)` of a
+per-region copy of the root's window-call table elsewhere, as
+`function-table` does for functions), and reloads only what T may write.
+The other locals stay in host registers across the call. `run_window_<w>`
+of an entered window is `enter_window()` and a tail call of
+`enter_window_<w>`, so the table and dispatcher path keep the diagnostics
+and direct calls skip them (a constant, aligned target).
+
+**Summaries** (`window_call_summaries`). A window entered at T runs its
+blocks until its next PC leaves it. In this mode a RET (and BR X30, RETAA,
+RETAB) leaves the window as such an exit does (`m.cpu.pc = next_pc;
+return m.finish_block();`, so a RET into the same window goes through the
+dispatcher or `Core::call`, which return at once when it is the return
+address). T's blocks are those reached from T inside its window through
+branches, both sides of conditional ones, fallthroughs and call return
+points; any other BR, or a B to a PLT stub (run in place), may reach any
+block of the window, so they all count. T gets a summary when those
+blocks hold no BLR, SVC, UDF, unsupported instruction or traced block,
+every BL in them is itself to a target with a summary, the calls form no
+cycle and nest at most `WINDOW_CALL_DEPTH_LIMIT` (16) deep (summarized
+calls take no `Core::call` depth, so the host stack is bounded here),
+and T is no PLT stub and has its own dispatch arm. The summary is the
+union of `crate::defuse` effects (general registers, SP, NZCV; FPCR and
+FPSR are stored and reloaded around every call as before) over those
+blocks and the callees' summaries.
+
+**Why nothing else sees a stale `Core`.** While a summarized window runs,
+only its reached blocks and summarized callees run: any exit returns
+from it. When it comes back with the PC not at the return address (an
+early return elsewhere, a branch out of the window, a call inside it that
+came back early), the caller returns from its own window too (its final
+store writes every local it holds), up to the window run by the
+dispatcher or `Core::call`, which continues from the PC. A trap, an SVC,
+a host boundary, preemption or the budget inside the callee comes back as
+an error, after which every caller reloads what the callee may have
+written and its final store writes the rest. Block charges, tags,
+boundaries and step counts are those of the same blocks, unchanged. The
+callee's window loads all its locals on entry and stores all it writes at
+exit, also those its reached blocks never touch: those hold the `Core`'s
+(possibly stale) value and write it back unchanged, and the caller, which
+holds the true value, never reloads them.
+
+**Coverage and gains** (`echora lift` prints the BL targets with
+summaries, their windows and the BL sites calling them). Kernels lifted
+in one 64 KiB region with the game's default set, against the same set
+plus `window-calls`, on a shared 4-core x86-64 container, five rounds
+(three of the call kernels alone, seven runs each; two of every kernel,
+five runs each), median Minstr/s per round:
+
+| Kernel | default set | + window-calls | change per round |
+|---|---|---|---|
+| calls (two leaves per iteration) | 580-614 | 833-889 | +38% to +46% |
+| calls2 (a frame function calling both leaves) | 317-342 | 702-787 | 2.1x to 2.5x |
+| gamecalls (game-shaped update loop) | 920-1198 | 1259-1614 | +8.5% to +71% (middle +37%) |
+
+Two full runs over every kernel moved only the call kernels' code (the
+other kernels' emitted Rust is identical between the builds); their
+changes there, -27% to +22% in both directions between rounds, are
+layout noise.
+
+Census (`echora_lift::census`, stores and reloads of locals inside window
+bodies) of the kernels' windows, default set against + window-calls:
+
+| window | spills | reloads |
+|---|---|---|
+| calls | 4 -> 2 | 6 -> 0 |
+| calls2 | 11 -> 5 | 15 -> 3 |
+| gamecalls | 12 -> 8 | 22 -> 9 |
+| gamecalls update, hash | 15 -> 6 | 16 -> 3 |
+
+and of the game-shaped random program of `tests/window_calls.rs` (7
+windows, 272 call sites, random bodies using every free register, so
+large summaries): per window 640 -> 538 spills and 1,249 -> 763 reloads
+(-16%, -39%).
+
+`tests/window_calls.rs` runs that program (frames, BL and BLR, a jump
+through BR, early returns to another window, SVCs, recursion, UDF faults,
+and a caller holding a register its callee's callee's early return reads)
+lifted without window calls, with them in one region, through the table
+across 1 KiB regions and in every other region, from 36 states per
+caller, whole, sliced into host boundaries and against a budget; every
+register, SP, NZCV, PC, step count, boundary count, trap, the data memory
+and the stack must equal the default emission's. Each lift runs in its
+own process (the window table `Core::call` uses is one per process). A
+summary without the callee's writes, RETs that do not leave the window,
+a BR not reaching the whole window or a callee's early return continuing
+in place each fail it. `tests/calls.rs` runs its callers with window
+calls against the reference interpreter, and the whole `echora-aot-tests`
+suite passes with every program lifted with the game set and
+`window-calls`.
+
 ## The step count in a window local (opt-in)
 
 `EmitOptions::steps_local` (`steps-local`, with split ticks, not with

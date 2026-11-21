@@ -4058,7 +4058,24 @@ fn window_call_code(out: &mut String) {
                 .map(|(_, source)| source.matches(pattern).count())
                 .sum::<usize>()
         };
+        // The census over every window (`echora_lift::census`): windows,
+        // stores and reloads of register locals in their bodies, calls.
+        let (mut windows, mut spills, mut reloads, mut calls) = (0, 0, 0, 0);
+        for (_, source) in &regions {
+            for (_, counts) in echora_lift::census::census(source) {
+                windows += 1;
+                spills += counts.spills;
+                reloads += counts.reloads;
+                calls += counts.calls;
+            }
+        }
         writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(
+            out,
+            "/// The census of its windows: windows, spills, reloads and calls.\n\
+             pub const CENSUS: (usize, usize, usize, usize) = ({windows}, {spills}, {reloads}, {calls});"
+        )
+        .expect("write");
         writeln!(
             out,
             "/// Summarized window calls, directly and through the table, and the windows they enter.\n\
