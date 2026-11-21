@@ -1124,6 +1124,7 @@ mod tests {
             (40, 10, 0x2fc),
         ]);
         let broadcast = word(&[(0, 12, 0x3c2), (16, 6, 4), (24, 8, 1)]);
+        let fma = |dest| word(&[(0, 12, 0x223), (16, 8, dest), (24, 8, 2)]);
         let recount = |instructions: &[u128]| {
             let mut program = header(1, 1, &[]);
             program.extend(bytes(instructions));
@@ -1137,6 +1138,8 @@ mod tests {
             count
         };
         assert_eq!(recount(&[source, load, broadcast, EXIT]), 0);
+        assert_eq!(recount(&[source, load, fma(2), broadcast, EXIT]), 0);
+        assert_eq!(recount(&[source, load, fma(1), broadcast, EXIT]), 1);
         assert_eq!(recount(&[source, load, vertex_id, broadcast, EXIT]), 1);
 
         // The back edge can reach R2UR after R1 has received a vertex ID.

@@ -172,6 +172,75 @@ fn a_switch_requires_all_entries_and_an_uninterrupted_index_definition() {
     code[6] = word(branch(6, 2));
     assert!(JumpTables::analyze(&code).is_none());
 }
+
+#[test]
+fn independent_vertex_switches_follow_each_vertices_target() {
+    use crate::decode::UniformReg;
+    use crate::spirv::capability::GROUP_NON_UNIFORM_ARITHMETIC;
+    use echora_shader_abi::Stage;
+
+    let mut code = program();
+    // ALD R0, a[0x2fc] puts the vertex ID in the jump table index.
+    code[0] = crate::decode(0x321 | 7 << 12 | 255 << 24 | 255 << 32 | 0x2fc << 40);
+    let layout = Layout {
+        stage: Stage::Vertex,
+        ..Layout::workgroup([1; 3])
+    };
+    let blocks = blocks(&code).unwrap();
+    assert!(structure::Graph::new(&blocks, None).is_none());
+    let emitter = emit_blocks(&code, &layout, &blocks, None).unwrap();
+    let result = emitter.registers[&3];
+    let (module, needs) = super::finish_with_needs(emitter);
+    assert!(
+        !needs
+            .capabilities
+            .iter()
+            .any(|(cap, _)| *cap == GROUP_NON_UNIFORM_ARITHMETIC)
+    );
+    assert_eq!(crate::spirv::tests::validate(&module.spirv), None);
+    let binding = module
+        .descriptors
+        .iter()
+        .find(|desc| desc.index == 1)
+        .unwrap()
+        .binding;
+    let machine = Machine::new(&module.spirv);
+    for (destinations, results) in [
+        ([80u32, 112, 144], [11, 22, 33, 33]),
+        ([144, 113, 80], [33, 0, 11, 11]),
+    ] {
+        let constants: Vec<_> = destinations
+            .into_iter()
+            .chain([0])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        for (vertex, expected) in results.into_iter().enumerate() {
+            let output = machine.simulate(&Inputs {
+                uniforms: [((0, binding), constants.clone())].into(),
+                builtins: [(42, vec![vertex as u64])].into(),
+                ..Inputs::default()
+            });
+            assert!(output.problems.is_empty(), "{:?}", output.problems);
+            assert_eq!(output.invocations[0][&result][0], expected);
+        }
+    }
+
+    code.insert(
+        11,
+        word(Op::R2ur {
+            d: UniformReg(4),
+            src: Reg(3),
+        }),
+    );
+    let (_, needs) = super::translate_with_needs(&code, &layout).unwrap();
+    assert!(
+        needs
+            .capabilities
+            .iter()
+            .any(|(cap, _)| *cap == GROUP_NON_UNIFORM_ARITHMETIC)
+    );
+}
+
 #[test]
 fn fragment_jump_tables_preserve_pixels_in_a_divergent_quad() {
     use crate::header::{Header, Interpolation};

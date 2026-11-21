@@ -103,6 +103,7 @@ pub(super) fn broadcasts(code: &[Instruction], first_block_end: usize) -> Vec<us
                     && source(&state, shift.src);
                 state.set(d.0, uniform, same);
             }
+            Op::Ffma { d, .. } => state.set(d.0, uniform, false),
             Op::Load {
                 d,
                 space: Space::Global,

@@ -3384,6 +3384,35 @@ impl Emitter {
     fn program(&mut self, code: &[Instruction], blocks: &[Block]) -> Result<(), Unsupported> {
         self.vertex_prologue(code);
         self.vertex_trace_begin();
+        // Independent vertex invocations can dispatch their own blocks.
+        // Keep warp reconvergence for code with cross-lane operations,
+        // synchronization or writes that may be visible to other lanes.
+        let reconverge = self.stage != Stage::Vertex
+            || self.layout.vertex_trace
+            || code.iter().any(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::R2ur { .. }
+                        | Op::Shfl { .. }
+                        | Op::Vote { .. }
+                        | Op::Redux { .. }
+                        | Op::S2r { .. }
+                        | Op::Cs2r { .. }
+                        | Op::Fswzadd { .. }
+                        | Op::Ldsm { .. }
+                        | Op::Movm { .. }
+                        | Op::Hmma { .. }
+                        | Op::Bar { .. }
+                        | Op::Membar { .. }
+                        | Op::Ldgsts { .. }
+                        | Op::Load { strong: true, .. }
+                        | Op::Store { .. }
+                        | Op::Atomic { .. }
+                        | Op::Surface { store: true, .. }
+                        | Op::SurfaceReduce { .. }
+                        | Op::Isbe { .. }
+                )
+            });
         let starts: BTreeSet<usize> = blocks.iter().map(|block| block.start).collect();
         let u32_ptr = self.u32_ptr;
         let bool_ptr = self.bool_ptr;
@@ -3406,45 +3435,47 @@ impl Emitter {
             self.module.id(),
         );
         self.function.emit(op::BRANCH, &[header]);
-        // Header: the subgroup runs the lowest next block among its running
-        // invocations (so they reconverge where the warp's threads would:
-        // a barrier's block runs once for all of them, and subgroup
-        // operations see them together), while any runs and within budget
-        // (both the same across the subgroup).
         self.function.label(header);
-        self.module
-            .capability(capability::GROUP_NON_UNIFORM_ARITHMETIC);
         let still = self.value(op::LOAD, self.bool, &[running]);
         let own = self.value(op::LOAD, self.u32, &[next]);
-        let none = self.constant(u32::MAX);
-        let pending = self.value(op::SELECT, self.u32, &[still, own, none]);
-        let subgroup = self.constant(SCOPE_SUBGROUP);
-        // Group operation 0: reduce.
-        let selector = self.value(
-            op::GROUP_NON_UNIFORM_U_MIN,
-            self.u32,
-            &[subgroup, 0, pending],
-        );
-        let any = self.value(op::I_NOT_EQUAL, self.bool, &[selector, none]);
+        let (selector, active) = if reconverge {
+            // Run the lowest pending block together so barriers and
+            // subgroup instructions see the lanes that reached it.
+            self.module
+                .capability(capability::GROUP_NON_UNIFORM_ARITHMETIC);
+            let none = self.constant(u32::MAX);
+            let pending = self.value(op::SELECT, self.u32, &[still, own, none]);
+            let subgroup = self.constant(SCOPE_SUBGROUP);
+            let selector = self.value(
+                op::GROUP_NON_UNIFORM_U_MIN,
+                self.u32,
+                &[subgroup, 0, pending],
+            );
+            let any = self.value(op::I_NOT_EQUAL, self.bool, &[selector, none]);
+            (selector, any)
+        } else {
+            (own, still)
+        };
         let left = self.value(op::LOAD, self.u32, &[budget]);
         let zero = self.constant(0);
         let some_left = self.value(op::U_GREATER_THAN, self.bool, &[left, zero]);
-        let go = self.value(op::LOGICAL_AND, self.bool, &[any, some_left]);
+        let go = self.value(op::LOGICAL_AND, self.bool, &[active, some_left]);
         self.function
             .emit(op::LOOP_MERGE, &[merge, continuing, spirv::NONE]);
         self.function
             .emit(op::BRANCH_CONDITIONAL, &[go, body, merge]);
-        // Body: the invocations at that block run it (the switch over
-        // blocks); the others wait.
         self.function.label(body);
-        let here = self.value(op::I_EQUAL, self.bool, &[own, selector]);
-        let chosen = self.value(op::LOGICAL_AND, self.bool, &[still, here]);
-        let (run, waiting) = (self.module.id(), self.module.id());
-        self.function
-            .emit(op::SELECTION_MERGE, &[waiting, spirv::NONE]);
-        self.function
-            .emit(op::BRANCH_CONDITIONAL, &[chosen, run, waiting]);
-        self.function.label(run);
+        let waiting = reconverge.then(|| {
+            let here = self.value(op::I_EQUAL, self.bool, &[own, selector]);
+            let chosen = self.value(op::LOGICAL_AND, self.bool, &[still, here]);
+            let (run, waiting) = (self.module.id(), self.module.id());
+            self.function
+                .emit(op::SELECTION_MERGE, &[waiting, spirv::NONE]);
+            self.function
+                .emit(op::BRANCH_CONDITIONAL, &[chosen, run, waiting]);
+            self.function.label(run);
+            waiting
+        });
         let switch_merge = self.module.id();
         let labels: Vec<u32> = blocks.iter().map(|_| self.module.id()).collect();
         // An index past the blocks stops the invocation.
@@ -3517,8 +3548,10 @@ impl Emitter {
             self.function.emit(op::BRANCH, &[switch_merge]);
         }
         self.function.label(switch_merge);
-        self.function.emit(op::BRANCH, &[waiting]);
-        self.function.label(waiting);
+        if let Some(waiting) = waiting {
+            self.function.emit(op::BRANCH, &[waiting]);
+            self.function.label(waiting);
+        }
         self.function.emit(op::BRANCH, &[continuing]);
         // Continue: spend one unit of the budget.
         self.function.label(continuing);
