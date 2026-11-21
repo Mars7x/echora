@@ -5,7 +5,7 @@ use std::ops::{Range, RangeInclusive};
 
 use crate::decode::{Combine, Instruction, IntCompare, Op, Operand, Reg, Src};
 
-/// Targets proved from the same bank-1 bytes that the dispatch binds.
+/// Targets proved from the same bank-1 bytes that the command binds.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct JumpTargets(pub(crate) BTreeMap<usize, Vec<usize>>);
 
@@ -16,8 +16,8 @@ struct Site {
     definitions: RangeInclusive<usize>,
 }
 
-/// Bounded jump table reads in a compute program. Its instructions bound
-/// the indices and each dispatch's constant bank supplies destinations.
+/// Bounded jump table reads in a program. Its instructions bound the
+/// indices and the command's constant bank supplies destinations.
 #[derive(Debug)]
 pub struct JumpTables {
     sites: Vec<Site>,
@@ -27,6 +27,14 @@ pub struct JumpTables {
 impl JumpTables {
     pub fn from_compute_program(program: &[u8]) -> Option<Self> {
         Self::analyze(&crate::program_code(program).ok()?)
+    }
+
+    pub fn from_fragment_program(program: &[u8]) -> Option<Self> {
+        if crate::header::parse(program)?.stage != echora_shader_abi::Stage::Fragment {
+            return None;
+        }
+        let code = crate::program_code(program.get(crate::GRAPHICS_HEADER_SIZE..)?).ok()?;
+        Self::analyze(&code)
     }
 
     pub(crate) fn analyze(code: &[Instruction]) -> Option<Self> {

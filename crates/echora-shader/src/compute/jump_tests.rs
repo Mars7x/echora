@@ -172,3 +172,87 @@ fn a_switch_requires_all_entries_and_an_uninterrupted_index_definition() {
     code[6] = word(branch(6, 2));
     assert!(JumpTables::analyze(&code).is_none());
 }
+#[test]
+fn fragment_jump_tables_preserve_pixels_in_a_divergent_quad() {
+    use crate::header::{Header, Interpolation};
+    use crate::sim::QuadPixel;
+    use echora_shader_abi::Stage;
+
+    let mut code = program();
+    // IPA R0, a[0x80] reads the first flat input as a register word.
+    code[0] = crate::decode(
+        0x326 | (7 << 12) | (255 << 24) | (255 << 32) | (32 << 64) | (1 << 76) | (7 << 81),
+    );
+    for (index, value) in [(5, 0.25f32), (7, 0.5), (9, 0.75)] {
+        code[index] = word(Op::Mov {
+            d: Reg(0),
+            src: Src::Imm(value.to_bits()),
+            lanes: 15,
+        });
+    }
+    let mut imap = [Interpolation::Unused; 128];
+    imap[0] = Interpolation::Constant;
+    let layout = Layout {
+        stage: Stage::Fragment,
+        header: Some(Header {
+            stage: Stage::Fragment,
+            imap,
+            targets: 1,
+            writes_depth: false,
+            writes_sample_mask: false,
+            local_bytes: Some(0),
+            outputs: [0; 5],
+            outputs_beyond: false,
+        }),
+        ..Layout::workgroup([1; 3])
+    };
+    let table = JumpTables::analyze(&code).unwrap();
+    let control = super::translate(&code, &layout).unwrap();
+    for destinations in [[80u32, 112, 144], [144, 80, 112]] {
+        let constants: Vec<_> = destinations
+            .into_iter()
+            .chain([0])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let targets = table.resolve(&constants).unwrap();
+        let (optimized, _) = super::translate_with_jump_targets(&code, &layout, &targets).unwrap();
+        assert_eq!(control.descriptors, optimized.descriptors);
+        let binding = control
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.index == 1)
+            .unwrap()
+            .binding;
+        let colors = |program: &echora_shader_abi::Translated| {
+            if let Some(problem) = crate::spirv::tests::validate(&program.spirv) {
+                panic!("{problem}");
+            }
+            let machine = Machine::new(&program.spirv);
+            let result = machine.simulate(&Inputs {
+                uniforms: [((0, binding), constants.clone())].into(),
+                quad: (0..4)
+                    .map(|value| QuadPixel {
+                        frag_coord: [0.0; 4],
+                        helper: false,
+                        locations: [(0, vec![value, 0, 0, 0])].into(),
+                    })
+                    .collect(),
+                ..Inputs::default()
+            });
+            assert!(result.problems.is_empty(), "{:?}", result.problems);
+            result
+                .invocations
+                .iter()
+                .map(|pixel| machine.located_outputs(pixel)[&(0, 0)][0] as u32)
+                .collect::<Vec<_>>()
+        };
+        let observed = colors(&control);
+        assert_eq!(colors(&optimized), observed);
+        let expected = [0, 1, 2, 2].map(|index| match destinations[index] {
+            80 => 0.25f32.to_bits(),
+            112 => 0.5f32.to_bits(),
+            _ => 0.75f32.to_bits(),
+        });
+        assert_eq!(observed, expected);
+    }
+}

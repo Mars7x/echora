@@ -35,6 +35,7 @@ pub(super) struct DrawBindings {
     spare_uniforms: Vec<Vec<u8>>,
     guest_uniforms: echora_gpu::FastMap<(usize, u32), (u64, usize)>,
     textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
+    stage_variants: Vec<Arc<Translated>>,
 }
 
 /// A built page table (see `Nvn::page_table`).
@@ -276,7 +277,9 @@ pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
     translations: HashMap<TranslationKey, Result<Arc<Translated>, String>>,
-    compute_jumps: HashMap<u64, Option<ComputeJumps>>,
+    jump_tables: HashMap<u64, Option<StageJumps>>,
+    fragment_jump_stages: super::FastSet<usize>,
+    fragment_jump_variants: HashMap<FragmentVariantKey, FragmentJumpVariant>,
     /// Bindless lookups by translation identity. The translation cache
     /// keeps each addressed translation alive.
     handle_reads: HashMap<usize, Arc<shader::handle_reads::HandleReads>>,
@@ -644,7 +647,9 @@ impl Backend {
             max_extent: renderer.max_image_extent(),
             renderer,
             translations: HashMap::default(),
-            compute_jumps: HashMap::default(),
+            jump_tables: HashMap::default(),
+            fragment_jump_stages: super::FastSet::default(),
+            fragment_jump_variants: HashMap::default(),
             handle_reads: HashMap::default(),
             global_writes: HashMap::default(),
             uniform_writes: HashMap::default(),
@@ -1056,7 +1061,7 @@ impl BoundProgram {
 }
 
 /// Stage key, binding base, previous stage's stores, generic input types,
-/// compute and mesh state, native pointers, and proved compute jump targets.
+/// compute and mesh state, native pointers, and proved jump targets.
 type TranslationKey = (
     u64,
     [u32; 3],
@@ -1071,17 +1076,21 @@ type TranslationKey = (
     Vec<shader::BoundStorageImage>,
 );
 
-struct ComputeJumps {
+type FragmentVariantKey = (usize, Vec<shader::SampledTexture>);
+
+struct FragmentJumpVariant {
+    targets: Arc<shader::JumpTargets>,
+    stage: Option<Arc<Translated>>,
+}
+
+struct StageJumps {
     tables: shader::JumpTables,
     last: Option<(Vec<Box<[u8]>>, Option<Arc<shader::JumpTargets>>)>,
 }
 
-impl ComputeJumps {
-    fn from_program(program: &[u8]) -> Option<Self> {
-        Some(Self {
-            tables: shader::JumpTables::from_compute_program(program)?,
-            last: None,
-        })
+impl StageJumps {
+    fn new(tables: shader::JumpTables) -> Self {
+        Self { tables, last: None }
     }
 
     fn resolve(&mut self, constants: &[u8]) -> Option<Arc<shader::JumpTargets>> {
@@ -2382,7 +2391,7 @@ impl Nvn {
         generic_input_types: [u8; 32],
         compute: [u32; 5],
         mesh: Option<MeshParameters>,
-        compute_constants: Option<&[u8]>,
+        stage_constants: Option<&[u8]>,
         sampled_textures: &[shader::SampledTexture],
         storage_images: &[shader::BoundStorageImage],
     ) -> Result<(Arc<Translated>, u64), String> {
@@ -2406,15 +2415,17 @@ impl Nvn {
         let typed_outputs = fragment_output_types != [0; MAX_COLOR_TARGETS];
         let backend = self.gpu.as_mut().unwrap();
         let native_pointers = backend.native_programs.contains(&key);
-        let jump_targets = compute_constants.and_then(|constants| {
+        let jump_targets = stage_constants.and_then(|constants| {
             backend
-                .compute_jumps
+                .jump_tables
                 .entry(key)
-                .or_insert_with(|| ComputeJumps::from_program(&code))
+                .or_insert_with(|| {
+                    shader::JumpTables::from_compute_program(&code).map(StageJumps::new)
+                })
                 .as_mut()?
                 .resolve(constants)
         });
-        let constants_for_translation = jump_targets.as_ref().and(compute_constants);
+        let constants_for_translation = jump_targets.as_ref().and(stage_constants);
         let cache_key = (
             key,
             base,
@@ -2501,7 +2512,7 @@ impl Nvn {
                         &mut PointerProbe {
                             nvn,
                             core,
-                            c1: compute_constants.unwrap_or_default(),
+                            c1: stage_constants.unwrap_or_default(),
                         },
                     )
                 } else {
@@ -2589,7 +2600,9 @@ impl Nvn {
         // Without a translator plugin, a program the Rust translator does
         // not handle stops the run with its report: nothing is drawn wrong
         // in silence.
+        // A failed fragment specialization can keep the general shader.
         if let Err(error) = &translated
+            && (stage_constants.is_none() || compute[0] != 0)
             && (typed_outputs || !shader::available())
         {
             backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
@@ -2616,6 +2629,25 @@ impl Nvn {
             if let Some(writes) = shader::handle_reads::UniformWriteRanges::from_program(&code) {
                 backend.uniform_writes.insert(id, writes);
             }
+        }
+        if builtin
+            && let Ok(stage) = &translated
+            && stage.stage == Stage::Fragment
+            && stage_constants.is_none()
+            && stage.descriptors.iter().any(|descriptor| {
+                descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 1
+            })
+            && backend
+                .jump_tables
+                .entry(key)
+                .or_insert_with(|| {
+                    shader::JumpTables::from_fragment_program(&code).map(StageJumps::new)
+                })
+                .is_some()
+        {
+            backend
+                .fragment_jump_stages
+                .insert(Arc::as_ptr(stage) as usize);
         }
         backend.translations.insert(cache_key, translated.clone());
         translated.map(|stage| (stage, key))
@@ -9566,28 +9598,120 @@ impl Nvn {
         Ok(())
     }
 
-    /// Translate a bound sampled texture's numeric type using the same image
-    /// the recorded draw will read. Floating-point bindings keep the
-    /// discovery translation.
-    fn typed_graphics_stages(
+    /// Specialize from the exact constant bytes and image types the draw
+    /// will bind, while keeping the discovery shader's resource layout.
+    fn graphics_stage_variants(
         &mut self,
         core: &Guest,
         program: &BoundProgram,
         sampled_textures: &[Vec<shader::SampledTexture>],
-    ) -> Result<Option<Vec<Arc<Translated>>>, String> {
-        let mut typed_stages = None;
+        fragment_constants: Option<(usize, &[u8])>,
+        variants: &mut Vec<Arc<Translated>>,
+    ) -> Result<(), String> {
         for (index, (stage, numeric)) in program.stages.iter().zip(sampled_textures).enumerate() {
-            if numeric.is_empty() {
+            let constants = fragment_constants.filter(|&(stage, _)| stage == index);
+            if constants.is_none() && numeric.is_empty() {
                 continue;
             }
             let (entry, layout) = program.entries[index];
-            let (typed, _) = self.translate_graphics_stage(core, entry.x[0], layout, numeric)?;
-            if !same_typed_descriptor_layout(&typed.descriptors, &stage.descriptors) {
-                return Err("numeric image types changed the graphics descriptor layout".into());
+            let specialized = constants.and_then(|(_, bytes)| {
+                self.specialize_fragment(
+                    core,
+                    program.keys.1,
+                    stage,
+                    entry.x[0],
+                    layout,
+                    numeric,
+                    bytes,
+                )
+            });
+            let variant = match specialized {
+                Some(fragment) => fragment,
+                None if numeric.is_empty() => continue,
+                None => {
+                    let (typed, _) =
+                        self.translate_graphics_stage(core, entry.x[0], layout, numeric)?;
+                    if !same_typed_descriptor_layout(&typed.descriptors, &stage.descriptors) {
+                        return Err(
+                            "numeric image types changed the graphics descriptor layout".into()
+                        );
+                    }
+                    typed
+                }
+            };
+            if variants.is_empty() {
+                variants.extend(program.stages.iter().cloned());
             }
-            typed_stages.get_or_insert_with(|| program.stages.to_vec())[index] = typed;
+            variants[index] = variant;
         }
-        Ok(typed_stages)
+        Ok(())
+    }
+
+    fn specialize_fragment(
+        &mut self,
+        core: &Guest,
+        key: u64,
+        original: &Arc<Translated>,
+        address: u64,
+        layout: GraphicsStageLayout,
+        numeric: &[shader::SampledTexture],
+        constants: &[u8],
+    ) -> Option<Arc<Translated>> {
+        let backend = self.gpu.as_mut()?;
+        let targets = backend
+            .jump_tables
+            .get_mut(&key)?
+            .as_mut()?
+            .resolve(constants)?;
+        let variant_key = (Arc::as_ptr(original) as usize, numeric.to_vec());
+        if let Some(variant) = backend.fragment_jump_variants.get(&variant_key) {
+            // A changing jump table can keep drawing with the general
+            // shader without compiling a new program on every change.
+            return (variant.targets == targets)
+                .then(|| variant.stage.clone())
+                .flatten();
+        }
+        let stage = self
+            .translate_stage(
+                core,
+                address,
+                layout.base,
+                layout.previous_stores,
+                layout.generic_inputs,
+                [0; 5],
+                layout.mesh,
+                Some(constants),
+                numeric,
+                &[],
+            )
+            .ok()
+            .filter(|(stage, actual)| {
+                *actual == key
+                    && stage.stage == original.stage
+                    && same_typed_descriptor_layout(&stage.descriptors, &original.descriptors)
+                    && stage.spec_constants == original.spec_constants
+                    && stage.cbuf_used_sizes == original.cbuf_used_sizes
+                    && stage.push_fields == original.push_fields
+                    && stage.texture_pool_bindings == original.texture_pool_bindings
+                    && stage.loaded_generics == original.loaded_generics
+                    && stage.stored_generics == original.stored_generics
+                    && stage.stores == original.stores
+                    && stage.frag_colors == original.frag_colors
+                    && stage.spirv != original.spirv
+            })
+            .map(|(stage, _)| stage);
+        let backend = self.gpu.as_mut()?;
+        if stage.is_some() {
+            backend.stat("stat: fragment jump variants", 1);
+        }
+        backend.fragment_jump_variants.insert(
+            variant_key,
+            FragmentJumpVariant {
+                targets,
+                stage: stage.clone(),
+            },
+        );
+        stage
     }
 
     fn ensure_graphics_program(
@@ -9765,6 +9889,7 @@ impl Nvn {
             }));
         bindings.guest_uniforms.clear();
         bindings.textures.clear();
+        bindings.stage_variants.clear();
         self.draw_bindings = bindings;
         result
     }
@@ -10013,11 +10138,13 @@ impl Nvn {
             spare_uniforms,
             guest_uniforms,
             textures,
+            stage_variants,
         } = bindings;
         uniforms.reserve(program.uniforms);
         guest_uniforms.reserve(program.uniforms);
         textures.reserve(program.textures);
         let mut sampled_textures: [Vec<shader::SampledTexture>; 3] = Default::default();
+        let mut fragment_constants = None;
         let mut storage = echora_gpu::FastMap::default();
         let mut storage_in_place = echora_gpu::FastMap::default();
         // Copied storage buffers a stage writes: guest address and GPU
@@ -10104,6 +10231,16 @@ impl Nvn {
                             .is_none()
                         {
                             bytes.clear();
+                        }
+                        if stage.stage == Stage::Fragment
+                            && self
+                                .gpu
+                                .as_ref()
+                                .unwrap()
+                                .fragment_jump_stages
+                                .contains(&(Arc::as_ptr(stage) as usize))
+                        {
+                            fragment_constants = Some((index, descriptor.binding, bytes.len()));
                         }
                         bytes.resize(bytes.len().max(16).next_multiple_of(16), 0);
                         uniforms.insert((index, descriptor.binding), bytes);
@@ -10321,10 +10458,18 @@ impl Nvn {
         if let Some((kind, since)) = binding_lap.take() {
             binding_times[kind] += since.elapsed();
         }
-        let typed_stages = self.typed_graphics_stages(core, &program, &sampled_textures)?;
-        let (built, traced_variant) =
-            self.ensure_graphics_program(&program, typed_stages.as_deref())?;
-        let stages = typed_stages.as_deref().unwrap_or(&program.stages);
+        let fragment_constants = fragment_constants
+            .map(|(index, binding, size)| (index, &uniforms[&(index, binding)][..size]));
+        self.graphics_stage_variants(
+            core,
+            &program,
+            &sampled_textures,
+            fragment_constants,
+            stage_variants,
+        )?;
+        let variants = (!stage_variants.is_empty()).then_some(stage_variants.as_slice());
+        let (built, traced_variant) = self.ensure_graphics_program(&program, variants)?;
+        let stages = variants.unwrap_or(&program.stages);
 
         let tail_started = timing.then(std::time::Instant::now);
         // Each stage's c0 holds its bound storage buffers' addresses and

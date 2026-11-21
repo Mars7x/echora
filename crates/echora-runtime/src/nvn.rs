@@ -9156,6 +9156,167 @@ mod tests {
     }
 
     #[test]
+    fn fragment_jump_variants_follow_bound_constants() {
+        use echora_gpu::ash::vk;
+
+        let Ok(Some(backend)) = gpu::Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.supports_storage(vk::Format::R32_UINT) {
+            return;
+        }
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10_0000;
+        let fragment = base + 0x400;
+        let control = base + 0x900;
+        let table_offset = 0x800u32;
+        let table = fragment + u64::from(table_offset);
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 4096, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([base, 0, 0, 0]));
+        nvn.initialize(2, "Program", BTreeMap::new()).unwrap();
+        nvn.objects.get_mut(&2).unwrap().state.extend([
+            ("Stage0".into(), args([base, 0, 0, 0])),
+            ("Stage1".into(), args([fragment, control, 0, 0])),
+        ]);
+
+        let word = |fields: &[(u32, u128)]| {
+            fields
+                .iter()
+                .fold(7 << 12, |word, &(at, value)| word | value << at)
+        };
+        let mov = |rd, value| word(&[(0, 0x802), (16, rd), (32, value), (72, 15)]);
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let ast = |offset, reg, words_minus_one| {
+            word(&[
+                (0, 0x322),
+                (24, 255),
+                (32, reg),
+                (40, offset),
+                (64, 255),
+                (74, words_minus_one),
+            ])
+        };
+        let mut vs = vec![0; 128];
+        vs[..4].copy_from_slice(&(1u32 | (1 << 10)).to_le_bytes());
+        vs.extend(
+            [
+                mov(0, 0),
+                mov(1, 0),
+                mov(2, 0),
+                mov(3, u128::from(1f32.to_bits())),
+                ast(0x70, 0, 3),
+                ast(0x6c, 3, 0),
+                exit,
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes),
+        );
+
+        let branch = |offset| word(&[(0, 0x947), (32, offset), (87, 7)]);
+        let mut fs = vec![0; 128];
+        fs[..4].copy_from_slice(&(2u32 | (5 << 10)).to_le_bytes());
+        fs[576 / 8] = 1;
+        fs.extend(
+            [
+                mov(0, 0),
+                // Clamp the index, scale it to a byte address, and jump via c1.
+                word(&[(0, 0x817), (16, 1), (32, 2), (87, 7)]),
+                word(&[(0, 0x819), (16, 1), (24, 1), (32, 2), (64, 255), (73, 3)]),
+                word(&[(0, 0xb82), (16, 2), (24, 1), (54, 1), (73, 4)]),
+                word(&[(0, 0x949), (24, 2)]),
+                mov(0, 11),
+                branch(64),
+                mov(0, 22),
+                branch(32),
+                mov(0, 33),
+                branch(0),
+                exit,
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes),
+        );
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 4096, READ | WRITE, STATE_NORMAL, "fragment jump test")
+            .unwrap();
+        memory.write(base, &vs).unwrap();
+        memory.write(fragment, &fs).unwrap();
+        memory.write_u32(control + 0x40, table_offset).unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let output = 8;
+        numeric_texture_fixture(&mut nvn, output);
+        let command = |name, x| Command {
+            name,
+            x,
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        nvn.execute(
+            &command("nvnCommandBufferBindProgram", [0, 2, 0x03, 0, 0, 0, 0, 0]),
+            &mut guest,
+        )
+        .unwrap();
+        let mut targets = command("nvnCommandBufferSetRenderTargets", [0, 1, 0, 0, 0, 0, 0, 0]);
+        targets.captured.push(output);
+        nvn.execute(&targets, &mut guest).unwrap();
+        let draw = command("nvnCommandBufferDrawArrays", [0, 0, 0, 1, 0, 0, 0, 0]);
+        for (words, size, expected, variants) in [
+            ([80, 112, 80], 12, 11u32, 1),
+            ([112, 80, 80], 12, 22, 1),
+            ([144, 80, 144], 12, 33, 1),
+            ([112, 80, 80], 8, 22, 1),
+            ([80, 112, 80], 12, 11, 1),
+        ] {
+            for (index, value) in words.into_iter().enumerate() {
+                guest
+                    .memory
+                    .write_u32(table + index as u64 * 4, value)
+                    .unwrap();
+            }
+            guest.memory.write_u32(control + 0x3c, size).unwrap();
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .clear_color(output, None, vk::ClearColorValue { uint32: [0; 4] })
+                .unwrap();
+            nvn.gpu_draw(&mut guest, &draw).unwrap();
+            let gpu = nvn.gpu.as_mut().unwrap();
+            assert_eq!(
+                gpu.renderer.read_target_bytes(output, 4).unwrap(),
+                expected.to_le_bytes()
+            );
+            assert_eq!(
+                gpu.notes_with_stats().get("stat: fragment jump variants"),
+                Some(&variants)
+            );
+        }
+    }
+
+    #[test]
     fn gpu_render_condition_follows_its_queue() {
         use echora_gpu::ash::vk;
 

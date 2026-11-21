@@ -172,9 +172,15 @@ fn translate_with_constants(
             denorm_flush_32: options.denorm_flush_32,
             dual_source_blend: options.dual_source_blend,
         };
+        let specialized = (layout.stage == Stage::Fragment)
+            .then_some(constants)
+            .flatten()
+            .and_then(|constants| jump_tables::JumpTables::analyze(&code)?.resolve(constants))
+            .and_then(|targets| compute::translate_with_jump_targets(&code, &layout, &targets));
         // Offsets in errors and needs are from the program's start.
         let header = GRAPHICS_HEADER_SIZE as u32;
-        return compute::translate_with_needs(&code, &layout)
+        return specialized
+            .map_or_else(|| compute::translate_with_needs(&code, &layout), Ok)
             .map(|(translated, mut needs)| {
                 for (_, site) in &mut needs.capabilities {
                     *site = site.map(|offset| offset + header);
