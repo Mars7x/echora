@@ -221,13 +221,26 @@ fn compare_program(second_word: bool) -> Vec<u32> {
     let bool_type = module.bool();
     let u32_type = module.u32();
     let u64_type = module.u64();
-    // word address, outcome address, value low, value high, render when
-    // equal, padding.
-    let block = module.ty(Type::Struct {
-        members: vec![u64_type, u64_type, u32_type, u32_type, u32_type, u32_type],
-    });
+    // Word address, outcome address, then the value's low and high halves
+    // (or, with `second_word`, the second word's address: a 64-bit member,
+    // as loading one through a 32-bit member is invalid and drivers then
+    // read only its low half), render when equal, padding.
+    let (members, offsets, when_equal_member): (Vec<_>, &[u32], usize) = if second_word {
+        (
+            vec![u64_type, u64_type, u64_type, u32_type, u32_type],
+            &[0, 8, 16, 24, 28],
+            3,
+        )
+    } else {
+        (
+            vec![u64_type, u64_type, u32_type, u32_type, u32_type, u32_type],
+            &[0, 8, 16, 20, 24, 28],
+            4,
+        )
+    };
+    let block = module.ty(Type::Struct { members });
     module.decorate(block, decoration::BLOCK, &[]);
-    for (member, offset) in [0, 8, 16, 20, 24, 28].into_iter().enumerate() {
+    for (member, &offset) in offsets.iter().enumerate() {
         module.member_decorate(block, member as u32, decoration::OFFSET, &[offset]);
     }
     let push_pointer = module.pointer(storage::PUSH_CONSTANT, block);
@@ -250,7 +263,13 @@ fn compare_program(second_word: bool) -> Vec<u32> {
     };
     let word = field(&mut main, &mut module, 0, push_u64, u64_type);
     let outcome = field(&mut main, &mut module, 1, push_u64, u64_type);
-    let when_equal = field(&mut main, &mut module, 4, push_u32, u32_type);
+    let when_equal = field(
+        &mut main,
+        &mut module,
+        when_equal_member,
+        push_u32,
+        u32_type,
+    );
     // A 64-bit word's halves at `at` (memory operand Aligned (2), 4).
     let halves = |main: &mut Function, module: &mut Module, at| {
         let high_at = main.value(module, op::I_ADD, u64_type, &[at, four]);
@@ -300,9 +319,10 @@ mod tests {
 
     fn simulate(word: u64, value: u64, render_when_equal: bool, second_word: bool) -> u32 {
         use echora_shader::sim::{Inputs, Machine};
-        const WORD: u64 = 0x1000;
-        const OUTCOME: u64 = 0x2000;
-        const SECOND: u64 = 0x3000;
+        // Above 4 GiB, as device addresses are once a few GiB are in use.
+        const WORD: u64 = 0x2_0000_1000;
+        const OUTCOME: u64 = 0x3_0000_2000;
+        const SECOND: u64 = 0x4_0000_3000;
         let comparand = if second_word { SECOND } else { value };
         let push: Vec<u8> = [WORD, OUTCOME, comparand]
             .iter()
@@ -342,11 +362,17 @@ mod tests {
             .host_buffer_with(8, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
             .unwrap();
         second.write(0, &5u64.to_le_bytes());
+        let same = renderer
+            .host_buffer_with(8, ash::vk::BufferUsageFlags::STORAGE_BUFFER, true)
+            .unwrap();
+        same.write(0, &(7u64 << 32 | 5).to_le_bytes());
         for (other, when_equal) in [
             (super::Comparand::Value(7u64 << 32 | 5), true),
             (super::Comparand::Value(5), true),
             (super::Comparand::Value(5), false),
             (super::Comparand::Word(second.buffer, 0), true),
+            (super::Comparand::Word(same.buffer, 0), true),
+            (super::Comparand::Word(same.buffer, 0), false),
         ] {
             let Some(outcome) = renderer
                 .condition_on_word((word.buffer, 0), other, when_equal)
@@ -354,6 +380,7 @@ mod tests {
             else {
                 word.destroy(renderer.device());
                 second.destroy(renderer.device());
+                same.destroy(renderer.device());
                 return;
             };
             outcomes.push(outcome);
@@ -370,11 +397,37 @@ mod tests {
             .collect();
         assert_eq!(
             outcomes.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
-            [0, 4, 8, 12]
+            [0, 4, 8, 12, 16, 20]
         );
-        assert_eq!(words, [1, 0, 1, 0]);
+        assert_eq!(words, [1, 0, 1, 0, 1, 0]);
         word.destroy(renderer.device());
         second.destroy(renderer.device());
+        same.destroy(renderer.device());
+    }
+
+    #[test]
+    fn the_compare_programs_are_valid_spirv() {
+        for second_word in [false, true] {
+            let words = super::compare_program(second_word);
+            let path = std::env::temp_dir().join(format!(
+                "echora-word-condition-{second_word}-{}.spv",
+                std::process::id()
+            ));
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).unwrap();
+            let output = std::process::Command::new("spirv-val")
+                .args(["--target-env", "vulkan1.3"])
+                .arg(&path)
+                .output();
+            let _ = std::fs::remove_file(&path);
+            if let Ok(output) = output {
+                assert!(
+                    output.status.success(),
+                    "second word {second_word}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     #[test]
