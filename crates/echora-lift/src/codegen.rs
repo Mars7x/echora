@@ -5177,6 +5177,17 @@ fn emit_split_cases(
             (block.start, body)
         })
         .collect();
+    let loop_heads: Arc<BTreeSet<u64>> = Arc::new(
+        blocks
+            .iter()
+            .flat_map(|block| {
+                crate::structure::block_successors(block)
+                    .0
+                    .into_iter()
+                    .filter(move |target| *target <= block.start)
+            })
+            .collect(),
+    );
     for block in blocks {
         if inlined.contains(&block.start) {
             continue;
@@ -5187,6 +5198,7 @@ fn emit_split_cases(
             (THREADED_SUCCESSORS.get() && !spin_heads.contains(&block.start)).then(|| Copying {
                 chain: Vec::new(),
                 budget: THREADED_LINE_BUDGET,
+                loop_heads: loop_heads.clone(),
             });
         expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
         output.push_str("            }\n");
@@ -5566,6 +5578,11 @@ fn split_conditional(body: &str) -> Option<(&str, &str, u64, u64)> {
 struct Copying {
     chain: Vec<u64>,
     budget: usize,
+    /// Targets of the window's backward branches: loop heads, which their
+    /// back edge reaches through the `match` every iteration anyway, and
+    /// whose copy measured slower (the arm grows, and the host compiler's
+    /// registers for the loop with it).
+    loop_heads: Arc<BTreeSet<u64>>,
 }
 
 /// Lines of copied successors one arm may hold
@@ -5600,11 +5617,15 @@ fn expand_block_copying(
     let copies = |copying: &Option<Copying>, target: u64| {
         copying.as_ref().is_some_and(|copy| {
             target > start
+                && !copy.loop_heads.contains(&target)
                 && !inlined.contains(&target)
                 && !copy.chain.contains(&target)
-                && bodies
-                    .get(&target)
-                    .is_some_and(|body| body.lines().count() <= copy.budget)
+                && bodies.get(&target).is_some_and(|body| {
+                    // Not a cold end (an SVC or a trap).
+                    body.lines().count() <= copy.budget
+                        && !body.contains("m.svc(")
+                        && !body.contains("return Err(Trap::")
+                })
         })
     };
     let here = |copying: &Option<Copying>, target: u64| {
