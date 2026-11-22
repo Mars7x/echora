@@ -67,7 +67,7 @@ fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
 /// if set, else the settings' `cpu.workers`, else its default
 /// (`echora_config::DEFAULT_WORKERS`). "auto" is one per host CPU, at most
 /// six.
-fn worker_count() -> usize {
+pub(crate) fn worker_count() -> usize {
     let from_env = std::env::var("ECHORA_WORKERS").ok().and_then(|text| {
         text.parse::<echora_config::Workers>()
             .map_err(|error| eprintln!("ECHORA_WORKERS: {error}; using the settings"))

@@ -87,10 +87,92 @@ pub(in crate::nvn) fn threads() -> usize {
     })
 }
 
-/// Whether draws are planned in parallel (`threads`), unless planning
-/// failed (`FAILED`).
+/// Whether draws are planned in parallel (`placement` leaves threads to
+/// plan on), unless planning failed (`FAILED`).
 pub(in crate::nvn) fn enabled() -> bool {
-    threads() > 0 && !FAILED.load(Ordering::Relaxed)
+    placement().0 > 0 && !FAILED.load(Ordering::Relaxed)
+}
+
+/// The planning threads to start and the CPUs they may run on: only CPUs
+/// the guest threads leave idle (`planner_placement`), whatever
+/// ECHORA_PARALLEL_DRAWS asks for.
+fn placement() -> (usize, Option<Vec<usize>>) {
+    #[cfg(test)]
+    if let Some(threads) = testing::THREADS.with(std::cell::Cell::get) {
+        return (threads, None);
+    }
+    static PLACEMENT: std::sync::OnceLock<(usize, Option<Vec<usize>>)> = std::sync::OnceLock::new();
+    PLACEMENT
+        .get_or_init(|| {
+            let requested = threads();
+            if requested == 0 {
+                return (0, None);
+            }
+            let reserved = crate::host_cores::reserved();
+            let placed = planner_placement(
+                requested,
+                reserved
+                    .as_ref()
+                    .map(|reserved| (&reserved.kept[..], &reserved.others[..])),
+                crate::bootstrap::worker_count(),
+                std::thread::available_parallelism().map_or(1, usize::from),
+            );
+            eprintln!(
+                "parallel draws: {} planning threads of {requested} asked for{}",
+                placed.0,
+                placed
+                    .1
+                    .as_ref()
+                    .map(|cpus| format!(" on CPUs {cpus:?}"))
+                    .unwrap_or_default()
+            );
+            placed
+        })
+        .clone()
+}
+
+/// Where planning threads go: the replay's own core (`host_cores`: its
+/// sibling hardware threads are idle while it waits for its planners) and
+/// the CPUs beyond those the `workers` guest threads take; without a
+/// reserved core, the CPUs beyond the workers and the replay. The replay
+/// plans a share itself, so one CPU of the set is its own.
+fn planner_placement(
+    requested: usize,
+    reserved: Option<(&[usize], &[usize])>,
+    workers: usize,
+    available: usize,
+) -> (usize, Option<Vec<usize>>) {
+    match reserved {
+        Some((kept, others)) => {
+            let idle = others.len().saturating_sub(workers);
+            let mut cpus = kept.to_vec();
+            cpus.extend(others.iter().rev().take(idle));
+            cpus.sort_unstable();
+            let count = requested.min(cpus.len().saturating_sub(1));
+            (count, (count > 0).then_some(cpus))
+        }
+        None => (requested.min(available.saturating_sub(workers + 1)), None),
+    }
+}
+
+/// Queued lists the replay has yet to run past which new windows are made
+/// (ECHORA_PARALLEL_DRAWS_BACKLOG, 4): with fewer it keeps up with the
+/// game, and planning would only take CPU time from the game's threads.
+fn backlog() -> usize {
+    #[cfg(test)]
+    {
+        testing::BACKLOG.with(std::cell::Cell::get).unwrap_or(0)
+    }
+    #[cfg(not(test))]
+    {
+        static BACKLOG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BACKLOG.get_or_init(|| {
+            std::env::var("ECHORA_PARALLEL_DRAWS_BACKLOG")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(4)
+        })
+    }
 }
 
 /// Set when a planning thread panicked: the replay then plans every draw
@@ -1186,6 +1268,26 @@ impl Nvn {
         let walk_started = std::time::Instant::now();
         let made_before = self.renderer_made();
         let look_ahead = InPhase::enter(Phase::LookAhead);
+        // Only while the replay is behind the game (work queued for it).
+        let queued: usize = self
+            .pending
+            .values()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| matches!(item, QueueItem::List { .. }))
+                    .count()
+            })
+            .sum();
+        if queued < backlog() {
+            if let Some(backend) = self.gpu.as_mut() {
+                backend.stat(
+                    "stat: parallel draw windows skipped: the replay keeps up",
+                    1,
+                );
+            }
+            return;
+        }
         let pool_set = |name| self.render.state.get(name).map(|set| set.x[1]);
         if self.parallel.limit == 0 {
             self.parallel.limit = window_commands();
@@ -1262,7 +1364,7 @@ impl Nvn {
             .parallel
             .pool
             .take()
-            .unwrap_or_else(|| Pool::new(threads()));
+            .unwrap_or_else(|| Pool::new(placement()));
         let mut plans = self.plan_window(&pool, &draws, core);
         let planned_at = std::time::Instant::now();
         let mut resolve_time = std::time::Duration::ZERO;
@@ -2111,7 +2213,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(threads: usize) -> Self {
+    fn new((threads, cpus): (usize, Option<Vec<usize>>)) -> Self {
         let shared = Arc::new(PoolShared {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
@@ -2123,9 +2225,17 @@ impl Pool {
         let threads = (0..threads)
             .map(|index| {
                 let shared = shared.clone();
+                let cpus = cpus.clone();
                 std::thread::Builder::new()
                     .name(format!("nvn-plan-{index}"))
-                    .spawn(move || Self::work(&shared))
+                    .spawn(move || {
+                        // Not the replay's placement (inherited): the CPUs
+                        // the guest threads leave idle.
+                        if let Some(cpus) = cpus {
+                            crate::host_cores::run_on(&cpus);
+                        }
+                        Self::work(&shared)
+                    })
                     .expect("draw planning thread")
             })
             .collect();
@@ -2268,6 +2378,7 @@ pub(super) mod testing {
     thread_local! {
         pub static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         pub static VERIFY: Cell<bool> = const { Cell::new(false) };
+        pub static BACKLOG: Cell<Option<usize>> = const { Cell::new(None) };
         pub static RECORD: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     }
 
@@ -2320,7 +2431,7 @@ mod tests {
 
     #[test]
     fn pool_runs_every_chunk_once_and_can_be_reused() {
-        let pool = Pool::new(3);
+        let pool = Pool::new((3, None));
         for round in 0..50 {
             let chunks = 1 + round % 7;
             let counts: Vec<AtomicUsize> = (0..chunks).map(|_| AtomicUsize::new(0)).collect();
@@ -3314,5 +3425,57 @@ mod replay_tests {
         // The replay's own resolution brought the write back first.
         assert!(nvn.gpu.as_ref().unwrap().in_place_writes.is_empty());
         assert!(guest_uniforms.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn planners_take_only_the_cpus_the_guest_threads_leave() {
+        // Eight CPUs, the replay's core 6-7, five guest workers: 7 and
+        // the one CPU the workers leave (5).
+        let (count, cpus) = planner_placement(4, Some((&[6, 7], &[0, 1, 2, 3, 4, 5])), 5, 8);
+        assert_eq!((count, cpus.as_deref()), (2, Some(&[5, 6, 7][..])));
+        // Six workers on six CPUs: the replay's sibling only.
+        let (count, cpus) = planner_placement(4, Some((&[6, 7], &[0, 1, 2, 3, 4, 5])), 6, 8);
+        assert_eq!((count, cpus.as_deref()), (1, Some(&[6, 7][..])));
+        // No sibling and nothing idle: no planning threads.
+        assert_eq!(
+            planner_placement(4, Some((&[7], &[0, 1, 2, 3, 4, 5, 6])), 7, 8),
+            (0, None)
+        );
+        // Without a reserved core: what the workers and the replay leave.
+        assert_eq!(planner_placement(4, None, 6, 8), (1, None));
+        assert_eq!(planner_placement(2, None, 2, 16), (2, None));
+    }
+
+    #[test]
+    fn windows_wait_for_a_backlog() {
+        let Some(mut nvn) = fixture() else {
+            return;
+        };
+        let memory = memory();
+        let mut view = memory.view();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::View(&mut view),
+            counter: Some(0),
+        };
+        let list = Arc::new(batch());
+        let first = list
+            .iter()
+            .position(|command| step(command) == Step::Draw)
+            .unwrap();
+        testing::THREADS.with(|cell| cell.set(Some(2)));
+        testing::BACKLOG.with(|cell| cell.set(Some(2)));
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
+        testing::BACKLOG.with(|cell| cell.set(None));
+        testing::THREADS.with(|cell| cell.set(None));
+        assert_eq!(stat(&nvn, "stat: parallel draw windows"), 0);
+        assert_eq!(
+            stat(
+                &nvn,
+                "stat: parallel draw windows skipped: the replay keeps up"
+            ),
+            1
+        );
     }
 }

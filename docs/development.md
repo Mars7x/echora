@@ -91,7 +91,7 @@ read.
 | `ECHORA_DYNAMIC_UNIFORMS=0` | Use ordinary uniform descriptors for graphics. By default, graphics programs within the Vulkan device's dynamic uniform limit can reuse a descriptor set while changing uniform offsets. |
 | `ECHORA_SUBMIT_ITEMS=N` | Change the maximum draws and dispatches per Vulkan submission. The default is 100 so the GPU can start processing work before the CPU finishes recording the frame. |
 | `ECHORA_REPLAY_INLINE=1` | Replay submitted GPU work on the submitting guest thread instead of a thread of its own. |
-| `ECHORA_PARALLEL_DRAWS=N` | Plan the bindings of the replay's upcoming draws on N more threads (off by default). `ECHORA_PARALLEL_DRAWS_VERIFY=1` also plans each on the replay and reports differences; `ECHORA_PARALLEL_DRAWS_WINDOW` (4096) caps the commands one look-ahead spans. |
+| `ECHORA_PARALLEL_DRAWS=N` | Plan the bindings of the replay's upcoming draws on up to N more threads (off by default): only on the replay's own core and the CPUs the guest workers leave, and only while at least `ECHORA_PARALLEL_DRAWS_BACKLOG` (4) submitted lists wait for the replay. `ECHORA_PARALLEL_DRAWS_VERIFY=1` also plans each on the replay and reports differences; `ECHORA_PARALLEL_DRAWS_WINDOW` (4096) caps the commands one look-ahead spans. |
 | `ECHORA_REPLAY_CHUNK=N` | Let other threads access NVN state after at most N replayed commands. The default is 96, and 0 runs the replay without yielding between commands. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
 | `ECHORA_PAGE_TABLE=0` | Give translated programs an empty GPU page table, so their global memory reads return zeros (debugging). The page table is on by default. |
