@@ -1578,7 +1578,7 @@ const PROGRAM_STAGE_KEYS: [&str; 6] = ["Stage0", "Stage1", "Stage2", "Stage3", "
 
 /// Raw argument registers after the object pointer (X1..X4, V0..V1 low 64
 /// bits). Setters store them; matching getters return the first of each.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct Args {
     pub x: [u64; 4],
     pub v: [u64; 2],
@@ -8198,6 +8198,48 @@ fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
     Some(tag)
 }
 
+/// The tag of a tagged state after a setter (`property`, its arguments and
+/// X5) changed the state tagged `before`, as `state_tag` gives it for the
+/// new properties (`compute`). A tagged state's properties are its tag's
+/// snapshot, and a tag, once given to properties, stays theirs, so the
+/// transition is remembered instead of hashing and comparing every property
+/// again (each setter of a state built field by field did).
+fn state_transition(
+    before: Option<u32>,
+    property: &str,
+    args: Args,
+    x5: u64,
+    compute: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    use std::hash::{Hash, Hasher};
+    type Transitions = FastMap<(u32, u64, Args, u64), (Box<str>, Option<u32>)>;
+    thread_local! {
+        static TRANSITIONS: std::cell::RefCell<Transitions> = std::cell::RefCell::default();
+    }
+    let Some(before) = before else {
+        return compute();
+    };
+    let mut hasher = FastHasher::default();
+    property.hash(&mut hasher);
+    let key = (before, hasher.finish(), args, x5);
+    if let Some(after) = TRANSITIONS.with(|transitions| {
+        transitions
+            .borrow()
+            .get(&key)
+            .filter(|(known, _)| &**known == property)
+            .map(|(_, after)| *after)
+    }) {
+        return after;
+    }
+    let after = compute();
+    TRANSITIONS.with(|transitions| {
+        transitions
+            .borrow_mut()
+            .insert(key, (property.into(), after));
+    });
+    after
+}
+
 fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
     let Some(kind) = command
         .name
@@ -8445,6 +8487,9 @@ fn bag_call(
                 bag.props.remove("@Offset");
                 bag.tag = Some(tag);
             }
+            // The tag before this setter: with it, the setter's property
+            // and arguments determine the tag after (`state_transition`).
+            let before = bag.tag;
             // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
             // combined forms of SetWidth/SetHeight/SetDepth.
             if let Some(dimensions) = property
@@ -8499,7 +8544,9 @@ fn bag_call(
             } else {
                 bag.set(property, args);
             }
-            let tag = bag.tag.or_else(|| state_tag(kind, &bag.props));
+            let tag = bag.tag.or_else(|| {
+                state_transition(before, property, args, x[5], || state_tag(kind, &bag.props))
+            });
             bag.tag = tag;
             drop(bags);
             if let Some(tag) = tag {
@@ -9885,6 +9932,57 @@ mod tests {
         assert_eq!(call(&mut nvn, &mut core, "nvnSyncWait", &[sync, 0]), 0);
         assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 1);
         assert_eq!(nvn.sync_timeouts[&sync], 1);
+    }
+
+    #[test]
+    fn remembered_state_transitions_give_the_tags_of_the_properties() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        // The same properties reached in other orders and again after a
+        // detour: each structure's tag is the one its properties have.
+        let sequences: [(u64, &[(&str, u64)]); 3] = [
+            (0x1100, &[("DepthFunc", 3), ("DepthWriteEnable", 1)]),
+            (0x1200, &[("DepthWriteEnable", 1), ("DepthFunc", 3)]),
+            (
+                0x1300,
+                &[("DepthFunc", 5), ("DepthWriteEnable", 1), ("DepthFunc", 3)],
+            ),
+        ];
+        for _ in 0..2 {
+            for (address, setters) in sequences {
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    "nvnDepthStencilStateSetDefaults",
+                    &[address],
+                );
+                for (property, value) in setters {
+                    call(
+                        &mut nvn,
+                        &mut guest,
+                        &format!("nvnDepthStencilStateSet{property}"),
+                        &[address, *value],
+                    );
+                    let props = read_shared(nvn.bags.at(address))[&address].props.clone();
+                    assert_eq!(
+                        Some(guest.memory.read_u32(address).unwrap()),
+                        state_tag("DepthStencilState", &props)
+                    );
+                }
+            }
+            let tags = sequences.map(|(address, _)| guest.memory.read_u32(address).unwrap());
+            assert_eq!(tags[0], tags[1]);
+            assert_eq!(tags[0], tags[2]);
+        }
     }
 
     #[test]
