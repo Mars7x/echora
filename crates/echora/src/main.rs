@@ -799,6 +799,7 @@ fn lift(
                 "steps-local" => options.steps_local = true,
                 "call-summaries" => options.call_summaries = true,
                 "transitive-summaries" => options.transitive_summaries = true,
+                "call-summaries-audit" => options.call_summaries_audit = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
