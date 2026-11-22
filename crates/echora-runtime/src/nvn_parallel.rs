@@ -40,8 +40,9 @@ use echora_gpu::draw::{Sampler, TextureSource};
 use echora_gpu::shader::{self, DescriptorKind};
 
 use super::super::{
-    Command, Guest, GuestMemory, Nvn, PoolRange, RenderState, ResolvedBinding, StateSnapshots,
-    is_state_command, plural_bind, pool_lookup, program_key, without_prefix,
+    Command, Guest, GuestMemory, Nvn, PoolRange, QueueItem, RenderState, ResolvedBinding,
+    StateSnapshots, is_state_command, is_work_command, plural_bind, pool_lookup, program_key,
+    without_prefix,
 };
 use super::{
     BoundProgram, GuestFileSpan, bind_key, c0_storage_table, draw_switches_set, empty_draw,
@@ -174,6 +175,15 @@ fn step(command: &Command) -> Step {
     if is_state_command(rest) {
         return Step::State;
     }
+    // Called lists run next, ahead of the rest of this one.
+    if matches!(rest, "CallCommands" | "CopyCommands") {
+        return Step::End;
+    }
+    // Other work leaves the render state as it is; what it changes besides
+    // (targets, GPU writes, waits) the commit's stamp check sees.
+    if is_work_command(rest) || matches!(rest, "WaitEvent" | "FenceSync" | "WaitSync") {
+        return Step::Pass;
+    }
     Step::End
 }
 
@@ -221,17 +231,35 @@ pub(super) struct Stamp {
     shared_writes: (usize, u64),
 }
 
-/// A storage buffer binding as planned: whether it is shared in place or
-/// copied is decided at its commit (`shared_binding` imports spans, which
-/// must stay in order).
+/// A binding the commit resolves, in descriptor order, with the replay's
+/// own code: what imports shared spans (which must stay in order) or may
+/// wait for GPU work.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PlannedStorage {
-    pub key: (usize, u32),
-    pub guest: u64,
-    pub base: u64,
-    pub length: u64,
-    /// The stage only reads it (it may be shared in place).
-    pub read_only: bool,
+pub(super) enum Deferred {
+    /// A uniform buffer GPU work may still write or has results for
+    /// (`resolve_guest_uniform`: read in place, or after them).
+    Uniform {
+        key: (usize, u32),
+        guest: u64,
+        size: u64,
+    },
+    /// A storage buffer (`resolve_draw_storage`: shared in place or
+    /// copied).
+    Storage {
+        key: (usize, u32),
+        guest: u64,
+        base: u64,
+        length: u64,
+        read_only: bool,
+    },
+}
+
+impl Deferred {
+    fn key(&self) -> (usize, u32) {
+        match self {
+            Self::Uniform { key, .. } | Self::Storage { key, .. } => *key,
+        }
+    }
 }
 
 /// A draw's bindings, resolved by the planner as the replay's binding
@@ -244,7 +272,7 @@ pub(super) struct PlannedBindings {
     pub textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
     pub sampled_textures: [Vec<shader::SampledTexture>; 3],
     pub fragment_constants: Option<(usize, u32, usize)>,
-    pub storage: Vec<PlannedStorage>,
+    pub deferred: Vec<Deferred>,
     pub storage_written: super::super::FastMap<(usize, u32), (u64, u64)>,
     pub storage_entries: Vec<(usize, u32, u64, u64)>,
     pub uniform_bytes: u64,
@@ -404,7 +432,7 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
         textures: Default::default(),
         sampled_textures: Default::default(),
         fragment_constants: None,
-        storage: Vec::new(),
+        deferred: Vec::new(),
         storage_written: Default::default(),
         storage_entries: Vec::new(),
         uniform_bytes: 0,
@@ -437,12 +465,12 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
                         .ok_or("uniform buffer in no pool")?;
                     if size != 0 {
                         let end = guest.checked_add(size).ok_or("uniform buffer overflows")?;
-                        // Read in place or after a wait by the replay.
-                        if view.table_write_pending(guest..end) {
-                            return Err("uniform buffer written by unfinished GPU work");
-                        }
-                        if view.gpu_writes_pending(&(guest..end)) {
-                            return Err("uniform buffer holds GPU results to store");
+                        // Read in place, or after GPU work, by the commit.
+                        if view.table_write_pending(guest..end)
+                            || view.gpu_writes_pending(&(guest..end))
+                        {
+                            plan.deferred.push(Deferred::Uniform { key, guest, size });
+                            continue;
                         }
                     }
                     plan.uniform_bytes += size;
@@ -492,10 +520,7 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
                     }
                     plan.storage_entries
                         .push((index, descriptor.cbuf_offset, gpu, size));
-                    if view.gpu_writes_pending(&(guest..guest + length)) {
-                        return Err("storage buffer holds GPU results to store");
-                    }
-                    plan.storage.push(PlannedStorage {
+                    plan.deferred.push(Deferred::Storage {
                         key,
                         guest,
                         base,
@@ -849,7 +874,7 @@ impl Nvn {
             textures,
             sampled_textures,
             fragment_constants,
-            storage,
+            deferred,
             storage_written,
             storage_entries,
             uniform_bytes,
@@ -874,27 +899,36 @@ impl Nvn {
         out.storage_entries.extend(storage_entries);
         *out.uniform_bytes += uniform_bytes;
         *out.memo_hits += memo_hits;
-        for binding in storage {
-            if binding.read_only
-                && let Some((buffer, offset)) =
-                    self.shared_binding(binding.guest, binding.length)?
-            {
-                out.storage_in_place
-                    .insert(binding.key, (buffer, offset, binding.length));
-                self.gpu
-                    .as_mut()
-                    .unwrap()
-                    .stat("stat: draw storage shared", 1);
-                continue;
+        for binding in deferred {
+            match binding {
+                Deferred::Uniform { key, guest, size } => {
+                    match self.resolve_guest_uniform(core, guest, size)? {
+                        Some(in_place) => {
+                            out.uniforms_in_place.insert(key, in_place);
+                        }
+                        None => {
+                            *out.uniform_bytes += size;
+                            out.guest_uniforms.insert(key, (guest, size as usize));
+                        }
+                    }
+                }
+                Deferred::Storage {
+                    key,
+                    guest,
+                    base,
+                    length,
+                    read_only,
+                } => {
+                    match self.resolve_draw_storage(core, guest, base, length, read_only, false)? {
+                        Ok(in_place) => {
+                            out.storage_in_place.insert(key, in_place);
+                        }
+                        Err(bytes) => {
+                            out.storage.insert(key, bytes);
+                        }
+                    }
+                }
             }
-            self.gpu
-                .as_mut()
-                .unwrap()
-                .stat("stat: draw storage bytes", binding.length);
-            out.storage.insert(
-                binding.key,
-                self.gpu_bytes(core, binding.base, binding.length)?,
-            );
         }
         Ok(())
     }
@@ -921,17 +955,36 @@ impl Nvn {
         ) {
             differences.push("uniforms");
         }
-        if sorted(
+        // Uniform buffers the commit resolves are read in place or copied.
+        let deferred_key = |key: &(usize, u32)| plan.deferred.iter().any(|item| item.key() == *key);
+        let planned_guest = sorted(
             plan.guest_uniforms
                 .iter()
                 .map(|e| format!("{e:?}"))
                 .collect(),
-        ) != sorted(
+        );
+        let got_guest = sorted(
             got.guest_uniforms
                 .iter()
+                .filter(|(key, _)| !deferred_key(key))
                 .map(|e| format!("{e:?}"))
                 .collect(),
-        ) {
+        );
+        let mut deferred_uniforms: Vec<(usize, u32)> = plan
+            .deferred
+            .iter()
+            .filter(|item| matches!(item, Deferred::Uniform { .. }))
+            .map(Deferred::key)
+            .collect();
+        deferred_uniforms.sort_unstable();
+        let mut got_deferred: Vec<(usize, u32)> = got
+            .uniforms_in_place
+            .keys()
+            .copied()
+            .chain(got.guest_uniforms.keys().copied().filter(deferred_key))
+            .collect();
+        got_deferred.sort_unstable();
+        if planned_guest != got_guest || deferred_uniforms != got_deferred {
             differences.push("guest uniforms");
         }
         if sorted(plan.textures.iter().map(|e| format!("{e:?}")).collect())
@@ -952,7 +1005,12 @@ impl Nvn {
             .copied()
             .collect();
         storage_keys.sort_unstable();
-        let mut planned_keys: Vec<(usize, u32)> = plan.storage.iter().map(|s| s.key).collect();
+        let mut planned_keys: Vec<(usize, u32)> = plan
+            .deferred
+            .iter()
+            .filter(|item| matches!(item, Deferred::Storage { .. }))
+            .map(Deferred::key)
+            .collect();
         planned_keys.sort_unstable();
         if storage_keys != planned_keys {
             differences.push("storage buffers");
@@ -973,7 +1031,19 @@ impl Nvn {
         if plan.storage_entries != *got.storage_entries {
             differences.push("driver storage entries");
         }
-        if plan.uniform_bytes != got.uniform_bytes || plan.memo_hits != got.memo_hits {
+        let deferred_bytes: u64 = plan
+            .deferred
+            .iter()
+            .filter_map(|item| match item {
+                Deferred::Uniform { key, size, .. } if got.guest_uniforms.contains_key(key) => {
+                    Some(*size)
+                }
+                _ => None,
+            })
+            .sum();
+        if plan.uniform_bytes + deferred_bytes != got.uniform_bytes
+            || plan.memo_hits != got.memo_hits
+        {
             differences.push("counts");
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -1002,6 +1072,8 @@ pub(super) struct InstallTo<'a> {
     pub sampled_textures: &'a mut [Vec<shader::SampledTexture>; 3],
     pub fragment_constants: &'a mut Option<(usize, u32, usize)>,
     pub storage: &'a mut echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    pub uniforms_in_place:
+        &'a mut echora_gpu::FastMap<(usize, u32), (echora_gpu::ash::vk::Buffer, u64, u64)>,
     pub storage_in_place:
         &'a mut echora_gpu::FastMap<(usize, u32), (echora_gpu::ash::vk::Buffer, u64, u64)>,
     pub storage_written: &'a mut super::super::FastMap<(usize, u32), (u64, u64)>,
@@ -1018,6 +1090,8 @@ pub(super) struct Resolved<'a> {
     pub sampled_textures: &'a [Vec<shader::SampledTexture>; 3],
     pub fragment_constants: Option<(usize, u32, usize)>,
     pub storage: &'a echora_gpu::FastMap<(usize, u32), Vec<u8>>,
+    pub uniforms_in_place:
+        &'a echora_gpu::FastMap<(usize, u32), (echora_gpu::ash::vk::Buffer, u64, u64)>,
     pub storage_in_place:
         &'a echora_gpu::FastMap<(usize, u32), (echora_gpu::ash::vk::Buffer, u64, u64)>,
     pub storage_written: &'a super::super::FastMap<(usize, u32), (u64, u64)>,
@@ -1040,17 +1114,8 @@ fn fallback_stat(reason: &'static str) -> &'static str {
         "uniform buffer not bound" => "stat: parallel draw fallbacks: uniform buffer not bound",
         "uniform buffer in no pool" => "stat: parallel draw fallbacks: uniform buffer in no pool",
         "uniform buffer overflows" => "stat: parallel draw fallbacks: uniform buffer overflows",
-        "uniform buffer written by unfinished GPU work" => {
-            "stat: parallel draw fallbacks: uniform buffer written by unfinished GPU work"
-        }
-        "uniform buffer holds GPU results to store" => {
-            "stat: parallel draw fallbacks: uniform buffer holds GPU results to store"
-        }
         "storage buffer not bound" => "stat: parallel draw fallbacks: storage buffer not bound",
         "storage buffer in no pool" => "stat: parallel draw fallbacks: storage buffer in no pool",
-        "storage buffer holds GPU results to store" => {
-            "stat: parallel draw fallbacks: storage buffer holds GPU results to store"
-        }
         "texture not bound" => "stat: parallel draw fallbacks: texture not bound",
         "texture binding not memoized" => {
             "stat: parallel draw fallbacks: texture binding not memoized"
@@ -1292,13 +1357,15 @@ mod tests {
             step(&command("nvnCommandBufferSetTexturePool", 0)),
             Step::End
         );
-        assert_eq!(step(&command("nvnCommandBufferClearColor", 0)), Step::End);
+        assert_eq!(step(&command("nvnCommandBufferClearColor", 0)), Step::Pass);
         assert_eq!(
             step(&command("nvnCommandBufferDispatchCompute", 0)),
-            Step::End
+            Step::Pass
         );
         assert_eq!(step(&command("nvnCommandBufferCallCommands", 0)), Step::End);
-        assert_eq!(step(&command("nvnCommandBufferWaitEvent", 0)), Step::End);
+        assert_eq!(step(&command("nvnCommandBufferWaitEvent", 0)), Step::Pass);
+        assert_eq!(step(&command("nvnCommandBufferCopyCommands", 0)), Step::End);
+        assert_eq!(step(&command("nvnCommandBufferFooBar", 0)), Step::End);
     }
 }
 
