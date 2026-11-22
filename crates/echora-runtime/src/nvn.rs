@@ -1588,18 +1588,62 @@ pub struct Bag {
     pub props: BTreeMap<String, Args>,
     #[serde(skip)]
     tag: Option<u32>,
+    /// A tagged state whose `props` are not kept up to date: its
+    /// properties are its tag's (`tagged_state`, without "@Offset"). The
+    /// game sets its states up again for every draw, and a setup it made
+    /// before needs only its tags (`cached_state_tag`), not the map built
+    /// again; `materialize` or `current` gives them where they are read.
+    #[serde(skip)]
+    lazy: bool,
 }
 
 impl PartialEq for Bag {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.props == other.props
+        self.kind == other.kind && *self.current() == *other.current()
     }
 }
 
 impl Eq for Bag {}
 
 impl Bag {
+    /// Its properties (a copy of its tag's, for a lazy state).
+    fn current(&self) -> std::borrow::Cow<'_, BTreeMap<String, Args>> {
+        match self.lazy.then(|| self.tagged()).flatten() {
+            Some(props) => std::borrow::Cow::Owned(props),
+            None => std::borrow::Cow::Borrowed(&self.props),
+        }
+    }
+
+    /// Its property `key` (a lazy state's from its tag's, uncopied).
+    fn get(&self, key: &str) -> Option<Args> {
+        if self.lazy
+            && let Some(snapshot) = self.tag.and_then(|tag| tagged_state(&self.kind, tag))
+        {
+            return snapshot[0].get(key).copied().filter(|_| key != "@Offset");
+        }
+        self.props.get(key).copied()
+    }
+
+    /// A lazy state's properties: its tag's.
+    fn tagged(&self) -> Option<BTreeMap<String, Args>> {
+        let snapshot = tagged_state(&self.kind, self.tag?)?;
+        let mut props = snapshot[0].clone();
+        props.remove("@Offset");
+        Some(props)
+    }
+
+    /// Bring `props` up to date (a lazy state's become its tag's).
+    fn materialize(&mut self) {
+        if self.lazy {
+            if let Some(props) = self.tagged() {
+                self.props = props;
+            }
+            self.lazy = false;
+        }
+    }
+
     fn set(&mut self, property: &str, args: Args) {
+        self.materialize();
         match self.props.get_mut(property) {
             Some(value) if *value == args => return,
             Some(value) => *value = args,
@@ -8108,6 +8152,19 @@ const TAGGED_STATES: [&str; 6] = [
     "MultisampleState",
 ];
 
+/// Whether `kind` is one of `TAGGED_STATES` (one comparison, not six).
+fn tagged_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ColorState"
+            | "BlendState"
+            | "ChannelMaskState"
+            | "PolygonState"
+            | "DepthStencilState"
+            | "MultisampleState"
+    )
+}
+
 /// The contents of tagged state structures by tag, including the snapshot
 /// shared by recorded Bind commands.
 type StateTags = FastMap<u32, TaggedState>;
@@ -8193,6 +8250,26 @@ thread_local! {
     static TAG_CACHE: std::cell::RefCell<TagCache> = std::cell::RefCell::default();
 }
 
+/// The tag `step` led a `kind` structure to when this thread took it
+/// before (see `cached_state_tag`).
+fn known_state_step(kind: &str, step: TagStep<'_>) -> Option<Option<u32>> {
+    if step.from.is_none() || !tagged_kind(kind) {
+        return None;
+    }
+    let key = state_step_key(step);
+    TAG_CACHE.with(|cache| cache.borrow().steps.get(&key).copied())
+}
+
+fn state_step_key(step: TagStep<'_>) -> TagStepKey {
+    (
+        step.from,
+        step.name.as_ptr() as usize,
+        step.name.len(),
+        step.args,
+        step.extra,
+    )
+}
+
 /// The tag of the state `step` leaves a `kind` structure in: from the
 /// thread's cache when this step was taken before, otherwise `compute`d
 /// (`state_tag` of the structure's properties after it) and remembered.
@@ -8202,20 +8279,14 @@ fn cached_state_tag(
     step: TagStep<'_>,
     compute: impl FnOnce() -> Option<u32>,
 ) -> Option<u32> {
-    if !TAGGED_STATES.contains(&kind) {
+    if !tagged_kind(kind) {
         return None;
     }
     let cacheable = step.from.is_some() || step.name.ends_with("SetDefaults");
     if !cacheable {
         return compute();
     }
-    let key = (
-        step.from,
-        step.name.as_ptr() as usize,
-        step.name.len(),
-        step.args,
-        step.extra,
-    );
+    let key = state_step_key(step);
     if let Some(&tag) = TAG_CACHE
         .with(|cache| cache.borrow().steps.get(&key).copied())
         .as_ref()
@@ -8327,7 +8398,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
     // A single tagged state: what the bound structure's bytes hold; an
     // untagged one (never set through NVN) is the defaults, not another
     // structure's state.
-    if TAGGED_STATES.contains(&kind) {
+    if tagged_kind(kind) {
         let tagged = core
             .memory
             .read_u32(base)
@@ -8340,7 +8411,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
         let mut props = read_shared(bags.at(base))
             .get(&base)
             .filter(|bag| bag.kind == kind)
-            .map(|bag| bag.props.clone())
+            .map(|bag| bag.current().into_owned())
             .unwrap_or_default();
         props.insert(
             "@Offset".into(),
@@ -8546,9 +8617,7 @@ fn bag_call(
         // Builders keep their device across SetDefaults: the application
         // sets the device first for some kinds (QueueBuilder).
         let mut shard = write_shared(bags.at(this));
-        let device = shard
-            .get(&this)
-            .and_then(|bag| bag.props.get("Device").copied());
+        let device = shard.get(&this).and_then(|bag| bag.get("Device"));
         let defaults = || {
             let mut props = BTreeMap::new();
             if let Some(device) = device {
@@ -8572,8 +8641,15 @@ fn bag_call(
         // The structure set up again in place (the game does so for every
         // draw) keeps its bag's allocation.
         match shard.get_mut(&this) {
+            // A tagged state's properties are its tag's: the map waits until
+            // it is read (`Bag::lazy`).
+            Some(bag) if bag.kind == kind && tag.is_some() => {
+                bag.tag = tag;
+                bag.lazy = true;
+            }
             Some(bag) if bag.kind == kind => {
                 bag.props.clear();
+                bag.lazy = false;
                 if let Some(device) = device {
                     bag.props.insert("Device".into(), device);
                 }
@@ -8586,6 +8662,7 @@ fn bag_call(
                         kind: kind.into(),
                         props: defaults(),
                         tag,
+                        lazy: false,
                     },
                 );
             }
@@ -8593,8 +8670,7 @@ fn bag_call(
         return Ok(true);
     }
     if bag_like {
-        let memory_tag = TAGGED_STATES
-            .contains(&kind)
+        let memory_tag = tagged_kind(kind)
             .then(|| core.memory.read_u32(this).ok())
             .flatten();
         if let Some(property) = rest.strip_prefix("Set") {
@@ -8620,11 +8696,10 @@ fn bag_call(
             // when the destination address held a different state before.
             if let Some(tag) = memory_tag
                 && bag.tag != Some(tag)
-                && let Some(snapshot) = tagged_state(kind, tag)
+                && tagged_state(kind, tag).is_some()
             {
-                bag.props.clone_from(&snapshot[0]);
-                bag.props.remove("@Offset");
                 bag.tag = Some(tag);
+                bag.lazy = true;
             }
             // The tag before this setter: the state it names and this call
             // name the state after it (`cached_state_tag`).
@@ -8634,6 +8709,16 @@ fn bag_call(
                 args,
                 extra: if property == "ChannelMask" { x[5] } else { 0 },
             };
+            // A step taken before: the state it leads to is known, so only
+            // the tag changes (`Bag::lazy`).
+            if let Some(Some(tag)) = known_state_step(kind, step) {
+                bag.tag = Some(tag);
+                bag.lazy = true;
+                drop(bags);
+                core.memory.write_u32(this, tag)?;
+                return Ok(true);
+            }
+            bag.materialize();
             // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
             // combined forms of SetWidth/SetHeight/SetDepth.
             if let Some(dimensions) = property
@@ -8702,15 +8787,17 @@ fn bag_call(
         if let Some(property) = rest.strip_prefix("Get") {
             let snapshot = memory_tag.and_then(|tag| tagged_state(kind, tag));
             let locked;
+            let current;
             let props = if let Some(snapshot) = &snapshot {
                 &snapshot[0]
             } else {
                 locked = read_shared(bags.at(this));
-                &locked
+                current = locked
                     .get(&this)
                     .filter(|bag| bag.kind == kind)
                     .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?
-                    .props
+                    .current();
+                &*current
             };
             if kind == "DepthStencilState" && stencil_property_keys(property).is_some() {
                 // FRONT_AND_BACK (3) reads the front face's setting (a
@@ -12611,7 +12698,6 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let mut hasher = FastHasher::default();
         lists.hash(&mut hasher);
-        eprintln!("typical draws digest {:#x}", hasher.finish());
         assert_eq!(hasher.finish(), TYPICAL_DRAWS_DIGEST);
     }
 
@@ -12641,4 +12727,230 @@ mod tests {
             best.as_nanos() as f64 / (draws * 23) as f64
         );
     }
+
+    /// State setters, getters, copies and binds on tagged states, as a
+    /// list of what each call returned and what the binds snapshotted.
+    fn tagged_state_script() -> Vec<String> {
+        let mut memory = Memory::new(1 << 32);
+        memory
+            .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let (device, buffer) = (0x1000, 0x2000);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        let recorder = nvn.recorder();
+        let mut out = Vec::new();
+        let made = |core: &mut Guest, name: &str, args: &[u64], out: &mut Vec<String>| {
+            core.cpu.regs[..args.len()].copy_from_slice(args);
+            let name = intern(name);
+            let call = RecordedCall::classify(name).expect(name);
+            let result = recorder.call(name, call, core);
+            out.push(format!(
+                "{name} {args:x?} -> {result:?} x0 {:#x}",
+                core.cpu.regs[0]
+            ));
+        };
+        let (a, b, c) = (0x10_1000, 0x10_1100, 0x10_1200);
+        made(
+            &mut core,
+            "nvnCommandBufferInitialize",
+            &[buffer, device],
+            &mut out,
+        );
+        made(
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+            &mut out,
+        );
+        for round in 0..3u64 {
+            made(&mut core, "nvnDepthStencilStateSetDefaults", &[a], &mut out);
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetDepthFunc",
+                &[a],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateSetDepthFunc",
+                &[a, 3 + round % 2],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateSetDepthFunc",
+                &[a, 3 + round % 2],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetDepthFunc",
+                &[a],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateSetStencilFunc",
+                &[a, 3, 5],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateSetStencilOp",
+                &[a, 2, 1, 2, 3],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetStencilFunc",
+                &[a, 1],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetStencilOp",
+                &[a, 2, 0x10_3000, 0x10_3004, 0x10_3008],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnCommandBufferBindDepthStencilState",
+                &[buffer, a],
+                &mut out,
+            );
+            // The guest copies the structure (its tag word) and changes the copy.
+            let tag = core.memory.read_u32(a).unwrap();
+            core.memory.write_u32(b, tag).unwrap();
+            made(
+                &mut core,
+                "nvnDepthStencilStateSetDepthTestEnable",
+                &[b, 1],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetDepthFunc",
+                &[b],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetDepthTestEnable",
+                &[b],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnCommandBufferBindDepthStencilState",
+                &[buffer, b],
+                &mut out,
+            );
+            // A scribbled tag word: the bind falls back to the structure's bag.
+            core.memory.write_u32(a, 0x10).unwrap();
+            made(
+                &mut core,
+                "nvnCommandBufferBindDepthStencilState",
+                &[buffer, a],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnDepthStencilStateGetDepthFunc",
+                &[a],
+                &mut out,
+            );
+            // Another kind at the same address starts a new structure.
+            made(&mut core, "nvnColorStateSetDefaults", &[c], &mut out);
+            made(
+                &mut core,
+                "nvnColorStateSetBlendEnable",
+                &[c, 1, round & 1],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnCommandBufferBindColorState",
+                &[buffer, c],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnChannelMaskStateSetChannelMask",
+                &[c, 0, 1, 0, 1, 1],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnChannelMaskStateGetChannelMask",
+                &[c],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnCommandBufferBindChannelMaskState",
+                &[buffer, c],
+                &mut out,
+            );
+            made(
+                &mut core,
+                "nvnBlendStateSetBlendFunc",
+                &[c, 6, 7, 1, round],
+                &mut out,
+            );
+            made(&mut core, "nvnBlendStateGetBlendFunc", &[c], &mut out);
+            made(
+                &mut core,
+                "nvnCommandBufferBindBlendState",
+                &[buffer, c],
+                &mut out,
+            );
+        }
+        core.cpu.regs[0] = buffer;
+        assert!(nvn.call("nvnCommandBufferEndRecording", &mut core).unwrap());
+        let handle = core.cpu.regs[0];
+        for command in nvn.command_lists[&handle].commands.iter() {
+            out.push(format!("{} {:?}", command.name, &*command.states));
+        }
+        for address in [a, b, c] {
+            let bags = read_shared(nvn.bags.at(address));
+            let bag = &bags[&address];
+            out.push(format!("bag {address:#x} {} {:?}", bag.kind, bag.current()));
+        }
+        out
+    }
+
+    /// Setters taken before (the thread's cached steps, lazy bags) and
+    /// first taken (computed) leave the same states, getters and binds, and
+    /// those main's recording path gave.
+    #[test]
+    fn tagged_states_behave_the_same_with_cached_steps() {
+        use std::hash::{Hash, Hasher};
+        let cold = std::thread::spawn(tagged_state_script).join().unwrap();
+        let warm = std::thread::spawn(|| {
+            tagged_state_script();
+            tagged_state_script()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(cold, warm);
+        let mut hasher = FastHasher::default();
+        cold.hash(&mut hasher);
+        assert_eq!(hasher.finish(), TAGGED_STATE_DIGEST, "{cold:#?}");
+        // One comparison names the same kinds as the list.
+        for kind in KINDS {
+            assert_eq!(tagged_kind(kind), TAGGED_STATES.contains(kind), "{kind}");
+        }
+    }
+
+    /// `tagged_states_behave_the_same_with_cached_steps`' results, as the
+    /// recording path gave them before it cached steps (main's, checked
+    /// with this script there).
+    const TAGGED_STATE_DIGEST: u64 = 0x83f8_c43d_7664_5ec8;
 }
