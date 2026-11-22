@@ -201,6 +201,18 @@ fn window_calls_match_the_default_emission() {
                 == 0
         )
     };
+    for (lift, (windows, spills, reloads, calls)) in [
+        ("base", window_call_base::CENSUS),
+        ("on", window_call_on::CENSUS),
+        ("table", window_call_table::CENSUS),
+        ("mixed", window_call_mixed::CENSUS),
+    ] {
+        println!(
+            "{lift}: {windows} windows, {calls} calls; per window {:.1} spills, {:.1} reloads",
+            spills as f64 / windows as f64,
+            reloads as f64 / windows as f64
+        );
+    }
     let exe = std::env::current_exe().unwrap();
     let lines = |lift: &str| -> Vec<String> {
         let output = std::process::Command::new(&exe)

@@ -60,6 +60,7 @@ breaking its reference on purpose and seeing it fail.
 | `loops` | Counted loops with mid-loop entries, ADR + BR to blocks reached only through a register, ADRP + ADD + BLR into leaves mid-window and mid-block; straight and sliced. |
 | `switches` | 200 jump tables (2 to 8 ways, halfword and byte entries) recovered by discovery; straight and sliced. |
 | `calls` | 300 callers using BL and BLR into leaf functions in other windows, some nesting calls behind STP/LDP of X29/X30: registers, memory and stack. |
+| `window_calls` | Window calls (`EmitOptions::window_calls`) against the build's own emission: 61 game-shaped callers and 40 functions (frames, BL and BLR, a jump through BR, early returns to another window, SVCs, recursion, UDF faults) lifted without window calls, with them in one region, through the window-call table across 1 KiB regions and in every other region, each lift in a child process; whole, sliced and budgeted runs must match in every register, SP, NZCV, PC, step and boundary count, trap, data memory and stack. |
 | `exclusives` | LDXR/STXR pairs on one context, sliced, and on two contexts interleaved on one memory, against the runtime's local and global monitor model (a successful STXR on one context fails the other's pending pair). |
 | `spin_kernels`, `spin_semantics` | The spin-loop detector on the benchmark kernels (only the polling loop spins) and on 400 random loop candidates and every generated program: each reported loop, run from random states, never exits once it has come back to its head, and every pure poll is found. |
 | `stress` | The patterns a job system uses (`src/stress.rs`: claims from a shared index by CASAL, LDAXR/STLXR and LDADDAL; a ticket lock with LDAR, STLR, SEVL, WFE and SEV; a seqlock; message passing by STLR/LDAR and by DMB; a Treiber stack pushed and popped with CASPAL on a {pointer, tag} head; 64-bit halves of STP/LDP and STR/LDR Q pairs) on two to four Cores sharing one Memory on host threads, plain and preempted (slices end every 1 to 64 instructions, clearing the monitor and yielding the host thread). Each checks its invariant: every item claimed once, no torn pair inside the lock or in a seqlock read, every message whole, every stack node present once and never owned twice, no torn 64-bit half. `ECHORA_STRESS_SCALE=N` multiplies the work. |
@@ -87,7 +88,7 @@ cargo bench -p echora-aot-tests --bench kernels
 cargo bench -p echora-aot-tests --bench kernels -- calls --scale 4 --runs 5
 ```
 
-`build.rs` lifts nine kernels from `crates/echora-aot-tests/src/kernels.rs`
+`build.rs` lifts the kernels from `crates/echora-aot-tests/src/kernels.rs`
 through split emission, the layout real builds use, and the benchmark runs
 them natively, reporting guest instructions per second (best and median of
 `--runs`):
@@ -98,6 +99,8 @@ them natively, reporting guest instructions per second (best and median of
 | `memcpy` | 64 KiB copies with LDP/STP of Q registers and post-indexing. |
 | `memset` | 64 KiB fills with STP of X registers. |
 | `calls` | Two BLs per iteration to leaf functions in another dispatch window. |
+| `calls2` | A BL per iteration to a function that keeps a frame and calls both leaves. |
+| `gamecalls` | A game-shaped update loop: state in callee-saved registers, per object a call of an update function (frame, saved X19/X20, loads and stores, a clamp leaf and a flag getter in another window) and a hash leaf. |
 | `switch` | An eight-way switch through a halfword jump table (BR). |
 | `vector` | FMLA, FADD and FMUL on 4S vectors loaded with post-indexing. |
 | `poll` | An LDAR/CBZ polling loop; the host ends it after 500 slices of 100,000 instructions, as another thread setting the flag would. |
