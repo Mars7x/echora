@@ -1,4 +1,5 @@
-//! The step count in a window local (`EmitOptions::steps_local`) against
+//! The step count in a window local (`EmitOptions::steps_local`) and the
+//! stop word in a window local (`EmitOptions::cached_stop`) against
 //! per-block charging, on `build.rs`'s deferred-charges program (a loop
 //! through a diamond, a join, a block leaving for another window, a call
 //! of a leaf in a third, an SVC): final registers and steps, every host
@@ -23,7 +24,7 @@ use echora_aot_tests::{Core, Machine, Trap};
 mod lifted {
     include!(concat!(env!("OUT_DIR"), "/lifted_deferred_charge.rs"));
 }
-use lifted::{deferred_charge_code, deferred_charge_reference, steps_local_code};
+use lifted::{cached_stop_code, deferred_charge_code, deferred_charge_reference, steps_local_code};
 
 type Dispatch = fn(&mut Core) -> Result<(), Trap>;
 
@@ -104,6 +105,38 @@ fn a_local_step_count_charges_and_stops_exactly_as_the_core_s() {
                     let local = run(steps_local_code::dispatch, count, flip, due, budget);
                     assert_eq!(
                         local, reference,
+                        "count {count} flip {flip} due {due} budget {budget}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cached_stop_word_charges_and_stops_exactly_as_the_core_s() {
+    const { assert!(cached_stop_code::CACHED > 0) };
+    for count in [1, 2, 7] {
+        for flip in [0, 1] {
+            let expected = run(
+                deferred_charge_reference::dispatch,
+                count,
+                flip,
+                u64::MAX,
+                u64::MAX,
+            );
+            for limit in (0..expected.steps + 2).chain([u64::MAX]) {
+                for (due, budget) in [(limit, u64::MAX), (u64::MAX, limit)] {
+                    let reference = run(
+                        deferred_charge_reference::dispatch,
+                        count,
+                        flip,
+                        due,
+                        budget,
+                    );
+                    let cached = run(cached_stop_code::dispatch, count, flip, due, budget);
+                    assert_eq!(
+                        cached, reference,
                         "count {count} flip {flip} due {due} budget {budget}"
                     );
                 }

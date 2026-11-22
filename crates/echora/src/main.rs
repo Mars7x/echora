@@ -808,6 +808,7 @@ fn lift(
                 "transitive-summaries" => options.transitive_summaries = true,
                 "call-summaries-audit" => options.call_summaries_audit = true,
                 "threaded-successors" => options.threaded_successors = true,
+                "cached-stop" => options.cached_stop = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
