@@ -826,7 +826,13 @@ Game set plus window-calls; host instructions per guest instruction
 - **PC stores** cost 1-4%.
 - **Memory checks**: the ablation's stand-in accessor made the code
   larger at `opt-level` 1 (it cannot be priced that way); statically each
-  access adds a mask test and an alignment test, both predictable.
+  access adds a mask test and an alignment test, both predictable. In the
+  machine code there is less: the aligned path (a relaxed atomic) and the
+  misaligned one (`read_unaligned`) are the same x86-64 `mov`, which LLVM
+  merges, so a plain access is `andn mask, address; jne cold` and one
+  `mov` at the view's base plus the address (a dead `test $7` is left of
+  the alignment test). Page protections are the guest's permissions, with
+  no per-access lookup. See "Plain guest memory access" below.
 - **Dispatch**: a block ending in `next_pc = <constant>` goes back
   through the window's `match` (a compare tree and a jump table; LLVM does
   not thread the constant through the loop header at any level). In the
@@ -1221,6 +1227,52 @@ every other run edge values), data of random bytes, FZ and DN on and off
 and a rounding mode the float helpers trap on: every register, the data,
 FPSR and the trap must agree; the lift with the option keeps no TBL or
 structure transfer helper call.
+
+## Plain guest memory access (2026-11)
+
+A plain load or store (`wmem.load_u*`/`store_u*`, `GuestAccess` in
+`echora-guest`) is already the view's host base plus the guest address,
+after one test against the reservation's power-of-two mask (an address
+outside it panics). The view's page protections hold the guest's
+permissions: an access the guest may not make faults in the host, whose
+handler names the guest address before the process ends (no guest data
+abort is delivered). Exclusive and ordered accesses check natural
+alignment, LSE atomics a 16-byte block, SP-based accesses SP's alignment,
+each a trap. Nothing on this path consults MMIO or GPU tracking.
+
+An opt-in lowering was tried (not kept): each plain access as one `asm!`
+`mov` (`ldr`/`str` on AArch64) at the base plus the address, after the same
+range test, to drop the alignment branch. Counted as above (game set plus
+window-calls, and the regalloc set), host instructions per guest
+instruction:
+
+| kernel | game set | + one-instruction access | regalloc | + one-instruction access |
+|---|---|---|---|---|
+| ldst | 5.20 | 5.60 | 4.86 | 4.50 |
+| memset | 8.34 | 8.34 | 7.21 | 7.50 |
+| gamefn | 12.49 | 12.44 | 4.68 | 5.14 |
+| gamecalls | 14.98 | 15.41 | 4.66 | 4.74 |
+
+The alignment branch was already gone from the machine code (above), so
+the lowering saved one dead instruction per access and lost it to
+register allocation: the asm cannot fold into memory operands, and its
+mask lived in a stack slot. With the base taken through
+`GuestView::host_span` (a call at every window entry) gamecalls was +20%;
+the figures above read it through inline accessors. What remains per
+access is the range test (two instructions and a register). Removing it
+faithfully needs either a constant base and mask (a fixed-address
+reservation: one guest memory per process) or proof that an address lies
+within the reservation's 1 MiB inaccessible tail of one already tested
+(the second half of a Q or pair access, a base used again with a small
+offset), which turns the panic at the space's end into a host fault.
+
+`tests/memory_faults.rs` checks the faults and traps of every plain,
+exclusive, ordered, atomic and SP-based form against a model of what each
+must do: completed accesses against the reference interpreter, traps by
+kind and address with nothing changed, the panic outside the space, and,
+in child processes, accesses to read-only, unmapped, translated-code and
+past-the-end bytes ending the process by SIGSEGV with the handler naming
+one of those bytes.
 
 ## Counting helper fallbacks (debugging, opt-in)
 
