@@ -15,6 +15,9 @@
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/effects.rs"]
+mod effects;
+
 use echora_aot_tests::{Machine, Trap};
 
 /// The lifts this test runs (`build.rs` writes each to its own file, so
@@ -1056,6 +1059,8 @@ fn lifted_integer_simd_matches_the_reference() {
     let mut random = Random(0x7a3c_91e5_02bd_4f68);
     let mut failures = Vec::new();
     let mut runs = 0;
+    let (mut effect_checks, mut effect_failures) = (0, Vec::new());
+    let mut effect_random = effects::EffectRandom(0x9b05_688c_2b3e_6c1f);
     for (index, &word) in words.iter().enumerate() {
         let entry = simd_semantic_code::BASE + STRIDE * index as u64;
         let Instruction::Simd(op) = decode(word, entry) else {
@@ -1067,6 +1072,23 @@ fn lifted_integer_simd_matches_the_reference() {
                 v: std::array::from_fn(|_| random.vector()),
                 nzcv: (random.next() & 15) as u8,
             };
+            if effect_checks < effects::EFFECT_STATES * (index + 1) {
+                effect_checks += 1;
+                m.core.cpu.regs = before.x;
+                m.core.cpu.vectors = before.v;
+                m.core.cpu.nzcv = before.nzcv;
+                if let Err(problem) = effects::check_effects(
+                    &mut m,
+                    simd_semantic_code::dispatch,
+                    &decode(word, entry),
+                    entry,
+                    0x80_0000,
+                    0x1000,
+                    &mut effect_random,
+                ) {
+                    effect_failures.push(format!("{word:#010x}: {problem}"));
+                }
+            }
             let mut expected = before.clone();
             interpret(&op, &mut expected);
             runs += 1;
@@ -1081,6 +1103,7 @@ fn lifted_integer_simd_matches_the_reference() {
             break;
         }
     }
+    effects::assert_effects(effect_checks, &effect_failures);
     let saturating_shifts = words
         .iter()
         .filter(|&&word| {
