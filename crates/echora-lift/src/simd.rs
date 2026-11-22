@@ -4914,3 +4914,67 @@ mod tests {
         assert_eq!(cpu.vectors[6], 0x7788_7788_7788_7700);
     }
 }
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    /// With every inline option on, no SIMD word is taken by two of the
+    /// per-instruction emitters (`emit_inline`'s int, pairwise, fp-scalar
+    /// and misc, the base forms with `inline-vector-unary`, and the
+    /// structure transfers): turning several on together changes no
+    /// instruction's emission from what each option alone gives it, so
+    /// the only overlaps are with the run options (`vector-float-runs`,
+    /// `float-runs`), whose exact copies are these emissions.
+    #[test]
+    fn inline_emitters_take_disjoint_forms() {
+        let saved = (
+            crate::simd_int::set_inline_vector_int(true),
+            crate::simd_int::set_inline_vector_pairwise(true),
+            crate::simd_scalar::set_inline_fp_scalar(true),
+            crate::simd_misc::set_inline_vector_misc(true),
+            set_inline_vector_unary(true),
+        );
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut taken = [0usize; 6];
+        let mut overlaps = Vec::new();
+        for _ in 0..4_000_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let raw = (seed >> 32) as u32;
+            // SIMD and FP data processing (op0 x111) or SIMD loads and
+            // stores (x1x0 with V set), half each.
+            let word = if raw & 1 == 0 {
+                raw | 0x0e00_0000
+            } else {
+                (raw & !0x0200_0000) | 0x0c00_0000
+            };
+            let Some(op) = decode(word, 0x1000) else {
+                continue;
+            };
+            let takers = [
+                crate::simd_int::emit_int(&op).is_some(),
+                crate::simd_int::emit_pairwise(&op).is_some(),
+                crate::simd_scalar::emit_fp_scalar(&op).is_some(),
+                crate::simd_misc::emit_misc(&op).is_some(),
+                crate::simd_misc::emit_transfer(&op).is_some(),
+                emit_inline_base(&op).is_some(),
+            ];
+            for (count, took) in taken.iter_mut().zip(takers) {
+                *count += usize::from(took);
+            }
+            if takers.iter().filter(|&&took| took).count() > 1 && overlaps.len() < 8 {
+                overlaps.push(format!("{word:#010x} {op:?}: {takers:?}"));
+            }
+        }
+        crate::simd_int::set_inline_vector_int(saved.0);
+        crate::simd_int::set_inline_vector_pairwise(saved.1);
+        crate::simd_scalar::set_inline_fp_scalar(saved.2);
+        crate::simd_misc::set_inline_vector_misc(saved.3);
+        set_inline_vector_unary(saved.4);
+        // Every emitter took a share of the sample.
+        assert!(taken.iter().all(|&count| count > 1000), "{taken:?}");
+        assert!(overlaps.is_empty(), "{}", overlaps.join("\n"));
+    }
+}

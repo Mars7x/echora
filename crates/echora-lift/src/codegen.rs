@@ -7793,6 +7793,85 @@ mod tests {
         assert!(!inlined_blocks(&translation).contains(&0x100c));
     }
 
+    /// Where two options take the same thing, the emission with both is
+    /// the winner's alone, and the loser alone changes it (so the
+    /// comparison sees something): deferred charges turn the step-count
+    /// local off, and a BL to a lifted function calls it whatever
+    /// `direct_calls` says.
+    #[test]
+    fn overlapping_options_emit_the_winners_code() {
+        let emit = |translation: &Translation, options: EmitOptions| {
+            let (root, regions) = emit_rust_split_with(translation, 16, options);
+            let mut text = root;
+            for (_, source) in regions {
+                text.push_str(&source);
+            }
+            text
+        };
+        let base = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            ..EmitOptions::default()
+        };
+        // ADD X0, X0, #1; SUBS X1, X1, #1; B.NE -8; BL +12; SVC; (pad);
+        // ADD X2, X2, #1; RET.
+        let translation = discover(
+            &[region(&[
+                0x9100_0400,
+                0xf100_0421,
+                0x54ff_ffc1,
+                0x9400_0003,
+                0xd400_00e1,
+                0xd503_201f,
+                0x9100_0442,
+                0xd65f_03c0,
+            ])],
+            &[0x1000],
+            16,
+        )
+        .unwrap();
+        let deferred = EmitOptions {
+            deferred_charges: true,
+            ..base
+        };
+        let steps_local = EmitOptions {
+            steps_local: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, steps_local), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    steps_local: true,
+                    ..deferred
+                }
+            ),
+            emit(&translation, deferred)
+        );
+        let functions = EmitOptions {
+            functions: true,
+            ..base
+        };
+        let direct = EmitOptions {
+            direct_calls: true,
+            ..base
+        };
+        assert!(emit(&translation, direct).contains("m.call_window(0x1010, run_window_"));
+        let both = emit(
+            &translation,
+            EmitOptions {
+                direct_calls: true,
+                ..functions
+            },
+        );
+        assert!(
+            both.contains("m.call_window(0x1010, run_function_1018)"),
+            "{both}"
+        );
+        assert_eq!(both, emit(&translation, functions));
+    }
+
     #[test]
     fn split_windows_keep_arms_after_calls() {
         // BL +8; ADD X1, X1, #1; RET: the block after the call is where the
