@@ -691,6 +691,83 @@ helper not known to leave these alone, fails it too). It found no
 mismatch. The whole `echora-aot-tests` suite passes with
 every program lifted with the game set and `window-calls`.
 
+## Long windows and known returns (opt-in)
+
+A profile of the game's worker threads (forest scene, main) put 69% of
+their CPU in translated windows, 80% of window entries in direct
+window-to-window calls, and of those 21% to the neighbouring 1 KiB window:
+`Core::call` is inlined at each BL site, so when a callee runs past the
+end of its window, that window stores its locals and returns, and the
+call loop in the caller's frame enters the next window, which loads them
+again (and its `match next_pc` dispatches the PC afresh). A straight run
+never crosses a window edge (`discover` splits blocks there), so every
+function or loop laid across an edge pays this at each crossing. The
+window table (`echora_guest::install_windows`, 1 KiB windows) is
+unchanged.
+
+**Long windows** (`EmitOptions::long_windows`, `long-windows`; split
+windows, not structured, nor with lifted functions or deferred charges).
+Each window's `match` also has arms for copies of the blocks its code
+reaches outside the window (`window_blocks`): breadth first through
+branches, both sides of conditional ones, fallthroughs and call return
+points (no BL targets, no PLT stubs, no indirect branches), within the
+same region, each block with those inlined into it, up to
+`WINDOW_EXTENSION_LIMIT` (256) extra instructions per window. Every block
+keeps its arm in its own window, which the dispatcher, `Core::call` and
+resuming after a trap, boundary or budget use as before; a copy charges,
+tags and stores the PC exactly as the original, so nothing but the number
+of window entries changes (the recent-PC ring records fewer). Reaching a
+block a window has no arm for leaves the window as before. Window-call
+summaries (`window_call_summaries_in`) count a window's copies as inside
+it, so a callee that runs across an edge and returns gets a summary
+without early exits. `echora lift` prints how many windows hold copies
+and their share of the translation: that much more Rust compiles (at most
+one window's worth per window).
+
+**Known returns** (`EmitOptions::known_returns`, `known-returns`). After a
+call in a split window (through `Core::call`, `call_window` or a
+summarized window call) the window continued with `next_pc = m.cpu.pc`,
+a value the host compiler cannot see, so every return went through the
+window's `match`. With this option it is `next_pc = <return address>;
+if m.cpu.pc != next_pc { return m.finish_block(); }`: a constant on the
+common path, which the compiler branches to directly, and on any other PC
+(an early return, the call depth limit) the window leaves and its caller
+or the dispatcher continues from the PC, as with any exit. Dense
+dispatch (`dense_dispatch`, a jump table for the `match`) was measured
+slower before (memset -18%, calls -4%) and is not changed.
+
+Kernels lifted with the game's set plus `window-calls` (base), with
+`long-windows`, `known-returns` and both, on a shared 4-core container,
+median Minstr/s of six interleaved rounds of seven runs (ranges in
+brackets):
+
+| kernel | base | + long-windows | + known-returns | both |
+|---|---|---|---|---|
+| crossing (a function across a window edge, 4-round loop over it) | 2193 [1302-2209] | 4916 [2850-5176] (+124%) | 2066 [1340-2118] | 5003 [2954-5153] (+128%) |
+| calls | 794 [688-1132] | 1067 [686-1095] | 950 [683-981] | 922 [702-1100] |
+| gamecalls | 1189 [817-1574] | 1453 [850-1580] | 1449 [936-1539] | 1265 [830-1559] |
+
+Long windows change only the crossing kernel's three windows (the other
+kernels' emitted Rust is identical), so its calls and gamecalls columns
+show this container's noise (±30%); known returns change the call
+kernels' windows, and their gains there are inside that noise. A full
+three-round run over every kernel moved only these kernels' code; the
+rest moved -35% to +77% in both directions between builds of identical
+code (layout and the shared host). Census of crossing's windows (default
+set + window-calls, against + long-windows): the caller's window 9 -> 3
+spills and 11 -> 3 reloads (its BL now has a window-call summary), the
+function's first window holding the tail's stores and back-edge, every
+other kernel's row unchanged.
+
+The whole `echora-aot-tests` suite passes with the game set,
+`window-calls`, `long-windows` and `known-returns` (with `long-windows`
+its split programs lift in 64 KiB regions, the PLT program still in 1 KiB
+ones); `tests/kernel_calls.rs` runs the call kernels (calls, calls2,
+gamecalls, crossing) against the reference interpreter, whole and sliced,
+under whatever options the build has; the lifter's unit tests cover the
+copies, the limit, dense arms outside the window, the summaries and the
+known-return text.
+
 ## The step count in a window local (opt-in)
 
 `EmitOptions::steps_local` (`steps-local`, with split ticks, not with
