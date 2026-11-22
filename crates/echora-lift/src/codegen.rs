@@ -5594,9 +5594,13 @@ fn expand_block_copying(
     if let Some(copy) = copying.as_mut() {
         copy.chain.push(start);
     }
+    // Only forward successors: a backward one is a loop's head, which
+    // every iteration reaches through the `match` anyway (copying it into
+    // the latch only grows the arm; measured slower on tight loops).
     let copies = |copying: &Option<Copying>, target: u64| {
         copying.as_ref().is_some_and(|copy| {
-            !inlined.contains(&target)
+            target > start
+                && !inlined.contains(&target)
                 && !copy.chain.contains(&target)
                 && bodies
                     .get(&target)
@@ -5857,8 +5861,8 @@ pub struct EmitOptions {
     /// one outside what it may write changed, the caller's values put
     /// back). For one checked run, not for speed.
     pub call_summaries_audit: bool,
-    /// Split windows (not structured): a block's constant successor in its
-    /// window that keeps its own arm runs as a copy in the arm, as an
+    /// Split windows (not structured): a block's constant forward successor
+    /// in its window that keeps its own arm runs as a copy in the arm, as an
     /// inlined block does, instead of going back through the window's
     /// `match next_pc` (whose compare tree and indirect jump the host
     /// compiler does not thread through the loop). Only successors on the
