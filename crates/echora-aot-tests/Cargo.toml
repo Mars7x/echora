@@ -103,6 +103,9 @@ window-calls-audit = []
 # Windows also run the blocks they reach in neighbouring windows
 # (EmitOptions::long_windows); split programs lift in 64 KiB regions.
 long-windows = []
+# After a call, the return point as a constant successor; any other PC
+# leaves the window (EmitOptions::known_returns).
+known-returns = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

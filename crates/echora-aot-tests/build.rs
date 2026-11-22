@@ -67,6 +67,7 @@ fn options() -> EmitOptions {
             .is_some(),
         window_calls_audit: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS_AUDIT").is_some(),
         long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
+        known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
         stub_windows: false,
     }
 }

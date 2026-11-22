@@ -2541,7 +2541,15 @@ fn emit_instruction_body(
     let mut sets_pc = false;
     let successor = if local_pc { "next_pc" } else { "m.cpu.pc" };
     // After a direct call the callee left its return PC in `m.cpu.pc`.
-    let after_call = if local_pc {
+    // With `EmitOptions::known_returns` the window goes on at the return
+    // point as a constant (no dispatch), and any other PC leaves it.
+    let returned;
+    let after_call = if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
+        returned = format!(
+            "                if m.cpu.pc != {next:#x} {{ return Ok(()); }}\n                next_pc = {next:#x};\n"
+        );
+        returned.as_str()
+    } else if local_pc {
         "                next_pc = m.cpu.pc;\n"
     } else {
         ""
@@ -4729,6 +4737,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// With `EmitOptions::window_calls`: a RET leaves its split window.
     static RET_LEAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::known_returns` of the region being emitted.
+    static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Restores [`WINDOW_CALLS`] when it goes.
@@ -5688,6 +5698,14 @@ pub struct EmitOptions {
     /// in its own window, which the dispatcher, `Core::call` and resuming
     /// after traps and boundaries use as before.
     pub long_windows: bool,
+    /// After a call in a split window (BL, BLR, through `Core::call`,
+    /// directly or summarized), the window goes on at the return point as
+    /// a constant successor when the callee came back there, so the host
+    /// compiler branches to it instead of dispatching `m.cpu.pc` through
+    /// the window's `match`; any other PC (an early return, the depth
+    /// limit) leaves the window, and its caller or the dispatcher goes on
+    /// from the PC as with any exit.
+    pub known_returns: bool,
 }
 
 thread_local! {
@@ -6284,6 +6302,7 @@ struct RegionSettings {
     window_calls: WindowCalls,
     ret_leaves: Flag,
     audit: Flag,
+    known_returns: Flag,
 }
 
 impl RegionSettings {
@@ -6359,6 +6378,7 @@ impl RegionSettings {
                 &WINDOW_CALLS_AUDIT,
                 calls_windows && options.window_calls_audit,
             ),
+            known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
         }
     }
 }
@@ -9009,6 +9029,25 @@ mod tests {
         ] {
             assert!(!long_windows_on(&options));
         }
+    }
+
+    #[test]
+    fn known_returns_go_on_at_the_return_point_or_leave() {
+        let (translation, at) = crossing_function();
+        let options = EmitOptions {
+            known_returns: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let expected = format!(
+            "if m.cpu.pc != {next:#x} {{ return Ok(()); }}\nnext_pc = {next:#x};",
+            next = at(1)
+        );
+        assert!(regions[0].1.contains(&expected), "{}", regions[0].1);
+        assert!(!regions[0].1.contains("\nnext_pc = m.cpu.pc;"));
+        let (_, regions) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        assert!(regions[0].1.contains("\nnext_pc = m.cpu.pc;"));
+        assert!(!regions[0].1.contains(&expected));
     }
 
     #[test]

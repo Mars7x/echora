@@ -807,6 +807,7 @@ fn lift(
                 "window-call-early-exits" => options.window_call_early_exits = true,
                 "window-calls-audit" => options.window_calls_audit = true,
                 "long-windows" => options.long_windows = true,
+                "known-returns" => options.known_returns = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
