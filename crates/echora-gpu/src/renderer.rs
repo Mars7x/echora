@@ -1351,6 +1351,19 @@ impl Renderer {
         self.slot.open_pass.is_some()
     }
 
+    /// The device, borrowed apart from `self`, for a method that records
+    /// with it while calling `&mut self` helpers. Cloning the `Arc` instead
+    /// cost two atomic updates of a count other threads' cores share, the
+    /// hottest instructions of each draw and occlusion segment.
+    ///
+    /// # Safety
+    /// Use the reference only while `self` lives and its `gpu` is not
+    /// replaced (it never is after creation).
+    pub(crate) unsafe fn detached_gpu<'a>(&self) -> &'a Gpu {
+        // SAFETY: the caller keeps the Arc alive and in place meanwhile.
+        unsafe { &*std::sync::Arc::as_ptr(&self.gpu) }
+    }
+
     pub(crate) fn device(&self) -> &ash::Device {
         &self.gpu.device
     }
