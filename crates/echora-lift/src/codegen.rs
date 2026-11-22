@@ -73,6 +73,8 @@ pub struct Translation {
     pub jump_tables: BTreeMap<u64, usize>,
     /// Every recovered jump-table case target (reached by an indirect branch).
     pub indirect_targets: BTreeSet<u64>,
+    /// The case targets of each recovered jump table, by its BR's address.
+    pub jump_table_cases: BTreeMap<u64, Vec<u64>>,
     /// Predicted 64-bit words of data the guest's dynamic linker writes
     /// (GOT slots), by address: what the loader's relocations say it will
     /// store there. Empty unless the caller fills it after discovery. A
@@ -224,6 +226,7 @@ pub fn discover_with_tables(
     let mut all_entries = entries.to_vec();
     let mut deferred_queued = deferred.is_empty();
     let mut jump_tables = BTreeMap::new();
+    let mut jump_table_cases = BTreeMap::new();
     let mut indirect_targets = BTreeSet::new();
     loop {
         let pc = match pending.pop_front() {
@@ -260,6 +263,7 @@ pub fn discover_with_tables(
                 let targets = jump_table_targets(pc, &read_word, regions, data);
                 if !targets.is_empty() {
                     jump_tables.insert(pc, targets.len());
+                    jump_table_cases.insert(pc, targets.clone());
                     indirect_targets.extend(targets.iter().copied());
                     successors.extend(targets);
                 }
@@ -313,6 +317,7 @@ pub fn discover_with_tables(
         truncated,
         jump_tables,
         indirect_targets,
+        jump_table_cases,
         got_words: BTreeMap::new(),
     })
 }
@@ -4086,6 +4091,13 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
                 BranchCond { target, .. }
                 | CompareBranch { target, .. }
                 | TestBranch { target, .. } => vec![*target, next],
+                // A recovered jump table: its cases (a target the table
+                // does not hold at run time leaves the function).
+                BranchReg { link: false, .. }
+                    if let Some(cases) = translation.jump_table_cases.get(&last.pc) =>
+                {
+                    cases.clone()
+                }
                 instruction if instruction.ends_block() => Vec::new(),
                 _ => vec![next],
             };
@@ -4219,7 +4231,11 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
 /// running on outside its body (after an SVC, through a resume point, by a
 /// branch out) gets no summary, so the code it reaches never relies on a
 /// caller's held local.
-fn exits_only_by_return(starts: &[u64], by_start: &BTreeMap<u64, &BasicBlock>) -> bool {
+fn exits_only_by_return(
+    starts: &[u64],
+    by_start: &BTreeMap<u64, &BasicBlock>,
+    jump_tables: &BTreeMap<u64, Vec<u64>>,
+) -> bool {
     use Instruction::*;
     let body: BTreeSet<u64> = starts.iter().copied().collect();
     starts.iter().all(|start| {
@@ -4235,6 +4251,10 @@ fn exits_only_by_return(starts: &[u64], by_start: &BTreeMap<u64, &BasicBlock>) -
                 link: false,
             }
             | PAuthDisabledReturn { .. } => true,
+            // A recovered jump table with every case in the body.
+            BranchReg { link: false, .. } if let Some(cases) = jump_tables.get(&last.pc) => {
+                cases.iter().all(|case| body.contains(case))
+            }
             Branch {
                 target,
                 link: false,
@@ -4269,7 +4289,7 @@ pub fn leaf_summaries(
             | if regs.nzcv { DIRTY_NZCV } else { 0 }
     };
     'functions: for (&entry, starts) in lifted {
-        if !exits_only_by_return(starts, &by_start) {
+        if !exits_only_by_return(starts, &by_start, &translation.jump_table_cases) {
             continue;
         }
         let (mut touched, mut writes): (Dirty, Dirty) = (0, 0);
@@ -4329,7 +4349,7 @@ pub fn transitive_summaries(
     let mut own: BTreeMap<u64, OwnEffects> = BTreeMap::new();
     for (&entry, starts) in lifted {
         let (mut touched, mut writes, mut calls) = (0, 0, Vec::new());
-        let mut valid = exits_only_by_return(starts, &by_start);
+        let mut valid = exits_only_by_return(starts, &by_start, &translation.jump_table_cases);
         for start in starts {
             for record in &by_start[start].instructions {
                 match record.instruction {
@@ -4427,9 +4447,31 @@ pub fn transitive_summaries(
             break;
         }
     }
+    // Summarized calls take no `Core::call` depth: chains nest at most
+    // `WINDOW_CALL_DEPTH_LIMIT` deep (the call graph of summarized
+    // functions is acyclic; a caller is deeper than its callees, so it
+    // goes with them).
+    let mut depths: BTreeMap<u64, u32> = BTreeMap::new();
+    fn depth(entry: u64, own: &BTreeMap<u64, OwnEffects>, depths: &mut BTreeMap<u64, u32>) -> u32 {
+        if let Some(&known) = depths.get(&entry) {
+            return known;
+        }
+        let calls = match own.get(&entry) {
+            Some(Some((_, _, calls))) => calls.clone(),
+            _ => Vec::new(),
+        };
+        let deepest = calls
+            .into_iter()
+            .map(|callee| depth(callee, own, depths))
+            .max()
+            .unwrap_or(0);
+        depths.insert(entry, deepest + 1);
+        deepest + 1
+    }
     summaries
         .into_iter()
         .filter_map(|(entry, summary)| Some((entry, summary?)))
+        .filter(|(entry, _)| depth(*entry, &own, &mut depths) <= WINDOW_CALL_DEPTH_LIMIT)
         .collect()
 }
 
@@ -4786,7 +4828,7 @@ fn audited_call(next: u64, callee: &str, touched: Dirty, writes: Dirty) -> Strin
          for n in 0..31 {{ if {writes:#x}u64 >> n & 1 == 0 && m.cpu.regs[n] != expected.0[n] {{ changed = Some(format!(\"x{{n}}\")); }} }} \
          if {writes:#x}u64 & {DIRTY_SP:#x} == 0 && m.cpu.sp != expected.1 {{ changed = Some(\"sp\".to_owned()); }} \
          if {writes:#x}u64 & {DIRTY_NZCV:#x} == 0 && m.cpu.nzcv != expected.2 {{ changed = Some(\"nzcv\".to_owned()); }} \
-         if let Some(register) = changed {{ return Err(Trap::InvalidState {{ message: format!(\"window-call audit: the call at {site:#x} ({callee}) changed {{register}}, outside its summary {touched:#x}/{writes:#x}\") }}); }} \
+         if let Some(register) = changed {{ return Err(Trap::InvalidState {{ message: format!(\"summary audit: the call at {site:#x} ({callee}) changed {{register}}, outside its summary {touched:#x}/{writes:#x}\") }}); }} \
          for n in 0..31 {{ if {touched:#x}u64 >> n & 1 == 0 {{ m.cpu.regs[n] = saved.0[n]; }} }} \
          if {touched:#x}u64 & {DIRTY_SP:#x} == 0 {{ m.cpu.sp = saved.1; }} \
          if {touched:#x}u64 & {DIRTY_NZCV:#x} == 0 {{ m.cpu.nzcv = saved.2; }} "
@@ -5706,6 +5748,13 @@ pub struct EmitOptions {
     /// limit) leaves the window, and its caller or the dispatcher goes on
     /// from the PC as with any exit.
     pub known_returns: bool,
+    /// With `functions` and `call_summaries`: every summarized call of a
+    /// lifted function is audited as `window_calls_audit` audits window
+    /// calls (all locals stored, markers in the registers outside the
+    /// callee's summary, a `Trap::InvalidState` naming the call site when
+    /// one outside what it may write changed, the caller's values put
+    /// back). For one checked run, not for speed.
+    pub call_summaries_audit: bool,
 }
 
 thread_local! {
@@ -6376,7 +6425,10 @@ impl RegionSettings {
             ret_leaves: Flag::set(&RET_LEAVES, calls_windows),
             audit: Flag::set(
                 &WINDOW_CALLS_AUDIT,
-                calls_windows && options.window_calls_audit,
+                (calls_windows && options.window_calls_audit)
+                    || (options.functions
+                        && options.call_summaries
+                        && options.call_summaries_audit),
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
         }
@@ -9099,6 +9151,110 @@ mod tests {
         };
         let (_, regions) = emit_rust_split_with(&translation, 16, options);
         assert!(regions[0].1.contains("let called = enter_window_4(m);"));
+    }
+
+    /// A BL at 0x1000 to a switch at 0x1008 through a halfword jump table
+    /// in the code (as `tests/window_calls.rs`'s program has it).
+    fn switch_program() -> Translation {
+        let b = |from: u32, to: u32| 0x1400_0000 | (to.wrapping_sub(from) & 0x03ff_ffff);
+        let adr = |from: u32, to: u32, rd: u32| {
+            let delta = to.wrapping_sub(from);
+            0x1000_0000 | ((delta & 3) << 29) | (((delta >> 2) & 0x7_ffff) << 5) | rd
+        };
+        let mut words = vec![bl(0x1000, 0x1008), 0xd400_00e1];
+        let mut switch = vec![
+            0x1200_0411,        // and w17, w0, #3
+            adr(4, 4 * 15, 16), // adr x16, table
+            0x7871_7a09,        // ldrh w9, [x16, x17, lsl #1]
+            adr(12, 4 * 6, 3),  // adr x3, cases
+            0x8b09_0863,        // add x3, x3, x9, lsl #2
+            0xd61f_0060,        // br x3
+        ];
+        for case in 0..4u32 {
+            switch.push(0x9100_0000 | ((case + 1) << 10)); // add x0, x0, #case+1
+            switch.push(b(switch.len() as u32, 14));
+        }
+        switch.push(0xd65f_03c0);
+        switch.extend([2 << 16, 4 | (6 << 16)]);
+        words.extend(switch);
+        discover(&[region(&words)], &[0x1000], words.len()).unwrap()
+    }
+
+    #[test]
+    fn lifted_functions_hold_their_jump_tables_cases() {
+        let translation = switch_program();
+        let br = 0x1008 + 4 * 5;
+        let cases = &translation.jump_table_cases[&br];
+        assert_eq!(cases.len(), 4);
+        let lifted = functions(&translation, 16);
+        for case in cases {
+            assert!(lifted[&0x1008].contains(case), "{case:#x}");
+        }
+        // Every exit is the RET, so the switch gets a summary.
+        let x = |n: u32| 1u64 << n;
+        let (touched, writes) = leaf_summaries(&translation, &lifted)[&0x1008];
+        assert_eq!(writes, x(0) | x(3) | x(9) | x(16) | x(17));
+        assert_eq!(touched, writes | x(30));
+        assert!(transitive_summaries(&translation, &lifted, 16, true).contains_key(&0x1008));
+    }
+
+    #[test]
+    fn transitive_summaries_stop_at_the_depth_limit() {
+        // A caller, then 20 functions each calling the next with a frame.
+        const CHAIN: u64 = 20;
+        let at = |index: u64| 0x1000 + 4 * index;
+        let function = |i: u64| at(2 + 4 * i);
+        let mut words = vec![bl(at(0), function(0)), 0xd400_00e1];
+        for i in 0..CHAIN {
+            if i + 1 == CHAIN {
+                words.extend([0xd503_201f, 0xd503_201f, 0xd503_201f, 0xd65f_03c0]);
+            } else {
+                words.extend([
+                    0xa9bf_7bfd,
+                    bl(function(i) + 4, function(i + 1)),
+                    0xa8c1_7bfd,
+                    0xd65f_03c0,
+                ]);
+            }
+        }
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        let lifted = functions(&translation, 16);
+        let summaries = transitive_summaries(&translation, &lifted, 16, true);
+        for i in 0..CHAIN {
+            // Function i nests CHAIN - i deep.
+            let depth = (CHAIN - i) as u32;
+            assert_eq!(
+                summaries.contains_key(&function(i)),
+                depth <= WINDOW_CALL_DEPTH_LIMIT,
+                "{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_summaries_audit_audits_every_summarized_function_call() {
+        let translation = switch_program();
+        let options = EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        assert!(regions[0].1.contains("let called = function_at(0)(m);"));
+        assert!(!regions[0].1.contains("summary audit"));
+        let (_, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                call_summaries_audit: true,
+                ..options
+            },
+        );
+        let source = &regions[0].1;
+        assert!(source.contains("summary audit: the call at 0x1000 (function_at(0))"));
+        assert!(!source.contains("let called = function_at(0)(m); r."));
     }
 
     #[test]
