@@ -1206,6 +1206,25 @@ impl RenderState {
         true
     }
 
+    /// SetRenderTargets' change to the render state, as the replay's arm
+    /// for it makes it (there after checking the textures named are
+    /// textures), for the parallel draw planner's look-ahead.
+    pub(super) fn set_render_targets(&mut self, command: &Command) {
+        let count = (command.x[1] as usize).min(command.captured.len());
+        let views = &command.captured[count..];
+        self.color_levels = (0..count)
+            .map(|index| views.get(index).copied().unwrap_or(0))
+            .collect();
+        let depth_view = views.get(count).copied().unwrap_or(0);
+        self.depth_level = depth_view as u32;
+        self.depth_layer = (depth_view >> 32) as u32;
+        self.color_formats = (0..count)
+            .map(|index| views.get(count + 1 + index).copied().unwrap_or(0) as u32)
+            .collect();
+        self.depth = command.x[4];
+        self.colors = command.captured[..count].to_vec();
+    }
+
     /// Whether SetTexturePool or SetSamplerPool (`rest`) names another
     /// pool than the one set.
     pub(super) fn pool_change(&self, rest: &str, command: &Command) -> bool {
@@ -6438,6 +6457,9 @@ impl Nvn {
                                 );
                             }
                         }
+                    }
+                    if gpu::parallel::enabled() {
+                        self.check_parallel_deferred(&values);
                     }
                     let rebinds = self
                         .render

@@ -6,21 +6,27 @@
 //! the render state. That part reads state and changes none of it in the
 //! common case, so it can run ahead of the replay on several threads:
 //!
-//! 1. Look-ahead (`prepare_parallel_draws`): at a draw no plan covers,
-//!    the replay looks down its command list, and on through the lists
-//!    queued after it, for a window of commands: everything up to the next
-//!    command that changes the render state another way (a called list, a
-//!    deferred bind, a pool set) or a queue item that is not a list (a
-//!    present, a wait). Other work in between (clears, copies, dispatches)
-//!    leaves the render state as it is and is passed over. Plans outlive
-//!    the replay's pieces: a draw meets its plan whenever it runs.
+//! 1. Look-ahead (`prepare_parallel_draws`): at a draw no window covers,
+//!    the replay looks down its command list, into the lists it calls and
+//!    on through the lists queued after it, for a window of commands:
+//!    everything up to a command that changes the render state another way
+//!    (a pool set naming another pool, a deferred bind whose array GPU work
+//!    may still write) or a queue item that is not a list (a present, a
+//!    wait). Deferred binds' arrays are read for the window, and checked
+//!    when they run (`check_parallel_deferred`). Other work in between
+//!    (clears, copies, dispatches) leaves the render state as it is and is
+//!    passed over. Plans outlive the replay's pieces. Why each window ended
+//!    is counted ("parallel draw windows ended by ...").
 //! 2. Plan (`plan_draw`, on `N` worker threads and the replay thread): the
 //!    window's draws are split into one run per thread. Each thread starts
 //!    from the render state at the window's start, applies the state
 //!    commands before its draws as the replay does (`RenderState::
 //!    apply_state`, shared with it), and plans each of its draws from the
 //!    state that draw sees. The replay waits for all of them: while they
-//!    run nothing changes the NVN state they read.
+//!    run nothing changes the NVN state they read. Draws whose program or
+//!    textures the replay has not resolved yet are resolved by it then, in
+//!    draw order, from the state each draw meets, as their binding loops
+//!    would (`resolve_ahead`), and planned again.
 //! 3. Commit (the replay, in order): each command runs as before; a draw
 //!    with a plan takes its bindings from it (`take_planned_bindings`) in
 //!    place of resolving them. What changes shared state stays in order:
@@ -51,7 +57,8 @@ use super::super::{
 };
 use super::{
     BoundProgram, GuestFileSpan, bind_key, c0_storage_table, draw_switches_set, empty_draw,
-    nvn_stage, overlapping_spans, shared_write_serial_in, typed_sampled_texture,
+    generic_input_types, nvn_stage, overlapping_spans, shared_write_serial_in,
+    typed_sampled_texture,
 };
 
 /// Threads planning draws besides the replay's (ECHORA_PARALLEL_DRAWS=N;
@@ -119,12 +126,22 @@ enum Step {
     State,
     /// A plural bind with its array captured.
     Plural(&'static str, usize),
+    /// A plural bind with its array in guest memory, read when the window
+    /// is made (`Window::deferred`) and checked when it runs.
+    Deferred(&'static str, usize),
     /// Push{Graphics,Compute}Constants.
     Constants,
-    /// Changes nothing planning reads (other draws, barriers, targets,
-    /// viewports, render enables): passed over.
+    /// SetTexturePool or SetSamplerPool: in a window only while it sets
+    /// the pool already set (another moves every memoized binding).
+    Pool,
+    /// SetRenderTargets (the program's output types follow them).
+    Targets,
+    /// CallCommands or CopyCommands: the called lists join the window.
+    Call,
+    /// Changes nothing planning reads (other draws, barriers, viewports,
+    /// render enables, other work): passed over.
     Pass,
-    /// Other work: the window ends before it.
+    /// Anything else: the window ends before it.
     End,
 }
 
@@ -150,11 +167,10 @@ fn step(command: &Command) -> Step {
         };
     }
     match rest {
+        "SetRenderTargets" => return Step::Targets,
         // Handled by `execute_command`'s own arms, none of whose effects
-        // planning reads (targets enter only through the program, which the
-        // commit checks).
-        "SetRenderTargets"
-        | "SetViewports"
+        // planning reads.
+        "SetViewports"
         | "SetScissors"
         | "SetScissor"
         | "SetDepthRanges"
@@ -162,27 +178,22 @@ fn step(command: &Command) -> Step {
         | "SetRenderEnable"
         | "SetRenderEnableConditional" => return Step::Pass,
         "PushGraphicsConstants" | "PushComputeConstants" => return Step::Constants,
-        // A pool set moves the binding serial (every memoized binding).
-        "SetTexturePool" | "SetSamplerPool" => return Step::End,
+        "SetTexturePool" | "SetSamplerPool" => return Step::Pool,
+        "CallCommands" | "CopyCommands" => return Step::Call,
         _ => {}
     }
     if rest.starts_with("Draw") || rest.starts_with("MultiDraw") {
         return Step::Pass;
     }
     if let Some((single, words)) = plural_bind(rest) {
-        // Deferred arrays are read from guest memory in queue order.
         return if rest.ends_with("Deferred") {
-            Step::End
+            Step::Deferred(single, words)
         } else {
             Step::Plural(single, words)
         };
     }
     if is_state_command(rest) {
         return Step::State;
-    }
-    // Called lists run next, ahead of the rest of this one.
-    if matches!(rest, "CallCommands" | "CopyCommands") {
-        return Step::End;
     }
     // Other work leaves the render state as it is; what it changes besides
     // (targets, GPU writes, waits) the commit's stamp check sees.
@@ -192,20 +203,27 @@ fn step(command: &Command) -> Step {
     Step::End
 }
 
-/// Apply a look-ahead step's change to the render state.
-fn apply(render: &mut RenderState, command: &Command, step: Step) {
+/// Apply a look-ahead step's change to the render state (`deferred`: a
+/// deferred bind's array, as the window read it).
+fn apply(render: &mut RenderState, command: &Command, step: Step, deferred: Option<&[u64]>) {
     match step {
-        Step::State => {
+        Step::State | Step::Pool => {
             let rest = without_prefix(command.name, "nvnCommandBuffer");
             render.apply_state(rest, command);
         }
         Step::Plural(single, words) => {
             render.apply_plural_bind(single, words, command, &command.captured);
         }
+        Step::Deferred(single, words) => {
+            if let Some(values) = deferred {
+                render.apply_plural_bind(single, words, command, values);
+            }
+        }
         Step::Constants => {
             render.push_constants(command);
         }
-        Step::Draw | Step::Pass | Step::End => {}
+        Step::Targets => render.set_render_targets(command),
+        Step::Draw | Step::Call | Step::Pass | Step::End => {}
     }
 }
 
@@ -301,6 +319,7 @@ struct View<'a> {
         >,
     >,
     recent: &'a super::super::FastMap<ProgramKey, (StateSnapshots, Arc<BoundProgram>)>,
+    typed: &'a super::super::FastMap<TypedKey, Arc<BoundProgram>>,
     pools: &'a [PoolRange],
     memo: &'a super::super::FastMap<u64, ResolvedBinding>,
     block_aliases: &'a super::super::FastMap<u64, u64>,
@@ -365,10 +384,14 @@ impl View<'_> {
     /// state. Several entries for the same stages (other target formats)
     /// are not told apart here: the commit checks the program it binds.
     fn program(&self, render: &RenderState) -> Result<Arc<BoundProgram>, &'static str> {
-        let ((vertex, fragment, attributes), _) =
-            program_key_of(render).ok_or("no program bound")?;
-        // The program the same binds bound last.
-        if let Some((_, bound)) = self.recent.get(&(vertex, fragment, attributes)) {
+        let (key, snapshots) = program_key_of(render).ok_or("no program bound")?;
+        let (vertex, fragment, attributes) = key;
+        // The program the same binds bound last, with these attributes or
+        // others giving the same input types.
+        if let Some((_, bound)) = self.recent.get(&key) {
+            return Ok(bound.clone());
+        }
+        if let Some(bound) = self.typed.get(&typed_key(key, &snapshots)) {
             return Ok(bound.clone());
         }
         let programs = self.programs.ok_or("program not memoized")?;
@@ -588,18 +611,30 @@ pub(in crate::nvn) struct ParallelDraws {
     /// The lists the plans cover, in replay order, each with the command
     /// range (end exclusive). Held, so no other list takes their address.
     segments: Vec<(Arc<Vec<Command>>, usize, usize)>,
+    /// Deferred binds' arrays as the window read them, by (segment,
+    /// index): their commit checks it reads the same.
+    deferred: super::super::FastMap<(usize, usize), Vec<u64>>,
+    /// The last covered draw the replay met: a draw at or before it runs
+    /// its list again.
+    last: Option<(usize, usize)>,
     stamp: Option<Stamp>,
     /// Plans by (segment, command index), in replay order.
     plans: VecDeque<((usize, usize), PlanResult)>,
     /// The program each draw bound, by its stages' binds and vertex
-    /// attribute state (`program_key`): what later plans of the same
+    /// attribute snapshots (`ProgramKey`), and by those binds and the
+    /// attributes' input types (`TypedKey`): what later plans of the same
     /// binds plan with (the commit checks it is still the one bound).
     programs: super::super::FastMap<ProgramKey, (StateSnapshots, Arc<BoundProgram>)>,
+    typed_programs: super::super::FastMap<TypedKey, Arc<BoundProgram>>,
 }
 
 /// The vertex and fragment programs bound and the vertex attribute
 /// snapshots' address (kept alive beside the key).
 type ProgramKey = (u64, u64, usize);
+
+/// The vertex and fragment programs bound and the generic input types
+/// their attributes give (what the program's translation depends on).
+type TypedKey = (u64, u64, [u8; 32]);
 
 /// Programs kept for planning before they are forgotten all at once.
 const PROGRAMS_KEPT: usize = 4096;
@@ -621,6 +656,11 @@ fn program_key_of(render: &RenderState) -> Option<(ProgramKey, StateSnapshots)> 
         .as_ref()
         .map_or(0, |snapshots| Arc::as_ptr(snapshots) as usize);
     Some(((bind(0)?, bind(1)?, address), attributes))
+}
+
+/// `TypedKey` of a `ProgramKey`'s binds and attributes.
+fn typed_key((vertex, fragment, _): ProgramKey, attributes: &StateSnapshots) -> TypedKey {
+    (vertex, fragment, generic_input_types(attributes))
 }
 
 /// Whether bindings planned for `planned` hold for `bound`: the same
@@ -653,13 +693,17 @@ impl std::fmt::Debug for ParallelDraws {
 }
 
 impl ParallelDraws {
-    /// Drop every plan.
-    pub fn forget(&mut self) {
+    /// Drop every plan; how many were never used.
+    pub fn forget(&mut self) -> usize {
+        let unused = self.plans.len();
         self.queue = None;
         self.segments.clear();
+        self.deferred.clear();
+        self.last = None;
         self.stamp = None;
         self.plans.clear();
         self.position = None;
+        unused
     }
 
     /// The segment and index of a command in the covered lists.
@@ -672,20 +716,84 @@ impl ParallelDraws {
             .map(|segment| (segment, index))
     }
 
-    /// Pop the plans before `key` (draws passed over: not drawn, render
-    /// disabled); whether the next one is `key`'s.
-    fn reach(&mut self, key: (usize, usize)) -> bool {
+    /// Pop the plans before `key` (draws not drawn: render disabled,
+    /// stopped); whether the next one is `key`'s, and how many were popped.
+    fn reach(&mut self, key: (usize, usize)) -> (bool, u64) {
+        let mut popped = 0;
         while self
             .plans
             .front()
             .is_some_and(|(planned, _)| *planned < key)
         {
             self.plans.pop_front();
+            popped += 1;
         }
-        self.plans
+        let found = self
+            .plans
             .front()
-            .is_some_and(|(planned, _)| *planned == key)
+            .is_some_and(|(planned, _)| *planned == key);
+        (found, popped)
     }
+
+    /// Remember the program a draw bound.
+    fn remember_program(&mut self, render: &RenderState, program: &Arc<BoundProgram>) {
+        // Vertex and fragment programs only (a mesh draw binds others).
+        if program
+            .stages
+            .first()
+            .is_none_or(|stage| stage.stage != shader::Stage::Vertex)
+        {
+            return;
+        }
+        let Some((key, attributes)) = program_key_of(render) else {
+            return;
+        };
+        if self
+            .programs
+            .get(&key)
+            .is_some_and(|(_, known)| Arc::ptr_eq(known, program))
+        {
+            return;
+        }
+        if self.programs.len() >= PROGRAMS_KEPT {
+            self.programs.clear();
+            self.typed_programs.clear();
+        }
+        self.typed_programs
+            .insert(typed_key(key, &attributes), program.clone());
+        self.programs.insert(key, (attributes, program.clone()));
+    }
+}
+
+/// Why a look-ahead window ended (counted per reason).
+fn window_end_stat(reason: &str) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::RefCell<super::super::FastMap<String, &'static str>> =
+            std::cell::RefCell::new(Default::default());
+    }
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(known) = names.get(reason) {
+            return *known;
+        }
+        let name: &'static str =
+            Box::leak(format!("stat: parallel draw windows ended by {reason}").into_boxed_str());
+        names.insert(reason.to_string(), name);
+        name
+    })
+}
+
+/// A look-ahead window as it is made.
+#[derive(Default)]
+struct Window {
+    segments: Vec<(Arc<Vec<Command>>, usize, usize)>,
+    draws: Vec<(usize, usize)>,
+    deferred: super::super::FastMap<(usize, usize), Vec<u64>>,
+    walked: usize,
+    /// The texture and sampler pools set (`Step::Pool`).
+    pools: [Option<u64>; 2],
+    /// Why it ended (`None`: it may go on).
+    ended: Option<String>,
 }
 
 impl Nvn {
@@ -725,17 +833,18 @@ impl Nvn {
     }
 
     /// Before the replay executes `list[index]` of `queue`: when it is a
-    /// draw no plan covers, plan the draws of the look-ahead window from
-    /// there on other threads. The window runs on through the queue's
-    /// next lists, up to a command that changes the render state another
-    /// way (`Step::End`), a queue item other than a list or fence, or
-    /// `window_commands`.
+    /// draw no window covers, make the look-ahead window from there and
+    /// plan its draws on other threads. The window runs on through the
+    /// lists it calls and the queue's next lists, up to a command that
+    /// changes the render state another way (`Step::End`, a pool change, a
+    /// deferred bind GPU work writes), a queue item other than a list or
+    /// fence, or `window_commands`.
     pub(in crate::nvn) fn prepare_parallel_draws(
         &mut self,
         queue: u64,
         list: &Arc<Vec<Command>>,
         index: usize,
-        core: &Guest,
+        core: &mut Guest,
     ) {
         let address = Arc::as_ptr(list) as usize;
         self.parallel.position = Some((address, index));
@@ -748,18 +857,26 @@ impl Nvn {
         if self.parallel.queue == Some(queue)
             && let Some(key) = self.parallel.locate(address, index)
         {
-            if self.parallel.reach(key) {
+            // On through the window (planned or too short to plan).
+            if self.parallel.last.is_none_or(|last| key > last) {
+                self.parallel.last = Some(key);
                 return;
             }
-            // Covered, but its plan is gone: the list runs again.
+            // A draw met again: its list runs again.
         }
-        self.parallel.forget();
+        let unused = self.parallel.forget();
         self.parallel.position = Some((address, index));
         if self.gpu.is_none()
             || draw_switches_set()
             || matches!(core.memory, GuestMemory::Checked(_))
         {
             return;
+        }
+        if unused > 0 {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: parallel plans dropped unused", unused as u64);
         }
         // Other modes of these change which bindings are read in place.
         static PLANNABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -768,169 +885,114 @@ impl Nvn {
         }) {
             return;
         }
-        // The window: this list from here, then the queue's next ones.
-        let most = window_commands();
-        let mut walked = 0;
-        let mut segments: Vec<(Arc<Vec<Command>>, usize, usize)> = Vec::new();
-        let mut draws: Vec<(usize, usize)> = Vec::new();
-        let mut walk = |list: &Arc<Vec<Command>>, from: usize, segments: &mut Vec<_>| -> bool {
-            let segment = segments.len();
-            let mut end = from;
-            let mut ended = false;
-            while end < list.len() {
-                if walked >= most {
-                    ended = true;
-                    break;
-                }
-                match step(&list[end]) {
-                    Step::End => {
-                        ended = true;
-                        break;
-                    }
-                    Step::Draw => draws.push((segment, end)),
-                    _ => {}
-                }
-                end += 1;
-                walked += 1;
-            }
-            if end > from {
-                segments.push((list.clone(), from, end));
-            }
-            !ended
+        let pool_set = |name| self.render.state.get(name).map(|set| set.x[1]);
+        let mut window = Window {
+            pools: [pool_set("SetTexturePool"), pool_set("SetSamplerPool")],
+            ..Window::default()
         };
-        if walk(list, index, &mut segments) {
-            let items = self.pending.get(&queue).into_iter().flatten();
+        if self.walk_window(&mut window, list, index, 0, core) {
             // The first item is the list being replayed.
-            for item in items.skip(1) {
+            for item in self.pending.get(&queue).into_iter().flatten().skip(1) {
                 match item {
                     QueueItem::List { commands, next, .. } => {
-                        // A list met again is located by its first run.
-                        if segments
-                            .iter()
-                            .any(|(known, ..)| Arc::ptr_eq(known, commands))
-                        {
-                            break;
-                        }
-                        if !walk(commands, *next, &mut segments) {
+                        if !self.walk_window(&mut window, commands, *next, 0, core) {
                             break;
                         }
                     }
                     QueueItem::Fence { .. } => {}
-                    _ => break,
+                    QueueItem::Present { .. } => {
+                        window.ended = Some("a present".into());
+                        break;
+                    }
+                    QueueItem::WaitSync { .. } => {
+                        window.ended = Some("a sync wait".into());
+                        break;
+                    }
                 }
             }
         }
+        let reason = window
+            .ended
+            .take()
+            .unwrap_or_else(|| "the end of the queued work".into());
+        let Window {
+            mut segments,
+            draws,
+            deferred,
+            ..
+        } = window;
         if segments.is_empty() {
             segments.push((list.clone(), index, index + 1));
         }
         self.parallel.queue = Some(queue);
         self.parallel.segments = segments;
+        self.parallel.deferred = deferred;
+        self.parallel.last = Some((0, index));
+        let backend = self.gpu.as_mut().unwrap();
+        backend.stat(window_end_stat(&reason), 1);
         if draws.len() < FEWEST_DRAWS {
-            self.gpu
-                .as_mut()
-                .unwrap()
-                .stat("stat: parallel draw windows too short", 1);
+            backend.stat("stat: parallel draw windows too short", 1);
+            backend.stat(
+                "stat: parallel draws in windows too short",
+                draws.len() as u64,
+            );
             return;
         }
         let started = std::time::Instant::now();
         // What the binding loop would do at its first texture first: the
         // planners then read the memo as the replay would.
         self.refresh_binding_memo();
-        let program_stamp = (self.presented_frames, self.flush_epoch);
         if let Some(backend) = self.gpu.as_ref() {
             // Built now: the planners read it as it is.
             backend.resident_writes_pending(&(0..0));
         }
-        let stamp = self.parallel_stamp();
-        let threads = threads();
+        let mut stamp = self.parallel_stamp();
         let pool = self
             .parallel
             .pool
             .take()
-            .unwrap_or_else(|| Pool::new(threads));
-        // A few draws a thread at least: each starts from the window's
-        // state and applies what comes before its own draws.
-        let chunks = (threads + 1).min(draws.len().div_ceil(FEWEST_DRAWS)).max(1);
-        let results: Vec<Mutex<Vec<((usize, usize), PlanResult)>>> =
-            (0..chunks).map(|_| Mutex::new(Vec::new())).collect();
-        {
-            let pools = self.indexed_pool_ranges();
-            let backend = self.gpu.as_ref().unwrap();
-            let dirty = backend.dirty_index.borrow();
-            let completed = backend.renderer.completed_serial();
-            let index_held = (backend.page_table_writes
-                && backend.page_table_write_serial > completed)
-                .then(|| self.shared_guest_index())
-                .flatten();
-            let memory = match &core.memory {
-                GuestMemory::View(view) => &**view,
-                // Checked reads report faults the view's do not.
-                GuestMemory::Checked(_) => unreachable!("checked above"),
+            .unwrap_or_else(|| Pool::new(threads()));
+        let mut plans = self.plan_window(&pool, &draws, core);
+        // Draws whose program or textures the replay has not resolved yet
+        // (a program after a flush, textures first bound in this list): the
+        // replay resolves them now, in draw order, as their draws would,
+        // and they are planned again.
+        let unresolved: Vec<(usize, usize)> = plans
+            .iter()
+            .filter(|(_, plan)| {
+                matches!(
+                    plan,
+                    Err("program not memoized"
+                        | "texture binding not memoized"
+                        | "texture binding to resolve again")
+                )
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if !unresolved.is_empty() {
+            self.resolve_ahead(&unresolved, core);
+            self.refresh_binding_memo();
+            let now = self.parallel_stamp();
+            let again = if now == stamp {
+                self.plan_window(&pool, &unresolved, core)
+            } else {
+                // Resolving changed what the other plans read.
+                stamp = now;
+                self.plan_window(&pool, &draws, core)
             };
-            let view = View {
-                memory,
-                programs: (self.program_memo.0 == program_stamp).then_some(&self.program_memo.1),
-                recent: &self.parallel.programs,
-                pools: &pools.entries,
-                memo: &self.binding_memo.1,
-                block_aliases: &self.block_aliases,
-                presented_frames: self.presented_frames,
-                flush_epoch: self.flush_epoch,
-                gpu_writes: backend.gpu_writes,
-                fragment_jump_stages: &backend.fragment_jump_stages,
-                in_place_writes: &backend.in_place_writes,
-                pending_storage: &backend.pending_storage,
-                resident_dirty: if backend.resident.is_empty() {
-                    &[]
-                } else {
-                    &dirty.1
-                },
-                table_writes: index_held.as_ref().map(|index| TableWrites {
-                    spans: &index.spans,
-                    shared_writes: &backend.shared_writes,
-                    unbounded_write_serial: backend.unbounded_write_serial,
-                    completed,
-                }),
-            };
-            let render = &self.render;
-            let draws = &draws;
-            let results = &results;
-            let segments = &self.parallel.segments;
-            pool.run(chunks, &|chunk| {
-                // An even share of the draws, each from its own state.
-                let from = draws.len() * chunk / chunks;
-                let to = draws.len() * (chunk + 1) / chunks;
-                let last = draws[to - 1];
-                let mut state = render.clone();
-                let mut out = Vec::with_capacity(to - from);
-                let mut next_draw = from;
-                'segments: for (segment, (list, start, end)) in segments.iter().enumerate() {
-                    for at in *start..*end {
-                        let key = (segment, at);
-                        if key > last {
-                            break 'segments;
-                        }
-                        let command = &list[at];
-                        let kind = step(command);
-                        if kind == Step::Draw {
-                            if next_draw < to && draws[next_draw] == key {
-                                out.push((key, plan_draw(&view, &state)));
-                                next_draw += 1;
-                            }
-                            continue;
-                        }
-                        apply(&mut state, command, kind);
-                    }
+            let mut again = again.into_iter().peekable();
+            for (key, plan) in &mut plans {
+                if again.peek().is_some_and(|(planned, _)| planned == key) {
+                    *plan = again.next().unwrap().1;
                 }
-                *results[chunk].lock().unwrap() = out;
-            });
+            }
+            self.gpu.as_mut().unwrap().stat(
+                "stat: parallel draws resolved ahead",
+                unresolved.len() as u64,
+            );
         }
         self.parallel.pool = Some(pool);
-        for result in results {
-            self.parallel
-                .plans
-                .extend(result.into_inner().unwrap_or_default());
-        }
+        self.parallel.plans = plans.into();
         self.parallel.stamp = stamp;
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: parallel draw windows", 1);
@@ -939,6 +1001,290 @@ impl Nvn {
             "stat: parallel draw planning us",
             started.elapsed().as_micros() as u64,
         );
+    }
+
+    /// Add `list` from `from` (and the lists it calls, in place) to
+    /// `window`; false once the window ends.
+    fn walk_window(
+        &self,
+        window: &mut Window,
+        list: &Arc<Vec<Command>>,
+        from: usize,
+        depth: usize,
+        core: &Guest,
+    ) -> bool {
+        // A list met again would be located by its first run.
+        if window
+            .segments
+            .iter()
+            .any(|(known, ..)| Arc::ptr_eq(known, list))
+        {
+            window.ended = Some("a list met again".into());
+            return false;
+        }
+        let most = window_commands();
+        let mut start = from;
+        let mut at = from;
+        while at < list.len() {
+            if window.walked >= most {
+                window.ended = Some("the window's length".into());
+                break;
+            }
+            let command = &list[at];
+            match step(command) {
+                Step::End => {
+                    window.ended = Some(without_prefix(command.name, "nvnCommandBuffer").into());
+                    break;
+                }
+                Step::Draw => window.draws.push((window.segments.len(), at)),
+                Step::Pool => {
+                    let slot = usize::from(command.name.ends_with("SamplerPool"));
+                    if window.pools[slot] != Some(command.x[1]) {
+                        window.ended = Some("a pool change".into());
+                        break;
+                    }
+                }
+                Step::Deferred(_, words) => match self.deferred_values(command, words, core) {
+                    Some(values) => {
+                        window.deferred.insert((window.segments.len(), at), values);
+                    }
+                    None => {
+                        window.ended = Some("a deferred bind GPU work writes".into());
+                        break;
+                    }
+                },
+                Step::Call => {
+                    if depth >= 8 {
+                        window.ended = Some("calls nested too deeply".into());
+                        break;
+                    }
+                    // The calling list up to the call, the called lists, then
+                    // the rest (the replay queues them that way).
+                    window.walked += 1;
+                    at += 1;
+                    window.segments.push((list.clone(), start, at));
+                    start = at;
+                    for handle in &command.captured {
+                        let Some(called) = self
+                            .command_lists
+                            .get(handle)
+                            .map(|called| called.commands.clone())
+                        else {
+                            window.ended = Some("a called list not at hand".into());
+                            return false;
+                        };
+                        if !self.walk_window(window, &called, 0, depth + 1, core) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            window.walked += 1;
+            at += 1;
+        }
+        if at > start {
+            window.segments.push((list.clone(), start, at));
+        }
+        window.ended.is_none()
+    }
+
+    /// A deferred bind's array as its execution would read it, when no
+    /// GPU work may still write it.
+    fn deferred_values(&self, command: &Command, words: usize, core: &Guest) -> Option<Vec<u64>> {
+        let count = (command.x[3] as usize).min(32);
+        let address = command.x[4];
+        let length = (count * words * 8) as u64;
+        let end = address.checked_add(length)?;
+        if length > 0 {
+            let backend = self.gpu.as_ref()?;
+            if self.gpu_writes_pending(&(address..end))
+                || self
+                    .draw_input_write_serial(address..end)
+                    .is_some_and(|serial| serial > backend.renderer.completed_serial())
+            {
+                return None;
+            }
+        }
+        (0..(count * words) as u64)
+            .map(|index| core.memory.read_u64(address + index * 8).ok())
+            .collect()
+    }
+
+    /// Plan the window's `wanted` draws (in replay order) on the pool's
+    /// threads and this one.
+    fn plan_window(
+        &self,
+        pool: &Pool,
+        wanted: &[(usize, usize)],
+        core: &Guest,
+    ) -> Vec<((usize, usize), PlanResult)> {
+        let threads = pool.threads.len();
+        // A few draws a thread at least: each starts from the window's
+        // state and applies what comes before its own draws.
+        let chunks = (threads + 1)
+            .min(wanted.len().div_ceil(FEWEST_DRAWS))
+            .max(1);
+        let results: Vec<Mutex<Vec<((usize, usize), PlanResult)>>> =
+            (0..chunks).map(|_| Mutex::new(Vec::new())).collect();
+        let program_stamp = (self.presented_frames, self.flush_epoch);
+        let pools = self.indexed_pool_ranges();
+        let backend = self.gpu.as_ref().unwrap();
+        let dirty = backend.dirty_index.borrow();
+        let completed = backend.renderer.completed_serial();
+        let index_held = (backend.page_table_writes && backend.page_table_write_serial > completed)
+            .then(|| self.shared_guest_index())
+            .flatten();
+        let memory = match &core.memory {
+            GuestMemory::View(view) => &**view,
+            // Checked reads report faults the view's do not.
+            GuestMemory::Checked(_) => unreachable!("checked memory is not planned"),
+        };
+        let view = View {
+            memory,
+            programs: (self.program_memo.0 == program_stamp).then_some(&self.program_memo.1),
+            recent: &self.parallel.programs,
+            typed: &self.parallel.typed_programs,
+            pools: &pools.entries,
+            memo: &self.binding_memo.1,
+            block_aliases: &self.block_aliases,
+            presented_frames: self.presented_frames,
+            flush_epoch: self.flush_epoch,
+            gpu_writes: backend.gpu_writes,
+            fragment_jump_stages: &backend.fragment_jump_stages,
+            in_place_writes: &backend.in_place_writes,
+            pending_storage: &backend.pending_storage,
+            resident_dirty: if backend.resident.is_empty() {
+                &[]
+            } else {
+                &dirty.1
+            },
+            table_writes: index_held.as_ref().map(|index| TableWrites {
+                spans: &index.spans,
+                shared_writes: &backend.shared_writes,
+                unbounded_write_serial: backend.unbounded_write_serial,
+                completed,
+            }),
+        };
+        let render = &self.render;
+        let results_ref = &results;
+        let segments = &self.parallel.segments;
+        let deferred = &self.parallel.deferred;
+        pool.run(chunks, &|chunk| {
+            // An even share of the draws, each from its own state.
+            let from = wanted.len() * chunk / chunks;
+            let to = wanted.len() * (chunk + 1) / chunks;
+            let last = wanted[to - 1];
+            let mut state = render.clone();
+            let mut out = Vec::with_capacity(to - from);
+            let mut next_draw = from;
+            'segments: for (segment, (list, start, end)) in segments.iter().enumerate() {
+                for at in *start..*end {
+                    let key = (segment, at);
+                    if key > last {
+                        break 'segments;
+                    }
+                    let command = &list[at];
+                    let kind = step(command);
+                    if kind == Step::Draw {
+                        if next_draw < to && wanted[next_draw] == key {
+                            out.push((key, plan_draw(&view, &state)));
+                            next_draw += 1;
+                        }
+                        continue;
+                    }
+                    apply(
+                        &mut state,
+                        command,
+                        kind,
+                        deferred.get(&key).map(Vec::as_slice),
+                    );
+                }
+            }
+            *results_ref[chunk].lock().unwrap() = out;
+        });
+        drop(view);
+        results
+            .into_iter()
+            .flat_map(|result| result.into_inner().unwrap_or_default())
+            .collect()
+    }
+
+    /// Resolve the programs and textures the window's `draws` (in replay
+    /// order) bind, from the render state each meets, as their binding
+    /// loops would.
+    fn resolve_ahead(&mut self, draws: &[(usize, usize)], core: &mut Guest) {
+        let mut render = self.render.clone();
+        let segments = self.parallel.segments.clone();
+        let mut draws = draws.iter().copied().peekable();
+        'segments: for (segment, (list, start, end)) in segments.iter().enumerate() {
+            for at in *start..*end {
+                let Some(&next) = draws.peek() else {
+                    break 'segments;
+                };
+                let key = (segment, at);
+                let command = &list[at];
+                let kind = step(command);
+                if kind == Step::Draw {
+                    if key == next {
+                        draws.next();
+                        std::mem::swap(&mut self.render, &mut render);
+                        self.resolve_draw_ahead(core);
+                        std::mem::swap(&mut self.render, &mut render);
+                    }
+                    continue;
+                }
+                let values = self.parallel.deferred.get(&key).cloned();
+                apply(&mut render, command, kind, values.as_deref());
+            }
+        }
+    }
+
+    /// `resolve_ahead` for the draw the render state is at. Errors are
+    /// left to the draw itself.
+    fn resolve_draw_ahead(&mut self, core: &mut Guest) {
+        let Ok(program) = self.bound_program(core) else {
+            return;
+        };
+        self.parallel.remember_program(&self.render, &program);
+        for stage in program.stages.iter() {
+            let nvn = nvn_stage(stage.stage);
+            for descriptor in &stage.descriptors {
+                if !matches!(
+                    descriptor.kind(),
+                    DescriptorKind::Texture | DescriptorKind::TextureBuffer
+                ) || descriptor.cbuf_index != 2
+                    || descriptor.cbuf_offset < 0x20
+                {
+                    continue;
+                }
+                let slot = (descriptor.cbuf_offset - 0x20) / 8;
+                let Some(&handle) = self
+                    .render
+                    .bound_textures
+                    .get(u64::from(nvn), u64::from(slot))
+                else {
+                    continue;
+                };
+                self.refresh_binding_memo();
+                if self.memoized_binding(handle).is_some() {
+                    continue;
+                }
+                let Ok(texture) = self.handle_texture(handle) else {
+                    continue;
+                };
+                if self
+                    .resolve_texture_binding(core, handle, texture, false)
+                    .is_ok()
+                {
+                    self.gpu
+                        .as_mut()
+                        .unwrap()
+                        .stat("stat: parallel texture bindings resolved ahead", 1);
+                }
+            }
+        }
     }
 
     /// The plan for the draw being executed, when one was made and the
@@ -951,35 +1297,32 @@ impl Nvn {
         if !enabled() {
             return None;
         }
-        if let Some((key, attributes)) = program_key_of(&self.render) {
-            let programs = &mut self.parallel.programs;
-            if programs
-                .get(&key)
-                .is_none_or(|(_, known)| !Arc::ptr_eq(known, program))
-            {
-                if programs.len() >= PROGRAMS_KEPT {
-                    programs.clear();
-                }
-                programs.insert(key, (attributes, program.clone()));
-            }
-        }
+        self.parallel.remember_program(&self.render, program);
         let (address, index) = self.parallel.position?;
         if self.parallel.queue != self.render_queue {
             return None;
         }
         let key = self.parallel.locate(address, index)?;
-        if !self.parallel.reach(key) {
+        let (found, popped) = self.parallel.reach(key);
+        if popped > 0 {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: parallel plans of draws not drawn", popped);
+        }
+        if !found {
             return None;
         }
         let (_, plan) = self.parallel.plans.pop_front().unwrap();
         if self.parallel.stamp.is_none() || self.parallel_stamp() != self.parallel.stamp {
             // Something the plans read changed: the rest are made again.
-            self.parallel.plans.clear();
-            self.parallel.segments.clear();
-            self.gpu
-                .as_mut()
-                .unwrap()
-                .stat("stat: parallel draw plans dropped by a state change", 1);
+            let dropped = 1 + self.parallel.forget() as u64;
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat("stat: parallel draw windows dropped by a state change", 1);
+            backend.stat(
+                "stat: parallel draw plans dropped by a state change",
+                dropped,
+            );
             return None;
         }
         let backend = self.gpu.as_mut().unwrap();
@@ -995,6 +1338,32 @@ impl Nvn {
             Err(reason) => {
                 backend.stat(fallback_stat(reason), 1);
                 None
+            }
+        }
+    }
+
+    /// A deferred bind (at the replay's position) read `values`: plans
+    /// made with others are dropped.
+    pub(in crate::nvn) fn check_parallel_deferred(&mut self, values: &[u64]) {
+        let Some((address, index)) = self.parallel.position else {
+            return;
+        };
+        let Some(key) = self.parallel.locate(address, index) else {
+            return;
+        };
+        if self
+            .parallel
+            .deferred
+            .get(&key)
+            .is_some_and(|expected| expected.as_slice() != values)
+        {
+            let dropped = self.parallel.forget() as u64;
+            if let Some(backend) = self.gpu.as_mut() {
+                backend.stat("stat: parallel draw windows dropped by a deferred bind", 1);
+                backend.stat(
+                    "stat: parallel draw plans dropped by a deferred bind",
+                    dropped,
+                );
             }
         }
     }
@@ -1538,20 +1907,26 @@ mod tests {
         );
         assert_eq!(
             step(&command("nvnCommandBufferBindTexturesDeferred", 0)),
-            Step::End
+            Step::Deferred("BindTexture", 1)
         );
         assert_eq!(
             step(&command("nvnCommandBufferSetTexturePool", 0)),
-            Step::End
+            Step::Pool
         );
         assert_eq!(step(&command("nvnCommandBufferClearColor", 0)), Step::Pass);
         assert_eq!(
             step(&command("nvnCommandBufferDispatchCompute", 0)),
             Step::Pass
         );
-        assert_eq!(step(&command("nvnCommandBufferCallCommands", 0)), Step::End);
+        assert_eq!(
+            step(&command("nvnCommandBufferCallCommands", 0)),
+            Step::Call
+        );
         assert_eq!(step(&command("nvnCommandBufferWaitEvent", 0)), Step::Pass);
-        assert_eq!(step(&command("nvnCommandBufferCopyCommands", 0)), Step::End);
+        assert_eq!(
+            step(&command("nvnCommandBufferCopyCommands", 0)),
+            Step::Call
+        );
         assert_eq!(step(&command("nvnCommandBufferFooBar", 0)), Step::End);
     }
 }
@@ -1828,7 +2203,7 @@ mod replay_tests {
     /// Each draw's resolved bindings after replaying `batch` with `threads`
     /// planner threads (0: the replay alone), and the NVN state's stats.
     fn replay(threads: usize, verify: bool) -> Option<(Vec<String>, Nvn)> {
-        replay_with(threads, verify, &[batch()], None, |_| {})
+        replay_with(threads, verify, &[batch()], None, |_| {}, |_| {})
     }
 
     /// `replay` of `lists`, queued in order, in pieces of `budget`
@@ -1839,10 +2214,12 @@ mod replay_tests {
         lists: &[Vec<Command>],
         budget: Option<u32>,
         setup: impl Fn(&mut Nvn),
+        fill: fn(&mut Memory),
     ) -> Option<(Vec<String>, Nvn)> {
         let mut nvn = fixture()?;
         setup(&mut nvn);
-        let memory = memory();
+        let mut memory = memory();
+        fill(&mut memory);
         let mut view = memory.view();
         let mut cpu = Cpu::default();
         let mut core = Guest {
@@ -1928,7 +2305,7 @@ mod replay_tests {
         let memory = memory();
         let mut view = memory.view();
         let mut cpu = Cpu::default();
-        let core = Guest {
+        let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::View(&mut view),
             counter: Some(0),
@@ -1941,9 +2318,9 @@ mod replay_tests {
             .position(|command| step(command) == Step::Draw)
             .unwrap();
         for command in &list[..first] {
-            apply(&mut nvn.render, command, step(command));
+            apply(&mut nvn.render, command, step(command), None);
         }
-        nvn.prepare_parallel_draws(QUEUE, &list, first, &core);
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
         assert_eq!(stat(&nvn, "stat: parallel draws planned"), 6);
         let program = nvn.program_memo.1.values().next().unwrap().1.clone();
         assert!(nvn.take_planned_bindings(&program).is_some());
@@ -1958,8 +2335,16 @@ mod replay_tests {
         nvn.parallel.position = Some((Arc::as_ptr(&list) as usize, second));
         assert!(nvn.take_planned_bindings(&program).is_none());
         assert_eq!(
-            stat(&nvn, "stat: parallel draw plans dropped by a state change"),
+            stat(
+                &nvn,
+                "stat: parallel draw windows dropped by a state change"
+            ),
             1
+        );
+        // That draw's plan and the four after it.
+        assert_eq!(
+            stat(&nvn, "stat: parallel draw plans dropped by a state change"),
+            5
         );
         testing::THREADS.with(|cell| cell.set(None));
     }
@@ -1973,7 +2358,7 @@ mod replay_tests {
         let memory = memory();
         let mut view = memory.view();
         let mut cpu = Cpu::default();
-        let core = Guest {
+        let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::View(&mut view),
             counter: Some(0),
@@ -1985,9 +2370,9 @@ mod replay_tests {
             .position(|command| step(command) == Step::Draw)
             .unwrap();
         for command in &list[..first] {
-            apply(&mut nvn.render, command, step(command));
+            apply(&mut nvn.render, command, step(command), None);
         }
-        nvn.prepare_parallel_draws(QUEUE, &list, first, &core);
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
         testing::THREADS.with(|cell| cell.set(None));
         let reasons: Vec<Result<(), &str>> = nvn
             .parallel
@@ -2014,11 +2399,11 @@ mod replay_tests {
         // Its programs and bindings carry over from the first list.
         second.drain(..2);
         let lists = [batch(), second];
-        let Some((serial, _)) = replay_with(0, false, &lists, Some(7), |_| {}) else {
+        let Some((serial, _)) = replay_with(0, false, &lists, Some(7), |_| {}, |_| {}) else {
             return;
         };
         assert_eq!(serial.len(), 12);
-        let (parallel, nvn) = replay_with(2, false, &lists, Some(7), |_| {}).unwrap();
+        let (parallel, nvn) = replay_with(2, false, &lists, Some(7), |_| {}, |_| {}).unwrap();
         assert_eq!(parallel, serial);
         assert_eq!(stat(&nvn, "stat: parallel draw windows"), 1);
         assert_eq!(stat(&nvn, "stat: parallel draws used"), 12);
@@ -2035,13 +2420,13 @@ mod replay_tests {
                 .in_place_writes
                 .push(GUEST + 0x100..GUEST + 0x104);
         };
-        let Some((serial, _)) = replay_with(0, false, &[batch()], None, pending) else {
+        let Some((serial, _)) = replay_with(0, false, &[batch()], None, pending, |_| {}) else {
             return;
         };
-        let (parallel, nvn) = replay_with(3, false, &[batch()], None, pending).unwrap();
+        let (parallel, nvn) = replay_with(3, false, &[batch()], None, pending, |_| {}).unwrap();
         assert_eq!(parallel, serial);
         assert!(stat(&nvn, "stat: parallel draws used") >= 1);
-        let (_, verified) = replay_with(3, true, &[batch()], None, pending).unwrap();
+        let (_, verified) = replay_with(3, true, &[batch()], None, pending, |_| {}).unwrap();
         assert_eq!(stat(&verified, "stat: parallel draws that differ"), 0);
     }
 
@@ -2053,7 +2438,7 @@ mod replay_tests {
         let memory = memory();
         let mut view = memory.view();
         let mut cpu = Cpu::default();
-        let core = Guest {
+        let mut core = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::View(&mut view),
             counter: Some(0),
@@ -2064,22 +2449,88 @@ mod replay_tests {
             .position(|command| step(command) == Step::Draw)
             .unwrap();
         for command in &list[..first] {
-            apply(&mut nvn.render, command, step(command));
+            apply(&mut nvn.render, command, step(command), None);
         }
         // A flush since: the present's memo is for another flush.
         let program = nvn.program_memo.1.values().next().unwrap().1.clone();
         nvn.flush_epoch += 1;
         testing::THREADS.with(|cell| cell.set(Some(2)));
-        nvn.prepare_parallel_draws(QUEUE, &list, first, &core);
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
         assert!(nvn.parallel.plans.iter().all(|(_, plan)| plan.is_err()));
         // A draw that bound it (the replay's) is remembered.
         nvn.parallel.forget();
         assert!(nvn.take_planned_bindings(&program).is_none());
-        nvn.prepare_parallel_draws(QUEUE, &list, first, &core);
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
         assert!(!nvn.parallel.plans.is_empty());
         assert!(nvn.parallel.plans.iter().all(|(_, plan)| plan.is_ok()));
         let taken = nvn.take_planned_bindings(&program).is_some();
         testing::THREADS.with(|cell| cell.set(None));
         assert!(taken);
+    }
+
+    #[test]
+    fn called_lists_and_deferred_binds_join_the_window() {
+        const CALLED: u64 = 0x4000;
+        const ARRAY: u64 = GUEST + 0xe000;
+        let mut called = batch();
+        called.drain(..2);
+        // A texture array the GPU reads from guest memory.
+        let deferred = command(
+            "nvnCommandBufferBindTexturesDeferred",
+            [0, 1, 0, 2, ARRAY, 0, 0, 0],
+            vec![],
+        );
+        let mut list = batch();
+        let at = list.len() - 3;
+        list.insert(at, deferred);
+        list.insert(
+            3,
+            command(
+                "nvnCommandBufferCallCommands",
+                [0, 1, 0, 0, 0, 0, 0, 0],
+                vec![CALLED],
+            ),
+        );
+        let setup = |nvn: &mut Nvn| {
+            nvn.command_lists.insert(
+                CALLED,
+                super::super::super::CommandList::new(called.clone(), 0),
+            );
+        };
+        let write_array: fn(&mut Memory) = |memory| {
+            for (index, handle) in [21u64, 22].into_iter().enumerate() {
+                memory
+                    .write(ARRAY + index as u64 * 8, &handle.to_le_bytes())
+                    .unwrap();
+            }
+        };
+        let lists = [list];
+        let Some((serial, _)) = replay_with(0, false, &lists, None, setup, write_array) else {
+            return;
+        };
+        assert_eq!(serial.len(), 12);
+        let (parallel, nvn) = replay_with(3, false, &lists, None, setup, write_array).unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(stat(&nvn, "stat: parallel draw windows"), 1);
+        assert_eq!(stat(&nvn, "stat: parallel draws used"), 12);
+    }
+
+    #[test]
+    fn a_window_too_short_to_plan_is_counted_once() {
+        // Two draws, then the end of the queued work.
+        let list: Vec<Command> = batch().into_iter().take(15).collect();
+        let Some((record, nvn)) = replay_with(2, false, &[list], None, |_| {}, |_| {}) else {
+            return;
+        };
+        assert_eq!(record.len(), 2);
+        assert_eq!(stat(&nvn, "stat: parallel draw windows too short"), 1);
+        assert_eq!(stat(&nvn, "stat: parallel draws in windows too short"), 2);
+        assert_eq!(
+            stat(
+                &nvn,
+                "stat: parallel draw windows ended by the end of the queued work"
+            ),
+            1
+        );
     }
 }
