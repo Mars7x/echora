@@ -4730,7 +4730,7 @@ impl Machine {
             "steps":self.core.steps,
             "host_check_at":self.core.host_check_at,
             "attention":self.core.attention,
-            "parallel_lock":{"audio_thread_frames":self.audio_thread_frames,"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
+            "parallel_lock":{"audio_thread_frames":self.audio_thread_frames,"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"deferred_nvn_calls":self.nvn.deferred_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
             "thread_window_instructions":self.thread_instructions().into_iter().map(|(thread, count)| (thread.to_string(), count - self.profile_instructions.get(&thread).copied().unwrap_or(0))).collect::<BTreeMap<_, _>>(),
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
@@ -5004,17 +5004,32 @@ impl<'a> Shared<'a> {
         }
     }
 
-    /// The NVN state, counted among its waiters until it is held.
+    /// The NVN state, counted among its waiters until it is held. Calls
+    /// workers deferred while others held it are made first
+    /// (`nvn::Deferred`).
     fn lock_nvn(&self) -> std::sync::MutexGuard<'_, crate::nvn::Nvn> {
         self.nvn_waiters
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let nvn = self
+        let mut nvn = self
             .nvn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.nvn_waiters
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        nvn.apply_deferred();
         nvn
+    }
+
+    /// The NVN state if no other thread holds it (deferred calls made
+    /// first, as `lock_nvn` does).
+    fn try_lock_nvn(&self) -> Option<std::sync::MutexGuard<'_, crate::nvn::Nvn>> {
+        let mut nvn = match self.nvn.try_lock() {
+            Ok(nvn) => nvn,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        nvn.apply_deferred();
+        Some(nvn)
     }
 
     /// Wake the parked workers named by `workers` (bit per worker).
@@ -5303,6 +5318,26 @@ fn needs_replayed(nvn: &crate::nvn::Nvn, name: &'static str, regs: &[u64; 31]) -
         _ => replay_sensitive_name(name),
     }
 }
+
+/// The calls `needs_replayed` makes wait for the replay by their name and
+/// arguments alone (those it decides from the NVN state are left out).
+fn replayed_first_by_name(name: &'static str, regs: &[u64; 31]) -> bool {
+    match name {
+        "nvnSyncWait" => regs[1] != 0,
+        "nvnQueueFinish" => true,
+        "nvnCommandBufferInitialize" | "nvnCommandBufferFinalize" | "nvnSamplerFinalize" => false,
+        _ if name.ends_with("Initialize") => false,
+        "nvnTexturePoolRegisterTexture"
+        | "nvnTexturePoolRegisterImage"
+        | "nvnSamplerPoolRegisterSampler"
+        | "nvnSamplerPoolRegisterSamplerBuilder" => false,
+        _ => replay_sensitive_name(name),
+    }
+}
+
+/// How long a call waits for the replay thread without the NVN state
+/// (`Worker::wait_for_replay_unlocked`) before replaying with it.
+const UNLOCKED_REPLAY_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The part of `needs_replayed` its name alone decides, remembered per
 /// interned name: five substring searches on every held NVN call showed
@@ -5678,10 +5713,18 @@ impl Worker {
         };
         match path {
             NvnCallPath::Record => {
-                self.recorded_nvn_call(shared, pc)
-                    || (self.held_failed.is_none() && self.held_nvn_call(shared, pc))
+                if self.recorded_nvn_call(shared, pc) {
+                    return true;
+                }
+                if self.held_failed.is_some() {
+                    return false;
+                }
+                if let Some(made) = self.deferred_nvn_call(shared, pc) {
+                    return made;
+                }
+                self.held_nvn_call(shared, pc, None)
             }
-            NvnCallPath::NvnLock => self.held_nvn_call(shared, pc),
+            NvnCallPath::NvnLock => self.held_nvn_call(shared, pc, None),
             NvnCallPath::MachineLock => false,
         }
     }
@@ -5739,6 +5782,97 @@ impl Worker {
         }
     }
 
+    /// The name of NVN thunk `pc` as this worker knows it (filled by
+    /// `recorded_nvn_call`).
+    fn known_thunk(&self, pc: u64) -> Option<&'static str> {
+        let index = crate::nvn::thunk_index(pc)?;
+        self.nvn_thunks.get(index).map(|&(name, _)| name)
+    }
+
+    /// With a replay thread, a call another thread may hand over without
+    /// waiting for the NVN state (`nvn::deferrable_call`): made at once
+    /// when the state is free, as `held_nvn_call` makes it, and otherwise
+    /// handed to whoever holds it, who makes it before anything else
+    /// (`nvn::Deferred`): a pool flush or a texture registration then no
+    /// longer waits for a replay piece, nor the replay for it. None when
+    /// `pc` is no such call (or the replay failed, which `held_nvn_call`
+    /// reports).
+    fn deferred_nvn_call(&mut self, shared: &Shared, pc: u64) -> Option<bool> {
+        let name = self.known_thunk(pc)?;
+        if !crate::nvn::deferrable_call(name)
+            || !crate::nvn::Nvn::replay_thread()
+            || shared
+                .replay_failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        {
+            return None;
+        }
+        if let Some(nvn) = shared.try_lock_nvn() {
+            return Some(self.held_nvn_call(shared, pc, Some(nvn)));
+        }
+        self.core.settle_block_trap();
+        let deferred = {
+            let mut guest = crate::nvn::Guest {
+                cpu: &mut self.core.cpu,
+                memory: crate::nvn::GuestMemory::View(&mut self.core.memory),
+                counter: None,
+            };
+            shared.recorder.defer(name, &mut guest)
+        };
+        if !deferred {
+            return None;
+        }
+        self.core.cpu.pc = self.core.cpu.regs[30];
+        self.lock_free_calls += 1;
+        self.recorded_calls += 1;
+        Some(true)
+    }
+
+    /// With a replay thread, before a call that waits for the submitted
+    /// work to be replayed (`needs_replayed`, by name alone): wait for the
+    /// replay thread to finish it without the NVN state, instead of taking
+    /// the state and replaying pieces of it between the replay thread's.
+    /// The call is then made as before (replaying what is left, if
+    /// anything), so it sees the same state; only who replays changes. A
+    /// replay that does not finish soon (stopped, failed, waiting) is left
+    /// to the call.
+    fn wait_for_replay_unlocked(&mut self, shared: &Shared, pc: u64) {
+        let Some(name) = self.known_thunk(pc) else {
+            return;
+        };
+        if !crate::nvn::Nvn::replay_thread()
+            || !replayed_first_by_name(name, &self.core.cpu.regs)
+            || !shared.recorder.replay_pending()
+        {
+            return;
+        }
+        let started = std::time::Instant::now();
+        shared.wake_replay();
+        while shared.recorder.replay_pending()
+            && started.elapsed() < UNLOCKED_REPLAY_WAIT
+            && !shared.stop.load(std::sync::atomic::Ordering::Acquire)
+            && shared
+                .replay_failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        {
+            if started.elapsed() < std::time::Duration::from_micros(50) {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(20));
+            }
+        }
+        crate::timeline::span(
+            self.core.current_thread_id,
+            "replay-wait-unlocked",
+            started,
+            std::time::Instant::now(),
+        );
+    }
+
     /// Make NVN call `pc` holding only the NVN state's own lock, not the
     /// machine's: recording commands is most of the game's host calls, and
     /// executing submitted work most of their time, while other guest
@@ -5749,7 +5883,13 @@ impl Worker {
     /// a call or the call failed: the boundary then takes the machine lock,
     /// where a failed call's error is reported, or a call this path cannot
     /// make is made (`held_failed`).
-    fn held_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
+    /// `held` is the state when the caller holds it already.
+    fn held_nvn_call(
+        &mut self,
+        shared: &Shared,
+        pc: u64,
+        held: Option<std::sync::MutexGuard<'_, crate::nvn::Nvn>>,
+    ) -> bool {
         if let Some(trap) = shared
             .replay_failed
             .lock()
@@ -5759,8 +5899,11 @@ impl Worker {
             self.held_failed = Some(Some(trap));
             return false;
         }
+        if held.is_none() {
+            self.wait_for_replay_unlocked(shared, pc);
+        }
         let asked = std::time::Instant::now();
-        let mut nvn = shared.lock_nvn();
+        let mut nvn = held.unwrap_or_else(|| shared.lock_nvn());
         let locked = std::time::Instant::now();
         // Time this call let the lock go (its GPU-wait pauses, a replay
         // in pieces) and waited to take it again: held time and wait time
@@ -6070,6 +6213,44 @@ fn rearm_lowered_dispatch_limit(core: &Core) {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    /// A call waits for the replay without the NVN state only where the
+    /// locked call would wait for it too (`needs_replayed`), whatever the
+    /// state it decides from: the call then finds the same state.
+    #[test]
+    fn unlocked_replay_waits_only_where_the_call_settles() {
+        let nvn = crate::nvn::Nvn::default();
+        let mut regs = [0u64; 31];
+        for name in [
+            "nvnSyncWait",
+            "nvnQueueFinish",
+            "nvnTextureFinalize",
+            "nvnTextureInitialize",
+            "nvnMemoryPoolFinalize",
+            "nvnCommandBufferFinalize",
+            "nvnSamplerFinalize",
+            "nvnTexturePoolRegisterTexture",
+            "nvnSamplerPoolRegisterSampler",
+            "nvnTextureWriteTexels",
+            "nvnTextureReadTexels",
+            "nvnProgramSetShaders",
+            "nvnMemoryPoolFlushMappedRange",
+            "nvnMemoryPoolInvalidateMappedRange",
+            "nvnQueueSubmitCommands",
+        ] {
+            for timeout in [0, u64::MAX] {
+                regs[1] = timeout;
+                if replayed_first_by_name(name, &regs) {
+                    assert!(needs_replayed(&nvn, name, &regs), "{name}");
+                }
+            }
+        }
+        regs[1] = u64::MAX;
+        assert!(replayed_first_by_name("nvnSyncWait", &regs));
+        assert!(replayed_first_by_name("nvnTextureFinalize", &regs));
+        regs[1] = 0;
+        assert!(!replayed_first_by_name("nvnSyncWait", &regs));
+    }
 
     #[test]
     fn fixed_resolution_addon_can_preserve_or_force_the_guest_branch() {
