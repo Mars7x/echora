@@ -1074,6 +1074,159 @@ impl TextureBindings {
     }
 }
 
+/// What a state command did beyond the render state (`RenderState::apply_state`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct StateEffect {
+    /// SetTexturePool or SetSamplerPool named another pool: every handle
+    /// may name other entries (the binding serial moves).
+    pub pool_changed: bool,
+    /// BindTexture bound another handle at its stage (`stage_binds`).
+    pub texture_rebound: bool,
+}
+
+impl RenderState {
+    /// Apply a state command (`is_state_command`, `rest` its name without
+    /// the prefix; not a plural bind, a barrier or a render enable) to the
+    /// render state. Shared by the replay and by the parallel draw
+    /// planner's look-ahead (`gpu::parallel`), so both see the same state.
+    pub(super) fn apply_state(&mut self, rest: &'static str, command: &Command) -> StateEffect {
+        let mut effect = StateEffect::default();
+        if matches!(
+            rest,
+            "SetStencilRef" | "SetStencilValueMask" | "SetStencilMask"
+        ) {
+            let faces = command.x[1];
+            let value = command.x[2] as u32;
+            for (index, face) in self.stencil_values.iter_mut().enumerate() {
+                if faces & (1 << index) != 0 {
+                    match rest {
+                        "SetStencilRef" => face.reference = value,
+                        "SetStencilValueMask" => face.compare_mask = value,
+                        _ => face.write_mask = value,
+                    }
+                }
+            }
+            return effect;
+        }
+        // Per-slot bindings are kept per stage and slot; the
+        // others keep their latest command.
+        let key = match rest {
+            "BindUniformBuffer" => {
+                self.bound_uniforms
+                    .insert((command.x[1], command.x[2]), command.clone());
+                return effect;
+            }
+            "BindTexture"
+            | "BindStorageBuffer"
+            | "BindImage"
+            | "BindSeparateTexture"
+            | "BindSeparateSampler" => gpu::bind_key(rest, Some(command.x[1]), command.x[2]),
+            "BindVertexBuffer" => gpu::bind_key(rest, None, command.x[1]),
+            // A blend state holds one target's factors (its
+            // BlendTarget, read at record time): each target
+            // keeps the latest state bound for it. The decal
+            // pass binds one per G-buffer target; keeping only
+            // the last left target 0 overwritten, not blended.
+            "BindBlendState" => {
+                let target = command
+                    .states
+                    .first()
+                    .and_then(|state| state.get("BlendTarget"))
+                    .map_or(0, |value| value.x[0]);
+                gpu::bind_key(rest, None, target)
+            }
+            // BindProgram(cmd, program, stage bits): a program
+            // replaces the stages its bits name (inferred).
+            "BindProgram" => {
+                for bit in 0..8 {
+                    if command.x[2] >> bit & 1 != 0 {
+                        self.state.insert(program_key(bit), command.clone());
+                    }
+                }
+                return effect;
+            }
+            // Another pool: every handle may name other entries.
+            // Setting the pool already set changes nothing
+            // (each list sets its pools at its start); the same
+            // pool's registrations evict their own ids.
+            "SetTexturePool" | "SetSamplerPool" => {
+                effect.pool_changed = self.pool_change(rest, command);
+                rest
+            }
+            _ => rest,
+        };
+        if rest == "BindTexture"
+            && self
+                .bound_textures
+                .insert((command.x[1], command.x[2]), command.x[3])
+                != Some(command.x[3])
+        {
+            effect.texture_rebound = true;
+        }
+        if rest == "BindStorageBuffer" {
+            self.set_storage_slot(command.x[1], command.x[2]);
+        }
+        self.state.insert(key, command.clone());
+        effect
+    }
+
+    /// Whether SetTexturePool or SetSamplerPool (`rest`) names another
+    /// pool than the one set.
+    pub(super) fn pool_change(&self, rest: &str, command: &Command) -> bool {
+        self.state.get(rest).map(|set| set.x[1]) != Some(command.x[1])
+    }
+
+    /// Apply Bind{Textures,Images,UniformBuffers,StorageBuffers}[Deferred]
+    /// (cmd, stage, first, count, array) with the array's `values`: one
+    /// binding per slot, as the singular command would make it. Returns
+    /// how many texture slots got another handle (`stage_binds`).
+    pub(super) fn apply_plural_bind(
+        &mut self,
+        single: &'static str,
+        words: usize,
+        command: &Command,
+        values: &[u64],
+    ) -> u64 {
+        let count = (command.x[3] as usize).min(32);
+        let mut rebinds = 0;
+        for (index, value) in values.chunks(words).take(count).enumerate() {
+            let slot = command.x[2] + index as u64;
+            // Built directly: a clone would copy the whole
+            // captured array per slot only to drop it.
+            let mut bind = Command {
+                name: match single {
+                    "BindTexture" => "nvnCommandBufferBindTexture",
+                    "BindImage" => "nvnCommandBufferBindImage",
+                    "BindUniformBuffer" => "nvnCommandBufferBindUniformBuffer",
+                    _ => "nvnCommandBufferBindStorageBuffer",
+                },
+                x: [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0],
+                v: command.v,
+                captured: Vec::new(),
+                states: command.states.clone(),
+            };
+            if words == 2 {
+                bind.x[4] = value[1];
+            }
+            if single == "BindTexture"
+                && self.bound_textures.insert((command.x[1], slot), value[0]) != Some(value[0])
+            {
+                rebinds += 1;
+            }
+            if single == "BindStorageBuffer" {
+                self.set_storage_slot(command.x[1], slot);
+            }
+            if single == "BindUniformBuffer" {
+                self.bound_uniforms.insert((command.x[1], slot), bind);
+            } else {
+                self.state
+                    .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
+            }
+        }
+        rebinds
+    }
+}
+
 impl RenderState {
     fn viewport(&self) -> Option<[f32; 4]> {
         let command = self.state.get("SetViewport")?;
@@ -6229,27 +6382,11 @@ impl Nvn {
                     } else {
                         std::borrow::Cow::Borrowed(command.captured.as_slice())
                     };
-                    for (index, value) in values.chunks(words).take(count).enumerate() {
-                        let slot = command.x[2] + index as u64;
-                        // Built directly: a clone would copy the whole
-                        // captured array per slot only to drop it.
-                        let mut bind = Command {
-                            name: match single {
-                                "BindTexture" => "nvnCommandBufferBindTexture",
-                                "BindImage" => "nvnCommandBufferBindImage",
-                                "BindUniformBuffer" => "nvnCommandBufferBindUniformBuffer",
-                                _ => "nvnCommandBufferBindStorageBuffer",
-                            },
-                            x: [command.x[0], command.x[1], slot, value[0], 0, 0, 0, 0],
-                            v: command.v,
-                            captured: Vec::new(),
-                            states: command.states.clone(),
-                        };
-                        if words == 2 {
-                            bind.x[4] = value[1];
-                            // ECHORA_UNPOOLED_LOG, as for single binds.
+                    // ECHORA_UNPOOLED_LOG, as for single binds.
+                    if words == 2 && debug_var_os("ECHORA_UNPOOLED_LOG").is_some() {
+                        for (index, value) in values.chunks(words).take(count).enumerate() {
+                            let slot = command.x[2] + index as u64;
                             if value[0] != 0
-                                && debug_var_os("ECHORA_UNPOOLED_LOG").is_some()
                                 && self.pool_for(value[0]).is_none()
                                 && self.unpooled_seen.insert(value[0])
                             {
@@ -6265,27 +6402,12 @@ impl Nvn {
                                 );
                             }
                         }
-                        if single == "BindTexture"
-                            && self
-                                .render
-                                .bound_textures
-                                .insert((command.x[1], slot), value[0])
-                                != Some(value[0])
-                        {
-                            *self.stage_binds.entry(command.x[1]).or_default() += 1;
-                        }
-                        if single == "BindStorageBuffer" {
-                            self.render.set_storage_slot(command.x[1], slot);
-                        }
-                        if single == "BindUniformBuffer" {
-                            self.render
-                                .bound_uniforms
-                                .insert((command.x[1], slot), bind);
-                        } else {
-                            self.render
-                                .state
-                                .insert(gpu::bind_key(single, Some(command.x[1]), slot), bind);
-                        }
+                    }
+                    let rebinds = self
+                        .render
+                        .apply_plural_bind(single, words, command, &values);
+                    if rebinds != 0 {
+                        *self.stage_binds.entry(command.x[1]).or_default() += rebinds;
                     }
                     return Ok(());
                 }
@@ -6326,89 +6448,13 @@ impl Nvn {
                     );
                 }
                 if is_state_command(rest) {
-                    if matches!(
-                        rest,
-                        "SetStencilRef" | "SetStencilValueMask" | "SetStencilMask"
-                    ) {
-                        let faces = command.x[1];
-                        let value = command.x[2] as u32;
-                        for (index, face) in self.render.stencil_values.iter_mut().enumerate() {
-                            if faces & (1 << index) != 0 {
-                                match rest {
-                                    "SetStencilRef" => face.reference = value,
-                                    "SetStencilValueMask" => face.compare_mask = value,
-                                    _ => face.write_mask = value,
-                                }
-                            }
-                        }
-                        return Ok(());
+                    let effect = self.render.apply_state(rest, command);
+                    if effect.pool_changed {
+                        self.bump_binding_serial("stat: binding serial by a pool set");
                     }
-                    // Per-slot bindings are kept per stage and slot; the
-                    // others keep their latest command.
-                    let key = match rest {
-                        "BindUniformBuffer" => {
-                            self.render
-                                .bound_uniforms
-                                .insert((command.x[1], command.x[2]), command.clone());
-                            return Ok(());
-                        }
-                        "BindTexture"
-                        | "BindStorageBuffer"
-                        | "BindImage"
-                        | "BindSeparateTexture"
-                        | "BindSeparateSampler" => {
-                            gpu::bind_key(rest, Some(command.x[1]), command.x[2])
-                        }
-                        "BindVertexBuffer" => gpu::bind_key(rest, None, command.x[1]),
-                        // A blend state holds one target's factors (its
-                        // BlendTarget, read at record time): each target
-                        // keeps the latest state bound for it. The decal
-                        // pass binds one per G-buffer target; keeping only
-                        // the last left target 0 overwritten, not blended.
-                        "BindBlendState" => {
-                            let target = command
-                                .states
-                                .first()
-                                .and_then(|state| state.get("BlendTarget"))
-                                .map_or(0, |value| value.x[0]);
-                            gpu::bind_key(rest, None, target)
-                        }
-                        // BindProgram(cmd, program, stage bits): a program
-                        // replaces the stages its bits name (inferred).
-                        "BindProgram" => {
-                            for bit in 0..8 {
-                                if command.x[2] >> bit & 1 != 0 {
-                                    self.render.state.insert(program_key(bit), command.clone());
-                                }
-                            }
-                            return Ok(());
-                        }
-                        // Another pool: every handle may name other entries.
-                        // Setting the pool already set changes nothing
-                        // (each list sets its pools at its start); the same
-                        // pool's registrations evict their own ids.
-                        "SetTexturePool" | "SetSamplerPool" => {
-                            if self.render.state.get(rest).map(|set| set.x[1]) != Some(command.x[1])
-                            {
-                                self.bump_binding_serial("stat: binding serial by a pool set");
-                            }
-                            rest
-                        }
-                        _ => rest,
-                    };
-                    if rest == "BindTexture"
-                        && self
-                            .render
-                            .bound_textures
-                            .insert((command.x[1], command.x[2]), command.x[3])
-                            != Some(command.x[3])
-                    {
+                    if effect.texture_rebound {
                         *self.stage_binds.entry(command.x[1]).or_default() += 1;
                     }
-                    if rest == "BindStorageBuffer" {
-                        self.render.set_storage_slot(command.x[1], command.x[2]);
-                    }
-                    self.render.state.insert(key, command.clone());
                     return Ok(());
                 }
                 if rest.starts_with("Draw") || rest.starts_with("Dispatch") {
