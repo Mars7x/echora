@@ -2174,6 +2174,13 @@ fn kernel_code(out: &mut String) {
     if MODE.get().is_none() {
         writeln!(
             out,
+            "/// What keeps the kernels' vector float operations out of runs (`echora_lift::vector_float_report`).\npub const VECTOR_FLOAT_REPORT: &str = {:?};",
+            echora_lift::vector_float_report::vector_float_report(&translation, 16, None, None)
+                .to_string()
+        )
+        .expect("write");
+        writeln!(
+            out,
             "/// The census of the kernels' windows (`echora_lift::census::table`).\npub const KERNEL_CENSUS: &str = {:?};",
             echora_lift::census::table(&rows)
         )

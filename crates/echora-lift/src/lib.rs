@@ -38,3 +38,4 @@ mod simd_misc;
 mod simd_scalar;
 pub mod spin;
 pub mod structure;
+pub mod vector_float_report;
