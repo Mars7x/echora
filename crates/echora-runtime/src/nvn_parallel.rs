@@ -65,8 +65,9 @@ use super::super::{
     without_prefix,
 };
 use super::{
-    BoundProgram, bind_key, c0_storage_table, draw_switches_set, empty_draw, generic_input_types,
-    nvn_stage, typed_sampled_texture,
+    BoundProgram, GuestFileSpan, bind_key, c0_storage_table, draw_switches_set, empty_draw,
+    generic_input_types, nvn_stage, overlapping_spans_walked, shared_write_serial_in,
+    typed_sampled_texture,
 };
 
 /// Threads planning draws besides the replay's (ECHORA_PARALLEL_DRAWS=N;
@@ -301,6 +302,46 @@ fn step(command: &Command) -> Step {
     Step::End
 }
 
+/// The render state `plan_draw` reads: programs, vertex attributes,
+/// uniform, storage and texture bindings, the graphics root table.
+fn plan_state(render: &RenderState) -> RenderState {
+    let mut state = RenderState::default();
+    for (key, command) in &render.state {
+        if plan_key(key) {
+            state.state.insert(key, command.clone());
+        }
+    }
+    state.bound_uniforms = render.bound_uniforms.clone();
+    state.bound_textures = render.bound_textures.clone();
+    state.roots[0] = render.roots[0].clone();
+    state
+}
+
+/// The render state keys `plan_draw` reads.
+fn plan_key(key: &str) -> bool {
+    key.starts_with("BindProgram@")
+        || key == "BindVertexAttribState"
+        || key.starts_with("BindStorageBuffer/")
+}
+
+/// Whether a look-ahead step changes what `plan_state` keeps.
+fn plan_reads(command: &Command, step: Step) -> bool {
+    let rest = without_prefix(command.name, "nvnCommandBuffer");
+    match step {
+        Step::State => matches!(
+            rest,
+            "BindProgram"
+                | "BindVertexAttribState"
+                | "BindUniformBuffer"
+                | "BindTexture"
+                | "BindStorageBuffer"
+        ),
+        Step::Plural(single, _) | Step::Deferred(single, _) => single != "BindImage",
+        Step::Constants => rest == "PushGraphicsConstants",
+        _ => false,
+    }
+}
+
 /// Apply a look-ahead step's change to the render state (`deferred`: a
 /// deferred bind's array, as the window read it).
 fn apply(render: &mut RenderState, command: &Command, step: Step, deferred: Option<&[u64]>) {
@@ -340,12 +381,16 @@ pub(super) struct Stamp {
 /// wait for GPU work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Deferred {
-    /// A uniform buffer GPU work may still write or has results for
-    /// (`resolve_guest_uniform`: read in place, or after them).
+    /// A guest uniform buffer (`resolve_guest_uniform`: read in place, or
+    /// made current after GPU work that writes it). `direct`: when planned,
+    /// no GPU work could write it, so while the GPU writes recorded are
+    /// those the plan saw (`WriteGeneration`) it is copied as it is with
+    /// nothing to resolve.
     Uniform {
         key: (usize, u32),
         guest: u64,
         size: u64,
+        direct: bool,
     },
     /// A storage buffer (`resolve_draw_storage`: shared in place or
     /// copied).
@@ -389,6 +434,20 @@ pub(super) struct PlannedBindings {
     pub flush_epoch: u64,
     /// The stage constant buffers (c1) read, with their stage index.
     pub stage_constants: Vec<((usize, u32), usize)>,
+    /// The GPU writes recorded when the plan was made (`Deferred::Uniform`).
+    pub write_generation: WriteGeneration,
+}
+
+/// What `resolve_guest_uniform` and `resolve_storage` check of the GPU's
+/// recorded writes: unchanged, a range they found nothing to wait for or
+/// bring back still has nothing (finished work only shrinks them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WriteGeneration {
+    gpu_writes: u64,
+    in_place_writes: (usize, u64, u64),
+    pending_storage: (usize, u64, u64),
+    resident: (u64, usize),
+    page_table: (u64, u64, usize, u64),
 }
 
 /// What a planner thread reads: shared views of the NVN state, which
@@ -413,6 +472,16 @@ struct View<'a> {
     in_place_writes: &'a [std::ops::Range<u64>],
     pending_storage: &'a [(u64, std::ops::Range<u64>, u32, u64, u64)],
     resident_dirty: &'a [std::ops::Range<u64>],
+    /// Page-table writes not yet finished (`draw_input_write_serial`).
+    table_writes: Option<TableWrites<'a>>,
+    write_generation: WriteGeneration,
+}
+
+struct TableWrites<'a> {
+    spans: &'a [GuestFileSpan],
+    shared_writes: &'a VecDeque<(u64, super::BoundedWrites)>,
+    unbounded_write_serial: u64,
+    completed: u64,
 }
 
 impl View<'_> {
@@ -432,6 +501,26 @@ impl View<'_> {
                 .iter()
                 .any(|(_, guest, ..)| overlaps(guest))
             || super::ranges_overlap(self.resident_dirty, range)
+    }
+
+    /// Whether GPU work not yet finished may store into `range` through
+    /// the page table (`draw_input_write_serial` above the completed
+    /// serial): the replay then reads the input in place or waits for it.
+    fn table_write_pending(&self, range: std::ops::Range<u64>) -> bool {
+        let Some(writes) = &self.table_writes else {
+            return false;
+        };
+        overlapping_spans_walked(writes.spans, range, || {})
+            .map(|span| {
+                shared_write_serial_in(
+                    writes.shared_writes,
+                    writes.unbounded_write_serial,
+                    writes.completed,
+                    span,
+                )
+            })
+            .max()
+            .is_some_and(|serial| serial > writes.completed)
     }
 
     /// The bound program as `Nvn::bound_program` memoized it for this
@@ -523,6 +612,7 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
         texture_handles: Vec::new(),
         flush_epoch: view.flush_epoch,
         stage_constants: Vec::new(),
+        write_generation: view.write_generation,
     };
     plan.uniforms.reserve(program.uniforms);
     plan.guest_uniforms.reserve(program.uniforms);
@@ -548,10 +638,20 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
                     let guest = view
                         .gpu_to_guest(bind.x[3], size)
                         .ok_or("uniform buffer in no pool")?;
-                    // Read in place, or made current (after GPU work that
-                    // writes it), by the commit: GPU work recorded between
-                    // the plan and its draw may write it.
-                    plan.deferred.push(Deferred::Uniform { key, guest, size });
+                    // Nothing to resolve when no recorded GPU work may write
+                    // it (`resolve_guest_uniform` would copy it as it is);
+                    // the commit checks no GPU writes were recorded since.
+                    let direct = guest.checked_add(size).is_some_and(|end| {
+                        size == 0
+                            || !view.table_write_pending(guest..end)
+                                && !view.gpu_writes_pending(&(guest..end))
+                    });
+                    plan.deferred.push(Deferred::Uniform {
+                        key,
+                        guest,
+                        size,
+                        direct,
+                    });
                 }
                 DescriptorKind::UniformBuffer if descriptor.index == 1 => {
                     let mut bytes = Vec::new();
@@ -920,6 +1020,48 @@ struct Window {
 }
 
 impl Nvn {
+    /// The GPU writes recorded so far, as `WriteGeneration` compares them.
+    fn write_generation(&self) -> WriteGeneration {
+        let Some(backend) = self.gpu.as_ref() else {
+            return WriteGeneration::default();
+        };
+        let ends = |ranges: &mut dyn Iterator<Item = &std::ops::Range<u64>>| {
+            let mut count = 0;
+            let mut first = 0;
+            let mut last = 0;
+            for range in ranges {
+                if count == 0 {
+                    first = range.start;
+                }
+                last = range.end;
+                count += 1;
+            }
+            (count, first, last)
+        };
+        WriteGeneration {
+            gpu_writes: backend.gpu_writes,
+            in_place_writes: ends(&mut backend.in_place_writes.iter()),
+            pending_storage: ends(&mut backend.pending_storage.iter().map(|(_, range, ..)| range)),
+            resident: (
+                backend.dirty_removals,
+                backend
+                    .resident
+                    .values()
+                    .map(|pool| pool.gpu_dirty.len())
+                    .sum(),
+            ),
+            page_table: (
+                backend.page_table_write_serial,
+                backend.unbounded_write_serial,
+                backend.shared_writes.len(),
+                backend
+                    .shared_writes
+                    .back()
+                    .map_or(0, |(serial, _)| *serial),
+            ),
+        }
+    }
+
     /// The renderer's texture uploads, images and targets made so far.
     fn renderer_made(&self) -> [u64; 3] {
         self.gpu.as_ref().map_or([0; 3], |backend| {
@@ -965,11 +1107,22 @@ impl Nvn {
                 self.parallel.current = Some(key);
                 return;
             }
-            // Off the window: the replay went another way.
+            // Off the window: past its end, or the replay went another way.
+            let finished = self.parallel.cursor.is_some_and(|(segment, at)| {
+                segment + 1 == self.parallel.segments.len()
+                    && at + 1 == self.parallel.segments[segment].2
+            });
             let unused = self.parallel.forget() as u64;
             self.parallel.position = Some((address, index));
             if let Some(backend) = self.gpu.as_mut() {
-                backend.stat("stat: parallel draw windows left by the replay", 1);
+                backend.stat(
+                    if finished {
+                        "stat: parallel draw windows run to their end"
+                    } else {
+                        "stat: parallel draw windows left by the replay"
+                    },
+                    1,
+                );
                 if unused > 0 {
                     backend.stat("stat: parallel plans dropped unused", unused);
                 }
@@ -1332,6 +1485,10 @@ impl Nvn {
         let pools = self.indexed_pool_ranges();
         let backend = self.gpu.as_ref().unwrap();
         let dirty = backend.dirty_index.borrow();
+        let completed = backend.renderer.completed_serial();
+        let index_held = (backend.page_table_writes && backend.page_table_write_serial > completed)
+            .then(|| self.shared_guest_index())
+            .flatten();
         let memory = match &core.memory {
             GuestMemory::View(view) => &**view,
             // Checked reads report faults the view's do not.
@@ -1356,8 +1513,17 @@ impl Nvn {
             } else {
                 &dirty.1
             },
+            table_writes: index_held.as_ref().map(|index| TableWrites {
+                spans: &index.spans,
+                shared_writes: &backend.shared_writes,
+                unbounded_write_serial: backend.unbounded_write_serial,
+                completed,
+            }),
+            write_generation: self.write_generation(),
         };
-        let render = &self.render;
+        // Only what planning reads of the render state, so each thread's
+        // copy and the commands it applies are few.
+        let render = &plan_state(&self.render);
         let results_ref = &results;
         let segments = &self.parallel.segments;
         let deferred = &self.parallel.deferred;
@@ -1385,12 +1551,14 @@ impl Nvn {
                         }
                         continue;
                     }
-                    apply(
-                        &mut state,
-                        command,
-                        kind,
-                        deferred.get(&key).map(Vec::as_slice),
-                    );
+                    if plan_reads(command, kind) {
+                        apply(
+                            &mut state,
+                            command,
+                            kind,
+                            deferred.get(&key).map(Vec::as_slice),
+                        );
+                    }
                 }
             }
             *results_ref[chunk]
@@ -1467,6 +1635,23 @@ impl Nvn {
         if !enabled() {
             return None;
         }
+        let started = super::draw_phase_timing().then(std::time::Instant::now);
+        let plan = self.take_planned_bindings_untimed(program);
+        if let Some(started) = started
+            && plan.is_some()
+        {
+            self.gpu.as_mut().unwrap().stat(
+                "stat: parallel draw commit ns",
+                started.elapsed().as_nanos() as u64,
+            );
+        }
+        plan
+    }
+
+    fn take_planned_bindings_untimed(
+        &mut self,
+        program: &Arc<BoundProgram>,
+    ) -> Option<PlannedBindings> {
         self.parallel.remember_program(&self.render, program);
         if self.parallel.queue != self.render_queue {
             return None;
@@ -1579,6 +1764,25 @@ impl Nvn {
         plan: PlannedBindings,
         out: InstallTo<'_>,
     ) -> Result<(), String> {
+        let started = super::draw_phase_timing().then(std::time::Instant::now);
+        let result = self.install_planned_bindings_untimed(core, plan, out);
+        if let Some(started) = started {
+            let backend = self.gpu.as_mut().unwrap();
+            backend.stat(
+                "stat: parallel draw commit ns",
+                started.elapsed().as_nanos() as u64,
+            );
+            backend.stat("stat: parallel draws timed at commit", 1);
+        }
+        result
+    }
+
+    fn install_planned_bindings_untimed(
+        &mut self,
+        core: &mut Guest,
+        plan: PlannedBindings,
+        out: InstallTo<'_>,
+    ) -> Result<(), String> {
         let PlannedBindings {
             program,
             uniforms,
@@ -1594,6 +1798,7 @@ impl Nvn {
             texture_handles: _,
             flush_epoch,
             stage_constants,
+            write_generation,
         } = plan;
         let mut uniforms = uniforms;
         let mut fragment_constants = fragment_constants;
@@ -1632,9 +1837,26 @@ impl Nvn {
         *out.uniform_bytes += uniform_bytes;
         *out.memo_hits += memo_hits;
         let _phase = InPhase::enter(Phase::ResolvingAtCommit);
+        let unchanged = self.write_generation() == write_generation;
+        if !unchanged {
+            self.gpu.as_mut().unwrap().stat(
+                "stat: parallel draws with GPU writes recorded since planned",
+                1,
+            );
+        }
         for binding in deferred {
             match binding {
-                Deferred::Uniform { key, guest, size } => {
+                Deferred::Uniform {
+                    key,
+                    guest,
+                    size,
+                    direct,
+                } => {
+                    if direct && unchanged {
+                        *out.uniform_bytes += size;
+                        out.guest_uniforms.insert(key, (guest, size as usize));
+                        continue;
+                    }
                     match self.resolve_guest_uniform(core, guest, size)? {
                         Some(in_place) => {
                             out.uniforms_in_place.insert(key, in_place);
@@ -3018,5 +3240,79 @@ mod replay_tests {
             "verifying took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_gpu_write_recorded_after_planning_resolves_the_uniforms_at_the_commit() {
+        let Some(mut nvn) = fixture() else {
+            return;
+        };
+        let memory = memory();
+        let mut view = memory.view();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::View(&mut view),
+            counter: Some(0),
+        };
+        let list = Arc::new(batch());
+        let first = list
+            .iter()
+            .position(|command| step(command) == Step::Draw)
+            .unwrap();
+        for command in &list[..first] {
+            apply(&mut nvn.render, command, step(command), None);
+        }
+        testing::THREADS.with(|cell| cell.set(Some(2)));
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
+        let program = nvn.program_memo.1.values().next().unwrap().1.clone();
+        let plan = nvn.take_planned_bindings(&program).unwrap();
+        testing::THREADS.with(|cell| cell.set(None));
+        assert!(
+            plan.deferred
+                .iter()
+                .any(|item| matches!(item, Deferred::Uniform { direct: true, .. }))
+        );
+        // GPU work recorded since stores into the first uniform buffer.
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .in_place_writes
+            .push(GUEST + 0x100..GUEST + 0x104);
+        let (mut uniforms, mut guest_uniforms, mut textures) =
+            (Default::default(), Default::default(), Default::default());
+        let (mut storage, mut uniforms_in_place, mut storage_in_place) =
+            (Default::default(), Default::default(), Default::default());
+        let (mut storage_written, mut storage_entries) = (Default::default(), Vec::new());
+        let (mut sampled, mut fragment, mut bytes, mut hits) = (Default::default(), None, 0, 0);
+        nvn.install_planned_bindings(
+            &mut core,
+            plan,
+            InstallTo {
+                uniforms: &mut uniforms,
+                guest_uniforms: &mut guest_uniforms,
+                textures: &mut textures,
+                sampled_textures: &mut sampled,
+                fragment_constants: &mut fragment,
+                storage: &mut storage,
+                uniforms_in_place: &mut uniforms_in_place,
+                storage_in_place: &mut storage_in_place,
+                storage_written: &mut storage_written,
+                storage_entries: &mut storage_entries,
+                uniform_bytes: &mut bytes,
+                memo_hits: &mut hits,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stat(
+                &nvn,
+                "stat: parallel draws with GPU writes recorded since planned"
+            ),
+            1
+        );
+        // The replay's own resolution brought the write back first.
+        assert!(nvn.gpu.as_ref().unwrap().in_place_writes.is_empty());
+        assert!(guest_uniforms.contains_key(&(0, 1)));
     }
 }
