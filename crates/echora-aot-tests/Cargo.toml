@@ -94,6 +94,12 @@ direct-calls = []
 # storing and reloading only what the callee may touch
 # (EmitOptions::window_calls).
 window-calls = []
+# With window-calls: also targets whose window can be left other than by a
+# return (EmitOptions::window_call_early_exits).
+window-call-early-exits = []
+# With window-calls: check every summarized call's summary as it runs
+# (EmitOptions::window_calls_audit).
+window-calls-audit = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
