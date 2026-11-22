@@ -538,6 +538,14 @@ impl Core {
         self.block_tag = 0;
     }
 
+    /// Forgets the charged block, for generated code that counted a trap's
+    /// instructions exactly itself: `settle_block_trap` then refunds
+    /// nothing.
+    #[inline]
+    pub fn clear_block_tag(&mut self) {
+        self.block_tag = 0;
+    }
+
     /// The most recent instructions or block starts, oldest first (any thread).
     pub fn recent_thread_pcs(&self) -> Vec<ThreadPc> {
         let count = self.recent_next.min(RECENT_PCS);

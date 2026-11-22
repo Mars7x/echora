@@ -810,6 +810,7 @@ fn lift(
                 "threaded-successors" => options.threaded_successors = true,
                 "cached-stop" => options.cached_stop = true,
                 "arm-charges" => options.arm_charges = true,
+                "regalloc" => options.regalloc = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,

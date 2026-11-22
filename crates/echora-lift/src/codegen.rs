@@ -24,6 +24,9 @@ const WINDOW_BITS: u32 = 12;
 /// otherwise produce single functions too large to compile in bounded memory.
 const SPLIT_WINDOW_BITS: u32 = 10;
 
+#[path = "regalloc.rs"]
+mod regalloc;
+
 #[derive(Clone, Debug)]
 pub struct CodeRegion {
     pub name: String,
@@ -1625,7 +1628,12 @@ const WRITES_REGISTERS: &[&str] = &[
 const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call(", "m.call("),
     ("if let Err(trap) = m.call_window(", "m.call_window("),
+    ("if let Err(trap) = run_entry(", "run_entry("),
 ];
+
+/// With `EmitOptions::regalloc`: a window arm runs its block's structured
+/// function (`REGALLOC_ENTRIES`), as a call that is no guest call.
+const RUN_ENTRY_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn run_entry(m: &mut Machine, function: fn(&mut Machine) -> Result<(), Trap>) -> Result<(), Trap> { function(m) }\n";
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[(&str, &str)] = &[
@@ -2554,7 +2562,12 @@ fn emit_instruction_body(
     // With `EmitOptions::known_returns` the window goes on at the return
     // point as a constant (no dispatch), and any other PC leaves it.
     let returned;
-    let after_call = if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
+    let after_call = if local_pc && REGALLOC_BODY.get() {
+        returned = format!(
+            "                next_pc = {next:#x};\n                if m.cpu.pc != next_pc {{ return Ok(()); }}\n"
+        );
+        returned.as_str()
+    } else if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
         returned = format!(
             "                next_pc = {next:#x};\n                if m.cpu.pc != next_pc {{ return m.finish_block(); }}\n"
         );
@@ -2591,7 +2604,12 @@ fn emit_instruction_body(
             if *link {
                 put(output, 30, 64, false, &format!("{next:#x}"));
             }
-            if *link {
+            if *link
+                && REGALLOC_BODY.get()
+                && REGALLOC_INLINED.with_borrow(|inlined| inlined.contains(&pc))
+            {
+                writeln!(output, "                {successor} = {target:#x};").unwrap();
+            } else if *link {
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 match emit_plt_stub(output, pc, *target, true) {
                     Some(direct) => emit_call_predicted(output, next, direct),
@@ -2606,7 +2624,7 @@ fn emit_instruction_body(
                         writeln!(
                             output,
                             "                {SUMMARIZED_CALL}{next:#x}, {callee}, {touched:#x}, {writes:#x}, {}) {{ return Err(trap); }}",
-                            u8::from(IN_FUNCTION.get() && TRANSITIVE.get())
+                            u8::from(IN_FUNCTION.get() && (TRANSITIVE.get() || REGALLOC_BODY.get()))
                         )
                         .unwrap();
                     }
@@ -3770,7 +3788,18 @@ fn emit_block_body(
             skip_to = end;
             continue;
         }
-        let block_size = (index == 0).then_some(count);
+        let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
+        if REGALLOC_BODY.get()
+            && index + 1 == count
+            && matches!(
+                instruction.instruction,
+                Instruction::Branch { link: true, .. } | Instruction::BranchReg { link: true, .. }
+            )
+            && !REGALLOC_INLINED.with_borrow(|inlined| inlined.contains(&instruction.pc))
+        {
+            // The callee charges its own blocks against exact steps.
+            body.push_str("                m.steps += *n; *n = 0;\n");
+        }
         emit_instruction(
             &mut body,
             instruction,
@@ -3781,6 +3810,11 @@ fn emit_block_body(
         );
     }
     FUSE.set(fuse);
+    if REGALLOC_BODY.get() {
+        writeln!(output, "                *n += {count};").unwrap();
+        output.push_str(&body);
+        return;
+    }
     if SPLIT_TICKS.get()
         && let Some((tick, rest)) = body.split_once(")?;\n")
         && !tick.contains("enter_window")
@@ -4073,6 +4107,17 @@ pub const FUNCTION_BLOCK_LIMIT: usize = 256;
 /// returns with the PC there, and the caller's `Core::call_window`
 /// continues through the window table). By entry: its blocks, in order.
 pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, Vec<u64>> {
+    functions_with(translation, region_bits, &BTreeSet::new())
+}
+
+/// [`functions`], with `extra` entries besides the BL targets (with
+/// `EmitOptions::regalloc`: the translation's entries, which windows then
+/// run as structured functions).
+pub fn functions_with(
+    translation: &Translation,
+    region_bits: u32,
+    extra: &BTreeSet<u64>,
+) -> BTreeMap<u64, Vec<u64>> {
     use Instruction::*;
     let by_start: BTreeMap<u64, &BasicBlock> = translation
         .blocks
@@ -4086,6 +4131,12 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
             Branch { target, link: true } if by_start.contains_key(&target) => Some(target),
             _ => None,
         })
+        .chain(
+            extra
+                .iter()
+                .copied()
+                .filter(|entry| by_start.contains_key(entry)),
+        )
         .collect();
     let mut functions = BTreeMap::new();
     'entries: for &entry in &entries {
@@ -4158,7 +4209,8 @@ fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
     FUNCTIONS.with_borrow(|functions| {
         let set = functions.as_ref()?;
         let &index = set.entries.get(&target)?;
-        if set.table {
+        let same_region = target >> set.region_bits == from >> set.region_bits;
+        if set.table && !(REGALLOC.get() && same_region) {
             Some(Some(index))
         } else {
             (target >> set.region_bits == from >> set.region_bits).then_some(None)
@@ -5224,6 +5276,18 @@ fn emit_split_cases(
             continue;
         }
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
+        // A structured function's entry runs the function; where it comes
+        // back at its entry (its first test of the stop word failed), the
+        // block runs here with its per-block charge.
+        let entered = REGALLOC_ENTRIES.with_borrow(|entries| entries.get(&block.start).copied());
+        if let Some(function) = entered {
+            writeln!(
+                output,
+                "                if let Err(trap) = run_entry(m, run_function_{function:x}) {{ return Err(trap); }}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
+                block.start
+            )
+            .unwrap();
+        }
         // Spin-wait heads keep their dispatch (`crate::spin`).
         let mut copying =
             (THREADED_SUCCESSORS.get() && !spin_heads.contains(&block.start)).then(|| Copying {
@@ -5237,6 +5301,9 @@ fn emit_split_cases(
             output.push_str(&arm_charges(&arm));
         } else {
             expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
+        }
+        if entered.is_some() {
+            output.push_str("                }\n");
         }
         output.push_str("            }\n");
     }
@@ -6003,9 +6070,37 @@ pub struct EmitOptions {
     /// its charges fit under the stop word, and its untagged blocks then
     /// only add their counts (`arm_charges`).
     pub arm_charges: bool,
+    /// With `functions` (not with deferred charges or a local step
+    /// count): each lifted function whose blocks form a reducible graph
+    /// is emitted as structured host code (`crate::structure::
+    /// function_structure`: loops, ifs and labelled blocks, constant
+    /// successors as direct jumps) instead of a `match next_pc` loop over
+    /// its blocks. Its blocks add their counts to a local; the steps are
+    /// exact wherever they can be observed (calls, traps, SVCs, exits),
+    /// and the function tests the stop word only at its entry, its loop
+    /// heads and its call return points, against the longest path to the
+    /// next such test: where that could pass the stop word it leaves to
+    /// the windows at that block, whose per-block charges then take every
+    /// budget and host boundary exactly where window code would.
+    pub regalloc: bool,
 }
 
 thread_local! {
+    /// `EmitOptions::regalloc` of the region being emitted (with
+    /// functions).
+    static REGALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while the blocks of a structured lifted function are emitted
+    /// (`EmitOptions::regalloc`): no per-block charges, the count added
+    /// to the function's local `n`, flushed into the steps before calls.
+    static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The BLs of the structured lifted function being emitted whose
+    /// callee runs inlined: they only set X30 and branch.
+    static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+    /// The entries of the region's functions emitted structured: their
+    /// window arms run the function first (`run_entry`).
+    static REGALLOC_ENTRIES: std::cell::RefCell<BTreeMap<u64, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
     /// `EmitOptions::float_runs` of the emission running on this thread.
     static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::float_run_loads` of the emission running on this thread.
@@ -6603,6 +6698,7 @@ struct RegionSettings {
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
+    regalloc: Flag,
 }
 
 impl RegionSettings {
@@ -6690,6 +6786,13 @@ impl RegionSettings {
                     && !options.deferred_charges
                     && !options.steps_local
                     && !options.cached_stop,
+            ),
+            regalloc: Flag::set(
+                &REGALLOC,
+                options.regalloc
+                    && options.functions
+                    && !options.deferred_charges
+                    && !options.steps_local,
             ),
             cached_stop: Flag::set(
                 &CACHED_STOP,
@@ -7027,6 +7130,9 @@ pub fn emit_rust_split_to_regions<E>(
         if window_calls_on(&options) {
             header.push_str(WINDOW_CALL_HELPER);
         }
+        if options.functions && options.regalloc {
+            header.push_str(RUN_ENTRY_HELPER);
+        }
         if options.count_fallbacks {
             header.push_str(&format!(
                 "/// Calls of each helper inlined code fell back to (`FALLBACK_HELPERS` of the root).\n\
@@ -7039,7 +7145,12 @@ pub fn emit_rust_split_to_regions<E>(
     // Lifted functions, emitted after their region's windows: only those of
     // regions whose options have them.
     let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
-        functions(translation, region_bits)
+        let extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
+            translation.entries.iter().copied().collect()
+        } else {
+            BTreeSet::new()
+        };
+        functions_with(translation, region_bits, &extra)
             .into_iter()
             .filter(|(entry, _)| options_of(entry >> region_bits).functions)
             .collect()
@@ -7134,7 +7245,25 @@ pub fn emit_rust_split_to_regions<E>(
         for (&entry, starts) in lifted.range(first..=last) {
             let blocks: Vec<BasicBlock> =
                 starts.iter().map(|start| by_start[start].clone()).collect();
-            emit_function(output, entry, &blocks, &inlined, &spin_heads);
+            if REGALLOC.get()
+                && let Some(entered) = regalloc::emit_function(
+                    output,
+                    entry,
+                    &blocks,
+                    &spin_heads,
+                    &translation.jump_table_cases,
+                    &lifted,
+                    &by_start,
+                )
+            {
+                REGALLOC_ENTRIES.with_borrow_mut(|entries| {
+                    for block in entered {
+                        entries.entry(block).or_insert(entry);
+                    }
+                });
+            } else {
+                emit_function(output, entry, &blocks, &inlined, &spin_heads);
+            }
         }
     };
     for (window, _) in &windows {
@@ -7155,6 +7284,13 @@ pub fn emit_rust_split_to_regions<E>(
             &window_calls,
         );
         let mut source = header_of(options);
+        // With regalloc the region's functions are emitted first, so its
+        // windows know which entries run structured.
+        let mut functions_first = String::new();
+        if REGALLOC.get() {
+            REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            region_functions(region, &mut functions_first);
+        }
         for (window, blocks) in region_windows {
             let output = &mut source;
             let extended: Vec<BasicBlock>;
@@ -7336,7 +7472,12 @@ pub fn emit_rust_split_to_regions<E>(
             output.push_str(&locals.store());
             output.push_str("    result\n}\n");
         }
-        region_functions(region, &mut source);
+        if REGALLOC.get() {
+            source.push_str(&functions_first);
+            REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+        } else {
+            region_functions(region, &mut source);
+        }
         (region, unindent(&source))
     };
     let groups: Vec<_> = windows

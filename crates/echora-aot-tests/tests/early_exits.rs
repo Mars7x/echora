@@ -24,8 +24,9 @@ mod lifted {
     include!(concat!(env!("OUT_DIR"), "/lifted_two_level.rs"));
 }
 use lifted::{
-    early_exit_code, early_exit_table_code, svc_wrapper_code, svc_wrapper_table_code,
-    two_level_code, two_level_table_code,
+    early_exit_code, early_exit_regalloc_code, early_exit_table_code, svc_wrapper_code,
+    svc_wrapper_regalloc_code, svc_wrapper_table_code, two_level_code, two_level_regalloc_code,
+    two_level_table_code,
 };
 
 fn run(dispatch: fn(&mut Core) -> Result<(), Trap>, x5: u64) -> [u64; 31] {
@@ -59,7 +60,12 @@ fn early_exits_see_the_caller_s_held_registers() {
     const { assert!(early_exit_code::SUMMARIZED_CALLS == 1) };
     const { assert!(early_exit_table_code::SUMMARIZED_CALLS == 1) };
     early_exit_table_code::install();
-    for dispatch in [early_exit_code::dispatch, early_exit_table_code::dispatch] {
+    early_exit_regalloc_code::install();
+    for dispatch in [
+        early_exit_code::dispatch,
+        early_exit_table_code::dispatch,
+        early_exit_regalloc_code::dispatch,
+    ] {
         for x5 in [0, 1] {
             let regs = run(dispatch, x5);
             // X1: 10 + 1 + 2; X6: X4 + X1 after leaf A; X2: + X4 through the
@@ -105,7 +111,12 @@ fn an_inner_early_exit_sees_every_caller_s_held_registers() {
     const { assert!(two_level_code::PROPAGATING >= 1) };
     const { assert!(two_level_table_code::PROPAGATING >= 1) };
     two_level_table_code::install();
-    for dispatch in [two_level_code::dispatch, two_level_table_code::dispatch] {
+    two_level_regalloc_code::install();
+    for dispatch in [
+        two_level_code::dispatch,
+        two_level_table_code::dispatch,
+        two_level_regalloc_code::dispatch,
+    ] {
         for x5 in [0, 1] {
             let regs = run_two_levels(dispatch, x5);
             // X1: 10 + X8 (3) + 1 + X7 (5); X6: X4 + X1; X2: + X4 + X7
@@ -158,7 +169,12 @@ fn an_svc_wrapper_s_return_finds_the_caller_s_link_register() {
     // a resume point): no summary.
     const { assert!(svc_wrapper_code::SUMMARIZED_CALLS == 0) };
     svc_wrapper_table_code::install();
-    for dispatch in [svc_wrapper_code::dispatch, svc_wrapper_table_code::dispatch] {
+    svc_wrapper_regalloc_code::install();
+    for dispatch in [
+        svc_wrapper_code::dispatch,
+        svc_wrapper_table_code::dispatch,
+        svc_wrapper_regalloc_code::dispatch,
+    ] {
         for count in [1, 3] {
             let regs = run_svc_wrapper(dispatch, count).unwrap();
             // Every call returns to its caller: X2 counts the calls, and
