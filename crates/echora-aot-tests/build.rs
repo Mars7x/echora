@@ -1591,6 +1591,14 @@ fn kernel_code(out: &mut String) {
         .map(|&(name, offset)| ((kernels::KERNEL_BASE + offset) >> 10, name))
         .collect();
     named.push(((kernels::KERNEL_BASE + 0x1000) >> 10, "(leaf functions)"));
+    named.push((
+        (kernels::KERNEL_BASE + kernels::GAMECALLS_FUNCTIONS[0]) >> 10,
+        "(gamecalls update, hash)",
+    ));
+    named.push((
+        (kernels::KERNEL_BASE + kernels::GAMECALLS_FUNCTIONS[1]) >> 10,
+        "(gamecalls clamp, flags)",
+    ));
     for (_, source) in &regions {
         for (function, counts) in echora_lift::census::census(source) {
             let label = named
@@ -3135,14 +3143,15 @@ fn spill_code(out: &mut String) {
     )
     .expect("spills");
     let (root, regions) = split(&translation, options());
-    // The straight caller's call: the line storing before it.
+    // The straight caller's call (through the window table, or with
+    // window calls its window's): the line storing before it.
     let window = format!("fn run_window_{:x}(", straight >> 10);
     let call_line = regions
         .iter()
         .find_map(|(_, source)| {
             let body = &source[source.find(&window)?..];
             body.lines()
-                .find(|line| line.contains("let called = m.call"))
+                .find(|line| line.contains("let called = "))
                 .map(str::to_owned)
         })
         .expect("the straight caller's call");
@@ -3996,11 +4005,16 @@ fn window_call_code(out: &mut String) {
         window_calls: true,
         ..options()
     };
+    // The base lift never has window calls, whatever the features.
+    let plain = EmitOptions {
+        window_calls: false,
+        ..options()
+    };
     let active = !calling.structured && !calling.functions;
     let lifts: Vec<(&str, String, Vec<(u64, String)>)> = {
         let mut lifts = Vec::new();
         for (name, bits, options) in [
-            ("window_call_base", 16, options()),
+            ("window_call_base", 16, plain),
             ("window_call_on", 16, calling),
             ("window_call_table", 10, calling),
         ] {
@@ -4019,7 +4033,7 @@ fn window_call_code(out: &mut String) {
         let root = echora_lift::codegen::emit_rust_split_to_regions(
             &translation,
             10,
-            options(),
+            plain,
             calling,
             &listed,
             &mut |region, source, _| {
