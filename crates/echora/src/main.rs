@@ -740,15 +740,6 @@ fn lift(
         calls.summarized_callers,
         calls.summarized_caller_sites
     );
-    let window_calls = echora_lift::codegen::window_call_report(&d.translation, region_bits);
-    println!(
-        "window calls (window-calls): {} BL targets with summaries in {} windows; {} of {} BL sites call them ({} in the caller's region)",
-        window_calls.targets,
-        window_calls.windows,
-        window_calls.summarized_sites,
-        window_calls.sites,
-        window_calls.same_region_sites
-    );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
@@ -813,6 +804,8 @@ fn lift(
                 "float-runs" => options.float_runs = true,
                 "float-run-loads" => options.float_run_loads = true,
                 "window-calls" => options.window_calls = true,
+                "window-call-early-exits" => options.window_call_early_exits = true,
+                "window-calls-audit" => options.window_calls_audit = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
@@ -858,6 +851,32 @@ fn lift(
             "per-region options: {} regions (ECHORA_LIFT_OPTIONS_REGIONS) get the defaults plus {:?}; the others the defaults ({DEFAULT_OPTIONS})",
             listed_regions.len(),
             extra.as_deref().unwrap_or("")
+        );
+    }
+    if echora_lift::codegen::window_calls_on(&options)
+        || echora_lift::codegen::window_calls_on(&listed_options)
+    {
+        // The regions that make window calls, as the emission decides.
+        let active = |pc: u64| {
+            let region = pc >> region_bits;
+            let options = if listed_regions.contains(&region) {
+                &listed_options
+            } else {
+                &options
+            };
+            echora_lift::codegen::window_calls_on(options)
+                .then_some(options.window_call_early_exits)
+        };
+        let calls = echora_lift::codegen::window_call_report(&d.translation, region_bits, &active);
+        println!(
+            "window calls: {} BL targets with summaries in {} windows ({} of them leaving early; {} more would with window-call-early-exits); {} of {} BL sites call them ({} in the caller's region)",
+            calls.targets,
+            calls.windows,
+            calls.early_exit_targets,
+            calls.early_exit_only_targets - calls.early_exit_targets,
+            calls.summarized_sites,
+            calls.sites,
+            calls.same_region_sites
         );
     }
 
