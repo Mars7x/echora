@@ -10,6 +10,16 @@
 //! thread the sampled host thread was running (`set_guest_thread`; 0 for
 //! none), so one guest thread's time can be told apart from the others
 //! sharing its workers.
+//!
+//! `ECHORA_HOST_PROFILE_STACKS=PREFIX[,PREFIX...]` (or `*`) also keeps, for
+//! samples of host threads whose name starts with a prefix, the thread's
+//! registers and the top of its stack (`ECHORA_HOST_PROFILE_STACK_BYTES`,
+//! default 16 KiB, at most 64 KiB; `ECHORA_HOST_PROFILE_STACK_MB` of them in
+//! all, default 512), for an offline unwinder to walk with each object's
+//! `.eh_frame` (no frame pointers needed). They go to `PATH.stacks`: per
+//! sample, little-endian u64 rip, rsp, rbp, thread id, guest thread and
+//! byte count, the thread's 16-byte name, then that many stack bytes from
+//! rsp up.
 
 #![allow(unsafe_code)]
 
@@ -17,7 +27,32 @@
 mod imp {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use std::sync::atomic::AtomicPtr;
+
     const CAPACITY: usize = 1 << 21;
+    /// A stack sample's fixed part: six words and the thread name.
+    const STACK_HEADER: usize = 64;
+    /// The stack buffer (`ECHORA_HOST_PROFILE_STACKS`), its slot size and
+    /// slot count, and the next slot.
+    static STACKS: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+    static STACK_SLOT: AtomicUsize = AtomicUsize::new(0);
+    static STACK_SLOTS: AtomicUsize = AtomicUsize::new(0);
+    static STACK_NEXT: AtomicUsize = AtomicUsize::new(0);
+    /// A pipe the handler writes the stack into and reads it back from:
+    /// write() copies until the first unmapped page and reports how far it
+    /// got, without the address-space lock process_vm_readv takes (that
+    /// stalled the sampled threads behind every mmap). One thread at a
+    /// time (`PIPE_BUSY`); a sample finding it busy keeps no stack.
+    static PIPE: [std::sync::atomic::AtomicI32; 2] =
+        [const { std::sync::atomic::AtomicI32::new(-1) }; 2];
+    static PIPE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Thread name prefixes whose samples keep stacks (empty: all), each
+    /// at most 15 bytes, NUL-padded.
+    const MAX_PREFIXES: usize = 8;
+    static PREFIXES: [AtomicU64; MAX_PREFIXES * 2] =
+        [const { AtomicU64::new(0) }; MAX_PREFIXES * 2];
+    static PREFIX_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static ALL_THREADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static SAMPLES: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
     static TOPS: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
     static GUESTS: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
@@ -36,11 +71,12 @@ mod imp {
 
     extern "C" fn on_sample(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
         // SAFETY: the kernel passes a valid `ucontext_t` to SA_SIGINFO handlers.
-        let (rip, rsp) = unsafe {
+        let (rip, rsp, rbp) = unsafe {
             let registers = &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs;
             (
                 registers[libc::REG_RIP as usize],
                 registers[libc::REG_RSP as usize],
+                registers[libc::REG_RBP as usize],
             )
         };
         // SAFETY: the interrupted thread's stack pointer addresses its
@@ -58,6 +94,220 @@ mod imp {
             TOPS[slot].store(top, Ordering::Relaxed);
             GUESTS[slot].store(GUEST.with(std::cell::Cell::get), Ordering::Relaxed);
         }
+        if !STACKS.load(Ordering::Relaxed).is_null() {
+            // SAFETY: errno is this thread's; the system calls made while
+            // keeping the stack must not change what the interrupted code sees.
+            unsafe {
+                let errno = *libc::__errno_location();
+                keep_stack(rip as u64, rsp as u64, rbp as u64);
+                *libc::__errno_location() = errno;
+            }
+        }
+    }
+
+    /// Copy the interrupted thread's registers and the top of its stack
+    /// into the next stack slot, when its name is one asked for. Only
+    /// async-signal-safe calls: prctl, gettid, and write and read on the
+    /// profile's pipe (write stops at an unmapped page instead of faulting).
+    ///
+    /// # Safety
+    /// From the sampling signal's handler, with `STACKS` set by `start`.
+    unsafe fn keep_stack(rip: u64, rsp: u64, rbp: u64) {
+        let mut name = [0u8; 16];
+        // SAFETY: PR_GET_NAME writes at most 16 bytes.
+        unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr()) };
+        if !ALL_THREADS.load(Ordering::Relaxed) {
+            let wanted = (0..PREFIX_COUNT.load(Ordering::Relaxed)).any(|index| {
+                let mut prefix = [0u8; 16];
+                prefix[..8]
+                    .copy_from_slice(&PREFIXES[index * 2].load(Ordering::Relaxed).to_le_bytes());
+                prefix[8..].copy_from_slice(
+                    &PREFIXES[index * 2 + 1]
+                        .load(Ordering::Relaxed)
+                        .to_le_bytes(),
+                );
+                let length = prefix.iter().position(|byte| *byte == 0).unwrap_or(16);
+                name[..length] == prefix[..length]
+            });
+            if !wanted {
+                return;
+            }
+        }
+        if PIPE_BUSY.swap(true, Ordering::Acquire) {
+            return;
+        }
+        let slot = STACK_NEXT.fetch_add(1, Ordering::Relaxed);
+        if slot >= STACK_SLOTS.load(Ordering::Relaxed) {
+            PIPE_BUSY.store(false, Ordering::Release);
+            return;
+        }
+        let size = STACK_SLOT.load(Ordering::Relaxed);
+        // SAFETY: the slot lies inside the mapped buffer and is this
+        // sample's alone (claimed above).
+        let record = unsafe { STACKS.load(Ordering::Relaxed).add(slot * size) };
+        let capacity = size - STACK_HEADER;
+        let (reader, writer) = (
+            PIPE[0].load(Ordering::Relaxed),
+            PIPE[1].load(Ordering::Relaxed),
+        );
+        // SAFETY: write() reads [rsp, rsp + capacity) of this process,
+        // stopping at the first page it cannot read; read() fills the slot
+        // after its header with what was written.
+        let copied = unsafe {
+            let written = libc::write(writer, rsp as *const libc::c_void, capacity);
+            let mut copied = 0usize;
+            while (copied as isize) < written {
+                let got = libc::read(
+                    reader,
+                    record.add(STACK_HEADER + copied).cast(),
+                    written as usize - copied,
+                );
+                if got <= 0 {
+                    break;
+                }
+                copied += got as usize;
+            }
+            copied as u64
+        };
+        PIPE_BUSY.store(false, Ordering::Release);
+        // SAFETY: gettid is async-signal-safe.
+        let thread = unsafe { libc::gettid() } as u64;
+        let words = [
+            rip,
+            rsp,
+            rbp,
+            thread,
+            GUEST.with(std::cell::Cell::get),
+            copied,
+        ];
+        for (index, word) in words.iter().enumerate() {
+            // SAFETY: the header's first 48 bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(word.to_le_bytes().as_ptr(), record.add(index * 8), 8)
+            };
+        }
+        // SAFETY: the header's last 16 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), record.add(48), 16) };
+    }
+
+    /// Map the stack buffer and note which threads keep stacks
+    /// (`ECHORA_HOST_PROFILE_STACKS`).
+    fn arm_stacks() {
+        let Some(threads) = std::env::var_os("ECHORA_HOST_PROFILE_STACKS") else {
+            return;
+        };
+        let threads = threads.to_string_lossy().into_owned();
+        let mut count = 0;
+        for prefix in threads.split(',').filter(|prefix| !prefix.is_empty()) {
+            if prefix == "*" {
+                ALL_THREADS.store(true, Ordering::Relaxed);
+                continue;
+            }
+            if count == MAX_PREFIXES {
+                break;
+            }
+            let mut bytes = [0u8; 16];
+            let length = prefix.len().min(15);
+            bytes[..length].copy_from_slice(&prefix.as_bytes()[..length]);
+            PREFIXES[count * 2].store(
+                u64::from_le_bytes(*bytes.first_chunk().expect("16 bytes")),
+                Ordering::Relaxed,
+            );
+            PREFIXES[count * 2 + 1].store(
+                u64::from_le_bytes(*bytes.last_chunk().expect("16 bytes")),
+                Ordering::Relaxed,
+            );
+            count += 1;
+        }
+        PREFIX_COUNT.store(count, Ordering::Relaxed);
+        let number = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let bytes = number("ECHORA_HOST_PROFILE_STACK_BYTES", 16 << 10).clamp(512, 64 << 10);
+        let slot = (STACK_HEADER + bytes).next_multiple_of(64);
+        let total = number("ECHORA_HOST_PROFILE_STACK_MB", 512).clamp(1, 8192) << 20;
+        // SAFETY: an anonymous private mapping, kept for the run.
+        let buffer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if buffer == libc::MAP_FAILED {
+            eprintln!("host profile: no memory for stacks");
+            return;
+        }
+        let mut fds = [-1; 2];
+        // SAFETY: creates a pipe; its descriptors are kept for the run.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            eprintln!("host profile: no pipe for stacks");
+            return;
+        }
+        // Room for one sample's stack in the pipe (1 MiB is the default
+        // limit an unprivileged process may ask for).
+        // SAFETY: a valid descriptor and request.
+        let room = unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1 << 20) };
+        if room < bytes as libc::c_int {
+            eprintln!("host profile: the pipe holds {room} bytes, not {bytes}");
+        }
+        PIPE[0].store(fds[0], Ordering::Relaxed);
+        PIPE[1].store(fds[1], Ordering::Relaxed);
+        STACK_SLOT.store(slot, Ordering::Relaxed);
+        STACK_SLOTS.store(total / slot, Ordering::Relaxed);
+        STACKS.store(buffer.cast(), Ordering::Release);
+    }
+
+    /// Write the stack samples to `PATH.stacks`.
+    fn write_stacks(path: &std::ffi::OsStr) {
+        let buffer = STACKS.load(Ordering::Acquire);
+        if buffer.is_null() {
+            return;
+        }
+        // The vDSO is no file the unwinder can open: its image goes beside
+        // the stacks (`PATH.vdso`), for its call frame information.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        if let Some((start, end)) = maps
+            .lines()
+            .find(|line| line.ends_with("[vdso]"))
+            .and_then(|line| line.split_whitespace().next()?.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((
+                    usize::from_str_radix(start, 16).ok()?,
+                    usize::from_str_radix(end, 16).ok()?,
+                ))
+            })
+        {
+            // SAFETY: the vDSO mapping is readable for the process's life.
+            let image = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+            let mut name = path.to_owned();
+            name.push(".vdso");
+            let _ = std::fs::write(name, image);
+        }
+        let size = STACK_SLOT.load(Ordering::Relaxed);
+        let taken = STACK_NEXT
+            .load(Ordering::Relaxed)
+            .min(STACK_SLOTS.load(Ordering::Relaxed));
+        let mut out = Vec::new();
+        for slot in 0..taken {
+            // SAFETY: a claimed slot inside the buffer; the timer is disarmed.
+            let record = unsafe { std::slice::from_raw_parts(buffer.add(slot * size), size) };
+            let copied =
+                u64::from_le_bytes(*record[40..].first_chunk().expect("a full header")) as usize;
+            out.extend_from_slice(&record[..STACK_HEADER + copied.min(size - STACK_HEADER)]);
+        }
+        let mut name = path.to_owned();
+        name.push(".stacks");
+        match std::fs::write(&name, out) {
+            Ok(()) => eprintln!("host profile: {taken} stack samples"),
+            Err(error) => eprintln!("host profile: stack write failed: {error}"),
+        }
     }
 
     pub struct Profile {
@@ -68,10 +318,12 @@ mod imp {
     /// phase of a run).
     pub fn restart() {
         NEXT.store(0, Ordering::Relaxed);
+        STACK_NEXT.store(0, Ordering::Relaxed);
     }
 
     pub fn start() -> Option<Profile> {
         let path = std::env::var_os("ECHORA_HOST_PROFILE")?;
+        arm_stacks();
         // SAFETY: installs a handler that only touches atomics, then arms
         // the process CPU-time timer.
         unsafe {
@@ -126,6 +378,7 @@ mod imp {
             } else {
                 eprintln!("host profile: {taken} samples");
             }
+            write_stacks(&self.path);
         }
     }
 }
