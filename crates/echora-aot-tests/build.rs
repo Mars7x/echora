@@ -344,6 +344,7 @@ fn main() {
     println!("cargo::rerun-if-changed=src/kernels.rs");
     println!("cargo::rerun-if-changed=src/stress.rs");
     println!("cargo::rerun-if-env-changed=ECHORA_KERNEL_PAD");
+    println!("cargo::rerun-if-env-changed=ECHORA_KERNEL_ABLATE");
     let mut out = String::new();
     for (name, words) in PROGRAMS {
         let translation = discover(&[region(words)], &[CODE_BASE], 100)
@@ -1553,6 +1554,87 @@ fn vector_run_code(out: &mut String) {
     }
 }
 
+/// ECHORA_KERNEL_ABLATE (measuring only: the code is no longer faithful):
+/// the kernels' emitted Rust without one class of per-block cost, to time
+/// what it costs. A comma list of
+/// - `charges`: no block charges (no budget, host boundaries or block
+///   tags; the kernels still end at their SVC);
+/// - `pc`: no stores of the PC that only a trap or a boundary would read
+///   (an inlined successor's, and the window loop's after each block; a
+///   window still stores the PC when it leaves);
+/// - `memory`: guest loads and stores without the reservation and
+///   alignment tests (volatile accesses at the host address).
+fn ablate(source: &str, ablations: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let on = |name: &str| ablations.split(',').any(|a| a.trim() == name);
+    let lines: Vec<&str> = source.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let next = lines.get(index + 1).copied().unwrap_or("");
+        if on("charges") && line.starts_with("if !m.charge_block_at(") {
+            continue;
+        }
+        if on("pc") {
+            let constant = line
+                .strip_prefix("m.cpu.pc = 0x")
+                .and_then(|rest| rest.strip_suffix(';'))
+                .is_some_and(|pc| u64::from_str_radix(pc, 16).is_ok());
+            // An inlined successor's PC, followed by its charge (or, with
+            // charges ablated, by its body).
+            if constant
+                && (next.starts_with("if !m.charge_block_at(") || on("charges"))
+                && !next.contains("call")
+                && !next.starts_with("m.cpu.regs[")
+                && !next.contains("enter_window_")
+            {
+                continue;
+            }
+            if *line == "m.cpu.pc = next_pc;" && next == "m.finish_block()?;" {
+                continue;
+            }
+            if let Some(rest) = line.strip_suffix(" => return Ok(()),") {
+                // The window leaves: the PC is the next PC.
+                let pc = if rest.starts_with("pc ") {
+                    "pc"
+                } else {
+                    "next_pc"
+                };
+                out.push_str(&format!("{rest} => {{ m.cpu.pc = {pc}; return Ok(()) }}\n"));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if on("memory") {
+        out = out
+            .replace("wmem.load_u", "ablated_load_u")
+            .replace("wmem.store_u", "ablated_store_u");
+        for (name, ty) in [("8", "u8"), ("16", "u16"), ("32", "u32"), ("64", "u64")] {
+            out = out
+                .replace(
+                    &format!("ablated_load_u{name}("),
+                    &format!("ablated_load::<{ty}>(wmem, "),
+                )
+                .replace(
+                    &format!("ablated_store_u{name}("),
+                    &format!("ablated_store::<{ty}>(wmem, "),
+                );
+        }
+        // The view's host base: the page-aligned field of `WindowMemory`
+        // above 2^40 (its other fields are the size and its mask).
+        out.push_str(
+            "#[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_base(w: echora_guest::view::WindowMemory) -> usize { \
+             let raw: [u64; 3] = unsafe { std::mem::transmute(w) }; \
+             raw.into_iter().find(|v| *v > 1 << 40 && v % 4096 == 0).unwrap_or(0) as usize }\n\
+             #[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_load<T: Copy>(w: echora_guest::view::WindowMemory, address: u64) -> T { \
+             unsafe { std::ptr::read_volatile((ablated_base(w) + address as usize) as *const T) } }\n\
+             #[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_store<T: Copy>(w: echora_guest::view::WindowMemory, address: u64, value: T) { \
+             unsafe { std::ptr::write_volatile((ablated_base(w) + address as usize) as *mut T, value) } }\n",
+        );
+    }
+    out
+}
+
 /// The benchmark kernels, lifted together through split emission (as real
 /// builds are) and discovered with their jump table.
 fn kernel_code(out: &mut String) {
@@ -1589,6 +1671,13 @@ fn kernel_code(out: &mut String) {
     // the kernels' functions stay in their region.
     LIFTED.set(LIFTED.get() + translation.instructions.len());
     let (root, regions) = emit_rust_split_with(&translation, 16, kernel_options());
+    let regions = match std::env::var("ECHORA_KERNEL_ABLATE") {
+        Ok(ablations) if MODE.get().is_none() => regions
+            .into_iter()
+            .map(|(region, source)| (region, ablate(&source, &ablations)))
+            .collect(),
+        _ => regions,
+    };
     // ECHORA_KERNEL_PAD=n (measuring layout sensitivity): a function of n
     // kept additions before the kernels' windows in their region, so the
     // same generated code lands at other addresses.
