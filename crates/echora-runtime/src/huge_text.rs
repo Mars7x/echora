@@ -9,50 +9,68 @@
 //! pages and moves the copies over the originals (`mremap`). The addresses
 //! and bytes stay the same, so nothing else changes.
 //!
-//! `ECHORA_HUGE_TEXT=1` turns it on (off by default). `ECHORA_HUGE_TEXT_MB`
-//! bounds what each mapping gets from its start (0 or unset: all of it). It
-//! stays off while the host profiler runs: samples in anonymous memory have
-//! no file to be symbolized from.
+//! It pays with libraries linked hot code first (`echora layout`: an lld
+//! symbol ordering file from a profile, and segments aligned to 2 MiB):
+//! forest scene +5% presents/s with the first 128 MiB of each mapping
+//! (+0.35 GB resident), instruction TLB misses -94%. With the default layout
+//! the misses fall as much but the frame does not get faster, and all of the
+//! text costs +1.4 GB resident. So by default only mappings whose code
+//! segment the linker aligned to 2 MiB move, 128 MiB of each from its start.
 //!
-//! It pays with libraries linked hot code first (an lld symbol ordering
-//! file from a profile, and 2 MiB aligned segments): forest scene +5%
-//! presents/s with the first 128 MiB of each mapping (+0.35 GB resident),
-//! instruction TLB misses -94%. With the default layout the misses fall as
-//! much but the frame does not get faster, and all of the text costs
-//! +1.4 GB resident, hence off by default.
+//! `ECHORA_HUGE_TEXT=0` turns it off, `=1` moves every mapping (all of it
+//! unless bounded). `ECHORA_HUGE_TEXT_MB` bounds what each mapping gets from
+//! its start (0: all of it). It stays off while the host profiler runs:
+//! samples in anonymous memory have no file to be symbolized from.
 
 // mmap, madvise, mprotect and mremap of the process's own code.
 #![allow(unsafe_code)]
 
 const HUGE: usize = 2 << 20;
 
+/// What each aligned mapping gets by default: the hot code `echora layout`
+/// places first (99.9% of a forest profile's samples: at most 106 MiB in
+/// one library).
+const DEFAULT_MB: usize = 128;
+
 /// Remap once, before any translated code runs.
 pub(crate) fn remap_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let on = crate::nvn::debug_var("ECHORA_HUGE_TEXT").is_ok_and(|value| value == "1");
-        if !on || std::env::var_os("ECHORA_HOST_PROFILE").is_some() {
+        let mode = crate::nvn::debug_var("ECHORA_HUGE_TEXT").ok();
+        let every = match mode.as_deref() {
+            Some("0") => return,
+            Some("1") => true,
+            _ => false,
+        };
+        if std::env::var_os("ECHORA_HOST_PROFILE").is_some() {
             return;
         }
-        let limit = crate::nvn::debug_var("ECHORA_HUGE_TEXT_MB")
+        let limit = match crate::nvn::debug_var("ECHORA_HUGE_TEXT_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .map_or(usize::MAX, |mb| mb << 20);
+        {
+            Some(0) => usize::MAX,
+            Some(mb) => mb << 20,
+            None if every => usize::MAX,
+            None => DEFAULT_MB << 20,
+        };
         let started = std::time::Instant::now();
-        let (mappings, bytes) = remap(limit);
-        eprintln!(
-            "huge text: {mappings} mappings, {} MiB moved to huge-page memory ({} MiB on 2 MiB pages) in {} ms",
-            bytes >> 20,
-            anon_huge_bytes() >> 20,
-            started.elapsed().as_millis()
-        );
+        let (mappings, bytes) = remap(limit, !every);
+        if mappings > 0 {
+            eprintln!(
+                "huge text: {mappings} mappings, {} MiB moved to huge-page memory ({} MiB on 2 MiB pages) in {} ms",
+                bytes >> 20,
+                anon_huge_bytes() >> 20,
+                started.elapsed().as_millis()
+            );
+        }
     });
 }
 
 /// The executable file mappings of the runner and the libraries in its
-/// directory, as (start, end).
-fn own_text() -> Vec<(usize, usize)> {
+/// directory, as (start, end, whether the file's segment there is aligned
+/// to 2 MiB).
+fn own_text() -> Vec<(usize, usize, bool)> {
     let Ok(exe) = std::fs::read_link("/proc/self/exe") else {
         return Vec::new();
     };
@@ -67,7 +85,8 @@ fn own_text() -> Vec<(usize, usize)> {
             let mut fields = line.split_whitespace();
             let range = fields.next()?;
             let perms = fields.next()?;
-            let path = fields.nth(3)?;
+            let offset = u64::from_str_radix(fields.next()?, 16).ok()?;
+            let path = fields.nth(2)?;
             let path = std::path::Path::new(path);
             if !perms.starts_with("r-x") || (path != exe && path.parent() != Some(dir)) {
                 return None;
@@ -76,17 +95,52 @@ fn own_text() -> Vec<(usize, usize)> {
             Some((
                 usize::from_str_radix(start, 16).ok()?,
                 usize::from_str_radix(end, 16).ok()?,
+                segment_align(path, offset).is_some_and(|align| align >= HUGE as u64),
             ))
         })
         .collect()
 }
 
+/// The alignment of the loadable segment of ELF file `path` that starts at
+/// file offset `offset`.
+fn segment_align(path: &std::path::Path, offset: u64) -> Option<u64> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).ok()?;
+    if header[..6] != *b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let phoff = u64::from_le_bytes(header[0x20..0x28].try_into().ok()?);
+    let entry = usize::from(u16::from_le_bytes(header[0x36..0x38].try_into().ok()?));
+    let count = usize::from(u16::from_le_bytes(header[0x38..0x3a].try_into().ok()?));
+    if entry < 0x38 {
+        return None;
+    }
+    let mut table = vec![0u8; entry * count];
+    file.seek(std::io::SeekFrom::Start(phoff)).ok()?;
+    file.read_exact(&mut table).ok()?;
+    table.chunks_exact(entry).find_map(|header| {
+        let word = |at: usize| Some(u64::from_le_bytes(header.get(at..at + 8)?.try_into().ok()?));
+        // PT_LOAD at that offset.
+        if header[..4] == 1u32.to_le_bytes() && word(8)? == offset {
+            word(0x30)
+        } else {
+            None
+        }
+    })
+}
+
 /// Move each mapping's whole 2 MiB pages, up to `limit` bytes from its
-/// start, onto huge-page memory. Returns the mappings and bytes moved.
-fn remap(limit: usize) -> (usize, usize) {
+/// start, onto huge-page memory; with `only_aligned`, only mappings whose
+/// segment is aligned to 2 MiB. Returns the mappings and bytes moved.
+fn remap(limit: usize, only_aligned: bool) -> (usize, usize) {
     let mut mappings = 0;
     let mut moved = 0;
-    for (start, end) in own_text() {
+    for (start, end, aligned) in own_text() {
+        if only_aligned && !aligned {
+            continue;
+        }
         let low = start.next_multiple_of(HUGE);
         let high = (end.min(start.saturating_add(limit))) & !(HUGE - 1);
         if high <= low {
@@ -181,7 +235,7 @@ mod tests {
         let before: Vec<u8> = (0..64)
             .map(|offset| unsafe { *((probe + offset) as *const u8) })
             .collect();
-        let (mappings, bytes) = super::remap(usize::MAX);
+        let (mappings, bytes) = super::remap(usize::MAX, false);
         if bytes > 0 {
             assert!(mappings > 0);
         }
