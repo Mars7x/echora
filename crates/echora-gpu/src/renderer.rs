@@ -769,6 +769,10 @@ pub struct Renderer {
     submitted_labels: Vec<String>,
     /// Render targets created, and recreated because their shape changed.
     pub targets_created: u64,
+    /// Texture uploads recorded (guest texels copied into an image).
+    pub texture_uploads: u64,
+    /// Images created for targets and uploads (`create_shaped_image`).
+    pub images_created: std::cell::Cell<u64>,
     /// Changes to the set of targets (created, recreated, moved,
     /// removed): an index of them by key is current while this holds.
     pub target_changes: u64,
@@ -1295,6 +1299,8 @@ impl Renderer {
             completed_reads: Vec::new(),
             next_read_token: 0,
             targets_created: 0,
+            texture_uploads: 0,
+            images_created: std::cell::Cell::new(0),
             target_changes: 0,
             changed_targets: Vec::new(),
             targets_recreated: 0,
@@ -2854,6 +2860,7 @@ impl Renderer {
         source: &crate::draw::TextureSource,
         mut generated: Option<GeneratedTextureUpload<'_>>,
     ) -> Result<(), String> {
+        self.texture_uploads += 1;
         let crate::draw::TextureSource::Upload {
             key,
             generation,
@@ -6461,6 +6468,7 @@ impl Renderer {
         // SAFETY: valid create info; destroyed by destroy_target.
         let image =
             unsafe { device.create_image(&info, None) }.map_err(vk_error("vkCreateImage"))?;
+        self.images_created.set(self.images_created.get() + 1);
         // SAFETY: the image is live.
         let requirements = unsafe { device.get_image_memory_requirements(image) };
         let mut memory = vk::DeviceMemory::null();

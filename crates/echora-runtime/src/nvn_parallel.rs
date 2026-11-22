@@ -26,10 +26,11 @@
 //!    commands before its draws as the replay does (`RenderState::
 //!    apply_state`, shared with it), and plans each of its draws from the
 //!    state that draw sees. The replay waits for all of them: while they
-//!    run nothing changes the NVN state they read. Draws whose program or
-//!    textures the replay has not resolved yet are resolved by it then, in
-//!    draw order, from the state each draw meets, as their binding loops
-//!    would (`resolve_ahead`), and planned again.
+//!    run nothing changes the NVN state they read. Draws whose program the
+//!    replay has not resolved yet get it resolved then, in draw order, from
+//!    the state each draw meets (`resolve_ahead`), and are planned again.
+//!    Textures are never resolved ahead: resolving one may upload it or
+//!    create its image, which stays at its draw, in order.
 //! 3. Commit (the replay, in order): each command runs as before; a draw
 //!    with a plan takes its bindings from it (`take_planned_bindings`) in
 //!    place of resolving them. What changes shared state stays in order:
@@ -860,6 +861,18 @@ struct Window {
 }
 
 impl Nvn {
+    /// The renderer's texture uploads, images and targets made so far.
+    fn renderer_made(&self) -> [u64; 3] {
+        self.gpu.as_ref().map_or([0; 3], |backend| {
+            let renderer = &backend.renderer;
+            [
+                renderer.texture_uploads,
+                renderer.images_created.get(),
+                renderer.targets_created,
+            ]
+        })
+    }
+
     fn parallel_stamp(&self) -> Option<Stamp> {
         let backend = self.gpu.as_ref()?;
         Some(Stamp {
@@ -974,6 +987,8 @@ impl Nvn {
         }) {
             return;
         }
+        let walk_started = std::time::Instant::now();
+        let made_before = self.renderer_made();
         let pool_set = |name| self.render.state.get(name).map(|set| set.x[1]);
         if self.parallel.limit == 0 {
             self.parallel.limit = window_commands();
@@ -1032,6 +1047,7 @@ impl Nvn {
             return;
         }
         let started = std::time::Instant::now();
+        let walk_time = started - walk_started;
         // What the binding loop would do at its first texture first: the
         // planners then read the memo as the replay would.
         self.refresh_binding_memo();
@@ -1046,20 +1062,16 @@ impl Nvn {
             .take()
             .unwrap_or_else(|| Pool::new(threads()));
         let mut plans = self.plan_window(&pool, &draws, core);
-        // Draws whose program or textures the replay has not resolved yet
-        // (a program after a flush, textures first bound in this list): the
-        // replay resolves them now, in draw order, as their draws would,
-        // and they are planned again.
+        let planned_at = std::time::Instant::now();
+        let mut resolve_time = std::time::Duration::ZERO;
+        let mut replan_time = std::time::Duration::ZERO;
+        // Draws whose program the replay has not resolved yet (a program
+        // new since the last present or flush): the replay resolves them
+        // now, in draw order, as their draws would, and they are planned
+        // again.
         let unresolved: Vec<(usize, usize)> = plans
             .iter()
-            .filter(|(_, plan)| {
-                matches!(
-                    plan,
-                    Err("program not memoized"
-                        | "texture binding not memoized"
-                        | "texture binding to resolve again")
-                )
-            })
+            .filter(|(_, plan)| matches!(plan, Err("program not memoized")))
             .map(|(key, _)| *key)
             .collect();
         let mut unresolved = unresolved;
@@ -1072,7 +1084,10 @@ impl Nvn {
                 .stat("stat: parallel draw windows with more to resolve ahead", 1);
         }
         if !unresolved.is_empty() {
+            let resolving = std::time::Instant::now();
             self.resolve_ahead(&unresolved, core);
+            resolve_time = resolving.elapsed();
+            let replanning = std::time::Instant::now();
             self.refresh_binding_memo();
             let now = self.parallel_stamp();
             let again = if now == stamp {
@@ -1087,6 +1102,7 @@ impl Nvn {
                     .stat("stat: parallel draw windows planned again whole", 1);
                 self.plan_window(&pool, &draws, core)
             };
+            replan_time = replanning.elapsed();
             let mut again = again.into_iter().peekable();
             for (key, plan) in &mut plans {
                 if again.peek().is_some_and(|(planned, _)| planned == key) {
@@ -1102,19 +1118,42 @@ impl Nvn {
         self.parallel.planned = plans.len();
         self.parallel.plans = plans.into();
         self.parallel.stamp = stamp;
-        let took = started.elapsed();
-        if took >= SLOW_WINDOW {
+        let took = started.elapsed() + walk_time;
+        let plan_time = planned_at - started;
+        // Uploads and images made while the window was made: none are
+        // meant to be (each stays at its draw, in order).
+        let made_after = self.renderer_made();
+        let made = [
+            made_after[0].saturating_sub(made_before[0]),
+            made_after[1].saturating_sub(made_before[1]),
+            made_after[2].saturating_sub(made_before[2]),
+        ];
+        if took >= SLOW_WINDOW || made.iter().any(|&count| count > 0) {
             static REPORTED: AtomicUsize = AtomicUsize::new(0);
             if REPORTED.fetch_add(1, Ordering::Relaxed) < 20 {
                 eprintln!(
-                    "parallel draws: a window of {} draws in {} lists ({reason}) took {took:?}, {} resolved ahead",
+                    "parallel draws: a window of {} draws in {} lists ({reason}) took {took:?}: look-ahead {walk_time:?}, planning {plan_time:?}, resolving {} programs ahead {resolve_time:?}, planning again {replan_time:?}; texture uploads {}, images {}, targets {} made meanwhile",
                     draws.len(),
                     self.parallel.segments.len(),
-                    unresolved.len()
+                    unresolved.len(),
+                    made[0],
+                    made[1],
+                    made[2]
                 );
             }
         }
         let backend = self.gpu.as_mut().unwrap();
+        backend.stat("stat: parallel texture uploads while planning", made[0]);
+        backend.stat("stat: parallel images created while planning", made[1]);
+        backend.stat("stat: parallel targets created while planning", made[2]);
+        backend.stat(
+            "stat: parallel draw look-ahead us",
+            walk_time.as_micros() as u64,
+        );
+        backend.stat(
+            "stat: parallel draw resolving ahead us",
+            resolve_time.as_micros() as u64,
+        );
         backend.stat("stat: parallel draw windows", 1);
         backend.stat("stat: parallel draws planned", draws.len() as u64);
         backend.stat("stat: parallel draw planning us", took.as_micros() as u64);
@@ -1371,49 +1410,13 @@ impl Nvn {
         }
     }
 
-    /// `resolve_ahead` for the draw the render state is at. Errors are
-    /// left to the draw itself.
+    /// `resolve_ahead` for the draw the render state is at: its program
+    /// only (translation on the CPU, as its draw would make it). Textures
+    /// are left to the draw: resolving one may upload it or create its
+    /// image, which must stay in draw order. Errors are left to the draw.
     fn resolve_draw_ahead(&mut self, core: &mut Guest) {
-        let Ok(program) = self.bound_program(core) else {
-            return;
-        };
-        self.parallel.remember_program(&self.render, &program);
-        for stage in program.stages.iter() {
-            let nvn = nvn_stage(stage.stage);
-            for descriptor in &stage.descriptors {
-                if !matches!(
-                    descriptor.kind(),
-                    DescriptorKind::Texture | DescriptorKind::TextureBuffer
-                ) || descriptor.cbuf_index != 2
-                    || descriptor.cbuf_offset < 0x20
-                {
-                    continue;
-                }
-                let slot = (descriptor.cbuf_offset - 0x20) / 8;
-                let Some(&handle) = self
-                    .render
-                    .bound_textures
-                    .get(u64::from(nvn), u64::from(slot))
-                else {
-                    continue;
-                };
-                self.refresh_binding_memo();
-                if self.memoized_binding(handle).is_some() {
-                    continue;
-                }
-                let Ok(texture) = self.handle_texture(handle) else {
-                    continue;
-                };
-                if self
-                    .resolve_texture_binding(core, handle, texture, false)
-                    .is_ok()
-                {
-                    self.gpu
-                        .as_mut()
-                        .unwrap()
-                        .stat("stat: parallel texture bindings resolved ahead", 1);
-                }
-            }
+        if let Ok(program) = self.bound_program(core) {
+            self.parallel.remember_program(&self.render, &program);
         }
     }
 
@@ -2800,5 +2803,52 @@ mod replay_tests {
             let (_, verified) = replay_with(threads, true, &lists, None, setup, |_| {}).unwrap();
             assert_eq!(stat(&verified, "stat: parallel draws that differ"), 0);
         }
+    }
+
+    #[test]
+    fn a_texture_to_resolve_is_left_to_its_draw() {
+        let Some(mut nvn) = fixture() else {
+            return;
+        };
+        // Handle 21 has no memoized binding: resolving it may upload it.
+        nvn.binding_memo.1.remove(&21);
+        let memory = memory();
+        let mut view = memory.view();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::View(&mut view),
+            counter: Some(0),
+        };
+        let list = Arc::new(batch());
+        let first = list
+            .iter()
+            .position(|command| step(command) == Step::Draw)
+            .unwrap();
+        for command in &list[..first] {
+            apply(&mut nvn.render, command, step(command), None);
+        }
+        let made = nvn.renderer_made();
+        testing::THREADS.with(|cell| cell.set(Some(2)));
+        nvn.prepare_parallel_draws(QUEUE, &list, first, &mut core);
+        testing::THREADS.with(|cell| cell.set(None));
+        assert_eq!(nvn.renderer_made(), made);
+        assert_eq!(stat(&nvn, "stat: parallel draws resolved ahead"), 0);
+        assert_eq!(
+            stat(&nvn, "stat: parallel texture uploads while planning"),
+            0
+        );
+        assert_eq!(
+            stat(&nvn, "stat: parallel images created while planning"),
+            0
+        );
+        // Its draw resolves it itself, in order.
+        assert!(
+            nvn.parallel
+                .plans
+                .iter()
+                .any(|(_, plan)| { matches!(plan, Err("texture binding not memoized")) })
+        );
+        assert!(!nvn.binding_memo.1.contains_key(&21));
     }
 }
