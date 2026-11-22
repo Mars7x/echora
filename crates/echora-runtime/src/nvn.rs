@@ -12943,6 +12943,18 @@ mod tests {
         let mut hasher = FastHasher::default();
         cold.hash(&mut hasher);
         assert_eq!(hasher.finish(), TAGGED_STATE_DIGEST, "{cold:#?}");
+        // Threads recording at once (sharing the tag table, each with its
+        // own steps) all see the same.
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                std::thread::spawn(|| (0..3).map(|_| tagged_state_script()).collect::<Vec<_>>())
+            })
+            .collect();
+        for thread in threads {
+            for run in thread.join().unwrap() {
+                assert_eq!(run, cold);
+            }
+        }
         // One comparison names the same kinds as the list.
         for kind in KINDS {
             assert_eq!(tagged_kind(kind), TAGGED_STATES.contains(kind), "{kind}");
