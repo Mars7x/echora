@@ -112,6 +112,9 @@ call-summaries-audit = []
 # Constant successors with their own arms copied into the arm instead of
 # dispatched (EmitOptions::threaded_successors).
 threaded-successors = []
+# A 34-bit guest address space instead of 39 bits, for running the
+# benchmark kernels under valgrind (measuring only).
+small-address-space = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
