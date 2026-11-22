@@ -1621,12 +1621,12 @@ fn ablate(source: &str, ablations: &str) -> String {
                     &format!("ablated_store::<{ty}>(wmem, "),
                 );
         }
-        // The view's host base: the page-aligned field of `WindowMemory`
-        // above 2^40 (its other fields are the size and its mask).
+        // The view's host base: the field of `WindowMemory` that is neither
+        // the reservation's mask nor the size (the mask plus one).
         out.push_str(
             "#[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_base(w: echora_guest::view::WindowMemory) -> usize { \
              let raw: [u64; 3] = unsafe { std::mem::transmute(w) }; \
-             raw.into_iter().find(|v| *v > 1 << 40 && v % 4096 == 0).unwrap_or(0) as usize }\n\
+             raw.into_iter().find(|v| !raw.iter().any(|m| m.wrapping_add(1).is_power_of_two() && (v == m || *v == m + 1))).unwrap_or(0) as usize }\n\
              #[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_load<T: Copy>(w: echora_guest::view::WindowMemory, address: u64) -> T { \
              unsafe { std::ptr::read_volatile((ablated_base(w) + address as usize) as *const T) } }\n\
              #[allow(unsafe_code)]\n#[inline(always)]\nfn ablated_store<T: Copy>(w: echora_guest::view::WindowMemory, address: u64, value: T) { \
