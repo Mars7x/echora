@@ -25,8 +25,14 @@ fn the_kernel_census_matches_the_kernels() {
     let ldst = row("ldst");
     assert_eq!(ldst[1], "0/0/0/1");
     assert_eq!(ldst[2], "0/0/0/1");
-    // calls: two BLs, both through `Core::call`.
-    assert_eq!(row("calls")[4], "2");
+    // calls: two BLs, both through `Core::call` (with lifted functions
+    // each also has its summarized call of the function).
+    let calls = if cfg!(feature = "functions") {
+        "4"
+    } else {
+        "2"
+    };
+    assert_eq!(row("calls")[4], calls);
     // intvec: no helper call left in the default kernel lift is required
     // here; its inlined operations are counted by option only when the
     // features inline them, so only the row's presence is checked.

@@ -4323,6 +4323,12 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         window_calls: false,
         window_call_early_exits: false,
         window_calls_audit: false,
+        // Lifted functions only in the function lifts.
+        functions: false,
+        function_table: false,
+        call_summaries: false,
+        transitive_summaries: false,
+        call_summaries_audit: false,
         ..options()
     };
     let calling = EmitOptions {
