@@ -784,6 +784,94 @@ helper not known to leave these alone, fails it too). It found no
 mismatch. The whole `echora-aot-tests` suite passes with
 every program lifted with the game set and `window-calls`.
 
+## What a guest instruction costs inside a block (2026-11)
+
+**Method.** The game compiles its region crates at `opt-level` 1 with one
+codegen unit and no LTO (`echora`'s generated workspace), echora-guest at
+3, for the native CPU; the kernel benchmark builds at 3 with LTO. So the
+kernels were built the game's way (`--config
+profile.bench.package.echora-aot-tests.opt-level=1`, codegen-units 1, no
+LTO, echora-guest at 3; `-C target-cpu=x86-64-v3`, as valgrind decodes
+no AVX-512) and counted under valgrind's cachegrind (host instructions
+and its simulated branch mispredictions), the runs at `--scale 1` and
+`--scale 2` differenced so setup cancels: deterministic, unlike timings
+on this shared container (where removing work measured up to 49% slower,
+layout and the host dominating). `small-address-space` (aot-tests
+feature) makes the guest reservation fit valgrind. Each cost class was
+removed from the kernels' emitted Rust by `ECHORA_KERNEL_ABLATE` (a
+measuring-only rewrite in `build.rs`: the code is no longer faithful):
+`charges` (no block charges), `pc` (no PC stores only a trap or boundary
+reads), `memory` (accesses without the reservation and alignment tests).
+Game set plus window-calls; host instructions per guest instruction
+(mispredictions per 100 guest instructions):
+
+| kernel | game set | no charges | no PC stores | o3 | structured | deferred-charges | steps-local |
+|---|---|---|---|---|---|---|---|
+| gamecalls | 14.95 (6.1) | 11.76 | 14.36 | 14.79 | 21.68 | 15.76 | 15.30 |
+| gamefn | 12.41 (15.0) | 9.95 | 12.23 | 11.94 | 15.22 | 12.14 | 12.76 |
+| crossing | 10.95 (10.2) | 9.66 | 10.72 | 9.99 | 10.96 | 10.51 | 10.77 |
+| calls2 | 23.70 (38.5) | 16.00 | 23.23 | 23.00 | 45.96 | 23.70 | 24.54 |
+| vector | 28.14 | 27.71 | 27.86 | 23.86 | 29.00 | 28.14 | 28.71 |
+| floats | 17.11 | 16.67 | 17.06 | 16.84 | 17.45 | 17.11 | 17.28 |
+| scalar | 147.88 | 145.87 | 147.50 | 144.25 | 149.75 | 148.00 | 148.38 |
+| ldst | 5.20 | 4.20 | 5.00 | 5.60 | 6.40 | 5.60 | 5.40 |
+| arith | 5.29 | 1.61 | 5.15 | 5.29 | 5.43 | 5.29 | 5.15 |
+
+- **Block charges** are the largest single class: 20-21% of gamecalls'
+  and gamefn's instructions, 12% of crossing's, 32% of calls2's, 70% of
+  arith's (two-instruction blocks), 2-3% of the float kernels'. Each is
+  seven host instructions: the stop word's pointer and then the word (two
+  dependent loads), the steps loaded, added, compared, stored.
+- **PC stores** cost 1-4%.
+- **Memory checks**: the ablation's stand-in accessor made the code
+  larger at `opt-level` 1 (it cannot be priced that way); statically each
+  access adds a mask test and an alignment test, both predictable.
+- **Dispatch**: a block ending in `next_pc = <constant>` goes back
+  through the window's `match` (a compare tree and a jump table; LLVM does
+  not thread the constant through the loop header at any level). In the
+  hot gamefn window a two-instruction block costs one useful instruction,
+  seven for its charge and about eleven for the dispatch.
+- **Register locals**: 22% of the hot gamefn window's instructions (265
+  of 1,173) touch stack slots: its 16 locals and temporaries do not fit
+  x86-64's registers.
+- **`opt-level` 3** for the regions changes 0-15% (vector -15%): not the
+  lever it might seem.
+- `deferred-charges`, `steps-local` and `structured` give nothing at
+  `opt-level` 1, or lose.
+
+**Tried on this basis** (each opt-in, measured the same way):
+
+- `threaded-successors`: a block's constant forward successor that keeps
+  its own arm runs as a copy in the arm instead of going back through the
+  `match` (no loop heads, no SVC or trap ends, `THREADED_LINE_BUDGET`
+  lines of copies per arm; each block keeps its arm, so resuming is
+  unchanged). With a 96-line budget and every successor: gamefn -7%
+  (mispredictions 15.0 to 8.2), gamecalls -6%, crossing -6%, but arith
+  +27% and ldst +12% (copying a loop's head into the outer arm changes
+  the registers of the whole loop), and the aot-tests programs' Rust 9.7x
+  larger. Without loop heads: gamefn -4%, the loops unchanged, 2.8x. With
+  24 lines: gamefn -3%, the rest unchanged, 1.6x the Rust. Not worth its
+  compile time on the game.
+- `cached-stop`: the stop word in a window local (loaded on entry, at
+  every backward dispatch and when an untagged charge does not clear it),
+  so an untagged block's charge is a compare and an add without the two
+  dependent loads; steps stay in the `Core`. +3-4% host instructions on
+  the game-shaped kernels and +13% on arith: under x86-64's register
+  pressure the local lives on the stack, and the backward-dispatch test
+  adds work. `tests/steps_local.rs` checks it charges and stops exactly as
+  per-block charging (every host check point and budget).
+- `known-returns` (earlier): no change at `opt-level` 1.
+
+**Where that leaves the cost.** On game-shaped code about 12-15 host
+instructions per guest instruction: roughly 2.5-3 for the charges, 1-1.5
+for the dispatch, a fraction for PC stores and memory checks, and the
+rest the instructions' own work plus the stack traffic of locals that do
+not fit the host's registers. No single change inside blocks found here
+is worth more than a few percent faithfully; the next candidates are
+fewer, larger blocks (charges and dispatch scale with blocks, not
+instructions), and fewer live locals per window (smaller windows or
+liveness-based locals) to cut the stack traffic.
+
 ## Long windows and known returns (opt-in)
 
 A profile of the game's worker threads (forest scene, main) put 69% of
