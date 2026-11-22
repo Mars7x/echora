@@ -8928,14 +8928,21 @@ fn plural_bind(rest: &str) -> Option<(&'static str, usize)> {
 /// Data NVN reads through pointer arguments when a command is recorded.
 fn capture(command: &mut Command, core: &Guest) -> Result<(), Trap> {
     let read_u64s = |address: u64, count: usize| -> Result<Vec<u64>, Trap> {
+        if address == 0 {
+            return Ok(vec![0; count]);
+        }
+        // One read for the array (the binds read up to 64 words); where it
+        // fails, word by word, for the error of the first word that does.
+        const WORDS: usize = 64;
+        let mut bytes = [0u8; WORDS * 8];
+        if count <= WORDS && core.memory.read(address, &mut bytes[..count * 8]).is_ok() {
+            return Ok(bytes[..count * 8]
+                .chunks_exact(8)
+                .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+                .collect());
+        }
         (0..count as u64)
-            .map(|index| {
-                if address == 0 {
-                    Ok(0)
-                } else {
-                    core.memory.read_u64(address + index * 8)
-                }
-            })
+            .map(|index| core.memory.read_u64(address + index * 8))
             .collect()
     };
     // Plural binds read their array at record time (Deferred ones when the
