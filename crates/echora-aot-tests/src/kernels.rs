@@ -716,7 +716,7 @@ fn assemble() -> Assembler {
     dynasm!(ops
         ; .arch aarch64
         // A long game-shaped function: an update loop over 64 objects
-        // calls, per object, a function of about 90 instructions with a
+        // calls, per object, a function of about 70 instructions with a
         // frame saving X19-X22, loads of the object, compares and
         // branches, a four-way switch through a halfword jump table, calls
         // of the clamp and flag leaves, and stores back. x0 = iterations,

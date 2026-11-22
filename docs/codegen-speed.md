@@ -522,6 +522,99 @@ resuming at the RET) stores the caller's X30 before the SVC trap reaches
 the host, so the cause there is not yet seen, and the rule removes such
 calls from summarized ones whatever it was.
 
+### Toward the game: audit, jump tables, depth, tests and measurements
+
+**Audit** (`EmitOptions::call_summaries_audit`, `call-summaries-audit`,
+with functions and call summaries). Every summarized call of a lifted
+function (from a window or a function, directly or through the table)
+runs as `window-calls-audit` runs window calls: all locals stored, the
+registers, SP and NZCV outside the callee's summary filled with markers,
+and when the callee comes back (or traps) a `Trap::InvalidState` ("summary
+audit: the call at <site> (<callee>) changed <register>, outside its
+summary") if one outside what it may write changed; then the caller's
+values go back. For one checked game run before trusting the summaries.
+
+**Jump tables.** A recovered jump table's BR (`Translation::jump_table_cases`,
+its case targets by BR address) no longer ends a function: its cases are
+part of the body, and a function whose every case is in its body still
+leaves only by its return, so it (and its callers) can get a summary. A
+target the table does not hold at run time is not in the body: the
+function leaves, and its caller stores what it holds before going on
+through the window table, as for any early return.
+
+**Depth.** Summarized calls take no `Core::call` depth, so transitive
+summaries now stop at `WINDOW_CALL_DEPTH_LIMIT` (16) nested levels, as
+window calls do: a function that would nest deeper has no summary and is
+called through `Core::call_window` (with its depth limit).
+
+**Lift report.** `echora lift` also prints the BL targets over
+`FUNCTION_BLOCK_LIMIT`, the functions holding a jump table, and the
+instructions in function bodies with their share of the translation
+(each body is a copy of window code that compiles again as a function).
+
+**Tests.** `tests/window_calls.rs`'s game-shaped program now has a
+switch through a halfword jump table in the code (a leaf, and a frame
+calling it), a function of 600 blocks across three windows (over the
+block limit), and a game-shaped function (a frame saving X19/X20, six
+rounds of random bodies with CBZ skips and calls of the switch and its
+frame, in an eight-round loop). Besides its window-call lifts it lifts
+functions with the table, call and transitive summaries in one 64 KiB
+region, in 1 KiB regions (bodies cut at region edges), audited, with
+direct calls, with deferred charges and with the step count in a local,
+each against the function-free lift (whole, sliced and budgeted runs, in
+child processes: every general and vector register, SP, NZCV, FPCR,
+FPSR, PC, step and boundary count, trap, data and stack), and the
+integer twin's 64 KiB and 1 KiB function lifts against the reference
+interpreter (which reads the table from the code): 792 runs each, none
+skipped. `lifted_functions_cover_the_game_s_cases` checks the switch, its
+frame and the game function are lifted with summaries and the long one is
+not. The lifter's unit tests cover a function's jump-table cases and its
+summary, the depth limit and the audit's text. The whole
+`echora-aot-tests` suite passes with the game set plus `functions`,
+`function-table`, `call-summaries` and `transitive-summaries`.
+
+**Measurements.** Kernels lifted in 64 KiB regions on a shared 4-core
+container, median Minstr/s of six interleaved rounds of seven runs
+(ranges): game set + window-calls (wc), + window-calls, long-windows and
+known-returns (wcl), and game set + functions, function-table,
+call-summaries and transitive-summaries (fn). `gamefn` is a new kernel: an
+update loop calling, per object, a function of about 70 instructions
+(a frame saving X19-X22, loads, compares and branches, a four-way switch
+through a jump table, calls of the clamp and flag leaves, stores back).
+
+| kernel | wc | wcl | fn | fn against wc |
+|---|---|---|---|---|
+| calls | 1098 [903-1189] | 1021 [980-1029] | 1066 [635-1102] | -3% |
+| calls2 | 965 [731-1000] | 947 [619-979] | 760 [512-787] | -21% |
+| gamecalls | 1498 [1289-1580] | 1480 [1219-1574] | 1646 [888-1715] | +10% |
+| crossing | 2113 [2063-2155] | 4778 [3216-4836] | 5251 [5151-5292] | +149% |
+| gamefn | 2041 [1535-2094] | 2008 [1180-2031] | 2095 [1071-2152] | +3% |
+
+Census (stores and reloads of register locals; calls are emitted call
+sites):
+
+| window or function | wc calls/spills/reloads | fn calls/spills/reloads |
+|---|---|---|
+| calls window | 2 / 2 / 0 | 4 / 6 / 6 |
+| calls2 window | 3 / 5 / 3 | 6 / 15 / 18 |
+| gamecalls window | 2 / 8 / 9 | 4 / 14 / 31 |
+| gamecalls update (window; fn: `run_function_105000`) | 2 / 6 / 3 | 2 / 6 / 3 |
+| crossing window | 1 / 9 / 11 | 2 / 9 / 14 |
+| gamefn window | 1 / 9 / 11 | 2 / 9 / 22 |
+| gamefn function (window; fn: `run_function_106800`) | 2 / 6 / 3 | 2 / 6 / 3 |
+
+A function's body has the stores and reloads of the window it copies
+(a summarized call keeps the rest in host registers either way); with
+functions the windows hold a summarized and an unsummarized path per call
+site, which is where their larger counts come from. On these kernels the
+call boundary is no longer the cost: functions with summaries are about
+level with window calls, ahead where a function runs across a window
+edge (crossing, which long windows also cover), and behind on calls2
+(within this container's noise of about ±30% on the other kernels).
+Making the lifted code itself several times faster will take changes
+inside blocks (the per-block charge and PC bookkeeping, guest memory
+access, flags), not at calls.
+
 ## Window calls (opt-in)
 
 `EmitOptions::window_calls` (`window-calls` in `ECHORA_LIFT_OPTIONS`; split
