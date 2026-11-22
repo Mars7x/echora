@@ -103,6 +103,15 @@ fn split(
     translation: &echora_lift::codegen::Translation,
     options: EmitOptions,
 ) -> (String, Vec<(u64, String)>) {
+    split_at(translation, options, region_bits())
+}
+
+/// [`split`] in regions of `region_bits`.
+fn split_at(
+    translation: &echora_lift::codegen::Translation,
+    options: EmitOptions,
+    region_bits: u32,
+) -> (String, Vec<(u64, String)>) {
     LIFTED.set(LIFTED.get() + translation.instructions.len());
     if std::env::var_os("CARGO_FEATURE_CODESIZE").is_some() {
         let add = echora_lift::liveness::dead_writes(translation);
@@ -115,7 +124,7 @@ fn split(
         dead.dead_instructions += add.dead_instructions;
         DEAD.set(dead);
     }
-    emit_rust_split_with(translation, region_bits(), options)
+    emit_rust_split_with(translation, region_bits, options)
 }
 
 /// Every program lifted through split emission (what real builds use).
@@ -3046,8 +3055,10 @@ fn plt_code(out: &mut String) {
     let entries = [BASE, fa, fb, fc, fd, fe];
     let mut translation = discover(&[region], &entries, words.len()).expect("plt");
     translation.got_words = [(GOT, fa), (GOT + 8, fb), (GOT + 16, fc)].into();
-    let report = plt_report(&translation, region_bits());
-    let (root, regions) = split(&translation, options());
+    // 1 KiB regions whatever the build: the program puts its targets in
+    // and out of the callers' regions.
+    let report = plt_report(&translation, 10);
+    let (root, regions) = split_at(&translation, options(), 10);
     let direct = regions
         .iter()
         .map(|(_, source)| source.matches("m.call_window(").count())
