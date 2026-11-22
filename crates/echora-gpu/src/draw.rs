@@ -1647,7 +1647,8 @@ impl Renderer {
         let commands = self.recording_commands()?;
         // The device's function tables by reference (cloning them copies
         // hundreds of pointers per draw).
-        let gpu = self.gpu.clone();
+        // SAFETY: `self.gpu` stays in place for this call.
+        let gpu = unsafe { self.detached_gpu() };
         let objects = gpu.shader_objects()?;
         let device = &gpu.device;
         let fixed = &draw.fixed;

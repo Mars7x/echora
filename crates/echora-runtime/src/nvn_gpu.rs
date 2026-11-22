@@ -430,7 +430,7 @@ pub struct Backend {
     resident: HashMap<u64, ResidentPool>,
     /// GPU addresses SAMPLES_PASSED reports were written to on the GPU
     /// (`gpu_samples_report`): conditions on them are evaluated there.
-    samples_reports: std::collections::HashSet<u64>,
+    samples_reports: super::FastSet<u64>,
     /// Memory pools the GPU can read in place through guest memory's file
     /// (see `Renderer::import_file`), by guest base: size, file and the
     /// file offset of the base. Learned at presents (`share_new_pools`).
@@ -768,7 +768,7 @@ impl Backend {
             page_table_wrote_after_signal: false,
             page_table_wrote: false,
             resident: HashMap::default(),
-            samples_reports: std::collections::HashSet::new(),
+            samples_reports: super::FastSet::default(),
             shared_pools: HashMap::default(),
             shared_pieces: HashMap::default(),
             shared_guest_index: Default::default(),
@@ -10130,6 +10130,23 @@ impl Nvn {
         mode: u64,
         address: u64,
     ) -> Result<bool, String> {
+        // Compared on the GPU when it was set (this queue's state again
+        // after another's, or after a replay): the outcome it had then, as
+        // the console evaluates a condition once, where it is set.
+        if let Some(outcome) = self.render.word_condition
+            && (outcome.mode, outcome.address) == (mode, address)
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            if backend.renderer.word_outcome_held(outcome.made) {
+                backend
+                    .renderer
+                    .set_condition(Some((outcome.buffer, outcome.offset, false)));
+                backend.stat("stat: word conditions restored", 1);
+                return Ok(true);
+            }
+            backend.stat("stat: word conditions compared again: slot reused", 1);
+        }
+        self.render.word_condition = None;
         // Why a condition is left to the CPU, counted.
         let mut why = {
             let backend = self.gpu.as_ref().unwrap();
@@ -10172,11 +10189,117 @@ impl Nvn {
                 why = "stat: CPU conditions: report not in a resident pool";
             }
         }
+        if why == "stat: CPU conditions: word GPU work is writing"
+            && let Some(outcome) = self.gpu_word_condition(core, mode, address)?
+        {
+            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            self.render.word_condition = Some(WordOutcome {
+                mode,
+                address,
+                buffer: outcome.0,
+                offset: outcome.1,
+                made: renderer.word_conditions_made() - 1,
+            });
+            renderer.set_condition(Some((outcome.0, outcome.1, false)));
+            return Ok(true);
+        }
         if let Some(backend) = self.gpu.as_mut() {
             backend.stat(why, 1);
         }
         self.gpu_clear_condition();
         Ok(false)
+    }
+
+    /// A condition on a counter word GPU work is still writing (mode 0:
+    /// rendering holds while it equals the word 16 bytes on, mode 1 while
+    /// they differ), compared on the GPU after that work
+    /// (`Renderer::condition_on_word`) instead of waiting for it to read
+    /// the word on the CPU: where the word is shared with the GPU in place,
+    /// and so is the other word if GPU work writes it too (else its value
+    /// is the CPU's). The word the condition reads, or None (the CPU
+    /// compares them).
+    /// ECHORA_GPU_WORD_CONDITIONS=0 (debugging): the CPU always does.
+    fn gpu_word_condition(
+        &mut self,
+        core: &mut Guest,
+        mode: u64,
+        address: u64,
+    ) -> Result<Option<(vk::Buffer, u64)>, String> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            super::debug_var_os("ECHORA_GPU_WORD_CONDITIONS").is_none_or(|value| value != "0")
+        }) {
+            return Ok(None);
+        }
+        let (Ok(word), Ok(other)) = (
+            self.gpu_to_guest(address, 8),
+            self.gpu_to_guest(address.wrapping_add(16), 8),
+        ) else {
+            return Ok(None);
+        };
+        let completed = self.gpu.as_ref().unwrap().renderer.completed_serial();
+        let pending = |nvn: &Self, guest: u64| {
+            nvn.draw_input_write_serial(guest..guest + 8)
+                .is_some_and(|serial| serial > completed)
+        };
+        // Why the CPU compares them after all, counted.
+        let refused = [
+            (
+                !pending(self, word),
+                "stat: word conditions refused: no pending write",
+            ),
+            (
+                self.gpu_writes_pending(&(word..word + 8)),
+                "stat: word conditions refused: results to copy into the word",
+            ),
+            (
+                self.gpu_writes_pending(&(other..other + 8)),
+                "stat: word conditions refused: results to copy into the other word",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(refused, why)| refused.then_some(why));
+        if let Some(why) = refused {
+            self.gpu.as_mut().unwrap().stat(why, 1);
+            return Ok(None);
+        }
+        let Some(bound) = self
+            .shared_binding(word, 8)?
+            .filter(|&(_, offset)| offset.is_multiple_of(4))
+        else {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: word conditions refused: word not shared", 1);
+            return Ok(None);
+        };
+        let comparand = if pending(self, other) {
+            // Written by GPU work too: read where it is, after that work.
+            let Some((buffer, offset)) = self
+                .shared_binding(other, 8)?
+                .filter(|&(_, offset)| offset.is_multiple_of(4))
+            else {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: word conditions refused: other word not shared", 1);
+                return Ok(None);
+            };
+            echora_gpu::condition::Comparand::Word(buffer, offset)
+        } else {
+            // As the CPU holds it (nothing is pending there).
+            self.resolve_draw_input(core, other, 8)?;
+            echora_gpu::condition::Comparand::Value(
+                core.memory
+                    .read_u64(other)
+                    .map_err(|trap| format!("{trap:?}"))?,
+            )
+        };
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .condition_on_word(bound, comparand, mode == 0)
     }
 
     /// Guest CPU address of the comparison operand read by `gpu_condition`.
@@ -13172,6 +13295,19 @@ fn read_storage_into(core: &Guest, base: u64, mut bytes: &mut [u8]) {
 
 /// A texture storage's sample: its shape, and 256 evenly spaced 64-byte
 /// chunks of its `storage_size` bytes at `base` (see `guest_texture`).
+/// A render condition's counter words as compared on the GPU where it was
+/// set (`Nvn::gpu_word_condition`): its mode and counter address, the
+/// outcome word conditional rendering reads, and when it was compared
+/// (`Renderer::word_conditions_made`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WordOutcome {
+    mode: u64,
+    address: u64,
+    buffer: vk::Buffer,
+    offset: u64,
+    made: u64,
+}
+
 pub(super) fn texture_sample(
     core: &Guest,
     base: u64,
