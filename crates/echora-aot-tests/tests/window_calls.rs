@@ -21,7 +21,8 @@
 //! installed), so each lift runs in a child process of its own and prints a
 //! digest per run, which the parent compares.
 #![cfg(any(target_os = "linux", windows))]
-#![allow(clippy::unwrap_used)]
+// The lifts' counts are constants that the build's features decide.
+#![allow(clippy::unwrap_used, clippy::assertions_on_constants)]
 
 mod common;
 

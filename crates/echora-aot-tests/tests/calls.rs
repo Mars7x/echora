@@ -269,20 +269,20 @@ fn window_call_child() {
     let Ok(lift) = std::env::var(WINDOW_CHILD) else {
         return;
     };
-    let (dispatch, install, installed): (fn(&mut Core) -> Result<(), Trap>, fn(), fn() -> bool) =
-        match lift.as_str() {
-            "call_window_code" => (
-                call_window_code::dispatch,
-                call_window_code::install,
-                call_window_code::window_calls_installed,
-            ),
-            "call_window_table_code" => (
-                call_window_table_code::dispatch,
-                call_window_table_code::install,
-                call_window_table_code::window_calls_installed,
-            ),
-            other => panic!("unknown lift {other}"),
-        };
+    type Entry = (fn(&mut Core) -> Result<(), Trap>, fn(), fn() -> bool);
+    let (dispatch, install, installed): Entry = match lift.as_str() {
+        "call_window_code" => (
+            call_window_code::dispatch,
+            call_window_code::install,
+            call_window_code::window_calls_installed,
+        ),
+        "call_window_table_code" => (
+            call_window_table_code::dispatch,
+            call_window_table_code::install,
+            call_window_table_code::window_calls_installed,
+        ),
+        other => panic!("unknown lift {other}"),
+    };
     install();
     // Structured emission and lifted functions turn window calls off.
     let off = cfg!(feature = "structured") || cfg!(feature = "functions");
