@@ -4190,6 +4190,14 @@ pub struct CallReport {
     pub summarized_callers: usize,
     /// BL sites whose target is such a function.
     pub summarized_caller_sites: usize,
+    /// BL targets starting a block that are no lifted function (their
+    /// body over `FUNCTION_BLOCK_LIMIT` blocks).
+    pub over_limit: usize,
+    /// Lifted functions holding a recovered jump table with its cases.
+    pub with_jump_tables: usize,
+    /// Instructions in lifted functions' bodies (each a copy of window
+    /// code: what `functions` adds to compile).
+    pub function_instructions: usize,
 }
 
 /// [`CallReport`] of a translation with `region_bits`-bit regions.
@@ -4202,10 +4210,41 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
         .filter(|entry| !leaves.contains_key(entry))
         .copied()
         .collect();
+    let sizes: BTreeMap<u64, usize> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block.instructions.len()))
+        .collect();
+    let targets: BTreeSet<u64> = translation
+        .instructions
+        .values()
+        .filter_map(|record| match record.instruction {
+            Instruction::Branch { target, link: true } if sizes.contains_key(&target) => {
+                Some(target)
+            }
+            _ => None,
+        })
+        .collect();
     let mut report = CallReport {
         functions: lifted.len(),
         leaves: leaves.len(),
         summarized_callers: callers.len(),
+        over_limit: targets.iter().filter(|t| !lifted.contains_key(t)).count(),
+        with_jump_tables: lifted
+            .values()
+            .filter(|starts| {
+                starts.iter().any(|start| {
+                    translation
+                        .jump_table_cases
+                        .keys()
+                        .any(|br| (*start..*start + 4 * sizes[start] as u64).contains(br))
+                })
+            })
+            .count(),
+        function_instructions: lifted
+            .values()
+            .flat_map(|starts| starts.iter().map(|start| sizes[start]))
+            .sum(),
         ..CallReport::default()
     };
     for record in translation.instructions.values() {
