@@ -8843,4 +8843,326 @@ mod tests {
         let report = window_call_report(&translation, 16, &|_| Some(true));
         assert_eq!((report.targets, report.early_exit_targets), (1, 1));
     }
+
+    use crate::defuse;
+
+    /// The comma-separated arguments of the call whose `(` is at the start
+    /// of `text`, split at the top level.
+    fn call_arguments(text: &str) -> Vec<String> {
+        let mut depth = 0;
+        let mut arguments = vec![String::new()];
+        for c in text.chars() {
+            match c {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                ',' if depth == 1 => {
+                    arguments.push(String::new());
+                    continue;
+                }
+                _ => {}
+            }
+            arguments.last_mut().unwrap().push(c);
+        }
+        arguments.iter().map(|a| a.trim().to_owned()).collect()
+    }
+
+    /// The general registers, SP and NZCV the emitted Rust `body` of one
+    /// instruction reads and writes in the `Core`: `m.cpu.regs[n]`,
+    /// `m.cpu.sp`, `m.cpu.nzcv`, the flag operations and the helpers in
+    /// `READS_REGISTERS`/`WRITES_REGISTERS`/`USES_FLAGS` (by their
+    /// register arguments), or a description of an access it cannot place.
+    fn body_accesses(body: &str) -> Result<(defuse::Regs, defuse::Regs), String> {
+        use defuse::Regs;
+        let (mut reads, mut writes) = (Regs::NONE, Regs::NONE);
+        let number = |text: &str| -> Result<u8, String> {
+            text.parse::<u8>()
+                .map_err(|_| format!("a register number that is not a literal: {text:?}"))
+        };
+        // How the place just before `rest` is used: (read, written).
+        let usage = |before: &str, rest: &str| -> (bool, bool) {
+            let rest = rest.trim_start();
+            let compound = ["+=", "-=", "|=", "&=", "^=", "<<=", ">>=", "*="];
+            if before.ends_with("&mut ") || compound.iter().any(|op| rest.starts_with(op)) {
+                (true, true)
+            } else if rest.starts_with('=') && !rest.starts_with("==") {
+                (false, true)
+            } else {
+                (true, false)
+            }
+        };
+        for (at, _) in body.match_indices("m.cpu.regs[") {
+            let rest = &body[at + 11..];
+            let close = rest.find(']').unwrap();
+            let n = number(&rest[..close])?;
+            let (read, written) = usage(&body[..at], &rest[close + 1..]);
+            if read {
+                reads.add_gpr(n);
+            }
+            if written {
+                writes.add_gpr(n);
+            }
+        }
+        for (at, _) in body.match_indices("m.cpu.regs") {
+            if !body[at + 10..].starts_with('[') {
+                return Err("the whole register file".to_owned());
+            }
+        }
+        for (field, is_sp) in [("m.cpu.sp", true), ("m.cpu.nzcv", false)] {
+            for (at, _) in body.match_indices(field) {
+                let rest = &body[at + field.len()..];
+                if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let (read, written) = usage(&body[..at], rest);
+                let (r, w) = if is_sp {
+                    (&mut reads.sp, &mut writes.sp)
+                } else {
+                    (&mut reads.nzcv, &mut writes.nzcv)
+                };
+                *r |= read;
+                *w |= written;
+            }
+        }
+        for (at, _) in body.match_indices("m.cpu.read_reg(") {
+            let arguments = call_arguments(&body[at + 14..]);
+            let n = number(&arguments[0])?;
+            if n == 31 && arguments[2] == "true" {
+                reads.sp = true;
+            } else {
+                reads.add_gpr(n);
+            }
+        }
+        for (at, _) in body.match_indices("m.cpu.write_reg(") {
+            let arguments = call_arguments(&body[at + 15..]);
+            let n = number(&arguments[0])?;
+            if n == 31 && arguments[2] == "true" {
+                writes.sp = true;
+            } else {
+                writes.add_gpr(n);
+            }
+        }
+        // Flag operations: (name, reads NZCV, writes NZCV, index of the
+        // `flags` argument that decides the write, if any).
+        let flag_operations: [(&str, bool, bool, Option<usize>); 6] = [
+            ("m.cpu.add_sub(", false, true, Some(4)),
+            ("m.cpu.add_with_carry(", false, true, Some(4)),
+            ("m.cpu.condition(", true, false, None),
+            ("m.cpu.logical_flags(", false, true, None),
+            ("m.cpu.conditional_compare(", true, true, None),
+            ("m.cpu.conditional_compare_negative(", true, true, None),
+        ];
+        for (name, read, written, flags) in flag_operations {
+            for (at, _) in body.match_indices(name) {
+                let arguments = call_arguments(&body[at + name.len() - 1..]);
+                reads.nzcv |= read;
+                writes.nzcv |= written
+                    && flags.is_none_or(|index| {
+                        arguments.get(index).map(String::as_str) != Some("false")
+                    });
+            }
+        }
+        for helper in USES_FLAGS {
+            if body.contains(helper) {
+                // FCMP writes NZCV, FCCMP reads and writes it, FCSEL reads it.
+                reads.nzcv |= !helper.contains("fp_compare(");
+                writes.nzcv |= !helper.contains("fp_select(");
+            }
+        }
+        // SIMD helpers taking `(&mut m.cpu, rd, rn, ..)`: the general
+        // register each reads (rn) or writes (rd); 31 is the zero register.
+        let simd_helpers: [(&str, bool); 9] = [
+            ("::fp_move_from_general(", false),
+            ("::int_to_fp(", false),
+            ("::int_to_fp_fixed(", false),
+            ("::insert_general(", false),
+            ("::dup_general(", false),
+            ("::fp_move_to_general(", true),
+            ("::fp_to_int(", true),
+            ("::move_to_general(", true),
+            ("::fp_to_fixed(", true),
+        ];
+        for (name, writes_rd) in simd_helpers {
+            for (at, _) in body.match_indices(name) {
+                let arguments = call_arguments(&body[at + name.len() - 1..]);
+                if writes_rd {
+                    writes.add_gpr(number(&arguments[1])?);
+                } else {
+                    reads.add_gpr(number(&arguments[2])?);
+                }
+            }
+        }
+        if body.contains("m.cpu.strip_lr_instruction_pac(")
+            || body.contains("pauth_disabled_return(")
+        {
+            reads.add_gpr(30);
+        }
+        if body.contains("strip_lr_instruction_pac(") {
+            writes.add_gpr(30);
+        }
+        for (at, _) in body.match_indices("m.cpu.strip_pac(") {
+            let n = number(&call_arguments(&body[at + 15..])[0])?;
+            reads.add_gpr(n);
+            writes.add_gpr(n);
+        }
+        // Anything else handed the whole `Cpu` must be a helper known not
+        // to touch these (vector and FP helpers, which take V numbers).
+        for (at, _) in body.match_indices("&mut m.cpu") {
+            let rest = &body[at + 10..];
+            if rest.starts_with('.') {
+                continue;
+            }
+            let call = body[..at].rfind(|c: char| !(c.is_alphanumeric() || "_:(".contains(c)));
+            let name = &body[call.map_or(0, |c| c + 1)..at];
+            let known_gpr = simd_helpers
+                .iter()
+                .any(|(helper, _)| name.ends_with(&helper[2..]));
+            let known_flags = USES_FLAGS.iter().any(|helper| name.ends_with(&helper[6..]));
+            if !known_gpr && !known_flags && !name.contains("simd::") && !name.contains("simd_") {
+                return Err(format!("the Cpu handed to {name:?}"));
+            }
+        }
+        Ok((reads, writes))
+    }
+
+    #[test]
+    fn body_accesses_reads_the_emitted_forms() {
+        let (reads, writes) = body_accesses(
+            "m.cpu.regs[3] = m.cpu.regs[4] + 1; m.cpu.regs[5] += 1; let f = m.cpu.nzcv; m.cpu.sp = m.cpu.read_reg(31, 64, true); m.cpu.write_reg(7, 64, false, m.cpu.add_sub(1, 2, false, 64, false));",
+        )
+        .unwrap();
+        let x = |ns: &[u8]| ns.iter().fold(0u32, |set, n| set | 1 << n);
+        assert_eq!((reads.gpr, reads.sp, reads.nzcv), (x(&[4, 5]), true, true));
+        assert_eq!(
+            (writes.gpr, writes.sp, writes.nzcv),
+            (x(&[3, 5, 7]), true, false)
+        );
+        assert!(
+            body_accesses("simd::fp_to_int(&mut m.cpu, 9, 1, 64, x, y, z)?;")
+                .unwrap()
+                .1
+                .has_gpr(9)
+        );
+        assert!(body_accesses("helper(&mut m.cpu);").is_err());
+        assert!(body_accesses("m.cpu.regs[n] = 0;").is_err());
+    }
+
+    /// Window calls keep the registers outside a callee's summary in the
+    /// caller's locals, so `defuse::effects` must cover every general
+    /// register, SP and NZCV access of every instruction's emitted Rust.
+    /// Checked on random words over every value of the top 16 bits (each
+    /// encoding class) and fully random words, in both PC forms.
+    #[test]
+    fn defuse_effects_cover_every_emitted_register_access() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut words = Vec::new();
+        for high in 0..1u32 << 16 {
+            for _ in 0..12 {
+                words.push(high << 16 | (random() as u32 & 0xffff));
+            }
+        }
+        for high in 0..1u32 << 21 {
+            words.push(high << 11 | (random() as u32 & 0x7ff));
+        }
+        // System instructions (MRS, MSR, SYS, hints, barriers) by every
+        // operand field.
+        for system in 0..1u32 << 17 {
+            words.push(0xd500_0000 | system << 5 | (random() as u32 & 31));
+            words.push(0xd500_0000 | system << 5 | 31);
+        }
+        // Data processing with one source (REV, CLZ, PAC, AUT, XPAC), by
+        // every opcode and Rn field.
+        for opcode in 0..1u32 << 16 {
+            words.push(0xdac0_0000 | opcode << 5 | (random() as u32 & 31));
+            words.push(0x5ac0_0000 | opcode << 5 | (random() as u32 & 31));
+        }
+        // Branches to registers (BR, BLR, RET and their PAC forms), by
+        // every opcode field, with zero, all-ones and random low fields.
+        for opcode in 0..1u32 << 15 {
+            let rn = (random() as u32 & 31) << 5;
+            for low in [0, 31, random() as u32 & 31] {
+                words.push(0xd600_0000 | opcode << 10 | rn | low);
+                words.push(0xd600_0000 | opcode << 10 | 30 << 5 | low);
+                words.push(0xd600_0000 | opcode << 10 | 31 << 5 | low);
+            }
+        }
+        for _ in 0..400_000 {
+            words.push(random() as u32);
+        }
+        let mut variants: BTreeMap<String, usize> = BTreeMap::new();
+        let mut failures: BTreeMap<String, String> = BTreeMap::new();
+        let pc = 0x10_0000u64;
+        for word in words {
+            let instruction = aarch64::decode(word, pc);
+            if matches!(
+                instruction,
+                Instruction::Undefined | Instruction::Unsupported
+            ) {
+                continue;
+            }
+            let debug = format!("{instruction:?}");
+            let variant = debug[..debug.find([' ', '(', '{']).unwrap_or(debug.len())].to_owned();
+            let detail = match &instruction {
+                Instruction::Simd(op) => {
+                    let op = format!("{op:?}");
+                    op[..op.find([' ', '(', '{']).unwrap_or(op.len())].to_owned()
+                }
+                _ => String::new(),
+            };
+            *variants.entry(format!("{variant} {detail}")).or_default() += 1;
+            let effects = defuse::effects(&instruction);
+            let record = TranslatedInstruction {
+                pc,
+                word,
+                instruction,
+            };
+            for local_pc in [false, true] {
+                let mut body = String::new();
+                emit_instruction_body(&mut body, &record, true, local_pc);
+                let problem = match body_accesses(&body) {
+                    Err(problem) => Some(problem),
+                    Ok((reads, writes)) => {
+                        let missing_reads = reads.difference(effects.reads);
+                        let missing_writes = writes.difference(effects.writes);
+                        (!missing_reads.is_empty() || !missing_writes.is_empty()).then(|| {
+                            format!("reads {missing_reads:?} and writes {missing_writes:?} outside the effects")
+                        })
+                    }
+                };
+                if let Some(problem) = problem {
+                    failures
+                        .entry(format!("{variant} {detail}"))
+                        .or_insert_with(|| {
+                            format!("{word:#010x} {:?}: {problem}\n{body}", record.instruction)
+                        });
+                }
+            }
+        }
+        println!("{} instruction kinds checked:", variants.len());
+        for (variant, count) in &variants {
+            println!("  {variant}: {count}");
+        }
+        assert!(variants.len() > 110, "too few instruction kinds");
+        assert!(
+            failures.is_empty(),
+            "{} instruction kinds access registers outside defuse::effects:\n{}",
+            failures.len(),
+            failures.values().cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
 }
