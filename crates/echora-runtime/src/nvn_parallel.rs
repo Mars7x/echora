@@ -249,6 +249,9 @@ pub(super) struct PlannedBindings {
     pub storage_entries: Vec<(usize, u32, u64, u64)>,
     pub uniform_bytes: u64,
     pub memo_hits: u64,
+    /// Memoized texture bindings from another present or GPU write
+    /// generation that still hold: marked checked at the commit.
+    pub memo_checks: Vec<u64>,
 }
 
 /// What a planner thread reads: shared views of the NVN state, which
@@ -263,6 +266,7 @@ struct View<'a> {
     >,
     pools: &'a [PoolRange],
     memo: &'a super::super::FastMap<u64, ResolvedBinding>,
+    block_aliases: &'a super::super::FastMap<u64, u64>,
     presented_frames: u64,
     gpu_writes: u64,
     fragment_jump_stages: &'a super::super::FastSet<usize>,
@@ -351,6 +355,29 @@ impl View<'_> {
         found.cloned().ok_or("program not memoized")
     }
 
+    /// `with_memoized_binding` for an entry from another present or GPU
+    /// write generation: whether it holds (without marking it checked).
+    fn memo_still_holds(&self, entry: &ResolvedBinding) -> bool {
+        if entry.present != self.presented_frames {
+            let current = match &entry.source {
+                TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
+                    !self.block_aliases.contains_key(key)
+                }
+                _ => false,
+            };
+            if !current {
+                return false;
+            }
+        }
+        !(entry.gpu_writes != self.gpu_writes
+            && entry.backing.as_ref().is_some_and(|backing| {
+                backing
+                    .pieces()
+                    .iter()
+                    .any(|(_, range)| self.gpu_writes_pending(range))
+            }))
+    }
+
     /// `Nvn::read_stage_constants`.
     fn stage_constants(&self, stage: super::super::Args, bytes: &mut Vec<u8>) -> Option<()> {
         let (code, control) = (stage.x[0], stage.x[1]);
@@ -382,6 +409,7 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
         storage_entries: Vec::new(),
         uniform_bytes: 0,
         memo_hits: 0,
+        memo_checks: Vec::new(),
     };
     plan.uniforms.reserve(program.uniforms);
     plan.guest_uniforms.reserve(program.uniforms);
@@ -483,16 +511,21 @@ fn plan_draw(view: &View<'_>, render: &RenderState) -> Result<PlannedBindings, &
                         .bound_textures
                         .get(u64::from(nvn), u64::from(slot))
                         .ok_or("texture not bound")?;
-                    // The memo's common case only (`with_memoized_binding`):
-                    // an entry checked at this present and GPU write
-                    // generation. Others are checked again by the replay.
+                    // The memo as `with_memoized_binding` reads it: an entry
+                    // checked at this present and GPU write generation, or
+                    // one that still holds; others the replay resolves.
                     let entry = view
                         .memo
                         .get(&handle)
                         .ok_or("texture binding not memoized")?;
                     if entry.present != view.presented_frames || entry.gpu_writes != view.gpu_writes
                     {
-                        return Err("texture binding to check again");
+                        // Checked again as `with_memoized_binding` does;
+                        // the commit marks it checked (`install`).
+                        if !view.memo_still_holds(entry) {
+                            return Err("texture binding to resolve again");
+                        }
+                        plan.memo_checks.push(handle);
                     }
                     plan.memo_hits += 1;
                     if let Some(sampled) = typed_sampled_texture(descriptor, entry.sample_type) {
@@ -675,6 +708,7 @@ impl Nvn {
                 programs: (self.program_memo.0 == program_stamp).then_some(&self.program_memo.1),
                 pools: &pools.entries,
                 memo: &self.binding_memo.1,
+                block_aliases: &self.block_aliases,
                 presented_frames: self.presented_frames,
                 gpu_writes: backend.gpu_writes,
                 fragment_jump_stages: &backend.fragment_jump_stages,
@@ -820,7 +854,17 @@ impl Nvn {
             storage_entries,
             uniform_bytes,
             memo_hits,
+            memo_checks,
         } = plan;
+        // As the binding loop's lookups would have (the same check, under
+        // the same stamp).
+        for handle in memo_checks {
+            if self.with_memoized_binding(handle, |_| ()).is_none() {
+                return Err(format!(
+                    "planned texture binding {handle:#x} no longer holds"
+                ));
+            }
+        }
         out.uniforms.extend(uniforms);
         out.guest_uniforms.extend(guest_uniforms);
         out.textures.extend(textures);
@@ -1011,8 +1055,8 @@ fn fallback_stat(reason: &'static str) -> &'static str {
         "texture binding not memoized" => {
             "stat: parallel draw fallbacks: texture binding not memoized"
         }
-        "texture binding to check again" => {
-            "stat: parallel draw fallbacks: texture binding to check again"
+        "texture binding to resolve again" => {
+            "stat: parallel draw fallbacks: texture binding to resolve again"
         }
         _ => "stat: parallel draw fallbacks: other bindings",
     }
@@ -1410,6 +1454,10 @@ mod replay_tests {
                 )),
             ),
         );
+        // Handle 22 comes from an earlier present: a render target's
+        // binding that still holds (checked again, then used).
+        nvn.presented_frames = 1;
+        nvn.program_memo.0 = (1, 0);
         for handle in 19..23 {
             nvn.binding_memo.1.insert(
                 handle,
@@ -1419,7 +1467,7 @@ mod replay_tests {
                     sample_type: shader::SampleType::Float,
                     backing: Some(TextureBacking::linear(GUEST + 0x8000, 0x1000)),
                     gpu_writes: 0,
-                    present: 0,
+                    present: u64::from(handle != 22),
                     texture: handle + 100,
                 },
             );
