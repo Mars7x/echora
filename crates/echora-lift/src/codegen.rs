@@ -8372,6 +8372,53 @@ mod tests {
             "{both}"
         );
         assert_eq!(both, emit(&translation, functions));
+        // Window calls give way to lifted functions; with direct calls, a
+        // BL to a summarized target is a window call.
+        let window_calls = EmitOptions {
+            window_calls: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, window_calls), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    window_calls: true,
+                    ..functions
+                }
+            ),
+            emit(&translation, functions)
+        );
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    direct_calls: true,
+                    ..window_calls
+                }
+            ),
+            emit(&translation, window_calls)
+        );
+        // Long windows give way to lifted functions and deferred charges
+        // (on a loop across a window edge, which they change).
+        let (crossing, _) = crossing_function();
+        let long = EmitOptions {
+            long_windows: true,
+            ..base
+        };
+        assert_ne!(emit(&crossing, long), emit(&crossing, base));
+        for winner in [functions, deferred] {
+            assert_eq!(
+                emit(
+                    &crossing,
+                    EmitOptions {
+                        long_windows: true,
+                        ..winner
+                    }
+                ),
+                emit(&crossing, winner)
+            );
+        }
     }
 
     #[test]
