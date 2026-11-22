@@ -4820,6 +4820,8 @@ thread_local! {
     static RET_LEAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::known_returns` of the region being emitted.
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::threaded_successors` of the region being emitted.
+    static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Restores [`WINDOW_CALLS`] when it goes.
@@ -5165,7 +5167,13 @@ fn emit_split_cases(
             continue;
         }
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
-        expand_block(output, &bodies, inlined, block.start);
+        // Spin-wait heads keep their dispatch (`crate::spin`).
+        let mut copying =
+            (THREADED_SUCCESSORS.get() && !spin_heads.contains(&block.start)).then(|| Copying {
+                chain: Vec::new(),
+                budget: THREADED_LINE_BUDGET,
+            });
+        expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
         output.push_str("            }\n");
     }
 }
@@ -5546,16 +5554,63 @@ fn expand_block(
     inlined: &BTreeSet<u64>,
     start: u64,
 ) {
+    expand_block_copying(output, bodies, inlined, start, &mut None);
+}
+
+/// With `EmitOptions::threaded_successors`: the blocks an arm's expansion
+/// is in (a successor among them is a loop's back edge and dispatches),
+/// and the lines of copied bodies it may still add.
+struct Copying {
+    chain: Vec<u64>,
+    budget: usize,
+}
+
+/// Lines of copied successors one arm may hold
+/// (`EmitOptions::threaded_successors`).
+pub const THREADED_LINE_BUDGET: usize = 96;
+
+/// [`expand_block`], also copying successors that keep their own arms
+/// into the arm (`copying`): a constant successor of the window not on the
+/// arm's chain runs in place, as an inlined block does (the same body: its
+/// PC stored, its charge, which may take a host boundary there, since
+/// execution can resume at its arm), instead of going back through the
+/// window's `match`.
+fn expand_block_copying(
+    output: &mut String,
+    bodies: &BTreeMap<u64, String>,
+    inlined: &BTreeSet<u64>,
+    start: u64,
+    copying: &mut Option<Copying>,
+) {
     let body = &bodies[&start];
     let trimmed = body.trim_end_matches('\n');
     let split = trimmed.rfind('\n').map_or(0, |at| at + 1);
     let (head, last) = (&body[..split], &trimmed[split..]);
-    let here = |target: u64| inlined.contains(&target) && bodies.contains_key(&target);
+    if let Some(copy) = copying.as_mut() {
+        copy.chain.push(start);
+    }
+    let copies = |copying: &Option<Copying>, target: u64| {
+        copying.as_ref().is_some_and(|copy| {
+            !inlined.contains(&target)
+                && !copy.chain.contains(&target)
+                && bodies
+                    .get(&target)
+                    .is_some_and(|body| body.lines().count() <= copy.budget)
+        })
+    };
+    let here = |copying: &Option<Copying>, target: u64| {
+        (inlined.contains(&target) && bodies.contains_key(&target)) || copies(copying, target)
+    };
     let target = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
-    let branch = |output: &mut String, next: u64| {
-        if here(next) {
+    let branch = |output: &mut String, next: u64, copying: &mut Option<Copying>| {
+        if here(copying, next) {
+            if copies(copying, next)
+                && let Some(copy) = copying.as_mut()
+            {
+                copy.budget -= bodies[&next].lines().count();
+            }
             writeln!(output, "                m.cpu.pc = {next:#x};").unwrap();
-            expand_block(output, bodies, inlined, next);
+            expand_block_copying(output, bodies, inlined, next, copying);
         } else {
             writeln!(output, "                next_pc = {next:#x};").unwrap();
         }
@@ -5566,26 +5621,29 @@ fn expand_block(
         .strip_prefix("next_pc = ")
         .and_then(|rest| rest.strip_suffix(';'))
         .and_then(target)
-        .filter(|&next| here(next))
+        .filter(|&next| here(copying, next))
     {
-        branch(output, next);
-        return;
+        branch(output, next, copying);
+    } else {
+        let conditional = split_conditional(body)
+            .map(|(_, condition, taken, other)| (condition, taken, other))
+            .filter(|&(_, taken, other)| here(copying, taken) || here(copying, other));
+        match conditional {
+            Some((condition, taken, other)) => {
+                writeln!(output, "                if {condition} {{").unwrap();
+                branch(output, taken, copying);
+                output.push_str("                } else {\n");
+                branch(output, other, copying);
+                output.push_str("                }\n");
+            }
+            None => {
+                output.push_str(last);
+                output.push('\n');
+            }
+        }
     }
-    let conditional = split_conditional(body)
-        .map(|(_, condition, taken, other)| (condition, taken, other))
-        .filter(|&(_, taken, other)| here(taken) || here(other));
-    match conditional {
-        Some((condition, taken, other)) => {
-            writeln!(output, "                if {condition} {{").unwrap();
-            branch(output, taken);
-            output.push_str("                } else {\n");
-            branch(output, other);
-            output.push_str("                }\n");
-        }
-        None => {
-            output.push_str(last);
-            output.push('\n');
-        }
+    if let Some(copy) = copying.as_mut() {
+        copy.chain.pop();
     }
 }
 
@@ -5794,6 +5852,16 @@ pub struct EmitOptions {
     /// one outside what it may write changed, the caller's values put
     /// back). For one checked run, not for speed.
     pub call_summaries_audit: bool,
+    /// Split windows (not structured): a block's constant successor in its
+    /// window that keeps its own arm runs as a copy in the arm, as an
+    /// inlined block does, instead of going back through the window's
+    /// `match next_pc` (whose compare tree and indirect jump the host
+    /// compiler does not thread through the loop). Only successors on the
+    /// arm's chain (a loop's back edge) and those past
+    /// `THREADED_LINE_BUDGET` lines of copies per arm still dispatch. The
+    /// copies are the blocks' own code (PC store, charge, boundary), and
+    /// every block keeps its arm, so resuming is unchanged.
+    pub threaded_successors: bool,
 }
 
 thread_local! {
@@ -6391,6 +6459,7 @@ struct RegionSettings {
     ret_leaves: Flag,
     audit: Flag,
     known_returns: Flag,
+    threaded: Flag,
 }
 
 impl RegionSettings {
@@ -6470,6 +6539,7 @@ impl RegionSettings {
                         && options.call_summaries_audit),
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
+            threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
         }
     }
 }
@@ -9139,6 +9209,51 @@ mod tests {
         let (_, regions) = emit_rust_split_with(&translation, 16, EmitOptions::default());
         assert!(regions[0].1.contains("\nnext_pc = m.cpu.pc;"));
         assert!(!regions[0].1.contains(&expected));
+    }
+
+    #[test]
+    fn threaded_successors_copy_a_join_into_both_branches() {
+        // CBZ X0 over one ADD to a join (two predecessors: an arm of its
+        // own), then a loop back to the start through a SUBS/B.NE.
+        let words = [
+            0xb400_0040, // 0x1000: cbz x0, 0x1008
+            0x9100_0421, // 0x1004: add x1, x1, #1
+            0x9100_0842, // 0x1008: join: add x2, x2, #2
+            0xf100_0400, // 0x100c: subs x0, x0, #1
+            0x54ff_ff81, // 0x1010: b.ne 0x1000
+            0xd65f_03c0, // 0x1014: ret
+        ];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        // An arm: from its label to the next one (or the catch-all).
+        let arm = |source: &str, pc: u64| {
+            let start = source.find(&format!("\n{pc:#x} => {{")).unwrap() + 1;
+            let end = source[start..]
+                .find("\n0x")
+                .or_else(|| source[start..].find("\npc "))
+                .map_or(source.len(), |at| start + at);
+            source[start..end].to_owned()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        let plain = arm(&regions[0].1, 0x1000);
+        assert!(plain.contains("next_pc = 0x1008;"), "{plain}");
+        assert!(!plain.contains("m.cpu.pc = 0x1008;"), "{plain}");
+        let options = EmitOptions {
+            threaded_successors: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        let threaded = arm(source, 0x1000);
+        // The join runs in place on both sides; it keeps its own arm; the
+        // loop's back edge to the arm's own start still dispatches.
+        assert_eq!(
+            threaded.matches("m.cpu.pc = 0x1008;").count(),
+            2,
+            "{threaded}"
+        );
+        assert!(!threaded.contains("next_pc = 0x1008;"), "{threaded}");
+        assert!(threaded.contains("0x1000"), "{threaded}");
+        assert!(source.contains("\n0x1008 => {"));
     }
 
     #[test]

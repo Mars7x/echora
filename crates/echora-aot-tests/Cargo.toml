@@ -109,6 +109,9 @@ known-returns = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []
+# Constant successors with their own arms copied into the arm instead of
+# dispatched (EmitOptions::threaded_successors).
+threaded-successors = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
