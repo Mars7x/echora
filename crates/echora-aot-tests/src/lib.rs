@@ -47,8 +47,14 @@ pub struct Machine {
 }
 
 /// The process's 39-bit guest address space (the model PAuth stripping
-/// depends on). The host reservation is sparse.
-pub const ADDRESS_SPACE: u64 = 1 << 39;
+/// depends on). The host reservation is sparse. With `small-address-space`
+/// (measuring under valgrind, whose address space cannot hold the 512 GiB
+/// reservation; the kernels use only low addresses) 34 bits.
+pub const ADDRESS_SPACE: u64 = if cfg!(feature = "small-address-space") {
+    1 << 34
+} else {
+    1 << 39
+};
 
 impl Machine {
     /// Code mapped at 0x1000 (one page, read/execute) and data at 0x8000
