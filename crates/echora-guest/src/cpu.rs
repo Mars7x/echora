@@ -432,25 +432,32 @@ impl LazyFlags {
     /// N, Z, C, V in bits 3, 2, 1, 0.
     #[inline(always)]
     pub fn nzcv(&self) -> u8 {
-        let mut flags = Flags { nzcv: 0 };
+        let (x, y) = (self.x, self.y);
+        let (bits, mask) = match self.mode {
+            0 => return x as u8,
+            1 | 3 | 5 => (32, u64::from(u32::MAX)),
+            _ => (64, u64::MAX),
+        };
+        let top = bits - 1;
+        let pack = |n: u64, z: bool, c: bool, v: u64| {
+            ((n as u8 & 1) << 3) | (u8::from(z) << 2) | (u8::from(c) << 1) | (v as u8 & 1)
+        };
         match self.mode {
-            0 => return self.x as u8,
-            1 => {
-                flags.add_sub(self.x, self.y, true, 32, true);
+            1 | 2 => {
+                let r = x.wrapping_sub(y) & mask;
+                pack(r >> top, r == 0, x >= y, ((x ^ y) & (x ^ r)) >> top)
             }
-            2 => {
-                flags.add_sub(self.x, self.y, true, 64, true);
+            3 | 4 => {
+                let r = x.wrapping_add(y) & mask;
+                let carry = if bits == 32 {
+                    (x + y) >> 32 != 0
+                } else {
+                    r < x
+                };
+                pack(r >> top, r == 0, carry, (!(x ^ y) & (x ^ r)) >> top)
             }
-            3 => {
-                flags.add_sub(self.x, self.y, false, 32, true);
-            }
-            4 => {
-                flags.add_sub(self.x, self.y, false, 64, true);
-            }
-            5 => flags.logical_flags(self.x, 32),
-            _ => flags.logical_flags(self.x, 64),
+            _ => pack(x >> top, x == 0, false, 0),
         }
-        flags.nzcv
     }
 
     #[inline(always)]

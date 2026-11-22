@@ -1700,6 +1700,11 @@ fn kernel_code(out: &mut String) {
     let entries: Vec<u64> = kernels::KERNEL_ENTRIES
         .iter()
         .map(|(_, offset)| kernels::KERNEL_BASE + offset)
+        .chain(
+            kernels::VIRTUAL_TARGETS
+                .iter()
+                .map(|offset| kernels::KERNEL_BASE + offset),
+        )
         .collect();
     let translation = discover_with_tables(
         std::slice::from_ref(&image),

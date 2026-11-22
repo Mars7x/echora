@@ -148,6 +148,58 @@ pub fn install_windows(shift: u32, windows: &[(u64, WindowFn)]) {
     });
 }
 
+/// Lifted functions by entry, for indirect calls (`Core::call_indirect`):
+/// the entries ascending, and the function of each.
+struct FunctionEntries {
+    entries: &'static [u64],
+    functions: &'static [WindowFn],
+}
+
+static FUNCTION_ENTRIES: std::sync::OnceLock<FunctionEntries> = std::sync::OnceLock::new();
+
+/// Install the lifted functions indirect calls reach directly: `entries`
+/// ascending, `functions[i]` the function entered at `entries[i]`. Later
+/// calls are ignored.
+pub fn install_function_entries(entries: &'static [u64], functions: &'static [WindowFn]) {
+    assert_eq!(entries.len(), functions.len(), "one function per entry");
+    debug_assert!(entries.is_sorted(), "entries ascending");
+    let _ = FUNCTION_ENTRIES.set(FunctionEntries { entries, functions });
+}
+
+/// A call site's last two targets (`Core::call_indirect`), the latest
+/// first: each the guest PC in the low 40 bits and its lifted function's index plus one above, in one word
+/// so that threads sharing the site never see a PC with another's
+/// function (index part 0: the target has none; the whole word 0: empty,
+/// as no guest code runs at 0).
+pub struct CallCache([std::sync::atomic::AtomicU64; 2]);
+
+/// Guest PCs a call cache holds: below 2^40.
+const CACHE_PC_BITS: u32 = 40;
+
+impl CallCache {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        Self([
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ])
+    }
+}
+
+impl Default for CallCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The lifted function entered at `pc`, by index, if any.
+#[cold]
+#[inline(never)]
+fn function_entry(pc: u64) -> Option<usize> {
+    let table = FUNCTION_ENTRIES.get()?;
+    table.entries.binary_search(&pc).ok()
+}
+
 /// Nesting limit of `Core::call` (host stack frames per guest call).
 const MAX_CALL_DEPTH: u32 = 48;
 
@@ -289,6 +341,46 @@ impl Core {
         match result {
             Ok(()) if self.cpu.pc != return_to => self.continue_call(return_to),
             other => other,
+        }
+    }
+
+    /// A BLR that just set the PC to its target and the link register to
+    /// `return_to`: as `call`, but a target that is a lifted function's
+    /// entry runs that function (`call_window`), found through the call
+    /// site's `cache` (its last two targets) or else by a search of the
+    /// installed entries.
+    #[inline]
+    pub fn call_indirect(&mut self, return_to: u64, cache: &CallCache) -> Result<(), Trap> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let pc = self.cpu.pc;
+        let mask = (1u64 << CACHE_PC_BITS) - 1;
+        let mut word = cache.0[0].load(Relaxed);
+        if word & mask != pc || pc > mask {
+            let second = cache.0[1].load(Relaxed);
+            if second & mask == pc && pc <= mask {
+                word = second;
+            } else {
+                word = 0;
+                if pc <= mask {
+                    // A target without a function is remembered too
+                    // (index 0).
+                    word = pc;
+                    if let Some(index) = function_entry(pc)
+                        && (index as u64) < (1 << (64 - CACHE_PC_BITS)) - 1
+                    {
+                        word |= (index as u64 + 1) << CACHE_PC_BITS;
+                    }
+                    let first = cache.0[0].load(Relaxed);
+                    cache.0[1].store(first, Relaxed);
+                    cache.0[0].store(word, Relaxed);
+                }
+            }
+        }
+        match (word >> CACHE_PC_BITS).checked_sub(1) {
+            Some(index) if let Some(table) = FUNCTION_ENTRIES.get() => {
+                self.call_window(return_to, table.functions[index as usize])
+            }
+            _ => self.call(return_to),
         }
     }
 

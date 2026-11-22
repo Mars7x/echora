@@ -40,11 +40,19 @@ is the game set plus `window-calls`, regalloc the game set plus
 | gamecalls | 14.73 (6.1) | 12.27 | 8.30 | 5.92 | 4.95 | 4.55 (0) |
 | calls2 | 23.46 (46.2) | 17.61 | 11.08 | 9.62 | 7.39 | 1.62 (0) |
 | crossing | 10.95 (10.2) | 3.21 | 3.21 | 3.51 | 3.28 | 3.21 (0) |
-| calls | 44.78 (65.0) | | 29.67 | 11.88 | 9.79 | 6.02 (0) |
+| calls | 19.11 (33.3) | | | | | 1.34 (0) |
+| vcalls | 13.87 (3.3) | | | | | 11.27 (10.0) |
 | arith | 5.28 | 5.28 | | 3.29 | 3.29 | 3.14 |
 | ldst | 5.20 | 5.20 | | 5.09 | | 5.09 |
 | memset | 8.33 | 8.33 | | 8.41 | | 8.41 |
 | switch | 7.18 (27.3) | | | | | 2.73 (9.1) |
+
+(`calls` was measured with a substring filter before, which also ran
+calls2 and gamecalls; the benchmark now takes `=NAME` for one kernel, and
+the row shows the kernel alone. `vcalls`, new: an update loop calling
+one of two small functions per object through a table of function
+pointers; BLR in a structured function goes through
+`Core::call_indirect`, below.)
 
 Kernel machine code (`kernel_code::*` symbols): base 86,363 bytes,
 functions 103,776, regalloc 162,985 (windows 95,732 of it, structured
@@ -153,6 +161,18 @@ into the caller's graph under their own keys, the BL sets X30 and goes
 to the copy, and the callee's return goes on in the caller when the
 target is the return address (any other target leaves, as the RET would).
 Counts, traps and tests are those of the copied blocks.
+
+### Indirect calls
+
+A BLR in a structured function calls `Core::call_indirect` with a static
+two-entry cache for its site: each entry the target PC and the index of
+its lifted function (or none) in one word, so threads sharing the site
+never pair a PC with another target's function. A hit runs the function
+as a direct call would (`Core::call_window`); a miss searches the
+entries the root installed (`install_function_entries`, with regalloc
+and the function table) and replaces the older entry; a target with no
+function continues through the window table as before. The caller stores
+and reloads every local it holds around it (the callee is unknown).
 
 ### Entering at loop heads and from windows
 
