@@ -5587,7 +5587,7 @@ struct Copying {
 
 /// Lines of copied successors one arm may hold
 /// (`EmitOptions::threaded_successors`).
-pub const THREADED_LINE_BUDGET: usize = 96;
+pub const THREADED_LINE_BUDGET: usize = 24;
 
 /// `start`'s body with each successor that is inlined here written out in
 /// place of its `next_pc` assignment. An inlined block stores its PC first:
