@@ -806,6 +806,7 @@ fn lift(
                 "window-calls" => options.window_calls = true,
                 "window-call-early-exits" => options.window_call_early_exits = true,
                 "window-calls-audit" => options.window_calls_audit = true,
+                "long-windows" => options.long_windows = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
@@ -853,6 +854,25 @@ fn lift(
             extra.as_deref().unwrap_or("")
         );
     }
+    // The blocks each window runs, as the emission decides (long windows
+    // also run blocks of other windows).
+    let windows = echora_lift::codegen::window_blocks(&d.translation, region_bits, &|region| {
+        echora_lift::codegen::long_windows_on(if listed_regions.contains(&region) {
+            &listed_options
+        } else {
+            &options
+        })
+    });
+    if echora_lift::codegen::long_windows_on(&options)
+        || echora_lift::codegen::long_windows_on(&listed_options)
+    {
+        let (extended, blocks, instructions) =
+            echora_lift::codegen::window_extension_report(&d.translation, &windows);
+        println!(
+            "long windows: {extended} windows also run {blocks} blocks ({instructions} instructions, {:.1}% of the translation) of other windows",
+            100.0 * instructions as f64 / d.translation.instructions.len().max(1) as f64
+        );
+    }
     if echora_lift::codegen::window_calls_on(&options)
         || echora_lift::codegen::window_calls_on(&listed_options)
     {
@@ -867,7 +887,12 @@ fn lift(
             echora_lift::codegen::window_calls_on(options)
                 .then_some(options.window_call_early_exits)
         };
-        let calls = echora_lift::codegen::window_call_report(&d.translation, region_bits, &active);
+        let calls = echora_lift::codegen::window_call_report(
+            &d.translation,
+            region_bits,
+            &active,
+            &windows,
+        );
         println!(
             "window calls: {} BL targets with summaries in {} windows ({} of them leaving early; {} more would with window-call-early-exits); {} of {} BL sites call them ({} in the caller's region)",
             calls.targets,

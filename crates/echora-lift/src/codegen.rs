@@ -4449,19 +4449,28 @@ pub fn window_call_summaries(
     translation: &Translation,
     active: &dyn Fn(u64) -> Option<bool>,
 ) -> BTreeMap<u64, (Dirty, Dirty)> {
+    let windows = window_blocks(translation, SPLIT_WINDOW_BITS, &|_| false);
+    window_call_summaries_in(translation, active, &windows)
+}
+
+/// [`window_call_summaries`] where each window runs the blocks `windows`
+/// gives it (`window_blocks`, with long windows: also blocks of other
+/// windows, which then count as inside it).
+pub fn window_call_summaries_in(
+    translation: &Translation,
+    active: &dyn Fn(u64) -> Option<bool>,
+    window_blocks: &BTreeMap<u64, Vec<u64>>,
+) -> BTreeMap<u64, (Dirty, Dirty)> {
     use Instruction::*;
     let by_start: BTreeMap<u64, &BasicBlock> = translation
         .blocks
         .iter()
         .map(|block| (block.start, block))
         .collect();
-    let mut window_blocks: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for block in &translation.blocks {
-        window_blocks
-            .entry(block.start >> SPLIT_WINDOW_BITS)
-            .or_default()
-            .push(block.start);
-    }
+    let members: BTreeMap<u64, BTreeSet<u64>> = window_blocks
+        .iter()
+        .map(|(window, starts)| (*window, starts.iter().copied().collect()))
+        .collect();
     let inlined = inlined_blocks(translation);
     let stubs = plt_stubs(translation);
     let traced = traced_pcs();
@@ -4489,7 +4498,7 @@ pub fn window_call_summaries(
     let mut own: BTreeMap<u64, OwnEffects> = BTreeMap::new();
     for &entry in &targets {
         let window = entry >> SPLIT_WINDOW_BITS;
-        let in_window = |pc: u64| pc >> SPLIT_WINDOW_BITS == window && by_start.contains_key(&pc);
+        let in_window = |pc: u64| members[&window].contains(&pc);
         let (mut touched, mut writes, mut calls): (Dirty, Dirty, Vec<u64>) = (0, 0, Vec::new());
         let mut seen = BTreeSet::from([entry]);
         let mut pending = vec![entry];
@@ -4676,10 +4685,11 @@ pub fn window_call_report(
     translation: &Translation,
     region_bits: u32,
     active: &dyn Fn(u64) -> Option<bool>,
+    windows: &BTreeMap<u64, Vec<u64>>,
 ) -> WindowCallReport {
-    let summaries = window_call_summaries(translation, active);
-    let strict = window_call_summaries(translation, &|pc| active(pc).map(|_| false));
-    let early = window_call_summaries(translation, &|pc| active(pc).map(|_| true));
+    let summaries = window_call_summaries_in(translation, active, windows);
+    let strict = window_call_summaries_in(translation, &|pc| active(pc).map(|_| false), windows);
+    let early = window_call_summaries_in(translation, &|pc| active(pc).map(|_| true), windows);
     let mut report = WindowCallReport {
         targets: summaries.len(),
         early_exit_targets: summaries.keys().filter(|t| !strict.contains_key(t)).count(),
@@ -5669,6 +5679,15 @@ pub struct EmitOptions {
     /// what it may write changed, then puts the caller's values back. Not
     /// for speed.
     pub window_calls_audit: bool,
+    /// Split windows (not structured, nor with lifted functions or
+    /// deferred charges) also run, as arms of their own `match`, copies
+    /// of the blocks their code reaches past the 1 KiB window
+    /// (`window_blocks`): a function or loop crossing a window edge stays
+    /// in one window function and its locals in host registers, instead
+    /// of leaving and entering the next window. Every block keeps its arm
+    /// in its own window, which the dispatcher, `Core::call` and resuming
+    /// after traps and boundaries use as before.
+    pub long_windows: bool,
 }
 
 thread_local! {
@@ -6351,6 +6370,142 @@ pub fn window_calls_on(options: &EmitOptions) -> bool {
     options.window_calls && !options.structured && !options.functions
 }
 
+/// Whether a region with `options` emits long windows
+/// (`EmitOptions::long_windows`: split windows, not structured ones, nor
+/// with lifted functions or deferred charges).
+pub fn long_windows_on(options: &EmitOptions) -> bool {
+    options.long_windows && !options.structured && !options.functions && !options.deferred_charges
+}
+
+/// Guest instructions a long window (`EmitOptions::long_windows`) may hold
+/// beyond its own 1 KiB, as copies of other windows' blocks: one window's
+/// worth, which bounds the extra code each window function compiles.
+pub const WINDOW_EXTENSION_LIMIT: usize = 256;
+
+/// Block starts by split window (`window_blocks`).
+pub type WindowBlocks = BTreeMap<u64, Vec<u64>>;
+
+/// The blocks each split window's `match` has arms for, by window, in
+/// address order: its own blocks and, where `extend` says so for the
+/// window's region (`EmitOptions::long_windows`), the blocks of the same
+/// region its code reaches outside the window (`window_extension`).
+pub fn window_blocks(
+    translation: &Translation,
+    region_bits: u32,
+    extend: &dyn Fn(u64) -> bool,
+) -> BTreeMap<u64, Vec<u64>> {
+    let mut windows: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for block in &translation.blocks {
+        windows
+            .entry(block.start >> SPLIT_WINDOW_BITS)
+            .or_default()
+            .push(block.start);
+    }
+    if !windows
+        .keys()
+        .any(|window| extend(window >> (region_bits - SPLIT_WINDOW_BITS)))
+    {
+        return windows;
+    }
+    let by_start: BTreeMap<u64, &BasicBlock> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block))
+        .collect();
+    let inlined = inlined_blocks(translation);
+    let stubs = plt_stubs(translation);
+    for (window, starts) in &mut windows {
+        if extend(*window >> (region_bits - SPLIT_WINDOW_BITS)) {
+            let extra = window_extension(&by_start, &inlined, &stubs, starts, region_bits);
+            starts.extend(extra);
+            starts.sort_unstable();
+        }
+    }
+    windows
+}
+
+/// Of `windows` (`window_blocks`): the windows holding blocks of other
+/// windows, those blocks and their instructions.
+pub fn window_extension_report(
+    translation: &Translation,
+    windows: &BTreeMap<u64, Vec<u64>>,
+) -> (usize, usize, usize) {
+    let sizes: BTreeMap<u64, usize> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block.instructions.len()))
+        .collect();
+    let (mut extended, mut blocks, mut instructions) = (0, 0, 0);
+    for (window, starts) in windows {
+        let outside: Vec<&u64> = starts
+            .iter()
+            .filter(|start| *start >> SPLIT_WINDOW_BITS != *window)
+            .collect();
+        extended += usize::from(!outside.is_empty());
+        blocks += outside.len();
+        instructions += outside.iter().map(|start| sizes[start]).sum::<usize>();
+    }
+    (extended, blocks, instructions)
+}
+
+/// The blocks outside a window (its blocks `own`) its code reaches through
+/// branches, both sides of conditional ones, fallthroughs and call return
+/// points, breadth first: in the same region, no PLT stub, each with the
+/// blocks inlined into it (they have no arm of their own), while the total
+/// stays within `WINDOW_EXTENSION_LIMIT` instructions. A block that does
+/// not fit is left out (reaching it leaves the window, as before).
+fn window_extension(
+    by_start: &BTreeMap<u64, &BasicBlock>,
+    inlined: &BTreeSet<u64>,
+    stubs: &BTreeMap<u64, PltStub>,
+    own: &[u64],
+    region_bits: u32,
+) -> Vec<u64> {
+    let window = own[0] >> SPLIT_WINDOW_BITS;
+    let region = own[0] >> region_bits;
+    let mut members: BTreeSet<u64> = own.iter().copied().collect();
+    let mut queue: VecDeque<u64> = VecDeque::new();
+    let successors = |start: u64| crate::structure::block_successors(by_start[&start]).0;
+    for &start in own {
+        queue.extend(successors(start));
+    }
+    let (mut extra, mut size) = (Vec::new(), 0);
+    while let Some(start) = queue.pop_front() {
+        if members.contains(&start)
+            || start >> SPLIT_WINDOW_BITS == window
+            || start >> region_bits != region
+            || !by_start.contains_key(&start)
+            || inlined.contains(&start)
+            || stubs.contains_key(&start)
+        {
+            continue;
+        }
+        // The block and those inlined into it, which its arm runs.
+        let mut group = vec![start];
+        let mut index = 0;
+        while let Some(&block) = group.get(index) {
+            index += 1;
+            for next in successors(block) {
+                if inlined.contains(&next) && by_start.contains_key(&next) && !group.contains(&next)
+                {
+                    group.push(next);
+                }
+            }
+        }
+        let instructions: usize = group.iter().map(|b| by_start[b].instructions.len()).sum();
+        if size + instructions > WINDOW_EXTENSION_LIMIT {
+            continue;
+        }
+        size += instructions;
+        for &block in &group {
+            members.insert(block);
+            extra.push(block);
+            queue.extend(successors(block));
+        }
+    }
+    extra
+}
+
 /// Read-only results shared by the region emitters. A worker's region
 /// options stay in thread-local storage, independent of other regions.
 struct EmissionAnalyses {
@@ -6549,14 +6704,41 @@ pub fn emit_rust_split_to_regions<E>(
         }
         Arc::new(summaries)
     });
+    // Long windows: each window's blocks with those it runs from other
+    // windows.
+    let long_windows: Option<(WindowBlocks, BTreeMap<u64, &BasicBlock>)> = used(long_windows_on)
+        .then(|| {
+            (
+                window_blocks(translation, region_bits, &|region| {
+                    long_windows_on(&options_of(region))
+                }),
+                translation
+                    .blocks
+                    .iter()
+                    .map(|block| (block.start, block))
+                    .collect(),
+            )
+        });
     // Window calls: the summaries of the targets in regions emitting them,
     // and the windows they enter by index in the window-call table.
     let window_calls: Option<(SummaryMap, Arc<BTreeMap<u64, usize>>)> =
         used(window_calls_on).then(|| {
-            let summaries = window_call_summaries(translation, &|pc| {
-                let options = options_of(pc >> region_bits);
-                window_calls_on(&options).then_some(options.window_call_early_exits)
-            });
+            let plain;
+            let windows = match &long_windows {
+                Some((windows, _)) => windows,
+                None => {
+                    plain = window_blocks(translation, region_bits, &|_| false);
+                    &plain
+                }
+            };
+            let summaries = window_call_summaries_in(
+                translation,
+                &|pc| {
+                    let options = options_of(pc >> region_bits);
+                    window_calls_on(&options).then_some(options.window_call_early_exits)
+                },
+                windows,
+            );
             let windows: BTreeSet<u64> = summaries
                 .keys()
                 .map(|target| target >> SPLIT_WINDOW_BITS)
@@ -6607,6 +6789,19 @@ pub fn emit_rust_split_to_regions<E>(
         let mut source = header_of(options);
         for (window, blocks) in region_windows {
             let output = &mut source;
+            let extended: Vec<BasicBlock>;
+            let blocks: &[BasicBlock] = match long_windows
+                .as_ref()
+                .filter(|_| long_windows_on(&options))
+                .and_then(|(windows, by_start)| Some((windows.get(window)?, by_start)))
+                .filter(|(starts, _)| starts.len() > blocks.len())
+            {
+                Some((starts, by_start)) => {
+                    extended = starts.iter().map(|start| by_start[start].clone()).collect();
+                    &extended
+                }
+                None => blocks,
+            };
             // A window lies within one page, and page permissions change only in
             // SVCs, which leave the window: one execute check on entry covers
             // every block run before it returns.
@@ -6646,11 +6841,17 @@ pub fn emit_rust_split_to_regions<E>(
                     let arm = line
                         .strip_prefix("            0x")
                         .and_then(|rest| rest.strip_suffix(" => {\n"))
-                        .and_then(|pc| u64::from_str_radix(pc, 16).ok())
-                        .filter(|pc| *pc >> SPLIT_WINDOW_BITS == *window);
+                        .and_then(|pc| u64::from_str_radix(pc, 16).ok());
                     match arm {
                         Some(pc) => {
-                            writeln!(indexed, "            {} => {{", (pc - base) >> 2).unwrap();
+                            // Long windows' arms outside the window too
+                            // (in decimal: `arm_label` reads only PCs).
+                            writeln!(
+                                indexed,
+                                "            {} => {{",
+                                pc.wrapping_sub(base).rotate_right(2)
+                            )
+                            .unwrap();
                         }
                         None => indexed.push_str(line),
                     }
@@ -8716,6 +8917,151 @@ mod tests {
         0x9400_0000 | ((to.wrapping_sub(from) as i64 / 4) as u32 & 0x03ff_ffff)
     }
 
+    /// B.cond (`cond`) from `from` to `to` (byte addresses).
+    fn b_cond(from: u64, to: u64, cond: u32) -> u32 {
+        0x5400_0000 | (((to.wrapping_sub(from) as i64 / 4) as u32 & 0x7_ffff) << 5) | cond
+    }
+
+    /// A function called from window 0x4 (0x1000) whose loop crosses into
+    /// window 0x5 (0x1400): head in 0x4, latch in 0x5.
+    fn crossing_function() -> (Translation, impl Fn(u64) -> u64) {
+        let at = |index: u64| 0x1000 + 4 * index;
+        let mut words = vec![0u32; 262];
+        words[0] = bl(at(0), at(252));
+        words[1] = 0xd400_00e1; // svc #7
+        words[252] = 0x9100_0421; // add x1, x1, #1
+        words[253] = 0xd503_201f; // nop
+        words[254] = 0x9100_0463; // loop: add x3, x3, #1
+        words[255] = 0xd503_201f; // nop (the window's last word)
+        words[256] = 0x9100_0484; // add x4, x4, #1 (window 0x5)
+        words[257] = 0xf100_0442; // subs x2, x2, #1
+        words[258] = b_cond(at(258), at(254), 1); // b.ne loop
+        words[259] = 0xd65f_03c0; // ret
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        (translation, at)
+    }
+
+    #[test]
+    fn long_windows_hold_the_blocks_their_code_reaches_in_other_windows() {
+        let (translation, at) = crossing_function();
+        let plain = window_blocks(&translation, 16, &|_| false);
+        assert!(
+            plain
+                .iter()
+                .all(|(window, starts)| starts.iter().all(|s| s >> 10 == *window))
+        );
+        let long = window_blocks(&translation, 16, &|_| true);
+        // 0x4 runs the latch in 0x5, 0x5 the loop head in 0x4.
+        assert!(long[&4].contains(&at(256)), "{long:x?}");
+        assert!(long[&5].contains(&at(254)), "{long:x?}");
+        assert!(!long[&5].contains(&at(0)), "a caller is not reached");
+        // Not across regions (10 bits: one window per region).
+        assert_eq!(window_blocks(&translation, 10, &|_| true), plain);
+        let (extended, blocks, instructions) = window_extension_report(&translation, &long);
+        assert_eq!(extended, 2);
+        assert!(blocks >= 2 && instructions >= 4, "{blocks} {instructions}");
+
+        let options = EmitOptions {
+            long_windows: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        let window = |w: &str| {
+            let start = source.find(&format!("pub fn run_window_{w}(")).unwrap();
+            let end = source[start + 1..]
+                .find("pub fn run_window_")
+                .map_or(source.len(), |e| start + 1 + e);
+            source[start..end].to_owned()
+        };
+        assert!(window("4").contains(&format!("{:#x} => {{", at(256))));
+        assert!(window("5").contains(&format!("{:#x} => {{", at(254))));
+        let (_, regions) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        let source = &regions[0].1;
+        let start = source.find("pub fn run_window_5(").unwrap();
+        assert!(!source[start..].contains(&format!("{:#x} => {{", at(254))));
+        // Dense dispatch indexes the outside arms from the window's base.
+        let (_, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                dense_dispatch: true,
+                ..options
+            },
+        );
+        let index = at(254).wrapping_sub(0x1400).rotate_right(2);
+        assert!(regions[0].1.contains(&format!("\n{index} => {{")));
+        // Not with structured emission, lifted functions or deferred charges.
+        for options in [
+            EmitOptions {
+                structured: true,
+                ..options
+            },
+            EmitOptions {
+                functions: true,
+                ..options
+            },
+            EmitOptions {
+                deferred_charges: true,
+                split_ticks: true,
+                ..options
+            },
+        ] {
+            assert!(!long_windows_on(&options));
+        }
+    }
+
+    #[test]
+    fn long_windows_stop_at_the_extension_limit() {
+        // A straight run over three windows from 0x1000's last words: each
+        // window may take at most WINDOW_EXTENSION_LIMIT instructions more.
+        let at = |index: u64| 0x1000 + 4 * index;
+        let mut words = vec![0x9100_0421u32; 256 * 3 + 2];
+        words[0] = bl(at(0), at(200));
+        words[1] = 0xd400_00e1;
+        *words.last_mut().unwrap() = 0xd65f_03c0;
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        let long = window_blocks(&translation, 16, &|_| true);
+        let sizes: BTreeMap<u64, usize> = translation
+            .blocks
+            .iter()
+            .map(|block| (block.start, block.instructions.len()))
+            .collect();
+        for (window, starts) in &long {
+            let outside: usize = starts
+                .iter()
+                .filter(|start| *start >> 10 != *window)
+                .map(|start| sizes[start])
+                .sum();
+            assert!(outside <= WINDOW_EXTENSION_LIMIT, "{window:#x}: {outside}");
+        }
+        // 0x4 takes all of 0x5 (256 instructions) and nothing of 0x6.
+        assert!(long[&4].contains(&0x1400));
+        assert!(!long[&4].iter().any(|start| start >> 10 == 6));
+    }
+
+    #[test]
+    fn long_windows_summarize_calls_whose_function_crosses_a_window() {
+        let (translation, at) = crossing_function();
+        let active = |_: u64| Some(false);
+        // Without long windows the callee leaves its window early: no
+        // summary without early exits.
+        assert!(!window_call_summaries(&translation, &active).contains_key(&at(252)));
+        let long = window_blocks(&translation, 16, &|_| true);
+        let summaries = window_call_summaries_in(&translation, &active, &long);
+        let x = |n: u32| 1u64 << n;
+        let (touched, writes) = summaries[&at(252)];
+        assert_eq!(writes, x(1) | x(2) | x(3) | x(4) | DIRTY_NZCV);
+        assert_eq!(touched, writes | x(30));
+        let options = EmitOptions {
+            long_windows: true,
+            window_calls: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        assert!(regions[0].1.contains("let called = enter_window_4(m);"));
+    }
+
     #[test]
     fn window_call_summaries_cover_callees_and_refuse_blr_svc_and_cycles() {
         let at = |index: u64| 0x1000 + 4 * index;
@@ -8886,9 +9232,10 @@ mod tests {
         assert_eq!(touched, x(1) | x(2) | x(3) | x(30));
         // The BR may leave the window: only with early exits allowed.
         assert!(window_call_summaries(&translation, &|_| Some(false)).is_empty());
-        let report = window_call_report(&translation, 16, &|_| Some(false));
+        let plain_windows = window_blocks(&translation, 16, &|_| false);
+        let report = window_call_report(&translation, 16, &|_| Some(false), &plain_windows);
         assert_eq!((report.targets, report.early_exit_only_targets), (0, 1));
-        let report = window_call_report(&translation, 16, &|_| Some(true));
+        let report = window_call_report(&translation, 16, &|_| Some(true), &plain_windows);
         assert_eq!((report.targets, report.early_exit_targets), (1, 1));
     }
 
