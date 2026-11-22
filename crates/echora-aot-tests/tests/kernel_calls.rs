@@ -142,7 +142,7 @@ fn call_kernels_match_the_reference() {
     for &(name, offset) in KERNEL_ENTRIES {
         let iterations = match name {
             "calls" | "calls2" => 300,
-            "gamecalls" | "crossing" | "gamefn" => 200,
+            "gamecalls" | "crossing" | "gamefn" | "vcalls" => 200,
             _ => continue,
         };
         for _ in 0..3 {
@@ -174,5 +174,5 @@ fn call_kernels_match_the_reference() {
             assert!(steps > iterations, "{name}");
         }
     }
-    assert_eq!(runs, 5 * 3 * 3);
+    assert_eq!(runs, 6 * 3 * 3);
 }

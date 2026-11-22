@@ -757,6 +757,37 @@ fn exit_stores(
     output
 }
 
+/// A call's result returned as it is on its error path (`if
+/// called.is_err() { .. return called; }`) instead of moved into a new
+/// `Err`: the host compiler then keeps the `Result` where the callee wrote
+/// it instead of copying it around every call.
+fn returned_results(text: &str) -> String {
+    const HEAD: &str = "if let Err(trap) = called { ";
+    const TAIL: &str = "return Err(trap); }";
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(HEAD) {
+        let after = &rest[at + HEAD.len()..];
+        let Some(end) = after.find(TAIL) else {
+            break;
+        };
+        let stores = &after[..end];
+        output.push_str(&rest[..at]);
+        if stores.contains('}') || stores.contains('{') {
+            // Not a plain error path: unchanged.
+            output.push_str(HEAD);
+            rest = after;
+            continue;
+        }
+        output.push_str("if called.is_err() { ");
+        output.push_str(stores);
+        output.push_str("return called; }");
+        rest = &after[end + TAIL.len()..];
+    }
+    output.push_str(rest);
+    output
+}
+
 /// The NZCV local as a `cpu::LazyFlags` instead of a `cpu::Flags`: its writes `set(..)`, its
 /// reads `nzcv()`, the flag operations by the same names.
 fn lazy_flags(text: &str) -> String {
@@ -915,7 +946,7 @@ fn emit_tree(
             .replace("m.memory.load_u", "wmem.load_u")
             .replace("m.memory.store_u", "wmem.store_u");
     }
-    let body = lazy_flags(&body);
+    let body = lazy_flags(&returned_results(&body));
     writeln!(
         output,
         "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unreachable_code, unused_labels)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{"

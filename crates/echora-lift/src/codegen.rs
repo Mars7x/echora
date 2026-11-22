@@ -1629,6 +1629,7 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call(", "m.call("),
     ("if let Err(trap) = m.call_window(", "m.call_window("),
     ("if let Err(trap) = run_entry(", "run_entry("),
+    ("if let Err(trap) = m.call_indirect(", "m.call_indirect("),
 ];
 
 /// With `EmitOptions::regalloc`: a window arm runs its block's structured
@@ -2725,7 +2726,20 @@ fn emit_instruction_body(
             }
             if *link {
                 output.push_str("                m.cpu.pc = target;\n");
-                emit_call(output, next);
+                if REGALLOC_BODY.get()
+                    && FUNCTIONS
+                        .with_borrow(|functions| functions.as_ref().is_some_and(|set| set.table))
+                {
+                    // A target that is a lifted function's entry runs it
+                    // directly, found through the site's cache.
+                    writeln!(
+                        output,
+                        "                static CALL_SITE_{pc:x}: echora_guest::CallCache = echora_guest::CallCache::new();\n                if let Err(trap) = m.call_indirect({next:#x}, &CALL_SITE_{pc:x}) {{ return Err(trap); }}"
+                    )
+                    .unwrap();
+                } else {
+                    emit_call(output, next);
+                }
                 output.push_str(after_call);
             } else {
                 writeln!(output, "                {successor} = target;").unwrap();
@@ -7606,6 +7620,18 @@ pub fn emit_rust_split_to_regions<E>(
         }
         root.push_str("];\n");
         let mut installs = String::new();
+        if used(|o| o.functions && o.function_table && o.regalloc) {
+            // Indirect calls from structured functions enter functions by
+            // entry (`Core::call_indirect`).
+            root.push_str("\nstatic FUNCTION_ENTRIES: &[u64] = &[\n");
+            for &entry in lifted.keys() {
+                writeln!(root, "    {entry:#x},").unwrap();
+            }
+            root.push_str("];\n");
+            installs.push_str(
+                "    echora_guest::install_function_entries(FUNCTION_ENTRIES, FUNCTION_TABLE);\n",
+            );
+        }
         for region in regions_seen.iter().filter(|region| {
             let options = options_of(**region);
             options.functions && options.function_table

@@ -52,10 +52,15 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("gamecalls", 0x4c00),
     ("crossing", 0x5800),
     ("gamefn", 0x6400),
+    ("vcalls", 0x6c00),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x6c00;
+pub const KERNEL_SIZE: u64 = 0x7400;
+
+/// The functions `vcalls` calls through its table of function pointers
+/// (their own window): entries for discovery, which cannot see them.
+pub const VIRTUAL_TARGETS: [u64; 2] = [0x7000, 0x7040];
 
 /// The windows of `gamecalls`' functions (after its own).
 pub const GAMECALLS_FUNCTIONS: [u64; 2] = [0x5000, 0x5400];
@@ -816,6 +821,65 @@ fn assemble() -> Assembler {
         ; ldp x29, x30, [sp], 48
         ; ret
     );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Virtual calls as game code makes them: an update loop over 64
+        // objects calls, per object, one of two functions through a table
+        // of function pointers (BLR), alternating. x0 = iterations, x1 =
+        // the objects; SP a stack.
+        ; ->vcalls:
+        ; stp x29, x30, [sp, -16]!
+        ; stp x19, x20, [sp, -16]!
+        ; stp x21, x22, [sp, -16]!
+        ; mov x19, x0
+        ; mov x20, x1
+        ; mov x21, 0
+        ; mov x22, 0
+        ; l1:
+        ; and x9, x21, 63
+        ; add x0, x20, x9, lsl 6
+        ; adr x10, ->vtable
+        ; and x11, x21, 1
+        ; ldr x16, [x10, x11, lsl 3]
+        ; blr x16
+        ; add x22, x22, x0
+        ; add x21, x21, 1
+        ; subs x19, x19, 1
+        ; b.ne <l1
+        ; ldp x21, x22, [sp], 16
+        ; ldp x19, x20, [sp], 16
+        ; ldp x29, x30, [sp], 16
+        ; svc 7
+        ; udf 0
+    );
+    align(&mut ops, 8);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->vtable:
+        ; .u64 KERNEL_BASE + VIRTUAL_TARGETS[0]
+        ; .u64 KERNEL_BASE + VIRTUAL_TARGETS[1]
+    );
+    pad_to(&mut ops, VIRTUAL_TARGETS[0] as usize);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->virtual_a:
+        ; ldr w1, [x0]
+        ; add w1, w1, 3
+        ; str w1, [x0]
+        ; eor x0, x1, x1, lsr 2
+        ; ret
+    );
+    pad_to(&mut ops, VIRTUAL_TARGETS[1] as usize);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->virtual_b:
+        ; ldr w1, [x0, 4]
+        ; eor w1, w1, w0
+        ; str w1, [x0, 4]
+        ; add x0, x1, 7
+        ; ret
+    );
     ops
 }
 
@@ -828,6 +892,7 @@ pub fn image() -> Vec<u8> {
     starts.extend(GAMECALLS_FUNCTIONS);
     starts.push(CROSSING_FUNCTION);
     starts.push(GAMEFN_FUNCTION);
+    starts.extend(VIRTUAL_TARGETS);
     starts.sort_unstable();
     let mut bytes = vec![0; KERNEL_SIZE as usize];
     for (index, &start) in starts.iter().enumerate() {
@@ -860,6 +925,8 @@ mod tests {
             ("game_clamp", GAMECALLS_FUNCTIONS[1]),
             ("cross_update", CROSSING_FUNCTION),
             ("game_object", GAMEFN_FUNCTION),
+            ("virtual_a", VIRTUAL_TARGETS[0]),
+            ("virtual_b", VIRTUAL_TARGETS[1]),
         ];
         for &(name, offset) in KERNEL_ENTRIES.iter().chain(&functions) {
             let label = ops.labels().resolve_static(&StaticLabel::global(name)).unwrap();
