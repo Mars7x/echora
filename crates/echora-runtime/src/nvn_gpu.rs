@@ -10584,6 +10584,28 @@ impl Nvn {
         }
     }
 
+    /// Resolve texture object `texture`, bound by `handle`, as a draw
+    /// samples it, and memoize the binding (`remember_binding`).
+    fn resolve_texture_binding(
+        &mut self,
+        core: &mut Guest,
+        handle: u64,
+        texture: u64,
+        switches: bool,
+    ) -> Result<(TextureSource, Sampler, shader::SampleType), String> {
+        let (source, storage) = self.resolve_sampled_texture(core, texture)?;
+        let source = self.through_view(source, handle);
+        if let Some(swizzle) = self.handle_swizzle(handle) {
+            if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
+                let note = format!("flow view swizzle {swizzle:?} on {texture:x}");
+                self.gpu_note(note);
+            }
+        }
+        let sampler = self.binding_sampler(handle, texture, &source);
+        let sample_type = self.remember_binding(handle, texture, source.clone(), sampler, storage);
+        Ok((source, sampler, sample_type))
+    }
+
     /// A draw's uniform buffer of `size` bytes at guest `guest`: read in
     /// place by the GPU (`uniform_in_place`: the buffer, offset and size),
     /// or (`None`) made current in guest memory to be copied when the draw
@@ -11137,47 +11159,31 @@ impl Nvn {
                         // Valid within a present (textures are revalidated
                         // once per present); registrations evict their ids.
                         self.refresh_binding_memo();
-                        let (source, sampler, sample_type) = if let Some(binding) =
-                            self.memoized_binding(handle)
-                        {
-                            memo_hits += 1;
-                            binding
-                        } else {
-                            self.gpu
-                                .as_mut()
-                                .unwrap()
-                                .stat("stat: texture binding memo misses", 1);
-                            let started = timing.then(std::time::Instant::now);
-                            let texture = self.handle_texture(handle).map_err(|error| {
-                                format!(
-                                    "{error} ({:?} stage {:016x}, binding {})",
-                                    stage.stage,
-                                    keys_for_note.get(index).copied().unwrap_or(0),
-                                    descriptor.binding
-                                )
-                            })?;
-                            let (source, storage) = self.resolve_sampled_texture(core, texture)?;
-                            if let Some(started) = started {
-                                texture_time += started.elapsed();
-                            }
-                            let source = self.through_view(source, handle);
-                            if let Some(swizzle) = self.handle_swizzle(handle) {
-                                if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
-                                    let note =
-                                        format!("flow view swizzle {swizzle:?} on {texture:x}");
-                                    self.gpu_note(note);
+                        let (source, sampler, sample_type) =
+                            if let Some(binding) = self.memoized_binding(handle) {
+                                memo_hits += 1;
+                                binding
+                            } else {
+                                self.gpu
+                                    .as_mut()
+                                    .unwrap()
+                                    .stat("stat: texture binding memo misses", 1);
+                                let started = timing.then(std::time::Instant::now);
+                                let texture = self.handle_texture(handle).map_err(|error| {
+                                    format!(
+                                        "{error} ({:?} stage {:016x}, binding {})",
+                                        stage.stage,
+                                        keys_for_note.get(index).copied().unwrap_or(0),
+                                        descriptor.binding
+                                    )
+                                })?;
+                                let resolved =
+                                    self.resolve_texture_binding(core, handle, texture, switches)?;
+                                if let Some(started) = started {
+                                    texture_time += started.elapsed();
                                 }
-                            }
-                            let sampler = self.binding_sampler(handle, texture, &source);
-                            let sample_type = self.remember_binding(
-                                handle,
-                                texture,
-                                source.clone(),
-                                sampler,
-                                storage,
-                            );
-                            (source, sampler, sample_type)
-                        };
+                                resolved
+                            };
                         if let Some(sampled) = typed_sampled_texture(descriptor, sample_type) {
                             sampled_textures[index].push(sampled);
                         }
