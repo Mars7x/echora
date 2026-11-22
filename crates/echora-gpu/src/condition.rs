@@ -121,6 +121,23 @@ fn create_pipeline(
 }
 
 impl Renderer {
+    /// How many word conditions have been compared (`condition_on_word`).
+    /// The outcome of the one made when this was `made` stays in its slot
+    /// until `SLOTS` later comparisons reuse it (`word_outcome_held`).
+    pub fn word_conditions_made(&self) -> u64 {
+        self.word_conditions
+            .as_ref()
+            .map_or(0, |conditions| conditions.next)
+    }
+
+    /// Whether the outcome of the word condition compared when
+    /// `word_conditions_made` was `made` (before it) is still in its slot.
+    pub fn word_outcome_held(&self, made: u64) -> bool {
+        self.word_conditions_made()
+            .checked_sub(made)
+            .is_some_and(|later| (1..=SLOTS).contains(&later))
+    }
+
     /// The word a render condition reads to hold while the 64-bit word at
     /// `word` (a buffer and offset GPU work writes) equals `other`
     /// (`render_when_equal`) or differs from it: compared on the GPU after
@@ -385,6 +402,14 @@ mod tests {
             };
             outcomes.push(outcome);
         }
+        // Each outcome stays in its slot until SLOTS later comparisons.
+        assert_eq!(renderer.word_conditions_made(), 6);
+        assert!((0..6).all(|made| renderer.word_outcome_held(made)));
+        assert!(!renderer.word_outcome_held(6));
+        renderer.word_conditions.as_mut().unwrap().next = super::SLOTS + 1;
+        assert!(!renderer.word_outcome_held(0));
+        assert!(renderer.word_outcome_held(1));
+        renderer.word_conditions.as_mut().unwrap().next = 6;
         renderer.flush().unwrap();
         renderer.wait_for(renderer.recorded_serial()).unwrap();
         let held = renderer.word_conditions.as_ref().unwrap();

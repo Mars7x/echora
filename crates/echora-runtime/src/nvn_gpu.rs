@@ -10104,6 +10104,23 @@ impl Nvn {
         mode: u64,
         address: u64,
     ) -> Result<bool, String> {
+        // Compared on the GPU when it was set (this queue's state again
+        // after another's, or after a replay): the outcome it had then, as
+        // the console evaluates a condition once, where it is set.
+        if let Some(outcome) = self.render.word_condition
+            && (outcome.mode, outcome.address) == (mode, address)
+        {
+            let backend = self.gpu.as_mut().unwrap();
+            if backend.renderer.word_outcome_held(outcome.made) {
+                backend
+                    .renderer
+                    .set_condition(Some((outcome.buffer, outcome.offset, false)));
+                backend.stat("stat: word conditions restored", 1);
+                return Ok(true);
+            }
+            backend.stat("stat: word conditions compared again: slot reused", 1);
+        }
+        self.render.word_condition = None;
         // Why a condition is left to the CPU, counted.
         let mut why = {
             let backend = self.gpu.as_ref().unwrap();
@@ -10150,6 +10167,13 @@ impl Nvn {
             && let Some(outcome) = self.gpu_word_condition(core, mode, address)?
         {
             let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            self.render.word_condition = Some(WordOutcome {
+                mode,
+                address,
+                buffer: outcome.0,
+                offset: outcome.1,
+                made: renderer.word_conditions_made() - 1,
+            });
             renderer.set_condition(Some((outcome.0, outcome.1, false)));
             return Ok(true);
         }
@@ -13125,6 +13149,19 @@ fn read_storage_into(core: &Guest, base: u64, mut bytes: &mut [u8]) {
 
 /// A texture storage's sample: its shape, and 256 evenly spaced 64-byte
 /// chunks of its `storage_size` bytes at `base` (see `guest_texture`).
+/// A render condition's counter words as compared on the GPU where it was
+/// set (`Nvn::gpu_word_condition`): its mode and counter address, the
+/// outcome word conditional rendering reads, and when it was compared
+/// (`Renderer::word_conditions_made`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WordOutcome {
+    mode: u64,
+    address: u64,
+    buffer: vk::Buffer,
+    offset: u64,
+    made: u64,
+}
+
 pub(super) fn texture_sample(
     core: &Guest,
     base: u64,

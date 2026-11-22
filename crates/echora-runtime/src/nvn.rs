@@ -960,6 +960,8 @@ pub struct RenderState {
     pub render_enable: Option<(u64, u64)>,
     /// The current queue's predicate is being evaluated by the GPU.
     gpu_render_condition: bool,
+    /// Where its counter words were compared on the GPU when it was set.
+    word_condition: Option<gpu::WordOutcome>,
     stencil_values: [StencilValues; 2],
     /// The SAMPLES_PASSED counter (NVNcounterType 1) since its last reset,
     /// with ECHORA_OCCLUSION_ASSUME_VISIBLE (debugging, an approximation):
@@ -5604,6 +5606,7 @@ impl Nvn {
                 // On the GPU when the counter is a measured report there;
                 // else (counters the CPU wrote) evaluated here.
                 self.render.render_enable = Some((mode, address));
+                self.render.word_condition = None;
                 self.restore_render_condition(core).map_err(|message| {
                     Trap::UnsupportedService {
                         pc: core.cpu.pc,
