@@ -5545,18 +5545,6 @@ fn split_conditional(body: &str) -> Option<(&str, &str, u64, u64)> {
     (!condition.contains('{')).then_some((&body[..split], condition, taken, other))
 }
 
-/// `start`'s body with each successor that is inlined here written out in
-/// place of its `next_pc` assignment. An inlined block stores its PC first:
-/// its first instruction relies on `m.cpu.pc` as an arm's does.
-fn expand_block(
-    output: &mut String,
-    bodies: &BTreeMap<u64, String>,
-    inlined: &BTreeSet<u64>,
-    start: u64,
-) {
-    expand_block_copying(output, bodies, inlined, start, &mut None);
-}
-
 /// With `EmitOptions::threaded_successors`: the blocks an arm's expansion
 /// is in (a successor among them is a loop's back edge and dispatches),
 /// and the lines of copied bodies it may still add.
@@ -5569,8 +5557,10 @@ struct Copying {
 /// (`EmitOptions::threaded_successors`).
 pub const THREADED_LINE_BUDGET: usize = 96;
 
-/// [`expand_block`], also copying successors that keep their own arms
-/// into the arm (`copying`): a constant successor of the window not on the
+/// `start`'s body with each successor that is inlined here written out in
+/// place of its `next_pc` assignment. An inlined block stores its PC first:
+/// its first instruction relies on `m.cpu.pc` as an arm's does. With
+/// `copying`, also successors that keep their own arms: a constant successor of the window not on the
 /// arm's chain runs in place, as an inlined block does (the same body: its
 /// PC stored, its charge, which may take a host boundary there, since
 /// execution can resume at its arm), instead of going back through the
