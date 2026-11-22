@@ -1728,9 +1728,19 @@ fn kernel_code(out: &mut String) {
     ));
     for (_, source) in &regions {
         for (function, counts) in echora_lift::census::census(source) {
+            // An entered window's body is its `enter_window_<w>`; its
+            // `run_window_<w>` only calls it.
+            if let Some(window) = function.strip_prefix("run_window_")
+                && source.contains(&format!("pub fn enter_window_{window}("))
+            {
+                continue;
+            }
             let label = named
                 .iter()
-                .find(|(window, _)| function == format!("run_window_{window:x}"))
+                .find(|(window, _)| {
+                    function == format!("run_window_{window:x}")
+                        || function == format!("enter_window_{window:x}")
+                })
                 .map_or(function.clone(), |(_, name)| (*name).to_owned());
             rows.push((label, counts));
         }

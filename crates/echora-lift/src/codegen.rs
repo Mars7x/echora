@@ -7117,11 +7117,14 @@ pub fn emit_rust_split_to_regions<E>(
                     .is_some_and(|(_, windows)| windows.contains_key(window));
             if entered {
                 // Summarized calls enter the window past the entry's
-                // diagnostics (`window_call_summaries`).
-                // Both entries hold the body inlined: neither pays a second
-                // call (a `Result<(), Trap>` returns through memory, so a
-                // wrapper could not jump to the other).
-                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    window_body_{window:x}(m)\n}}\n\n#[inline(never)]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    window_body_{window:x}(m)\n}}\n\n#[inline(always)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\nfn window_body_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
+                // diagnostics (`window_call_summaries`). The body is compiled
+                // once, in `enter_window_<w>`; the dispatcher's entry runs
+                // the diagnostics and calls it (one more call there: a
+                // `Result<(), Trap>` returns through memory, so it is no tail
+                // jump; inlining the body into both doubled every entered
+                // window's machine code, which the game, bound by
+                // instruction fetch, paid for).
+                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    enter_window_{window:x}(m)\n}}\n\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
             } else {
                 writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
