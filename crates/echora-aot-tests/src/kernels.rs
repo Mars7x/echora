@@ -12,6 +12,13 @@ type Assembler = VecAssembler<Aarch64Relocation>;
 /// NOP, which pads the code to an alignment.
 const NOP: u32 = 0xd503_201f;
 
+/// Pads with NOPs to the offset `to`.
+fn pad_to(ops: &mut Assembler, to: usize) {
+    while ops.offset().0 < to {
+        ops.push_u32(NOP);
+    }
+}
+
 /// Pads with NOPs to a multiple of `to` bytes.
 fn align(ops: &mut Assembler, to: usize) {
     while !ops.offset().0.is_multiple_of(to) {
@@ -43,13 +50,18 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("fpscalar", 0x4400),
     ("misc", 0x4800),
     ("gamecalls", 0x4c00),
+    ("crossing", 0x5800),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x5800;
+pub const KERNEL_SIZE: u64 = 0x6400;
 
 /// The windows of `gamecalls`' functions (after its own).
 pub const GAMECALLS_FUNCTIONS: [u64; 2] = [0x5000, 0x5400];
+
+/// Where `crossing`'s function starts: 24 instructions before a window
+/// edge, its loop running across it.
+pub const CROSSING_FUNCTION: u64 = 0x5fa0;
 
 /// Where the leaf functions `calls` branches to start.
 const LEAVES: u64 = 0x1000;
@@ -622,6 +634,80 @@ fn assemble() -> Assembler {
         ; eor x0, x0, x0, lsr 3
         ; ret
     );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // A function laid out across a window edge, as long functions are:
+        // an update loop over 64 objects calls, per object, a function
+        // whose first 24 instructions end one window and whose inner loop
+        // (four rounds) runs on into the next, with a forward branch over
+        // the edge after it. x0 = iterations, x1 = the objects; SP a stack.
+        ; ->crossing:
+        ; stp x29, x30, [sp, -16]!
+        ; stp x19, x20, [sp, -16]!
+        ; stp x21, x22, [sp, -16]!
+        ; mov x19, x0
+        ; mov x20, x1
+        ; mov x21, 0
+        ; mov x22, 0
+        ; l1:
+        ; and x9, x21, 63
+        ; add x0, x20, x9, lsl 6
+        ; bl ->cross_update
+        ; add x22, x22, x0
+        ; add x21, x21, 1
+        ; subs x19, x19, 1
+        ; b.ne <l1
+        ; ldp x21, x22, [sp], 16
+        ; ldp x19, x20, [sp], 16
+        ; ldp x29, x30, [sp], 16
+        ; svc 7
+        ; udf 0
+    );
+    pad_to(&mut ops, CROSSING_FUNCTION as usize);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ->cross_update:
+        ; ldr w1, [x0]
+        ; ldr w2, [x0, 4]
+        ; ldr w3, [x0, 8]
+        ; add w4, w1, w2
+        ; eor w5, w3, w1, lsr 3
+        ; mov w6, 4
+        ; round:
+        ; add w4, w4, w5
+        ; eor w5, w5, w4, lsl 1
+        ; ror w4, w4, 7
+        ; add w5, w5, w6
+        ; eor w7, w4, w5, lsr 2
+        ; add w8, w7, w3
+        ; sub w4, w4, w8, lsr 5
+        ; eor w5, w5, w7
+        ; add w7, w7, w2
+        ; ror w8, w8, 13
+        ; add w4, w4, w8
+        ; eor w5, w5, w8, lsl 3
+        ; add w7, w7, w4
+        ; eor w8, w8, w5
+        ; sub w5, w5, w7, lsr 4
+        ; add w4, w4, w7
+        ; eor w8, w8, w4, lsr 9
+        ; add w5, w5, w8
+        ; ror w7, w7, 3
+        ; eor w4, w4, w7
+        ; add w5, w5, w1
+        ; eor w4, w4, w2
+        ; subs w6, w6, 1
+        ; b.ne <round
+        ; cmp w4, w3
+        ; b.lo >small
+        ; sub w4, w4, w3
+        ; small:
+        ; str w4, [x0]
+        ; str w5, [x0, 4]
+        ; add w0, w4, w5
+        ; ret
+    );
     ops
 }
 
@@ -632,6 +718,7 @@ pub fn image() -> Vec<u8> {
     let mut starts: Vec<u64> = KERNEL_ENTRIES.iter().map(|&(_, offset)| offset).collect();
     starts.push(LEAVES);
     starts.extend(GAMECALLS_FUNCTIONS);
+    starts.push(CROSSING_FUNCTION);
     starts.sort_unstable();
     let mut bytes = vec![0; KERNEL_SIZE as usize];
     for (index, &start) in starts.iter().enumerate() {
@@ -662,6 +749,7 @@ mod tests {
             ("leaf_add", LEAVES),
             ("game_update", GAMECALLS_FUNCTIONS[0]),
             ("game_clamp", GAMECALLS_FUNCTIONS[1]),
+            ("cross_update", CROSSING_FUNCTION),
         ];
         for &(name, offset) in KERNEL_ENTRIES.iter().chain(&functions) {
             let label = ops.labels().resolve_static(&StaticLabel::global(name)).unwrap();

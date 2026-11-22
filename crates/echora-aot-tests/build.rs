@@ -66,13 +66,20 @@ fn options() -> EmitOptions {
         window_call_early_exits: std::env::var_os("CARGO_FEATURE_WINDOW_CALL_EARLY_EXITS")
             .is_some(),
         window_calls_audit: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS_AUDIT").is_some(),
+        long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
         stub_windows: false,
     }
 }
 
-/// Region size of split emission: one 1 KiB window per region.
+/// Region size of split emission: one 1 KiB window per region; with
+/// `long-windows` (outside the golden modes) 64 KiB regions, as the game's,
+/// so windows can hold blocks of their neighbours.
 fn region_bits() -> u32 {
-    10
+    if MODE.get().is_none() && std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some() {
+        16
+    } else {
+        10
+    }
 }
 
 /// The benchmark kernels' options: structured also with
@@ -1601,6 +1608,14 @@ fn kernel_code(out: &mut String) {
     named.push((
         (kernels::KERNEL_BASE + kernels::GAMECALLS_FUNCTIONS[1]) >> 10,
         "(gamecalls clamp, flags)",
+    ));
+    named.push((
+        (kernels::KERNEL_BASE + kernels::CROSSING_FUNCTION) >> 10,
+        "(crossing function head)",
+    ));
+    named.push((
+        ((kernels::KERNEL_BASE + kernels::CROSSING_FUNCTION) >> 10) + 1,
+        "(crossing function tail)",
     ));
     for (_, source) in &regions {
         for (function, counts) in echora_lift::census::census(source) {

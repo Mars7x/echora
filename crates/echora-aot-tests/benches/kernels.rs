@@ -102,6 +102,11 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             regs[1] = VECTOR_A;
             m.core.cpu.sp = DATA_BASE + DATA_SIZE;
         }
+        "crossing" => {
+            regs[0] = 500_000 * scale;
+            regs[1] = VECTOR_A;
+            m.core.cpu.sp = DATA_BASE + DATA_SIZE;
+        }
         "switch" => regs[0] = 5_000_000 * scale,
         "vector" => {
             regs[0] = 500 * scale;

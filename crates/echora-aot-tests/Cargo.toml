@@ -100,6 +100,9 @@ window-call-early-exits = []
 # With window-calls: check every summarized call's summary as it runs
 # (EmitOptions::window_calls_audit).
 window-calls-audit = []
+# Windows also run the blocks they reach in neighbouring windows
+# (EmitOptions::long_windows); split programs lift in 64 KiB regions.
+long-windows = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
