@@ -38,7 +38,14 @@ mod imp {
     static STACK_SLOT: AtomicUsize = AtomicUsize::new(0);
     static STACK_SLOTS: AtomicUsize = AtomicUsize::new(0);
     static STACK_NEXT: AtomicUsize = AtomicUsize::new(0);
-    static PID: AtomicU64 = AtomicU64::new(0);
+    /// A pipe the handler writes the stack into and reads it back from:
+    /// write() copies until the first unmapped page and reports how far it
+    /// got, without the address-space lock process_vm_readv takes (that
+    /// stalled the sampled threads behind every mmap). One thread at a
+    /// time (`PIPE_BUSY`); a sample finding it busy keeps no stack.
+    static PIPE: [std::sync::atomic::AtomicI32; 2] =
+        [const { std::sync::atomic::AtomicI32::new(-1) }; 2];
+    static PIPE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     /// Thread name prefixes whose samples keep stacks (empty: all), each
     /// at most 15 bytes, NUL-padded.
     const MAX_PREFIXES: usize = 8;
@@ -100,8 +107,8 @@ mod imp {
 
     /// Copy the interrupted thread's registers and the top of its stack
     /// into the next stack slot, when its name is one asked for. Only
-    /// async-signal-safe calls: prctl, gettid and process_vm_readv (which
-    /// stops at an unmapped page instead of faulting).
+    /// async-signal-safe calls: prctl, gettid, and write and read on the
+    /// profile's pipe (write stops at an unmapped page instead of faulting).
     ///
     /// # Safety
     /// From the sampling signal's handler, with `STACKS` set by `start`.
@@ -126,8 +133,12 @@ mod imp {
                 return;
             }
         }
+        if PIPE_BUSY.swap(true, Ordering::Acquire) {
+            return;
+        }
         let slot = STACK_NEXT.fetch_add(1, Ordering::Relaxed);
         if slot >= STACK_SLOTS.load(Ordering::Relaxed) {
+            PIPE_BUSY.store(false, Ordering::Release);
             return;
         }
         let size = STACK_SLOT.load(Ordering::Relaxed);
@@ -135,42 +146,30 @@ mod imp {
         // sample's alone (claimed above).
         let record = unsafe { STACKS.load(Ordering::Relaxed).add(slot * size) };
         let capacity = size - STACK_HEADER;
-        // The stack one page at a time: a partial read stops at the first
-        // page that is not mapped.
-        let mut remote = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        }; 17];
-        let mut pieces = 0;
-        let mut at = rsp;
-        let end = rsp.saturating_add(capacity as u64);
-        while at < end && pieces < remote.len() {
-            let next = ((at | 4095) + 1).min(end);
-            remote[pieces] = libc::iovec {
-                iov_base: at as *mut libc::c_void,
-                iov_len: (next - at) as usize,
-            };
-            pieces += 1;
-            at = next;
-        }
-        let local = libc::iovec {
-            // SAFETY: inside this slot, after the header.
-            iov_base: unsafe { record.add(STACK_HEADER) }.cast(),
-            iov_len: capacity,
-        };
-        // SAFETY: reads this process's own memory into the slot; unmapped
-        // pages end the copy.
+        let (reader, writer) = (
+            PIPE[0].load(Ordering::Relaxed),
+            PIPE[1].load(Ordering::Relaxed),
+        );
+        // SAFETY: write() reads [rsp, rsp + capacity) of this process,
+        // stopping at the first page it cannot read; read() fills the slot
+        // after its header with what was written.
         let copied = unsafe {
-            libc::process_vm_readv(
-                PID.load(Ordering::Relaxed) as libc::pid_t,
-                &local,
-                1,
-                remote.as_ptr(),
-                pieces as libc::c_ulong,
-                0,
-            )
-        }
-        .max(0) as u64;
+            let written = libc::write(writer, rsp as *const libc::c_void, capacity);
+            let mut copied = 0usize;
+            while (copied as isize) < written {
+                let got = libc::read(
+                    reader,
+                    record.add(STACK_HEADER + copied).cast(),
+                    written as usize - copied,
+                );
+                if got <= 0 {
+                    break;
+                }
+                copied += got as usize;
+            }
+            copied as u64
+        };
+        PIPE_BUSY.store(false, Ordering::Release);
         // SAFETY: gettid is async-signal-safe.
         let thread = unsafe { libc::gettid() } as u64;
         let words = [
@@ -245,7 +244,21 @@ mod imp {
             eprintln!("host profile: no memory for stacks");
             return;
         }
-        PID.store(std::process::id().into(), Ordering::Relaxed);
+        let mut fds = [-1; 2];
+        // SAFETY: creates a pipe; its descriptors are kept for the run.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            eprintln!("host profile: no pipe for stacks");
+            return;
+        }
+        // Room for one sample's stack in the pipe (1 MiB is the default
+        // limit an unprivileged process may ask for).
+        // SAFETY: a valid descriptor and request.
+        let room = unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1 << 20) };
+        if room < bytes as libc::c_int {
+            eprintln!("host profile: the pipe holds {room} bytes, not {bytes}");
+        }
+        PIPE[0].store(fds[0], Ordering::Relaxed);
+        PIPE[1].store(fds[1], Ordering::Relaxed);
         STACK_SLOT.store(slot, Ordering::Relaxed);
         STACK_SLOTS.store(total / slot, Ordering::Relaxed);
         STACKS.store(buffer.cast(), Ordering::Release);
