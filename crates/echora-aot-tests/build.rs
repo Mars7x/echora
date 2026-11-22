@@ -217,6 +217,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("rounded_up", rounded_up_code),
     ("window_call", window_call_code),
     ("smallest_normal", smallest_normal_code),
+    ("memory_fault", memory_fault_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1905,6 +1906,88 @@ fn smallest_normal_code(out: &mut String) {
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/memory_faults.rs`: every plain load and store form
+/// (each size, sign extension, writeback, S/D/Q, pairs) and the exclusive,
+/// ordered, atomic and SP-based forms, each alone (an exclusive pair
+/// together), lifted with the build's options.
+fn memory_fault_code(out: &mut String) {
+    const BASE: u64 = 0x2e0_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let forms: &[(&str, &[u32])] = &[
+        ("ldrb w0, [x1]", &[0x3940_0020]),
+        ("ldrh w0, [x1]", &[0x7940_0020]),
+        ("ldr w0, [x1]", &[0xb940_0020]),
+        ("ldr x0, [x1]", &[0xf940_0020]),
+        ("ldrsb x0, [x1]", &[0x3980_0020]),
+        ("ldrsh w0, [x1]", &[0x79c0_0020]),
+        ("ldrsw x0, [x1]", &[0xb980_0020]),
+        ("strb w2, [x1]", &[0x3900_0022]),
+        ("strh w2, [x1]", &[0x7900_0022]),
+        ("str w2, [x1]", &[0xb900_0022]),
+        ("str x2, [x1]", &[0xf900_0022]),
+        ("ldr x0, [x1, #8]!", &[0xf840_8c20]),
+        ("str x2, [x1], #-8", &[0xf81f_8422]),
+        ("ldur x0, [x1, #-1]", &[0xf85f_f020]),
+        ("ldr s0, [x1]", &[0xbd40_0020]),
+        ("ldr d0, [x1]", &[0xfd40_0020]),
+        ("ldr q0, [x1]", &[0x3dc0_0020]),
+        ("str d0, [x1]", &[0xfd00_0020]),
+        ("str q0, [x1]", &[0x3d80_0020]),
+        ("ldp x0, x3, [x1]", &[0xa940_0c20]),
+        ("stp x2, x3, [x1]", &[0xa900_0c22]),
+        ("ldp w0, w3, [x1]", &[0x2940_0c20]),
+        ("ldxr x0, [x1]", &[0xc85f_7c20]),
+        ("ldxr w0, [x1]", &[0x885f_7c20]),
+        ("ldaxr x0, [x1]", &[0xc85f_fc20]),
+        ("stxr w4, x2, [x1]", &[0xc804_7c22]),
+        (
+            "ldxr x0, [x1]; stxr w4, x2, [x1]",
+            &[0xc85f_7c20, 0xc804_7c22],
+        ),
+        ("ldar x0, [x1]", &[0xc8df_fc20]),
+        ("stlr x2, [x1]", &[0xc89f_fc22]),
+        ("ldapr x0, [x1]", &[0xf8bf_c020]),
+        ("cas x0, x2, [x1]", &[0xc8a0_7c22]),
+        ("ldadd x2, x0, [x1]", &[0xf822_0020]),
+        ("swp x2, x0, [x1]", &[0xf822_8020]),
+        ("ldr x0, [sp]", &[0xf940_03e0]),
+        ("str x2, [sp, #8]", &[0xf900_07e2]),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    for (name, program) in forms {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "memory_fault".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("memory_fault");
+    {
+        let name = "memory_fault_code";
+        let (root, regions) = split(&translation, options());
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }
