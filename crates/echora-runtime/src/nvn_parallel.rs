@@ -131,28 +131,24 @@ fn placement() -> (usize, Option<Vec<usize>>) {
         .clone()
 }
 
-/// Where planning threads go: the replay's own core (`host_cores`: its
-/// sibling hardware threads are idle while it waits for its planners) and
-/// the CPUs beyond those the `workers` guest threads take; without a
-/// reserved core, the CPUs beyond the workers and the replay. The replay
-/// plans a share itself, so one CPU of the set is its own.
+/// Where planning threads go: the replay's own core only (`host_cores`
+/// keeps it for the replay; guest workers never run there, and its sibling
+/// hardware threads are idle while the replay waits for its planners). The
+/// replay plans a share itself, so one CPU of it is its own. Guest workers
+/// may run on every other CPU, so none of those counts as idle (`_workers`,
+/// `_available` are kept for a load-based rule); without a reserved core
+/// there are no planning threads.
 fn planner_placement(
     requested: usize,
     reserved: Option<(&[usize], &[usize])>,
-    workers: usize,
-    available: usize,
+    _workers: usize,
+    _available: usize,
 ) -> (usize, Option<Vec<usize>>) {
-    match reserved {
-        Some((kept, others)) => {
-            let idle = others.len().saturating_sub(workers);
-            let mut cpus = kept.to_vec();
-            cpus.extend(others.iter().rev().take(idle));
-            cpus.sort_unstable();
-            let count = requested.min(cpus.len().saturating_sub(1));
-            (count, (count > 0).then_some(cpus))
-        }
-        None => (requested.min(available.saturating_sub(workers + 1)), None),
-    }
+    let Some((kept, _)) = reserved else {
+        return (0, None);
+    };
+    let count = requested.min(kept.len().saturating_sub(1));
+    (count, (count > 0).then(|| kept.to_vec()))
 }
 
 /// Queued lists the replay has yet to run past which new windows are made
@@ -3429,21 +3425,18 @@ mod replay_tests {
 
     #[test]
     fn planners_take_only_the_cpus_the_guest_threads_leave() {
-        // Eight CPUs, the replay's core 6-7, five guest workers: 7 and
-        // the one CPU the workers leave (5).
-        let (count, cpus) = planner_placement(4, Some((&[6, 7], &[0, 1, 2, 3, 4, 5])), 5, 8);
-        assert_eq!((count, cpus.as_deref()), (2, Some(&[5, 6, 7][..])));
-        // Six workers on six CPUs: the replay's sibling only.
-        let (count, cpus) = planner_placement(4, Some((&[6, 7], &[0, 1, 2, 3, 4, 5])), 6, 8);
-        assert_eq!((count, cpus.as_deref()), (1, Some(&[6, 7][..])));
-        // No sibling and nothing idle: no planning threads.
+        // Sixteen CPUs, the replay's core 7 and 15, six guest workers free
+        // to run on the other fourteen: only the replay's sibling is idle.
+        let others: Vec<usize> = (0..16).filter(|cpu| *cpu != 7 && *cpu != 15).collect();
+        let (count, cpus) = planner_placement(4, Some((&[7, 15], &others)), 6, 16);
+        assert_eq!((count, cpus.as_deref()), (1, Some(&[7, 15][..])));
+        // No sibling: no planning threads.
         assert_eq!(
-            planner_placement(4, Some((&[7], &[0, 1, 2, 3, 4, 5, 6])), 7, 8),
+            planner_placement(4, Some((&[7], &others)), 6, 16),
             (0, None)
         );
-        // Without a reserved core: what the workers and the replay leave.
-        assert_eq!(planner_placement(4, None, 6, 8), (1, None));
-        assert_eq!(planner_placement(2, None, 2, 16), (2, None));
+        // No reserved core: no planning threads.
+        assert_eq!(planner_placement(4, None, 2, 16), (0, None));
     }
 
     #[test]
