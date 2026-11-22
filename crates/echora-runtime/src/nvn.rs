@@ -8442,6 +8442,40 @@ impl Nvn {
     }
 }
 
+/// A per-target setter's key, "<property>/<index>" (the first targets'
+/// without formatting one: the game sets them for every draw).
+fn per_target_key(property: &str, index: u64) -> std::borrow::Cow<'static, str> {
+    const BLEND_ENABLE: [&str; 8] = [
+        "BlendEnable/0",
+        "BlendEnable/1",
+        "BlendEnable/2",
+        "BlendEnable/3",
+        "BlendEnable/4",
+        "BlendEnable/5",
+        "BlendEnable/6",
+        "BlendEnable/7",
+    ];
+    const CHANNEL_MASK: [&str; 8] = [
+        "ChannelMask/0",
+        "ChannelMask/1",
+        "ChannelMask/2",
+        "ChannelMask/3",
+        "ChannelMask/4",
+        "ChannelMask/5",
+        "ChannelMask/6",
+        "ChannelMask/7",
+    ];
+    let known = match property {
+        "BlendEnable" => BLEND_ENABLE.get(index as usize),
+        "ChannelMask" => CHANNEL_MASK.get(index as usize),
+        _ => None,
+    };
+    match known {
+        Some(key) => std::borrow::Cow::Borrowed(key),
+        None => std::borrow::Cow::Owned(format!("{property}/{index}")),
+    }
+}
+
 fn stencil_property_keys(property: &str) -> Option<[&'static str; 2]> {
     match property {
         "StencilFunc" => Some(["StencilFunc/1", "StencilFunc/2"]),
@@ -8613,7 +8647,7 @@ fn bag_call(
                 if property == "ChannelMask" {
                     args.v[1] = x[5];
                 }
-                bag.set(&format!("{property}/{}", args.x[0]), args);
+                bag.set(&per_target_key(property, args.x[0]), args);
             }
             let mut args = args;
             // SetPackagedTextureLayout(builder, const
@@ -8764,7 +8798,7 @@ fn record_command(
     // whose name contains one of them, as the application records it: the
     // command buffer, the arguments and the guest's return address (the
     // code that issued it).
-    if let Ok(wanted) = debug_var("ECHORA_RECORD_LOG")
+    if let Some(wanted) = debug_var_os("ECHORA_RECORD_LOG").and_then(std::ffi::OsStr::to_str)
         && wanted.split(',').any(|part| rest.contains(part))
     {
         // The command buffer object's first words: NVN keeps the command
