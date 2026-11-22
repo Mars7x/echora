@@ -1581,7 +1581,10 @@ fn kernel_code(out: &mut String) {
         report.unsupported,
         report.unresolved_targets
     );
-    assert_eq!(report.jump_tables, 1, "the switch kernel's jump table");
+    assert_eq!(
+        report.jump_tables, 2,
+        "the switch and gamefn kernels' jump tables"
+    );
     // One 64 KiB region, as the game's regions hold code: calls between
     // the kernels' functions stay in their region.
     LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -1627,6 +1630,10 @@ fn kernel_code(out: &mut String) {
     named.push((
         ((kernels::KERNEL_BASE + kernels::CROSSING_FUNCTION) >> 10) + 1,
         "(crossing function tail)",
+    ));
+    named.push((
+        (kernels::KERNEL_BASE + kernels::GAMEFN_FUNCTION) >> 10,
+        "(gamefn function)",
     ));
     for (_, source) in &regions {
         for (function, counts) in echora_lift::census::census(source) {
