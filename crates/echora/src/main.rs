@@ -740,6 +740,15 @@ fn lift(
         calls.summarized_callers,
         calls.summarized_caller_sites
     );
+    let window_calls = echora_lift::codegen::window_call_report(&d.translation, region_bits);
+    println!(
+        "window calls (window-calls): {} BL targets with summaries in {} windows; {} of {} BL sites call them ({} in the caller's region)",
+        window_calls.targets,
+        window_calls.windows,
+        window_calls.summarized_sites,
+        window_calls.sites,
+        window_calls.same_region_sites
+    );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
@@ -803,6 +812,7 @@ fn lift(
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
                 "float-run-loads" => options.float_run_loads = true,
+                "window-calls" => options.window_calls = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }

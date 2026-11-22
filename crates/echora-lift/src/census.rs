@@ -28,7 +28,8 @@ pub struct Census {
     /// writes their body out instead).
     pub out_of_line: usize,
     /// Calls of other guest code: `Core::call` (through the window table),
-    /// `call_window` and direct calls of lifted functions or windows.
+    /// `call_window` and direct calls of lifted functions or windows
+    /// (`EmitOptions::window_calls`).
     pub calls: usize,
     /// Branches to a computed target (`next_pc = target`: BR, BLR's
     /// continuation, RET, jump tables).
@@ -180,7 +181,9 @@ fn count_line(line: &str, counts: &mut Census) {
     counts.calls += line.matches("m.call(").count()
         + line.matches("m.call_window(").count()
         + line.matches("= run_function_").count()
-        + line.matches("= function_at(").count();
+        + line.matches("= function_at(").count()
+        + line.matches("= enter_window_").count()
+        + line.matches("= window_call_at(").count();
     counts.indirect_branches += line.matches("next_pc = target;").count();
     counts.flags_set += line
         .match_indices("add_sub(")
