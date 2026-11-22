@@ -1576,7 +1576,7 @@ const PROGRAM_STAGE_KEYS: [&str; 6] = ["Stage0", "Stage1", "Stage2", "Stage3", "
 
 /// Raw argument registers after the object pointer (X1..X4, V0..V1 low 64
 /// bits). Setters store them; matching getters return the first of each.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct Args {
     pub x: [u64; 4],
     pub v: [u64; 2],
@@ -8121,13 +8121,105 @@ impl TaggedState {
 }
 
 fn tagged_state(kind: &str, tag: u32) -> Option<StateSnapshots> {
-    STATE_TAGS
+    // Tags are never removed nor changed, so each thread keeps those it
+    // looked up (binds look up several per draw).
+    let known = TAG_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .snapshots
+            .get(&tag)
+            .map(|(known, snapshot)| (*known == kind).then(|| snapshot.clone()))
+    });
+    if let Some(found) = known {
+        return found;
+    }
+    let state = STATE_TAGS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()?
         .get(&tag)
-        .filter(|state| state.kind == kind)
-        .map(|state| state.snapshot.clone())
+        .map(|state| (state.kind, state.snapshot.clone()))?;
+    TAG_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.snapshots.len() >= TAG_CACHE_LIMIT {
+            cache.snapshots.clear();
+        }
+        cache.snapshots.insert(tag, state.clone());
+    });
+    (state.0 == kind).then_some(state.1)
+}
+
+/// One setter (or SetDefaults) on a tagged state structure: the tag it
+/// held before (None for SetDefaults, whose result does not depend on it),
+/// the call, its arguments and the one more register a setter reads (X5
+/// for SetChannelMask; for SetDefaults, whether a device was kept).
+#[derive(Clone, Copy)]
+struct TagStep<'a> {
+    from: Option<u32>,
+    name: &'a str,
+    args: Args,
+    extra: u64,
+}
+
+/// What `TagStep` keys on: the name by its address (entry point names
+/// are interned; a name at another address only misses).
+type TagStepKey = (Option<u32>, usize, usize, Args, u64);
+
+/// Per thread: the tag each setter step led to, and the tagged states
+/// looked up (`tagged_state`). Both stay valid for the run: tags are never
+/// removed nor changed, so a state's tag and a setter's arguments name the
+/// state after it, whose tag `state_tag` gives the same every time.
+#[derive(Default)]
+struct TagCache {
+    steps: FastMap<TagStepKey, Option<u32>>,
+    snapshots: FastMap<u32, (&'static str, StateSnapshots)>,
+}
+
+/// Entries a thread's `TagCache` keeps of each kind before starting over.
+const TAG_CACHE_LIMIT: usize = 1 << 16;
+
+thread_local! {
+    static TAG_CACHE: std::cell::RefCell<TagCache> = std::cell::RefCell::default();
+}
+
+/// The tag of the state `step` leaves a `kind` structure in: from the
+/// thread's cache when this step was taken before, otherwise `compute`d
+/// (`state_tag` of the structure's properties after it) and remembered.
+/// A structure whose tag before the step is unknown is computed each time.
+fn cached_state_tag(
+    kind: &str,
+    step: TagStep<'_>,
+    compute: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    if !TAGGED_STATES.contains(&kind) {
+        return None;
+    }
+    let cacheable = step.from.is_some() || step.name.ends_with("SetDefaults");
+    if !cacheable {
+        return compute();
+    }
+    let key = (
+        step.from,
+        step.name.as_ptr() as usize,
+        step.name.len(),
+        step.args,
+        step.extra,
+    );
+    if let Some(&tag) = TAG_CACHE
+        .with(|cache| cache.borrow().steps.get(&key).copied())
+        .as_ref()
+    {
+        return tag;
+    }
+    let tag = compute();
+    TAG_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.steps.len() >= TAG_CACHE_LIMIT {
+            cache.steps.clear();
+        }
+        cache.steps.insert(key, tag);
+    });
+    tag
 }
 
 fn state_hash(kind: &str, props: &BTreeMap<String, Args>) -> u64 {
@@ -8402,21 +8494,51 @@ fn bag_call(
     if bag_like && rest == "SetDefaults" {
         // Builders keep their device across SetDefaults: the application
         // sets the device first for some kinds (QueueBuilder).
-        let device = read_shared(bags.at(this))
+        let mut shard = write_shared(bags.at(this));
+        let device = shard
             .get(&this)
             .and_then(|bag| bag.props.get("Device").copied());
-        let mut bag = Bag {
-            kind: kind.into(),
-            ..Bag::default()
+        let defaults = || {
+            let mut props = BTreeMap::new();
+            if let Some(device) = device {
+                props.insert("Device".to_string(), device);
+            }
+            props
         };
-        if let Some(device) = device {
-            bag.props.insert("Device".into(), device);
-        }
-        bag.tag = state_tag(kind, &bag.props);
-        if let Some(tag) = bag.tag {
+        let tag = cached_state_tag(
+            kind,
+            TagStep {
+                from: None,
+                name,
+                args: device.unwrap_or_default(),
+                extra: u64::from(device.is_some()),
+            },
+            || state_tag(kind, &defaults()),
+        );
+        if let Some(tag) = tag {
             core.memory.write_u32(this, tag)?;
         }
-        write_shared(bags.at(this)).insert(this, bag);
+        // The structure set up again in place (the game does so for every
+        // draw) keeps its bag's allocation.
+        match shard.get_mut(&this) {
+            Some(bag) if bag.kind == kind => {
+                bag.props.clear();
+                if let Some(device) = device {
+                    bag.props.insert("Device".into(), device);
+                }
+                bag.tag = tag;
+            }
+            _ => {
+                shard.insert(
+                    this,
+                    Bag {
+                        kind: kind.into(),
+                        props: defaults(),
+                        tag,
+                    },
+                );
+            }
+        }
         return Ok(true);
     }
     if bag_like {
@@ -8453,6 +8575,14 @@ fn bag_call(
                 bag.props.remove("@Offset");
                 bag.tag = Some(tag);
             }
+            // The tag before this setter: the state it names and this call
+            // name the state after it (`cached_state_tag`).
+            let step = TagStep {
+                from: bag.tag,
+                name,
+                args,
+                extra: if property == "ChannelMask" { x[5] } else { 0 },
+            };
             // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
             // combined forms of SetWidth/SetHeight/SetDepth.
             if let Some(dimensions) = property
@@ -8507,7 +8637,10 @@ fn bag_call(
             } else {
                 bag.set(property, args);
             }
-            let tag = bag.tag.or_else(|| state_tag(kind, &bag.props));
+            let tag = match bag.tag {
+                Some(tag) => Some(tag),
+                None => cached_state_tag(kind, step, || state_tag(kind, &bag.props)),
+            };
             bag.tag = tag;
             drop(bags);
             if let Some(tag) = tag {
