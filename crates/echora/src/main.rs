@@ -839,6 +839,37 @@ fn lift(
         }
         Err(_) => BTreeSet::new(),
     };
+    // ECHORA_LIFT_REPORT (comma-separated): extra reports on the lift.
+    // `vector-float`: what keeps vector float operations out of runs
+    // (`echora_lift::vector_float_report`), over the regions of
+    // ECHORA_LIFT_OPTIONS_REGIONS when that is set, weighted by window when
+    // ECHORA_LIFT_REPORT_WEIGHTS names a file of `WEIGHT REGIONHEX
+    // run_window_NAME` lines.
+    let reports = std::env::var("ECHORA_LIFT_REPORT").unwrap_or_default();
+    if reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "vector-float")
+    {
+        let weights = match std::env::var("ECHORA_LIFT_REPORT_WEIGHTS") {
+            Ok(path) => {
+                let text = std::fs::read_to_string(path.trim())
+                    .with_context(|| format!("read {}", path.trim()))?;
+                Some(
+                    echora_lift::vector_float_report::parse_weights(&text)
+                        .map_err(|error| anyhow::anyhow!("ECHORA_LIFT_REPORT_WEIGHTS: {error}"))?,
+                )
+            }
+            Err(_) => None,
+        };
+        let report = echora_lift::vector_float_report::vector_float_report(
+            &d.translation,
+            region_bits,
+            (!listed_regions.is_empty()).then_some(&listed_regions),
+            weights.as_ref(),
+        );
+        print!("{report}");
+    }
     let mut options = EmitOptions::default();
     let mut listed_options = EmitOptions::default();
     let extra = std::env::var("ECHORA_LIFT_OPTIONS").ok();
