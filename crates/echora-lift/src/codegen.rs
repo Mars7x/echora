@@ -2475,7 +2475,10 @@ fn replace_sp(line: &str) -> String {
 }
 
 /// The stack alignment check `emit_sp_alignment_check` writes.
-const SP_ALIGNMENT_CHECK: &str = "if base & 15 != 0 { return Err(Trap::InvalidState { message: format!(\"unaligned SP memory access at {:#x}\", m.cpu.pc) }); }";
+/// Its trap is built out of line (`unaligned_sp`, `AT_HELPER`): the check
+/// stands before every SP-based access, and an inline `format!` there put
+/// the formatting code in every hot path that touches the stack.
+const SP_ALIGNMENT_CHECK: &str = "if base & 15 != 0 { return Err(unaligned_sp(m.cpu.pc)); }";
 
 /// `body` with the PC stored only where it leaves with a trap, when its
 /// fallible calls (`)?`) and stack alignment checks are the only reasons it
@@ -2498,7 +2501,9 @@ fn pc_on_error_paths(body: &str, pc: u64) -> Option<String> {
 /// generic helper rather than a `map_err` closure per call site, which the
 /// compiler would type-check, borrow-check and compile as a function each.
 const AT_HELPER: &str = "#[allow(dead_code)]\ntrait At<T> { fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap>; }\n\
-impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap> { if self.is_err() { m.cpu.pc = pc; } self } }\n";
+impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap> { if self.is_err() { m.cpu.pc = pc; } self } }\n\
+/// The trap of a stack access with SP not 16-byte aligned (`SP_ALIGNMENT_CHECK`).\n\
+#[allow(dead_code)]\n#[cold]\n#[inline(never)]\nfn unaligned_sp(pc: u64) -> Trap { Trap::InvalidState { message: format!(\"unaligned SP memory access at {pc:#x}\") } }\n";
 
 /// Whether an instruction's emitted code might observe `m.cpu.pc`: it can
 /// trap or return early, reads the PC, or calls a CPU or SIMD helper other
@@ -7845,7 +7850,9 @@ mod tests {
         let translation = discover(&[region(&words)], &entries, count).unwrap();
         let output = emit_rust(&translation);
         assert_eq!(translation.blocks.len(), count);
-        assert_eq!(output.matches("#[inline(never)]").count(), 2);
+        // The two windows and the cold trap helper (`AT_HELPER`).
+        assert_eq!(output.matches("#[inline(never)]").count(), 3);
+        assert_eq!(output.matches("fn run_window_").count(), 2);
         assert!(output.contains("0x1 => return run_window_1(m),"));
         assert!(output.contains("0x2 => return run_window_2(m),"));
         assert!(output.contains("pc if pc >> 12 != 0x1 => return Ok(())"));
