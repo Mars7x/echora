@@ -5,7 +5,11 @@
 //! signalling NaNs and operands that overflow or underflow, under FPCR with
 //! FZ and DN each on or off and a directed rounding mode, and FPSR with the
 //! sticky IXC set or not. Every vector register and FPSR must match bit for
-//! bit, whether the fast copy committed or declined to the exact one.
+//! bit, whether the fast copy committed or declined to the exact one. The
+//! lift with runs has `inline-vector` and `inline-fp-scalar` in every other
+//! 1 KiB region as well (`split_alternate`), so a run's exact copy is there
+//! those options' code (a run's FSQRT `inline-fp-scalar`'s), the helpers'
+//! elsewhere.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
