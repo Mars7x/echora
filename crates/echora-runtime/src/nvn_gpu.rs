@@ -427,7 +427,7 @@ pub struct Backend {
     resident: HashMap<u64, ResidentPool>,
     /// GPU addresses SAMPLES_PASSED reports were written to on the GPU
     /// (`gpu_samples_report`): conditions on them are evaluated there.
-    samples_reports: std::collections::HashSet<u64>,
+    samples_reports: super::FastSet<u64>,
     /// Memory pools the GPU can read in place through guest memory's file
     /// (see `Renderer::import_file`), by guest base: size, file and the
     /// file offset of the base. Learned at presents (`share_new_pools`).
@@ -731,7 +731,7 @@ impl Backend {
             page_table_wrote_after_signal: false,
             page_table_wrote: false,
             resident: HashMap::default(),
-            samples_reports: std::collections::HashSet::new(),
+            samples_reports: super::FastSet::default(),
             shared_pools: HashMap::default(),
             shared_pieces: HashMap::default(),
             shared_guest_index: Default::default(),
