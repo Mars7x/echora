@@ -52,6 +52,33 @@ functions 66,320): the windows stay (resumption at any block), and the
 structured functions are further copies. Expect region crates to compile
 correspondingly longer, and more `.text`, most of it cold window code.
 
+Every split test program compiled as a game region
+(`cargo bench -p echora-aot-tests --features codesize --bench codesize -- game`,
+90,317 guest instructions, opt-level 1):
+
+| mode | Rust bytes/ins | rustc s | `.text` bytes/ins |
+|---|---|---|---|
+| game | 334.7 | 194 | 210.6 |
+| game_window_calls | 339.2 | 200 | 215.2 |
+| game_functions | 343.4 | 201 | 217.0 |
+| game_regalloc | 720.5 | 365 | 351.7 |
+
+The structured functions' Rust is about as large as the windows' (30 MB
+against 34 MB here: every program entry is a function), and compiles to
+about two thirds of the windows' machine code. A window whose every block
+a structured function holds runs only next to budgets and host
+boundaries, so it is `#[cold]` (out of the hot code's way, in
+`.text.unlikely`); the windows cannot go, since the per-block charges
+that place every boundary exactly live there. For the game, enabling
+regalloc on the hottest regions only (`ECHORA_LIFT_OPTIONS_REGIONS`)
+keeps the growth to those.
+
+Review notes (read-only faithfulness review, no correctness findings):
+a trap's refund (`tail`) takes the block of the function holding the
+trapping PC, as the block tag would name it (blocks do not overlap); a
+preemption another thread requests is seen up to the look-ahead later;
+a `?` in a string no longer turns precise exit stores off.
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and
