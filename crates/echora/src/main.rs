@@ -1,6 +1,7 @@
 //! The `echora` command-line front end.
 
 mod host_paths;
+mod layout;
 mod prepare;
 mod shaders;
 
@@ -140,6 +141,21 @@ enum Command {
         /// Guest instruction budget.
         #[arg(long, default_value_t = 1_000_000_000)]
         budget: u64,
+    },
+    /// Write a translation's code layout from a run's host profile
+    /// (ECHORA_HOST_PROFILE): per library, the functions its guest threads
+    /// ran, hottest first, to <translation>/layout/<file>.order. The next
+    /// build links those functions first with 2 MiB aligned segments (only
+    /// the final links run again), and the runtime then puts their code on
+    /// 2 MiB pages.
+    Layout {
+        /// The translation directory (`translation:` in prepare's output).
+        translation: PathBuf,
+        /// The host profile of a run of that translation's build.
+        profile: PathBuf,
+        /// Share of the guest-thread samples the ordered functions hold.
+        #[arg(long, default_value_t = 0.999)]
+        coverage: f64,
     },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
@@ -350,6 +366,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 prepare::mark_ready(&lifted)?;
             }
             println!("{}ready", prepare::PREFIX);
+        }
+        Command::Layout {
+            translation,
+            profile,
+            coverage,
+        } => {
+            for (file, functions) in layout::write_order_files(&translation, &profile, coverage)? {
+                println!("{file}: {functions} functions");
+            }
+            println!(
+                "order files in {}; the next build of the translation links with them",
+                layout::layout_dir(&translation).display()
+            );
         }
         Command::Run {
             input,
@@ -983,6 +1012,10 @@ fn lift(
         &out.join("guest/src/lib.rs"),
         "// Generated. Keep this file local.\npub use echora_guest::*;\nextern crate echora_simd;\n",
     )?;
+    write_if_changed(
+        &out.join("guest/build.rs"),
+        &layout::link_script("libechora_guest_shared.so", "../layout"),
+    )?;
     let mut imports = String::new();
     let bundles: Vec<&[u64]> = regions.chunks(BUNDLE_REGIONS).collect();
     for (index, members) in bundles.iter().enumerate() {
@@ -1007,6 +1040,10 @@ fn lift(
         let dir = out.join("bundles").join(index.to_string());
         write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
         write_if_changed(&dir.join("src/lib.rs"), &exports)?;
+        write_if_changed(
+            &dir.join("build.rs"),
+            &layout::link_script(&format!("libechora_bundle_{index}.so"), "../../layout"),
+        )?;
         dispatch.push_str(&format!(
             "echora-bundle-{index} = {{ path = \"../bundles/{index}\" }}\n"
         ));
@@ -1067,6 +1104,12 @@ fn lift(
             );
     }
     write_if_changed(&out.join("runner/src/main.rs"), &runner_main)?;
+    write_if_changed(
+        &out.join("runner/build.rs"),
+        &layout::link_script("echora-run", "../layout"),
+    )?;
+    // Order files of `echora layout`; the build scripts watch this directory.
+    std::fs::create_dir_all(layout::layout_dir(&out))?;
     // Generated code is compiled at a moderate level; the guest crate, the
     // runtime it calls into and the runtime's AV1 decoder (several times
     // slower at level 1) get full optimization.
