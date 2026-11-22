@@ -1718,6 +1718,10 @@ pub struct CommandBufferObject {
     copy_strides: [Option<Args>; 2],
     /// Set by Finalize: a handle to it someone still holds is stale.
     finalized: bool,
+    /// How many commands its last list held: the next recording reserves
+    /// room for as many (the game records the same lists every frame), so
+    /// the list does not grow by copying its commands over and over.
+    last_commands: usize,
 }
 
 impl CommandBufferObject {
@@ -1987,6 +1991,7 @@ fn command_buffer_call(
                 return Err(invalid("command buffer is already recording".into()));
             };
             slot.insert(std::sync::Arc::new(std::sync::Mutex::new(Recording {
+                commands: Vec::with_capacity(object.last_commands),
                 control_start,
                 copy_strides,
                 ..Recording::default()
@@ -3401,7 +3406,7 @@ impl Nvn {
                 let recording = write_shared(&self.recording)
                     .remove(&this)
                     .ok_or_else(|| invalid("command buffer is not recording".into()))?;
-                let (commands, (start_chunk, start_used)) = {
+                let (mut commands, (start_chunk, start_used)) = {
                     let mut recording = lock_shared(&recording);
                     recording.ended = true;
                     (
@@ -3409,6 +3414,12 @@ impl Nvn {
                         recording.control_start,
                     )
                 };
+                object.last_commands = commands.len();
+                // Kept lists hold no more room than they use (a list shorter
+                // than the last one gives the rest back).
+                if commands.capacity() > commands.len() + commands.len() / 4 + 4 {
+                    commands.shrink_to_fit();
+                }
                 if !commands.is_empty() {
                     object.memory[1].use_bytes(CONTROL_MEMORY_PER_LIST);
                 }
@@ -12169,5 +12180,273 @@ mod tests {
         assert_eq!(locked.0.len(), 2);
         assert!(locked.1.iter().all(|texel| *texel == [0.5, 0.25, 1.0, 1.0]));
         assert_eq!(locked, free);
+    }
+
+    /// A frame's typical recorded draws: state setters on stack structures,
+    /// the state binds, a program, uniform buffers, textures and the draw,
+    /// on one recording command buffer through the recorder (as a worker
+    /// records them). Returns the lists' commands, for comparing runs.
+    const TYPICAL_CALLS: &[&str] = &[
+        "nvnBlendStateSetBlendFunc",
+        "nvnBlendStateSetDefaults",
+        "nvnChannelMaskStateSetDefaults",
+        "nvnColorStateSetBlendEnable",
+        "nvnColorStateSetDefaults",
+        "nvnCommandBufferAddControlMemory",
+        "nvnCommandBufferBeginRecording",
+        "nvnCommandBufferBindBlendState",
+        "nvnCommandBufferBindChannelMaskState",
+        "nvnCommandBufferBindColorState",
+        "nvnCommandBufferBindDepthStencilState",
+        "nvnCommandBufferBindMultisampleState",
+        "nvnCommandBufferBindPolygonState",
+        "nvnCommandBufferBindProgram",
+        "nvnCommandBufferBindTextures",
+        "nvnCommandBufferBindUniformBuffers",
+        "nvnCommandBufferBindVertexBuffer",
+        "nvnCommandBufferDrawElements",
+        "nvnCommandBufferInitialize",
+        "nvnDepthStencilStateSetDefaults",
+        "nvnDepthStencilStateSetDepthFunc",
+        "nvnDepthStencilStateSetDepthTestEnable",
+        "nvnMultisampleStateSetDefaults",
+        "nvnPolygonStateSetCullFace",
+        "nvnPolygonStateSetDefaults",
+    ];
+
+    fn record_typical_draws(
+        draws: usize,
+        keep: bool,
+    ) -> (
+        Vec<Vec<(String, Vec<u64>, usize)>>,
+        std::time::Duration,
+        usize,
+    ) {
+        let mut memory = Memory::new(1 << 32);
+        memory
+            .map(0x10_0000, 0x10_0000, READ | WRITE, STATE_NORMAL, "test")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let (device, buffer) = (0x1000, 0x2000);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        let recorder = nvn.recorder();
+        // Classified once per entry point, as workers do per thunk.
+        let classified: FastMap<&str, (&'static str, RecordedCall<'static>)> = TYPICAL_CALLS
+            .iter()
+            .map(|&name| {
+                let name = intern(name);
+                (name, (name, RecordedCall::classify(name).expect(name)))
+            })
+            .collect();
+        let made = |core: &mut Guest, name: &str, args: &[u64]| {
+            core.cpu.regs[..args.len()].copy_from_slice(args);
+            let (name, call) = classified[name];
+            assert!(recorder.call(name, call, core).unwrap(), "{name}");
+        };
+        made(&mut core, "nvnCommandBufferInitialize", &[buffer, device]);
+        made(
+            &mut core,
+            "nvnCommandBufferAddControlMemory",
+            &[buffer, 0x10_8000, 0x8000],
+        );
+        // Uniform buffer ranges and texture handles the binds read.
+        for index in 0..8u64 {
+            core.memory
+                .write_u64(0x10_1000 + index * 8, 0x1_0000_0000 + index * 0x100)
+                .unwrap();
+            core.memory
+                .write_u64(0x10_2000 + index * 8, 0x40 + index)
+                .unwrap();
+        }
+        let (color, blend, mask, depth, polygon, multisample) = (
+            0x10_3000, 0x10_3100, 0x10_3200, 0x10_3300, 0x10_3400, 0x10_3500,
+        );
+        let mut lists = Vec::new();
+        let mut commands = 0;
+        let started = std::time::Instant::now();
+        for frame in 0..draws.div_ceil(100) {
+            made(&mut core, "nvnCommandBufferBeginRecording", &[buffer]);
+            for draw in 0..100.min(draws - frame * 100) as u64 {
+                let variant = draw % 7;
+                // The game sets its states up on the stack per draw.
+                made(&mut core, "nvnColorStateSetDefaults", &[color]);
+                made(
+                    &mut core,
+                    "nvnColorStateSetBlendEnable",
+                    &[color, 0, variant & 1],
+                );
+                made(&mut core, "nvnBlendStateSetDefaults", &[blend]);
+                made(&mut core, "nvnBlendStateSetBlendFunc", &[blend, 6, 7, 1, 0]);
+                made(&mut core, "nvnChannelMaskStateSetDefaults", &[mask]);
+                made(&mut core, "nvnDepthStencilStateSetDefaults", &[depth]);
+                made(
+                    &mut core,
+                    "nvnDepthStencilStateSetDepthTestEnable",
+                    &[depth, 1],
+                );
+                made(
+                    &mut core,
+                    "nvnDepthStencilStateSetDepthFunc",
+                    &[depth, 2 + variant % 3],
+                );
+                made(&mut core, "nvnPolygonStateSetDefaults", &[polygon]);
+                made(
+                    &mut core,
+                    "nvnPolygonStateSetCullFace",
+                    &[polygon, variant % 2],
+                );
+                made(&mut core, "nvnMultisampleStateSetDefaults", &[multisample]);
+                for (bind, state) in [
+                    ("nvnCommandBufferBindColorState", color),
+                    ("nvnCommandBufferBindBlendState", blend),
+                    ("nvnCommandBufferBindChannelMaskState", mask),
+                    ("nvnCommandBufferBindDepthStencilState", depth),
+                    ("nvnCommandBufferBindPolygonState", polygon),
+                    ("nvnCommandBufferBindMultisampleState", multisample),
+                ] {
+                    made(&mut core, bind, &[buffer, state]);
+                }
+                made(
+                    &mut core,
+                    "nvnCommandBufferBindProgram",
+                    &[buffer, 0x10_4000 + variant * 0x100, 0x1f],
+                );
+                made(
+                    &mut core,
+                    "nvnCommandBufferBindUniformBuffers",
+                    &[buffer, 0, 0, 4, 0x10_1000],
+                );
+                made(
+                    &mut core,
+                    "nvnCommandBufferBindUniformBuffers",
+                    &[buffer, 4, 0, 2, 0x10_1020],
+                );
+                made(
+                    &mut core,
+                    "nvnCommandBufferBindTextures",
+                    &[buffer, 4, 0, 4, 0x10_2000],
+                );
+                made(
+                    &mut core,
+                    "nvnCommandBufferBindVertexBuffer",
+                    &[buffer, 0, 0x2_0000_0000, 0x1000],
+                );
+                made(
+                    &mut core,
+                    "nvnCommandBufferDrawElements",
+                    &[buffer, 4, 2, 0x3_0000_0000, 36],
+                );
+                commands += 12;
+            }
+            let mut nvn_core = Guest {
+                cpu: core.cpu,
+                memory: GuestMemory::Checked(match &mut core.memory {
+                    GuestMemory::Checked(memory) => memory,
+                    _ => unreachable!(),
+                }),
+                counter: None,
+            };
+            nvn_core.cpu.regs[0] = buffer;
+            assert!(
+                nvn.call("nvnCommandBufferEndRecording", &mut nvn_core)
+                    .unwrap()
+            );
+            let handle = nvn_core.cpu.regs[0];
+            if !keep {
+                continue;
+            }
+            lists.push(
+                nvn.command_lists[&handle]
+                    .commands
+                    .iter()
+                    .map(|command| {
+                        let mut words = command.x.to_vec();
+                        words.extend(&command.v);
+                        words.extend(&command.captured);
+                        let states = command.states.iter().map(|state| {
+                            state
+                                .iter()
+                                .map(|(key, value)| format!("{key}={value:?}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        });
+                        let states = states.collect::<Vec<_>>().join(";");
+                        (
+                            format!("{} {states}", command.name),
+                            words,
+                            command.states.len(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        (lists, started.elapsed(), commands)
+    }
+
+    /// Recording through the recorder keeps every command's arguments,
+    /// captured words and state snapshots.
+    #[test]
+    fn typical_draws_record_their_arguments_and_states() {
+        let (lists, _, commands) = record_typical_draws(250, true);
+        assert_eq!(commands, 3000);
+        assert_eq!(lists.len(), 3);
+        let first = &lists[0];
+        assert_eq!(first.len(), 1200);
+        // Binds snapshot the structure's state as set for that draw.
+        assert!(
+            first[3].0.contains("DepthFunc=Args { x: [2"),
+            "{}",
+            first[3].0
+        );
+        assert!(
+            lists[0][15].0.contains("DepthFunc=Args { x: [3"),
+            "{}",
+            lists[0][15].0
+        );
+        // Uniform buffers: (address, size) per entry, read at record time.
+        let words: Vec<u64> = (0..8).map(|index| 0x1_0000_0000 + index * 0x100).collect();
+        assert_eq!(first[7].1[16..], words[..]);
+        assert_eq!(first[9].1[16..], [0x40, 0x41, 0x42, 0x43]);
+        // The same work recorded again records the same.
+        assert_eq!(record_typical_draws(250, true).0, lists);
+        // And what it recorded before the recording path was made cheaper.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = FastHasher::default();
+        lists.hash(&mut hasher);
+        eprintln!("typical draws digest {:#x}", hasher.finish());
+        assert_eq!(hasher.finish(), TYPICAL_DRAWS_DIGEST);
+    }
+
+    /// `typical_draws_record_their_arguments_and_states`' lists, as the
+    /// recording path recorded them before it was made cheaper.
+    const TYPICAL_DRAWS_DIGEST: u64 = 0xbc3f_fb8c_9de1_e6c4;
+
+    /// ECHORA bench (cargo test --release -p echora-runtime --lib
+    /// recording_benchmark -- --ignored --nocapture): recording cost per
+    /// command of the typical draws.
+    #[test]
+    #[ignore]
+    fn recording_benchmark() {
+        record_typical_draws(2000, false);
+        let mut best = std::time::Duration::MAX;
+        let mut commands = 0;
+        for _ in 0..5 {
+            let (_, elapsed, count) = record_typical_draws(20_000, false);
+            best = best.min(elapsed);
+            commands = count;
+        }
+        // 23 calls per draw: 11 setters and 12 commands.
+        let draws = commands / 12;
+        eprintln!(
+            "recording: {draws} draws in {best:?}, {:.0} ns per draw, {:.1} ns per call",
+            best.as_nanos() as f64 / draws as f64,
+            best.as_nanos() as f64 / (draws * 23) as f64
+        );
     }
 }
