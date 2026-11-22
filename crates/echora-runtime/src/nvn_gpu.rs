@@ -10584,6 +10584,83 @@ impl Nvn {
         }
     }
 
+    /// A draw's uniform buffer of `size` bytes at guest `guest`: read in
+    /// place by the GPU (`uniform_in_place`: the buffer, offset and size),
+    /// or (`None`) made current in guest memory to be copied when the draw
+    /// is recorded.
+    fn resolve_guest_uniform(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+        size: u64,
+    ) -> Result<Option<(vk::Buffer, u64, u64)>, String> {
+        // Computed once for both (it walks the pending shared writes).
+        let mut writes = None;
+        if let Some(end) = guest.checked_add(size) {
+            let serial = self.draw_input_write_serial(guest..end);
+            writes = Some(serial);
+            if self.uniform_in_place(guest..end, serial)
+                && let Some((buffer, offset)) = self.shared_binding(guest, size)?
+            {
+                let backend = self.gpu.as_mut().unwrap();
+                if offset % backend.renderer.uniform_offset_alignment() == 0 {
+                    backend.stat("stat: draw uniforms read in place", 1);
+                    return Ok(Some((buffer, offset, size)));
+                }
+                // Importing the span may have changed what the serial
+                // walked.
+                writes = None;
+            }
+        }
+        self.resolve_draw_input_after(core, "uniforms", guest, size, writes)?;
+        Ok(None)
+    }
+
+    /// A draw's storage buffer of `length` bytes at guest `guest` (GPU
+    /// `base`): shared in place (`Ok`: buffer, offset, length) or its bytes
+    /// copied (`Err`).
+    #[allow(clippy::type_complexity)]
+    fn resolve_draw_storage(
+        &mut self,
+        core: &mut Guest,
+        guest: u64,
+        base: u64,
+        length: u64,
+        read_only: bool,
+        switches: bool,
+    ) -> Result<Result<(vk::Buffer, u64, u64), Vec<u8>>, String> {
+        // What dispatches wrote comes back to guest memory first, for the
+        // copy or the shared span alike.
+        self.resolve_storage(core, Some(guest..guest + length))?;
+        // A buffer the stage only reads is shared in place when its pool's
+        // file span imports (whole buffers copied per draw were most of the
+        // host's time after the movie). A buffer the stage writes keeps the
+        // copy, whose writes come back like a dispatch's
+        // (`resolve_storage`).
+        // ECHORA_DRAW_STORAGE_RESIDENT (measuring) reads it from the pool's
+        // GPU-memory copy instead, to compare the GPU's time reading system
+        // memory.
+        if read_only {
+            let in_place = if draw_var_os(switches, "ECHORA_DRAW_STORAGE_RESIDENT").is_some() {
+                self.resident_pool_binding(core, guest, length)?
+            } else {
+                self.shared_binding(guest, length)?
+            };
+            if let Some((buffer, offset)) = in_place {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: draw storage shared", 1);
+                return Ok(Ok((buffer, offset, length)));
+            }
+        }
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .stat("stat: draw storage bytes", length);
+        Ok(Err(self.gpu_bytes(core, base, length)?))
+    }
+
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
         if empty_draw(command) {
@@ -10948,32 +11025,16 @@ impl Nvn {
                         if let Some(started) = started {
                             uniform_time += started.elapsed();
                         }
-                        // Computed once for both (it walks the pending
-                        // shared writes).
-                        let mut writes = None;
-                        if let Some(end) = guest.checked_add(size) {
-                            let serial = self.draw_input_write_serial(guest..end);
-                            writes = Some(serial);
-                            if self.uniform_in_place(guest..end, serial)
-                                && let Some((buffer, offset)) = self.shared_binding(guest, size)?
-                            {
-                                let backend = self.gpu.as_mut().unwrap();
-                                if offset % backend.renderer.uniform_offset_alignment() == 0 {
-                                    uniforms_in_place.insert(
-                                        (index, descriptor.binding),
-                                        (buffer, offset, size),
-                                    );
-                                    backend.stat("stat: draw uniforms read in place", 1);
-                                    continue;
-                                }
-                                // Importing the span may have changed what
-                                // the serial walked.
-                                writes = None;
+                        let key = (index, descriptor.binding);
+                        match self.resolve_guest_uniform(core, guest, size)? {
+                            Some(in_place) => {
+                                uniforms_in_place.insert(key, in_place);
+                            }
+                            None => {
+                                uniform_bytes += size;
+                                guest_uniforms.insert(key, (guest, size as usize));
                             }
                         }
-                        self.resolve_draw_input_after(core, "uniforms", guest, size, writes)?;
-                        uniform_bytes += size;
-                        guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
                     }
                     DescriptorKind::UniformBuffer if descriptor.index == 1 => {
                         let mut bytes = spare_uniforms.pop().unwrap_or_default();
@@ -11050,44 +11111,18 @@ impl Nvn {
                             storage_written.insert((index, descriptor.binding), (guest, base));
                         }
                         storage_entries.push((index, descriptor.cbuf_offset, gpu, size));
-                        // What dispatches wrote comes back to guest memory
-                        // first, for the copy or the shared span alike.
-                        self.resolve_storage(core, Some(guest..guest + length))?;
-                        // A buffer the stage only reads is shared in place
-                        // when its pool's file span imports (whole buffers
-                        // copied per draw were most of the host's time after
-                        // the movie). A buffer the stage writes keeps the
-                        // copy, whose writes come back like a dispatch's
-                        // (`resolve_storage`).
-                        // ECHORA_DRAW_STORAGE_RESIDENT (measuring) reads it
-                        // from the pool's GPU-memory copy instead, to compare
-                        // the GPU's time reading system memory.
-                        if descriptor.flags & 1 == 0 {
-                            let in_place = if draw_var_os(switches, "ECHORA_DRAW_STORAGE_RESIDENT")
-                                .is_some()
-                            {
-                                self.resident_pool_binding(core, guest, length)?
-                            } else {
-                                self.shared_binding(guest, length)?
-                            };
-                            if let Some((buffer, offset)) = in_place {
-                                storage_in_place
-                                    .insert((index, descriptor.binding), (buffer, offset, length));
-                                self.gpu
-                                    .as_mut()
-                                    .unwrap()
-                                    .stat("stat: draw storage shared", 1);
-                                continue;
+                        let key = (index, descriptor.binding);
+                        let read_only = descriptor.flags & 1 == 0;
+                        match self
+                            .resolve_draw_storage(core, guest, base, length, read_only, switches)?
+                        {
+                            Ok(in_place) => {
+                                storage_in_place.insert(key, in_place);
+                            }
+                            Err(bytes) => {
+                                storage.insert(key, bytes);
                             }
                         }
-                        self.gpu
-                            .as_mut()
-                            .unwrap()
-                            .stat("stat: draw storage bytes", length);
-                        storage.insert(
-                            (index, descriptor.binding),
-                            self.gpu_bytes(core, base, length)?,
-                        );
                     }
                     // Texel buffers (buffer textures) bind like textures.
                     DescriptorKind::Texture | DescriptorKind::TextureBuffer
