@@ -2546,7 +2546,7 @@ fn emit_instruction_body(
     let returned;
     let after_call = if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
         returned = format!(
-            "                if m.cpu.pc != {next:#x} {{ return Ok(()); }}\n                next_pc = {next:#x};\n"
+            "                next_pc = {next:#x};\n                if m.cpu.pc != next_pc {{ return m.finish_block(); }}\n"
         );
         returned.as_str()
     } else if local_pc {
@@ -9040,7 +9040,7 @@ mod tests {
         };
         let (_, regions) = emit_rust_split_with(&translation, 16, options);
         let expected = format!(
-            "if m.cpu.pc != {next:#x} {{ return Ok(()); }}\nnext_pc = {next:#x};",
+            "next_pc = {next:#x};\nif m.cpu.pc != next_pc {{ return m.finish_block(); }}",
             next = at(1)
         );
         assert!(regions[0].1.contains(&expected), "{}", regions[0].1);
