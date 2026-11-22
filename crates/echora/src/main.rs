@@ -151,7 +151,10 @@ enum Command {
     Layout {
         /// The translation directory (`translation:` in prepare's output).
         translation: PathBuf,
-        /// The host profile of a run of that translation's build.
+        /// The host profile of a run of that translation's build. Profile a
+        /// long stretch (the forest scene: some 2000 presents): its 1 kHz
+        /// samples over a few hundred presents miss warm functions, which
+        /// then fall outside the code put on huge pages.
         profile: PathBuf,
         /// Share of the guest-thread samples the ordered functions hold.
         #[arg(long, default_value_t = 0.999)]
