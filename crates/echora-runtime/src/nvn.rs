@@ -818,6 +818,9 @@ pub struct Nvn {
         StateSnapshots,
         std::sync::Arc<gpu::ParsedVertexState>,
     )>,
+    /// Draws planned ahead on other threads (ECHORA_PARALLEL_DRAWS).
+    #[serde(skip)]
+    parallel: gpu::parallel::ParallelDraws,
     #[serde(skip)]
     program_memo: (
         (u64, u64),
@@ -928,6 +931,19 @@ struct PoolRange {
     size: u64,
     guest: u64,
     furthest_end: u64,
+}
+
+/// `Nvn::pool_for` in an index of pool ranges (`PoolRanges::entries`).
+fn pool_lookup(ranges: &[PoolRange], address: u64) -> Option<(u64, u64)> {
+    let after = ranges.partition_point(|range| range.gpu <= address);
+    ranges[..after]
+        .iter()
+        .rev()
+        .take_while(|range| address < range.furthest_end)
+        .find_map(|range| {
+            let offset = address - range.gpu;
+            (offset < range.size).then(|| (range.guest + offset, range.size - offset))
+        })
 }
 
 /// A host image: RGBA, one f32 per channel.
@@ -1168,6 +1184,26 @@ impl RenderState {
         }
         self.state.insert(key, command.clone());
         effect
+    }
+
+    /// Push{Graphics,Compute}Constants: words into root table `table` at
+    /// `offset` (bytes, word aligned, within the 256-byte table). False
+    /// (nothing written) outside the table.
+    pub(super) fn push_constants(&mut self, command: &Command) -> bool {
+        let pipeline = usize::from(command.name.ends_with("ComputeConstants"));
+        let table = (command.x[1] & 7) as usize;
+        let offset = command.x[2] as usize;
+        if offset % 4 != 0 || offset + command.captured.len() * 4 > 0x100 {
+            return false;
+        }
+        let roots = &mut self.roots[pipeline];
+        if roots.len() < 8 {
+            roots.resize(8, [0; 64]);
+        }
+        for (index, word) in command.captured.iter().enumerate() {
+            roots[table][offset / 4 + index] = *word as u32;
+        }
+        true
     }
 
     /// Whether SetTexturePool or SetSamplerPool (`rest`) names another
@@ -5353,7 +5389,10 @@ impl Nvn {
                 command_id: None,
                 message: format!("restore queue {queue:#x} render condition: {message}"),
             })?;
-        self.run_queue_work(queue, core, force)
+        let result = self.run_queue_work(queue, core, force);
+        // Plans hold only while the replay keeps the NVN state.
+        self.parallel.forget();
+        result
     }
 
     /// Make `queue`'s GPU state the current one.
@@ -5425,6 +5464,7 @@ impl Nvn {
                         replayed_list = Some(commands.clone());
                     }
                     let descriptor_epoch = *descriptor_epoch;
+                    let index = *next;
                     let command = &replayed_list.as_ref().unwrap()[*next];
                     let rest = without_prefix(&command.name, "nvnCommandBuffer");
                     if rest == "WaitEvent" {
@@ -5506,6 +5546,15 @@ impl Nvn {
                     self.select_descriptors(
                         descriptor_epoch.max(self.render.descriptors_after_wait),
                     );
+                    if gpu::parallel::enabled() {
+                        let list = replayed_list.as_ref().unwrap();
+                        self.prepare_parallel_draws(
+                            list,
+                            index,
+                            self.replay_budget.map(|budget| budget as usize),
+                            core,
+                        );
+                    }
                     self.execute(command, core)?;
                 }
                 QueueItem::Fence { sync, args } => {
@@ -5834,21 +5883,11 @@ impl Nvn {
             // Push{Graphics,Compute}Constants: words into root table `table`
             // at `offset` (bytes, word aligned, within the 256-byte table).
             "nvnCommandBufferPushGraphicsConstants" | "nvnCommandBufferPushComputeConstants" => {
-                let pipeline = usize::from(command.name.ends_with("ComputeConstants"));
-                let table = (command.x[1] & 7) as usize;
-                let offset = command.x[2] as usize;
-                if offset % 4 != 0 || offset + command.captured.len() * 4 > 0x100 {
+                if !self.render.push_constants(command) {
+                    let offset = command.x[2];
                     self.gpu_note(format!(
                         "push constants at {offset:#x} outside the root table"
                     ));
-                    return Ok(());
-                }
-                let roots = &mut self.render.roots[pipeline];
-                if roots.len() < 8 {
-                    roots.resize(8, [0; 64]);
-                }
-                for (index, word) in command.captured.iter().enumerate() {
-                    roots[table][offset / 4 + index] = *word as u32;
                 }
                 Ok(())
             }
@@ -7492,17 +7531,7 @@ impl Nvn {
     /// memory pool. Sorted ranges and their running maximum end allow a
     /// binary search even when ranges overlap.
     fn pool_for(&self, address: u64) -> Option<(u64, u64)> {
-        let index = self.indexed_pool_ranges();
-        let ranges = &index.entries;
-        let after = ranges.partition_point(|range| range.gpu <= address);
-        ranges[..after]
-            .iter()
-            .rev()
-            .take_while(|range| address < range.furthest_end)
-            .find_map(|range| {
-                let offset = address - range.gpu;
-                (offset < range.size).then(|| (range.guest + offset, range.size - offset))
-            })
+        pool_lookup(&self.indexed_pool_ranges().entries, address)
     }
 
     fn indexed_pool_ranges(&self) -> std::cell::RefMut<'_, PoolRanges> {

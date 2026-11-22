@@ -303,6 +303,9 @@ impl PagePool {
 #[path = "nvn_write_ranges.rs"]
 mod writer_ranges;
 
+#[path = "nvn_parallel.rs"]
+pub(super) mod parallel;
+
 pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
@@ -590,29 +593,12 @@ impl GuestFileIndex {
     }
 
     fn overlapping(&self, guest: std::ops::Range<u64>) -> impl Iterator<Item = SharedRange> + '_ {
-        let after = self.spans.partition_point(|span| span.guest < guest.end);
         let [lookups, walked] = self.walks.get();
         self.walks.set([lookups + 1, walked]);
-        self.spans[..after]
-            .iter()
-            .rev()
-            .take_while(move |span| span.furthest_end > guest.start)
-            .inspect(|_| {
-                let [lookups, walked] = self.walks.get();
-                self.walks.set([lookups, walked + 1]);
-            })
-            .filter_map(move |span| {
-                let first = span.guest.max(guest.start);
-                let last = span.end.min(guest.end);
-                if first >= last {
-                    return None;
-                }
-                Some(SharedRange {
-                    file: span.file,
-                    start: span.offset.checked_add(first - span.guest)?,
-                    end: span.offset.checked_add(last - span.guest)?,
-                })
-            })
+        overlapping_spans_walked(&self.spans, guest, || {
+            let [lookups, walked] = self.walks.get();
+            self.walks.set([lookups, walked + 1]);
+        })
     }
 
     fn range(&self, guest: u64, length: u64) -> Option<SharedRange> {
@@ -631,6 +617,65 @@ impl GuestFileIndex {
             end: start.checked_add(length)?,
         })
     }
+}
+
+/// The file bytes behind the parts of guest range `guest` that `spans`
+/// (`GuestFileIndex::spans`) hold.
+fn overlapping_spans(
+    spans: &[GuestFileSpan],
+    guest: std::ops::Range<u64>,
+) -> impl Iterator<Item = SharedRange> + '_ {
+    overlapping_spans_walked(spans, guest, || {})
+}
+
+/// `overlapping_spans`, calling `walked` for each span looked at.
+fn overlapping_spans_walked<'a>(
+    spans: &'a [GuestFileSpan],
+    guest: std::ops::Range<u64>,
+    mut walked: impl FnMut() + 'a,
+) -> impl Iterator<Item = SharedRange> + 'a {
+    let after = spans.partition_point(|span| span.guest < guest.end);
+    spans[..after]
+        .iter()
+        .rev()
+        .take_while(move |span| span.furthest_end > guest.start)
+        .inspect(move |_| walked())
+        .filter_map(move |span| {
+            let first = span.guest.max(guest.start);
+            let last = span.end.min(guest.end);
+            if first >= last {
+                return None;
+            }
+            Some(SharedRange {
+                file: span.file,
+                start: span.offset.checked_add(first - span.guest)?,
+                end: span.offset.checked_add(last - span.guest)?,
+            })
+        })
+}
+
+/// `Backend::shared_write_serial` from its parts.
+fn shared_write_serial_in(
+    shared_writes: &VecDeque<(u64, BoundedWrites)>,
+    unbounded_write_serial: u64,
+    completed: u64,
+    range: SharedRange,
+) -> u64 {
+    let minimum = unbounded_write_serial.max(completed);
+    shared_writes
+        .iter()
+        .rev()
+        .take_while(|&&(serial, _)| serial > minimum)
+        .find(|(_, written)| {
+            let first = written
+                .shared
+                .partition_point(|span| (span.file, span.end) <= (range.file, range.start));
+            written
+                .shared
+                .get(first)
+                .is_some_and(|span| range.overlaps(*span))
+        })
+        .map_or(minimum, |(serial, _)| *serial)
 }
 
 impl Drop for Backend {
@@ -930,23 +975,12 @@ impl Backend {
 
     /// Newest submission that may write these file bytes.
     fn shared_write_serial(&self, range: SharedRange) -> u64 {
-        let minimum = self
-            .unbounded_write_serial
-            .max(self.renderer.completed_serial());
-        self.shared_writes
-            .iter()
-            .rev()
-            .take_while(|&&(serial, _)| serial > minimum)
-            .find(|(_, written)| {
-                let first = written
-                    .shared
-                    .partition_point(|span| (span.file, span.end) <= (range.file, range.start));
-                written
-                    .shared
-                    .get(first)
-                    .is_some_and(|span| range.overlaps(*span))
-            })
-            .map_or(minimum, |(serial, _)| *serial)
+        shared_write_serial_in(
+            &self.shared_writes,
+            self.unbounded_write_serial,
+            self.renderer.completed_serial(),
+            range,
+        )
     }
 
     fn wait_for_table_writes(&mut self, range: Option<SharedRange>) -> Result<(), String> {
@@ -10509,6 +10543,47 @@ impl Nvn {
         Ok((built, traced_variant))
     }
 
+    /// Drop the memoized texture bindings that changes since may affect
+    /// (`evict_bindings`), and all of them when their stamp moved: what a
+    /// draw does before it looks a texture binding up.
+    fn refresh_binding_memo(&mut self) {
+        let stamp = (
+            self.binding_epoch,
+            0,
+            self.binding_serial,
+            // Across presents: entries are revalidated per
+            // present (`memoized_binding`); texture and
+            // target changes evict what they touch
+            // (`evict_bindings`).
+            0,
+        );
+        self.evict_bindings();
+        if self.binding_memo.0 != stamp {
+            let old = self.binding_memo.0;
+            let backend = self.gpu.as_mut().unwrap();
+            for (changed, name) in [
+                (
+                    old.0 != stamp.0,
+                    "stat: binding memo resets by texture epoch",
+                ),
+                (
+                    old.1 != stamp.1,
+                    "stat: binding memo resets by target changes",
+                ),
+                (
+                    old.2 != stamp.2,
+                    "stat: binding memo resets by binding serial",
+                ),
+                (old.3 != stamp.3, "stat: binding memo resets by present"),
+            ] {
+                if changed {
+                    backend.stat(name, 1);
+                }
+            }
+            self.binding_memo = (stamp, Default::default());
+        }
+    }
+
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
         if empty_draw(command) {
@@ -10525,6 +10600,8 @@ impl Nvn {
                 bytes.clear();
                 bytes
             }));
+        // Planned draws bring their own buffers (`parallel`).
+        bindings.spare_uniforms.truncate(parallel::SPARE_UNIFORMS);
         bindings.guest_uniforms.clear();
         bindings.textures.clear();
         bindings.stage_variants.clear();
@@ -10801,7 +10878,16 @@ impl Nvn {
         let mut binding_times = [std::time::Duration::ZERO; 5];
         let mut memo_hits = 0u64;
         let mut binding_lap: Option<(usize, std::time::Instant)> = None;
-        for (index, stage) in stages.iter().enumerate() {
+        // Bindings planned on another thread (`parallel`) are installed
+        // after the loop, which then resolves none (all, when verifying).
+        let planned = self.take_planned_bindings(&program);
+        let verify_plan = planned.is_some() && parallel::verify();
+        let resolved_stages = if planned.is_some() && !verify_plan {
+            &[][..]
+        } else {
+            stages
+        };
+        for (index, stage) in resolved_stages.iter().enumerate() {
             let nvn = nvn_stage(stage.stage);
             for descriptor in &stage.descriptors {
                 let now = timing.then(std::time::Instant::now);
@@ -11015,41 +11101,7 @@ impl Nvn {
                             .ok_or_else(|| format!("texture {nvn}/{slot} is not bound"))?;
                         // Valid within a present (textures are revalidated
                         // once per present); registrations evict their ids.
-                        let stamp = (
-                            self.binding_epoch,
-                            0,
-                            self.binding_serial,
-                            // Across presents: entries are revalidated per
-                            // present (`memoized_binding`); texture and
-                            // target changes evict what they touch
-                            // (`evict_bindings`).
-                            0,
-                        );
-                        self.evict_bindings();
-                        if self.binding_memo.0 != stamp {
-                            let old = self.binding_memo.0;
-                            let backend = self.gpu.as_mut().unwrap();
-                            for (changed, name) in [
-                                (
-                                    old.0 != stamp.0,
-                                    "stat: binding memo resets by texture epoch",
-                                ),
-                                (
-                                    old.1 != stamp.1,
-                                    "stat: binding memo resets by target changes",
-                                ),
-                                (
-                                    old.2 != stamp.2,
-                                    "stat: binding memo resets by binding serial",
-                                ),
-                                (old.3 != stamp.3, "stat: binding memo resets by present"),
-                            ] {
-                                if changed {
-                                    backend.stat(name, 1);
-                                }
-                            }
-                            self.binding_memo = (stamp, Default::default());
-                        }
+                        self.refresh_binding_memo();
                         let (source, sampler, sample_type) = if let Some(binding) =
                             self.memoized_binding(handle)
                         {
@@ -11123,6 +11175,63 @@ impl Nvn {
 
         if let Some((kind, since)) = binding_lap.take() {
             binding_times[kind] += since.elapsed();
+        }
+        if let Some(plan) = planned {
+            if verify_plan {
+                self.verify_planned_bindings(
+                    &plan,
+                    parallel::Resolved {
+                        uniforms,
+                        guest_uniforms,
+                        textures,
+                        sampled_textures: &sampled_textures,
+                        fragment_constants,
+                        storage: &storage,
+                        storage_in_place: &storage_in_place,
+                        storage_written: &storage_written,
+                        storage_entries: &storage_entries,
+                        uniform_bytes,
+                        memo_hits,
+                    },
+                );
+            } else {
+                self.install_planned_bindings(
+                    core,
+                    plan,
+                    parallel::InstallTo {
+                        uniforms,
+                        guest_uniforms,
+                        textures,
+                        sampled_textures: &mut sampled_textures,
+                        fragment_constants: &mut fragment_constants,
+                        storage: &mut storage,
+                        storage_in_place: &mut storage_in_place,
+                        storage_written: &mut storage_written,
+                        storage_entries: &mut storage_entries,
+                        uniform_bytes: &mut uniform_bytes,
+                        memo_hits: &mut memo_hits,
+                    },
+                )?;
+            }
+        }
+        #[cfg(test)]
+        if parallel::testing::record_bindings(|| {
+            format!(
+                "uniforms {:?} guest {:?} textures {:?} sampled {:?} fragment {:?} storage {:?} in place {:?} written {:?} entries {:?} bytes {} hits {}",
+                parallel::sorted_entries(uniforms.iter()),
+                parallel::sorted_entries(guest_uniforms.iter()),
+                parallel::sorted_entries(textures.iter()),
+                sampled_textures,
+                fragment_constants,
+                parallel::sorted_entries(storage.iter()),
+                parallel::sorted_entries(storage_in_place.iter()),
+                parallel::sorted_entries(storage_written.iter()),
+                storage_entries,
+                uniform_bytes,
+                memo_hits
+            )
+        }) {
+            return Ok(());
         }
         let fragment_constants = fragment_constants
             .map(|(index, binding, size)| (index, &uniforms[&(index, binding)][..size]));
