@@ -622,8 +622,13 @@ fn window_calls_match_the_default_emission() {
     }
     if window_call_program::ACTIVE {
         assert!(window_call_table::TABLE_CALLS > 0);
-        // Early exits allow more targets.
-        assert!(window_call_early::DIRECT_CALLS > window_call_on::DIRECT_CALLS);
+        // Early exits allow more targets (with long windows, the windows
+        // of the program's targets already hold every block they reach).
+        if cfg!(feature = "long-windows") {
+            assert!(window_call_early::DIRECT_CALLS >= window_call_on::DIRECT_CALLS);
+        } else {
+            assert!(window_call_early::DIRECT_CALLS > window_call_on::DIRECT_CALLS);
+        }
     }
     let mut outputs = std::collections::BTreeMap::new();
     for lift in &lifts {
@@ -679,10 +684,14 @@ fn window_calls_match_the_default_emission() {
         // Calls through the table enter windows as direct calls do (no
         // entry record); without the table they would return early and
         // the dispatcher would enter the callee, recording it.
-        assert_eq!(
-            outputs["window_call_table"].ring,
-            outputs["window_call_on"].ring
-        );
+        // (Long windows enter fewer windows in `window_call_on`'s 64 KiB
+        // region than in the table lift's 1 KiB regions.)
+        if !cfg!(feature = "long-windows") {
+            assert_eq!(
+                outputs["window_call_table"].ring,
+                outputs["window_call_on"].ring
+            );
+        }
         let uninstalled = child("window_call_table,uninstalled");
         assert!(!uninstalled.installed);
         assert_eq!(&uninstalled.runs, base, "uninstalled: still the same runs");
