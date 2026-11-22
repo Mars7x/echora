@@ -68,6 +68,7 @@ fn options() -> EmitOptions {
         window_calls_audit: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS_AUDIT").is_some(),
         long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
         known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
+        call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         stub_windows: false,
     }
 }
@@ -4120,6 +4121,90 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     ));
     let missing_caller = pieces.len();
     pieces.push(piece(vec![0, 0xd400_00e1], vec![(0, Fix::Bl(missing))]));
+    // A switch through a halfword jump table (a leaf): AND W17, W0, #3;
+    // ADR X16, table; LDRH W9, [X16, X17, LSL #1]; ADR X3, cases;
+    // ADD X3, X3, X9, LSL #2; BR X3; four cases of an ADD to X0 and a B to
+    // the RET; the table (offsets in words from the cases).
+    let switch = pieces.len();
+    {
+        let mut words = vec![
+            0x1200_0411,
+            adr(4, 4 * 15, 16),
+            0x7871_7a09,
+            adr(12, 4 * 6, 3),
+            0x8b09_0863,
+            0xd61f_0060,
+        ];
+        for case in 0..4u32 {
+            words.push(0x9100_0000 | ((case * 3 + 1) << 10));
+            words.push(b(words.len(), 14));
+        }
+        words.push(RET);
+        words.extend([2 << 16, 4 | (6 << 16)]);
+        assert_eq!(words.len(), 17);
+        pieces.push(piece(words, Vec::new()));
+    }
+    // A frame calling the switch (a transitive summary over a jump table).
+    let switch_frame = pieces.len();
+    pieces.push(piece(
+        vec![0xa9bf_7bfd, 0, 0xa8c1_7bfd, RET],
+        vec![(1, Fix::Bl(switch))],
+    ));
+    // A function of more than FUNCTION_BLOCK_LIMIT blocks (and windows):
+    // 300 CBZs over an ADD each.
+    let long = pieces.len();
+    {
+        let mut words = Vec::new();
+        for _ in 0..300 {
+            let at = words.len();
+            words.push(cbz(at, at + 2, 1 + next() % 15));
+            words.push(0x9100_0421 | ((next() % 15) << 10)); // add x1, x1, #k
+        }
+        words.push(RET);
+        pieces.push(piece(words, Vec::new()));
+    }
+    // A game-shaped function: a frame saving X19/X20, eight rounds of a
+    // body (random instructions, CBZ skips) with calls of the switch and of
+    // the switch's frame, then the frame back.
+    let game = pieces.len();
+    {
+        let keep = |instruction: &Instruction| {
+            let writes = effects(instruction).writes;
+            reserved(instruction) || [19, 20, 29].iter().any(|&n| writes.has_gpr(n))
+        };
+        let mut words = vec![0xa9be_7bfd, 0xa901_53f3, 0xd280_0113]; // stp; stp x19, x20; mov x19, #8
+        let mut fixes = Vec::new();
+        let head = words.len();
+        for round in 0..6 {
+            for _ in 0..4 {
+                words.push(body_instruction(&mut next, &keep));
+            }
+            let at = words.len();
+            words.push(cbz(at, at + 3, 1 + next() % 15));
+            words.push(body_instruction(&mut next, &keep));
+            words.push(body_instruction(&mut next, &keep));
+            // (Callees that leave X19, its round count, alone.)
+            let callee = if round % 2 == 0 { switch } else { switch_frame };
+            fixes.push((words.len(), Fix::Bl(callee)));
+            words.push(0);
+        }
+        words.push(0xd100_0673); // sub x19, x19, #1
+        let at = words.len();
+        words.push(0xb500_0013 | ((offset(at, head) & 0x7_ffff) << 5)); // cbnz x19, head
+        words.extend([0xa941_53f3, 0xa8c2_7bfd, RET]); // ldp x19, x20; ldp x29, x30
+        pieces.push(Piece {
+            words,
+            fixes,
+            entries: Vec::new(),
+        });
+    }
+    let new_callers = pieces.len();
+    pieces.push(piece(
+        vec![0, 0, 0xd400_00e1],
+        vec![(0, Fix::Bl(switch)), (1, Fix::Bl(switch_frame))],
+    ));
+    pieces.push(piece(vec![0, 0xd400_00e1], vec![(0, Fix::Bl(long))]));
+    pieces.push(piece(vec![0, 0xd400_00e1], vec![(0, Fix::Bl(game))]));
     // A function straddling a window boundary (placed last), and its
     // caller.
     let straddle = pieces.len();
@@ -4190,6 +4275,9 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         addresses[chain_caller],
         addresses[missing_caller],
         addresses[straddle_caller],
+        addresses[new_callers],
+        addresses[new_callers + 1],
+        addresses[new_callers + 2],
     ]);
     let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     let region = CodeRegion {
@@ -4306,6 +4394,56 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             },
         );
     }
+    // Lifted functions with transitive summaries through the function
+    // table: in one region, in 1 KiB regions (functions spanning
+    // regions), and with float bodies also audited, called directly, with
+    // deferred charges and with the step count in a local.
+    let functions = EmitOptions {
+        functions: true,
+        function_table: true,
+        call_summaries: true,
+        transitive_summaries: true,
+        ..plain
+    };
+    lift("function_on", 16, functions);
+    lift("function_regions", 10, functions);
+    if fp {
+        lift(
+            "function_audit",
+            16,
+            EmitOptions {
+                call_summaries_audit: true,
+                ..functions
+            },
+        );
+        lift(
+            "function_direct",
+            16,
+            EmitOptions {
+                function_table: false,
+                ..functions
+            },
+        );
+        lift(
+            "function_deferred",
+            16,
+            EmitOptions {
+                split_ticks: true,
+                deferred_charges: true,
+                ..functions
+            },
+        );
+        lift(
+            "function_steps",
+            16,
+            EmitOptions {
+                split_ticks: true,
+                deferred_charges: false,
+                steps_local: true,
+                ..functions
+            },
+        );
+    }
     if fp {
         let listed: std::collections::BTreeSet<u64> = translation
             .blocks
@@ -4347,6 +4485,29 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     )
     .expect("write");
     writeln!(out, "/// Whether the build's options allow window calls (not structured, no lifted functions).\npub const ACTIVE: bool = {active};").expect("write");
+    let lifted_16 = echora_lift::codegen::functions(&translation, 16);
+    let lifted_10 = echora_lift::codegen::functions(&translation, 10);
+    let summaries_16: Vec<u64> =
+        echora_lift::codegen::transitive_summaries(&translation, &lifted_16, 16, true)
+            .into_keys()
+            .collect();
+    writeln!(
+        out,
+        "/// The switch, its frame, the function over the block limit and the game-shaped function.\n\
+         pub const SWITCH: u64 = {:#x};\npub const SWITCH_FRAME: u64 = {:#x};\npub const LONG: u64 = {:#x};\npub const GAME: u64 = {:#x};\n\
+         pub const JUMP_TABLES: usize = {};\n\
+         /// Lifted functions in 64 KiB and 1 KiB regions, and those with summaries (64 KiB, the table).\n\
+         pub const FUNCTIONS_16: &[u64] = &{:#x?};\npub const FUNCTIONS_10: &[u64] = &{:#x?};\npub const SUMMARIES_16: &[u64] = &{:#x?};",
+        addresses[switch],
+        addresses[switch_frame],
+        addresses[long],
+        addresses[game],
+        report.jump_tables,
+        lifted_16.keys().collect::<Vec<_>>(),
+        lifted_10.keys().collect::<Vec<_>>(),
+        summaries_16,
+    )
+    .expect("write");
     writeln!(out, "}}").expect("write");
     for (name, mut root, regions) in lifts {
         // Every lift answers whether its window-call table is installed
@@ -4385,6 +4546,15 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             count("= enter_window_"),
             count("= window_call_at("),
             count("pub fn enter_window_")
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Lifted functions, and summarized calls of them (directly and through the table).
+             pub const FUNCTIONS: usize = {};
+pub const FUNCTION_CALLS: usize = {};",
+            count("pub fn run_function_"),
+            count("let called = run_function_") + count("let called = function_at(")
         )
         .expect("write");
         for (region, source) in regions {

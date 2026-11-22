@@ -28,7 +28,7 @@ mod common;
 
 use common::*;
 use echora_aot_tests::{Core, Machine, READ, STATE_NORMAL, Trap, WRITE};
-use echora_lift::aarch64::{Instruction, MemoryOp, Writeback, decode};
+use echora_lift::aarch64::{Address, Instruction, MemoryOp, Writeback, decode};
 
 #[allow(
     missing_debug_implementations,
@@ -104,7 +104,7 @@ macro_rules! lift {
             install: $module::install,
             installed: $module::window_calls_installed,
             census: $module::CENSUS,
-            summarized: $module::DIRECT_CALLS + $module::TABLE_CALLS,
+            summarized: $module::DIRECT_CALLS + $module::TABLE_CALLS + $module::FUNCTION_CALLS,
         }
     };
 }
@@ -127,6 +127,12 @@ fn lifts() -> Vec<Lift> {
         lift!(window_call_direct_on),
         lift!(window_call_stub_base),
         lift!(window_call_stub_on),
+        lift!(function_on),
+        lift!(function_regions),
+        lift!(function_audit),
+        lift!(function_direct),
+        lift!(function_deferred),
+        lift!(function_steps),
     ]
 }
 
@@ -142,6 +148,12 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_dense_base", "window_call_dense_on"),
     ("window_call_direct_base", "window_call_direct_on"),
     ("window_call_stub_base", "window_call_stub_on"),
+    ("window_call_base", "function_on"),
+    ("window_call_base", "function_regions"),
+    ("window_call_base", "function_audit"),
+    ("window_call_base", "function_direct"),
+    ("window_call_deferred_base", "function_deferred"),
+    ("window_call_steps_base", "function_steps"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -456,6 +468,38 @@ fn reference(program: &Program, entry: u64, start: &Start) -> Option<End> {
                     stack_pair(&mut start, &instruction)?;
                     pc + 4
                 }
+                // A load from the code (the jump table's halfwords).
+                Instruction::LoadStore {
+                    rt,
+                    rn,
+                    bytes,
+                    op: op @ MemoryOp::Load { .. },
+                    address: Address::Register { rm, option, shift },
+                } if {
+                    let at = get_sp(&start.state, rn).wrapping_add(extend(
+                        get(&start.state, rm),
+                        option,
+                        shift,
+                        64,
+                    ));
+                    at.checked_sub(program.base)
+                        .is_some_and(|offset| offset < 4 * program.words.len() as u64)
+                } =>
+                {
+                    let at = get_sp(&start.state, rn).wrapping_add(extend(
+                        get(&start.state, rm),
+                        option,
+                        shift,
+                        64,
+                    ));
+                    let mut value = 0u64;
+                    for byte in 0..u64::from(bytes) {
+                        let word = word_at(program, (at + byte) & !3)?;
+                        value |= u64::from((word >> (8 * ((at + byte) & 3))) as u8) << (8 * byte);
+                    }
+                    set(&mut start.state, rt, loaded(value, u64::from(bytes), op));
+                    pc + 4
+                }
                 _ => {
                     let taken = interpret(&instruction, &mut start.state)?;
                     match instruction {
@@ -503,6 +547,14 @@ fn window_call_lift_child() {
             "table" => (
                 window_call_int::window_call_table::dispatch,
                 window_call_int::window_call_table::install,
+            ),
+            "function_on" => (
+                window_call_int::function_on::dispatch,
+                window_call_int::function_on::install,
+            ),
+            "function_regions" => (
+                window_call_int::function_regions::dispatch,
+                window_call_int::function_regions::install,
             ),
             other => panic!("unknown lift {other}"),
         };
@@ -639,7 +691,10 @@ fn window_calls_match_the_default_emission() {
             "{}: runs",
             lift.name
         );
-        if window_call_program::ACTIVE && !lift.name.ends_with("base") {
+        if window_call_program::ACTIVE
+            && !lift.name.ends_with("base")
+            && !lift.name.starts_with("function_")
+        {
             assert!(
                 output.installed,
                 "{}: the window-call table is not installed",
@@ -699,6 +754,31 @@ fn window_calls_match_the_default_emission() {
     }
 }
 
+/// The cases lifted functions meet in the game: a switch through a jump
+/// table (its cases in the function, so it and the frame calling it get
+/// summaries), a function over `FUNCTION_BLOCK_LIMIT` blocks (left to
+/// the windows), a game-shaped function calling both in a loop, and
+/// functions cut at region edges (1 KiB regions).
+#[test]
+fn lifted_functions_cover_the_game_s_cases() {
+    use window_call_program::*;
+    assert_eq!(JUMP_TABLES, 1);
+    for function in [SWITCH, SWITCH_FRAME, GAME] {
+        assert!(FUNCTIONS_16.contains(&function), "{function:#x} is lifted");
+        assert!(
+            SUMMARIES_16.contains(&function),
+            "{function:#x} has a summary"
+        );
+    }
+    assert!(!FUNCTIONS_16.contains(&LONG), "over the block limit");
+    // In 1 KiB regions bodies end at region edges (the long function's
+    // part in its first region may fit the limit).
+    assert!(!FUNCTIONS_10.is_empty());
+    assert!(function_on::FUNCTION_CALLS > 0);
+    assert!(function_regions::FUNCTION_CALLS > 0);
+    assert!(function_on::FUNCTIONS > 0);
+}
+
 /// The integer twin, without and with window calls (in one region and
 /// through the table), against the reference interpreter.
 #[test]
@@ -707,7 +787,7 @@ fn window_calls_match_the_reference() {
         assert!(window_call_int::window_call_on::DIRECT_CALLS > 0);
         assert!(window_call_int::window_call_table::TABLE_CALLS > 0);
     }
-    for lift in ["base", "on", "table"] {
+    for lift in ["base", "on", "table", "function_on", "function_regions"] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
