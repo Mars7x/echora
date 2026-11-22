@@ -74,7 +74,9 @@ fn every_stub_is_recognised_and_the_in_region_call_is_direct() {
     // Three stubs, all predicted and inlined; BLs to each, one of them (to
     // FA, in the caller's region) with a direct window call; one B.
     assert_eq!(plt_code::REPORT, (3, 3, 3, 3, 1, 1));
-    assert_eq!(plt_code::DIRECT_CALLS, 1);
+    // (With lifted functions the function's own copy of the call too.)
+    let direct = if cfg!(feature = "functions") { 2 } else { 1 };
+    assert_eq!(plt_code::DIRECT_CALLS, direct);
     // Running the predicted window for another word would still be right
     // (`Core::call_window` leaves a window that does not hold the PC), so
     // only the emitted guard shows the call is skipped then.
