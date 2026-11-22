@@ -861,6 +861,15 @@ Game set plus window-calls; host instructions per guest instruction
   adds work. `tests/steps_local.rs` checks it charges and stops exactly as
   per-block charging (every host check point and budget).
 - `known-returns` (earlier): no change at `opt-level` 1.
+- `long-windows` (earlier), counted the same way: crossing 10.95 to 4.90
+  host instructions per guest instruction (mispredictions 10.2 to 3.4
+  per 100), every other kernel unchanged, with or without
+  `known-returns`; the aot-tests programs' Rust 44% larger (75 to 109
+  MB). The game measured about 8% slower with window-calls, long-windows
+  and known-returns than plain (forest, three rounds): on the kernels
+  neither option adds instructions, so the extra code (instruction cache,
+  predictor capacity, which kernels this small cannot show) is the
+  candidate; a profile of the two translations decides it.
 
 **Where that leaves the cost.** On game-shaped code about 12-15 host
 instructions per guest instruction: roughly 2.5-3 for the charges, 1-1.5
