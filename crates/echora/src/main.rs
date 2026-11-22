@@ -740,6 +740,13 @@ fn lift(
         calls.summarized_callers,
         calls.summarized_caller_sites
     );
+    println!(
+        "lifted functions: {} BL targets over the block limit; {} functions hold a jump table; {} instructions in function bodies ({:.0}% of the translation, compiled again as functions)",
+        calls.over_limit,
+        calls.with_jump_tables,
+        calls.function_instructions,
+        100.0 * calls.function_instructions as f64 / d.translation.instructions.len().max(1) as f64
+    );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
