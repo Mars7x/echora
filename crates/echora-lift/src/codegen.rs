@@ -3832,6 +3832,17 @@ fn emit_block_body(
             output.push_str(rest);
             return;
         }
+        if CACHED_STOP.get() && !IN_FUNCTION.get() && !tagged {
+            // The window's copy of the stop word (`EmitOptions::cached_stop`):
+            // the steps in the `Core` as before; only a charge it does not
+            // clear reloads the word and takes the exact checks.
+            let count = count as u64;
+            output.push_str(&format!(
+                "{indent}if m.steps + {count} <= stop {{ m.steps += {count}; }} else {{ stop = m.stop.load(std::sync::atomic::Ordering::Relaxed); if !m.charge_block_at({arguments}, false) {{ m.charge_block_slow({arguments}, {resumable})?; }} }}\n"
+            ));
+            output.push_str(rest);
+            return;
+        }
         output.push_str(&format!(
             "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
         ));
@@ -4822,6 +4833,10 @@ thread_local! {
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::cached_stop` of the region being emitted (split
+    /// windows with split ticks, not structured, without deferred charges
+    /// or a local step count).
+    static CACHED_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Restores [`WINDOW_CALLS`] when it goes.
@@ -5852,6 +5867,16 @@ pub struct EmitOptions {
     /// copies are the blocks' own code (PC store, charge, boundary), and
     /// every block keeps its arm, so resuming is unchanged.
     pub threaded_successors: bool,
+    /// With split ticks (not structured, without deferred charges or a
+    /// local step count): a split window keeps the stop word in a local,
+    /// loaded on entry, at every backward dispatch and whenever an
+    /// untagged block's charge does not clear it; that charge is then
+    /// `m.steps + n <= stop` and an add, without the two dependent loads
+    /// of `Core::charge_block_at`. Steps stay in the `Core`, exact for
+    /// calls, traps and counters; budgets and host boundaries fall on the
+    /// same blocks. A preemption another thread requests (lowering the
+    /// word) is seen at the next backward dispatch or failed check.
+    pub cached_stop: bool,
 }
 
 thread_local! {
@@ -6450,6 +6475,7 @@ struct RegionSettings {
     audit: Flag,
     known_returns: Flag,
     threaded: Flag,
+    cached_stop: Flag,
 }
 
 impl RegionSettings {
@@ -6530,6 +6556,14 @@ impl RegionSettings {
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
+            cached_stop: Flag::set(
+                &CACHED_STOP,
+                options.cached_stop
+                    && options.split_ticks
+                    && !options.structured
+                    && !options.deferred_charges
+                    && !options.steps_local,
+            ),
         }
     }
 }
@@ -7078,6 +7112,8 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, pending: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             } else if STEPS_LOCAL.get() {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, st: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
+            } else if CACHED_STOP.get() {
+                "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    let mut stop = m.stop.load(std::sync::atomic::Ordering::Relaxed);\n"
             } else {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
@@ -7119,6 +7155,12 @@ pub fn emit_rust_split_to_regions<E>(
                 // the steps.
                 output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
+            );
+            } else if CACHED_STOP.get() {
+                // A backward dispatch reloads the stop word, so every loop
+                // sees a preemption within an iteration.
+                output.push_str(
+                "}\nif next_pc <= m.cpu.pc { stop = m.stop.load(std::sync::atomic::Ordering::Relaxed); }\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
             );
             } else {
                 output.push_str(
@@ -9244,6 +9286,49 @@ mod tests {
         assert!(!threaded.contains("next_pc = 0x1008;"), "{threaded}");
         assert!(threaded.contains("0x1000"), "{threaded}");
         assert!(source.contains("\n0x1008 => {"));
+    }
+
+    #[test]
+    fn cached_stop_charges_untagged_blocks_against_the_window_s_word() {
+        let words = [
+            0x9100_0421, // 0x1000: add x1, x1, #1
+            0xf100_0400, // 0x1004: subs x0, x0, #1
+            0x54ff_ffc1, // 0x1008: b.ne 0x1000
+            0xd65f_03c0, // 0x100c: ret
+        ];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            cached_stop: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        assert!(
+            source.contains("let mut stop = m.stop.load(std::sync::atomic::Ordering::Relaxed);")
+        );
+        assert!(
+            source.contains("if m.steps + 3 <= stop { m.steps += 3; } else { stop = m.stop.load(")
+        );
+        assert!(source.contains("if next_pc <= m.cpu.pc { stop = m.stop.load("));
+        for other in [
+            EmitOptions {
+                steps_local: true,
+                ..options
+            },
+            EmitOptions {
+                deferred_charges: true,
+                ..options
+            },
+            EmitOptions {
+                split_ticks: false,
+                ..options
+            },
+        ] {
+            let (_, regions) = emit_rust_split_with(&translation, 16, other);
+            assert!(!regions[0].1.contains("<= stop {"), "{other:?}");
+        }
     }
 
     #[test]

@@ -114,6 +114,8 @@ call-summaries-audit = []
 threaded-successors = []
 # A 34-bit guest address space instead of 39 bits, for running the
 # benchmark kernels under valgrind (measuring only).
+# With split ticks: the stop word in a window local (EmitOptions::cached_stop).
+cached-stop = []
 small-address-space = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
