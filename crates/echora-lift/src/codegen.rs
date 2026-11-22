@@ -22,7 +22,7 @@ pub const MAX_BLOCKS_PER_FUNCTION: usize = 128;
 const WINDOW_BITS: u32 = 12;
 /// Split crates use 1 KiB windows: densely seeded windows of FP-heavy code
 /// otherwise produce single functions too large to compile in bounded memory.
-const SPLIT_WINDOW_BITS: u32 = 10;
+pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
 
 #[path = "regalloc.rs"]
 mod regalloc;
@@ -4028,7 +4028,7 @@ fn emit_float_run(
 /// block's first instruction (which charges the block) or its last.
 /// Nothing between two of a run's operations writes FPCR, calls a helper
 /// or leaves the block: they are consecutive instructions.
-fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
     let count = block.instructions.len();
     let mut runs = Vec::new();
