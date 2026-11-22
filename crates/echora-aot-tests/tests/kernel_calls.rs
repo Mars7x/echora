@@ -1,5 +1,5 @@
 //! The call-shaped benchmark kernels (`calls`, `calls2`, `gamecalls`,
-//! `crossing`) as `build.rs` lifts them for the benchmark (the build's
+//! `crossing`, `gamefn`) as `build.rs` lifts them for the benchmark (the build's
 //! options, 64 KiB regions), run at small iteration counts against the
 //! shared reference interpreter extended with BL and RET: every register,
 //! SP, NZCV and the data memory (objects and stack) must match at the
@@ -14,7 +14,7 @@ mod common;
 use common::*;
 use echora_aot_tests::kernels::{KERNEL_BASE, KERNEL_ENTRIES, KERNEL_SIZE, image};
 use echora_aot_tests::{Machine, Trap, kernel_code};
-use echora_lift::aarch64::{Instruction, decode};
+use echora_lift::aarch64::{Address, Instruction, MemoryOp, decode};
 
 const SVC_EXIT: u32 = 0xd400_00e1;
 
@@ -35,9 +35,37 @@ fn reference(image: &[u8], entry: u64, state: &mut State) -> Option<u64> {
         }
         let instruction = decode(word, pc);
         pc = match instruction {
-            Instruction::Branch { target, link: true } => {
-                state.x[30] = pc + 4;
+            Instruction::Branch { target, link } => {
+                if link {
+                    state.x[30] = pc + 4;
+                }
                 target
+            }
+            Instruction::Adr { rd, address } => {
+                set(state, rd, address);
+                pc + 4
+            }
+            // A load from the code (a jump table's halfwords).
+            Instruction::LoadStore {
+                rt,
+                rn,
+                bytes,
+                op: op @ MemoryOp::Load { .. },
+                address: Address::Register { rm, option, shift },
+            } if word_at(
+                image,
+                get_sp(state, rn).wrapping_add(extend(get(state, rm), option, shift, 64)) & !3,
+            )
+            .is_some() =>
+            {
+                let at = get_sp(state, rn).wrapping_add(extend(get(state, rm), option, shift, 64));
+                let mut value = 0u64;
+                for byte in 0..u64::from(bytes) {
+                    let word = word_at(image, (at + byte) & !3)?;
+                    value |= u64::from((word >> (8 * ((at + byte) & 3))) as u8) << (8 * byte);
+                }
+                set(state, rt, loaded(value, u64::from(bytes), op));
+                pc + 4
             }
             Instruction::BranchReg { rn, link } => {
                 let target = get(state, rn);
@@ -49,7 +77,6 @@ fn reference(image: &[u8], entry: u64, state: &mut State) -> Option<u64> {
             _ => {
                 let taken = interpret(&instruction, state)?;
                 match instruction {
-                    Instruction::Branch { target, .. } => target,
                     Instruction::BranchCond { target, .. }
                     | Instruction::CompareBranch { target, .. }
                     | Instruction::TestBranch { target, .. }
@@ -115,7 +142,7 @@ fn call_kernels_match_the_reference() {
     for &(name, offset) in KERNEL_ENTRIES {
         let iterations = match name {
             "calls" | "calls2" => 300,
-            "gamecalls" | "crossing" => 200,
+            "gamecalls" | "crossing" | "gamefn" => 200,
             _ => continue,
         };
         for _ in 0..3 {
@@ -147,5 +174,5 @@ fn call_kernels_match_the_reference() {
             assert!(steps > iterations, "{name}");
         }
     }
-    assert_eq!(runs, 4 * 3 * 3);
+    assert_eq!(runs, 5 * 3 * 3);
 }
