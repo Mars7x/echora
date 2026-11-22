@@ -133,6 +133,9 @@ fn lifts() -> Vec<Lift> {
         lift!(function_direct),
         lift!(function_deferred),
         lift!(function_steps),
+        lift!(regalloc_on),
+        lift!(regalloc_regions),
+        lift!(regalloc_direct),
     ]
 }
 
@@ -154,6 +157,9 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "function_direct"),
     ("window_call_deferred_base", "function_deferred"),
     ("window_call_steps_base", "function_steps"),
+    ("window_call_base", "regalloc_on"),
+    ("window_call_base", "regalloc_regions"),
+    ("window_call_base", "regalloc_direct"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -556,6 +562,14 @@ fn window_call_lift_child() {
                 window_call_int::function_regions::dispatch,
                 window_call_int::function_regions::install,
             ),
+            "regalloc_on" => (
+                window_call_int::regalloc_on::dispatch,
+                window_call_int::regalloc_on::install,
+            ),
+            "regalloc_regions" => (
+                window_call_int::regalloc_regions::dispatch,
+                window_call_int::regalloc_regions::install,
+            ),
             other => panic!("unknown lift {other}"),
         };
         install();
@@ -694,6 +708,7 @@ fn window_calls_match_the_default_emission() {
         if window_call_program::ACTIVE
             && !lift.name.ends_with("base")
             && !lift.name.starts_with("function_")
+            && !lift.name.starts_with("regalloc_")
         {
             assert!(
                 output.installed,
@@ -777,6 +792,10 @@ fn lifted_functions_cover_the_game_s_cases() {
     assert!(function_on::FUNCTION_CALLS > 0);
     assert!(function_regions::FUNCTION_CALLS > 0);
     assert!(function_on::FUNCTIONS > 0);
+    // Structured functions run, entered by calls and by window arms.
+    assert!(regalloc_on::STRUCTURED_FUNCTIONS > 0);
+    assert!(regalloc_regions::STRUCTURED_FUNCTIONS > 0);
+    assert!(regalloc_on::STRUCTURED_ENTRIES > 0);
 }
 
 /// The integer twin, without and with window calls (in one region and
@@ -787,7 +806,15 @@ fn window_calls_match_the_reference() {
         assert!(window_call_int::window_call_on::DIRECT_CALLS > 0);
         assert!(window_call_int::window_call_table::TABLE_CALLS > 0);
     }
-    for lift in ["base", "on", "table", "function_on", "function_regions"] {
+    for lift in [
+        "base",
+        "on",
+        "table",
+        "function_on",
+        "function_regions",
+        "regalloc_on",
+        "regalloc_regions",
+    ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

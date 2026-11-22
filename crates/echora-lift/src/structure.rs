@@ -1072,6 +1072,76 @@ impl Graph {
     }
 }
 
+/// The structured form of a lifted function: `blocks` (start, successors)
+/// entered only at `entries` (more than one: a `Dispatch` at the top on
+/// the entry PC), a successor outside them leaving
+/// (`Leave(Some(pc))`) and an empty list leaving by a computed PC
+/// (`Leave(None)`). A block with more than two successors (a jump table)
+/// ends in a `Switch` on the next PC. `None` when the graph is
+/// irreducible (some cycle can be entered at more than one block), or a
+/// block is unreachable from the entry.
+pub fn function_structure(
+    entries: &[u64],
+    blocks: &[(u64, Vec<Option<u64>>)],
+) -> Option<Structured> {
+    let index: BTreeMap<u64, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, (start, _))| (*start, i + 1))
+        .collect();
+    let roots: Vec<Edge> = entries
+        .iter()
+        .map(|entry| index.get(entry).map(|&node| Edge::Node(node)))
+        .collect::<Option<_>>()?;
+    let mut successors = vec![roots];
+    for (_, targets) in blocks {
+        let mut edges: Vec<Edge> = Vec::new();
+        for target in targets {
+            let edge = match target {
+                Some(pc) => match index.get(pc) {
+                    Some(&node) => Edge::Node(node),
+                    None => Edge::Leave(Some(*pc)),
+                },
+                None => Edge::Leave(None),
+            };
+            if !edges.contains(&edge) {
+                edges.push(edge);
+            }
+        }
+        if edges.is_empty() {
+            edges.push(Edge::Leave(None));
+        }
+        successors.push(edges);
+    }
+    let mut graph = Graph {
+        starts: std::iter::once(0)
+            .chain(blocks.iter().map(|(start, _)| *start))
+            .collect(),
+        successors,
+        root_pcs: entries.to_vec(),
+        regions: vec![None; blocks.len() + 1],
+        rpo: Vec::new(),
+        idom: Vec::new(),
+        children: Vec::new(),
+        loop_header: Vec::new(),
+        merge: Vec::new(),
+    };
+    let (rpo, retreating) = graph.depth_first();
+    graph.rpo = rpo;
+    if graph.rpo.iter().any(Option::is_none) {
+        return None;
+    }
+    graph.dominators();
+    if retreating
+        .iter()
+        .any(|&(from, to)| !graph.dominates(to, from))
+    {
+        return None;
+    }
+    graph.classify();
+    graph.do_tree(0, &mut Vec::new())
+}
+
 /// A sequence, flattened, without one-element wrappers.
 fn seq(parts: Vec<Structured>) -> Structured {
     let mut flat = Vec::new();

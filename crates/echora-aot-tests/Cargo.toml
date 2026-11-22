@@ -119,6 +119,9 @@ cached-stop = []
 # With split ticks: one stop test per window arm (EmitOptions::arm_charges).
 arm-charges = []
 small-address-space = []
+# With functions: lifted functions as structured host code, charged at
+# entries, loop heads and call returns (EmitOptions::regalloc).
+regalloc = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

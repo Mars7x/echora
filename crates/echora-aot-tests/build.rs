@@ -72,6 +72,7 @@ fn options() -> EmitOptions {
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
         arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
+        regalloc: std::env::var_os("CARGO_FEATURE_REGALLOC").is_some(),
         stub_windows: false,
     }
 }
@@ -858,6 +859,8 @@ fn vector_unary_code(out: &mut String) {
             // As game builds lift: helper calls then pass FPCR and FPSR
             // through window locals.
             fp_status_locals: true,
+            // The count is of the windows' code: no function copies.
+            regalloc: false,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -1436,6 +1439,8 @@ fn q_pair_code(out: &mut String) {
             direct_q_pairs: direct,
             window_memory: true,
             fp_status_locals: true,
+            // The census counts the windows' calls: no function copies.
+            regalloc: false,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -2431,13 +2436,14 @@ fn call_code(out: &mut String) {
     let translation = discover(&[region], &caller_addresses, words.len() + 16).expect("calls");
     // As split windows, and with lifted functions in one 64 KiB region (as
     // the game's regions hold code), whose calls between them are direct.
-    for (name, functions, function_table, call_summaries, transitive_summaries) in [
-        ("call_code", false, false, false, false),
-        ("call_function_code", true, false, false, false),
-        ("call_function_table_code", true, true, false, false),
-        ("call_summary_code", true, false, true, false),
-        ("call_summary_table_code", true, true, true, false),
-        ("call_transitive_code", true, true, true, true),
+    for (name, functions, function_table, call_summaries, transitive_summaries, regalloc) in [
+        ("call_code", false, false, false, false, false),
+        ("call_function_code", true, false, false, false, false),
+        ("call_function_table_code", true, true, false, false, false),
+        ("call_summary_code", true, false, true, false, false),
+        ("call_summary_table_code", true, true, true, false, false),
+        ("call_transitive_code", true, true, true, true, false),
+        ("call_regalloc_code", true, true, true, true, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -2449,6 +2455,7 @@ fn call_code(out: &mut String) {
                     function_table,
                     call_summaries,
                     transitive_summaries,
+                    regalloc,
                     ..options()
                 },
             )
@@ -3200,7 +3207,15 @@ fn plt_code(out: &mut String) {
     // 1 KiB regions whatever the build: the program puts its targets in
     // and out of the callers' regions.
     let report = plt_report(&translation, 10);
-    let (root, regions) = split_at(&translation, options(), 10);
+    // Counted as with lifted functions alone: no structured copies.
+    let (root, regions) = split_at(
+        &translation,
+        EmitOptions {
+            regalloc: false,
+            ..options()
+        },
+        10,
+    );
     let direct = regions
         .iter()
         .map(|(_, source)| source.matches("m.call_window(").count())
@@ -3684,7 +3699,11 @@ fn early_exit_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &[BASE, far], words.len()).expect("early exits");
-    for (name, function_table) in [("early_exit_code", false), ("early_exit_table_code", true)] {
+    for (name, function_table, regalloc) in [
+        ("early_exit_code", false, false),
+        ("early_exit_table_code", true, false),
+        ("early_exit_regalloc_code", true, true),
+    ] {
         LIFTED.set(LIFTED.get() + translation.instructions.len());
         let (root, regions) = emit_rust_split_with(
             &translation,
@@ -3693,6 +3712,7 @@ fn early_exit_code(out: &mut String) {
                 functions: true,
                 function_table,
                 call_summaries: true,
+                regalloc,
                 ..options()
             },
         );
@@ -3778,7 +3798,11 @@ fn two_level_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &[BASE, far], words.len()).expect("two levels");
-    for (name, function_table) in [("two_level_code", false), ("two_level_table_code", true)] {
+    for (name, function_table, regalloc) in [
+        ("two_level_code", false, false),
+        ("two_level_table_code", true, false),
+        ("two_level_regalloc_code", true, true),
+    ] {
         LIFTED.set(LIFTED.get() + translation.instructions.len());
         let (root, regions) = emit_rust_split_with(
             &translation,
@@ -3788,6 +3812,7 @@ fn two_level_code(out: &mut String) {
                 function_table,
                 call_summaries: true,
                 transitive_summaries: true,
+                regalloc,
                 ..options()
             },
         );
@@ -3843,9 +3868,10 @@ fn svc_wrapper_code(out: &mut String) {
         bytes,
     };
     let translation = discover(&[region], &[BASE], words.len()).expect("svc wrapper");
-    for (name, function_table) in [
-        ("svc_wrapper_code", false),
-        ("svc_wrapper_table_code", true),
+    for (name, function_table, regalloc) in [
+        ("svc_wrapper_code", false, false),
+        ("svc_wrapper_table_code", true, false),
+        ("svc_wrapper_regalloc_code", true, true),
     ] {
         LIFTED.set(LIFTED.get() + translation.instructions.len());
         let (root, regions) = emit_rust_split_with(
@@ -3855,6 +3881,7 @@ fn svc_wrapper_code(out: &mut String) {
                 functions: true,
                 function_table,
                 call_summaries: true,
+                regalloc,
                 ..options()
             },
         );
@@ -4564,6 +4591,24 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     };
     lift("function_on", 16, functions);
     lift("function_regions", 10, functions);
+    // Structured functions (regalloc): in one region, in 1 KiB regions,
+    // and called without the table.
+    let structured_functions = EmitOptions {
+        regalloc: true,
+        ..functions
+    };
+    lift("regalloc_on", 16, structured_functions);
+    lift("regalloc_regions", 10, structured_functions);
+    if fp {
+        lift(
+            "regalloc_direct",
+            16,
+            EmitOptions {
+                function_table: false,
+                ..structured_functions
+            },
+        );
+    }
     if fp {
         lift(
             "function_audit",
@@ -4712,6 +4757,14 @@ fn window_call_lifts(out: &mut String, fp: bool) {
 pub const FUNCTION_CALLS: usize = {};",
             count("pub fn run_function_"),
             count("let called = run_function_") + count("let called = function_at(")
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Functions emitted structured (regalloc), and window arms running them.\n\
+             pub const STRUCTURED_FUNCTIONS: usize = {};\npub const STRUCTURED_ENTRIES: usize = {};",
+            count("n: &mut u64) -> Result<(), Trap>"),
+            count("= run_entry(m, run_function_")
         )
         .expect("write");
         for (region, source) in regions {
