@@ -1667,42 +1667,25 @@ impl Nvn {
     }
 
     /// ECHORA_PARALLEL_DRAWS_VERIFY: compare a plan with what the replay's
-    /// own binding loop resolved, reporting the first differences.
+    /// own binding loop resolved, reporting the first differences. Values
+    /// are compared as they are, never formatted: an upload's source holds
+    /// its texels (hundreds of MiB for the forest's texture arrays).
     pub(super) fn verify_planned_bindings(&mut self, plan: &PlannedBindings, got: Resolved<'_>) {
         let mut differences = Vec::new();
-        let sorted = |map: Vec<String>| {
-            let mut map = map;
-            map.sort();
-            map
-        };
-        if sorted(
-            plan.uniforms
+        if plan.uniforms.len() != got.uniforms.len()
+            || plan
+                .uniforms
                 .iter()
-                .map(|(k, v)| format!("{k:?}{v:?}"))
-                .collect(),
-        ) != sorted(
-            got.uniforms
-                .iter()
-                .map(|(k, v)| format!("{k:?}{v:?}"))
-                .collect(),
-        ) {
+                .any(|(key, bytes)| got.uniforms.get(key) != Some(bytes))
+        {
             differences.push("uniforms");
         }
         // Uniform buffers the commit resolves are read in place or copied.
         let deferred_key = |key: &(usize, u32)| plan.deferred.iter().any(|item| item.key() == *key);
-        let planned_guest = sorted(
-            plan.guest_uniforms
-                .iter()
-                .map(|e| format!("{e:?}"))
-                .collect(),
-        );
-        let got_guest = sorted(
-            got.guest_uniforms
-                .iter()
-                .filter(|(key, _)| !deferred_key(key))
-                .map(|e| format!("{e:?}"))
-                .collect(),
-        );
+        let direct = got
+            .guest_uniforms
+            .iter()
+            .filter(|(key, _)| !deferred_key(key));
         let mut deferred_uniforms: Vec<(usize, u32)> = plan
             .deferred
             .iter()
@@ -1717,15 +1700,26 @@ impl Nvn {
             .chain(got.guest_uniforms.keys().copied().filter(deferred_key))
             .collect();
         got_deferred.sort_unstable();
-        if planned_guest != got_guest || deferred_uniforms != got_deferred {
+        if direct.clone().count() != plan.guest_uniforms.len()
+            || direct
+                .into_iter()
+                .any(|(key, value)| plan.guest_uniforms.get(key) != Some(value))
+            || deferred_uniforms != got_deferred
+        {
             differences.push("guest uniforms");
         }
-        if sorted(plan.textures.iter().map(|e| format!("{e:?}")).collect())
-            != sorted(got.textures.iter().map(|e| format!("{e:?}")).collect())
+        if plan.textures.len() != got.textures.len()
+            || plan.textures.iter().any(|(key, (source, sampler))| {
+                got.textures
+                    .get(key)
+                    .is_none_or(|(got_source, got_sampler)| {
+                        !source.same_as(got_source) || sampler != got_sampler
+                    })
+            })
         {
             differences.push("textures");
         }
-        if format!("{:?}", plan.sampled_textures) != format!("{:?}", got.sampled_textures) {
+        if plan.sampled_textures != *got.sampled_textures {
             differences.push("sampled texture types");
         }
         if plan.fragment_constants != got.fragment_constants {
@@ -1748,17 +1742,12 @@ impl Nvn {
         if storage_keys != planned_keys {
             differences.push("storage buffers");
         }
-        if sorted(
-            plan.storage_written
+        if plan.storage_written.len() != got.storage_written.len()
+            || plan
+                .storage_written
                 .iter()
-                .map(|e| format!("{e:?}"))
-                .collect(),
-        ) != sorted(
-            got.storage_written
-                .iter()
-                .map(|e| format!("{e:?}"))
-                .collect(),
-        ) {
+                .any(|(key, value)| got.storage_written.get(key) != Some(value))
+        {
             differences.push("written storage buffers");
         }
         if plan.storage_entries != *got.storage_entries {
@@ -2071,6 +2060,22 @@ pub(super) mod testing {
             record.push(describe());
             true
         })
+    }
+}
+
+/// A texture source without its texels (for comparing resolved bindings).
+#[cfg(test)]
+pub(super) fn source_summary(source: &TextureSource) -> String {
+    match source {
+        TextureSource::Upload {
+            key,
+            generation,
+            width,
+            height,
+            format,
+            ..
+        } => format!("upload {key:#x}/{generation} {width}x{height} {format:?}"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -2984,5 +2989,34 @@ mod replay_tests {
             );
         });
         assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() >= serial);
+    }
+
+    #[test]
+    fn verifying_a_draw_does_not_format_an_upload_s_texels() {
+        // A memoized upload as large as a forest texture array's share.
+        let big = |nvn: &mut Nvn| {
+            nvn.binding_memo.1.get_mut(&19).unwrap().source = TextureSource::Upload {
+                key: 0x19,
+                generation: 1,
+                width: 1365,
+                height: 1365,
+                shape: echora_gpu::draw::ImageShape::D2 { layers: 9 },
+                format: echora_gpu::ash::vk::Format::R8G8B8A8_UNORM,
+                texels: Arc::new(vec![0; 64 << 20]),
+                levels: Arc::new([]),
+            };
+        };
+        let started = std::time::Instant::now();
+        let Some((_, nvn)) = replay_with(2, true, &[batch()], None, big, |_| {}) else {
+            return;
+        };
+        assert_eq!(stat(&nvn, "stat: parallel draws verified"), 6);
+        assert_eq!(stat(&nvn, "stat: parallel draws that differ"), 0);
+        // Formatting the texels took seconds a draw.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "verifying took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -11255,7 +11255,9 @@ impl Nvn {
                 "uniforms {:?} guest {:?} textures {:?} sampled {:?} fragment {:?} storage {:?} in place {:?} written {:?} entries {:?} bytes {} hits {}",
                 parallel::sorted_entries(uniforms.iter()),
                 parallel::sorted_entries(guest_uniforms.iter()),
-                parallel::sorted_entries(textures.iter()),
+                parallel::sorted_entries(textures.iter().map(|(key, (source, sampler))| {
+                    (key, (parallel::source_summary(source), sampler))
+                })),
                 sampled_textures,
                 fragment_constants,
                 parallel::sorted_entries(storage.iter()),
