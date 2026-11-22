@@ -606,6 +606,16 @@ pub struct Nvn {
     /// without the NVN state's lock (see `Registry`). Buffers live only here.
     #[serde(skip)]
     registry: SharedRegistry,
+    /// Calls workers handed over without waiting for the NVN state, made
+    /// by whoever holds it next (see `Deferred`).
+    #[serde(skip)]
+    deferred: DeferredCalls,
+    /// The first deferred call that failed: the next call or replay
+    /// reports it.
+    #[serde(skip)]
+    deferred_failed: Option<Trap>,
+    /// Deferred calls made so far.
+    pub deferred_calls: u64,
     /// Finished command lists by NVNcommandHandle, with the order of their
     /// last recording or submission.
     #[serde(skip)]
@@ -2043,6 +2053,70 @@ pub struct Recorder {
     recordings: Recordings,
     command_buffers: CommandBuffers,
     registry: SharedRegistry,
+    deferred: DeferredCalls,
+}
+
+/// A call a worker hands to the NVN state without waiting for its lock,
+/// when another thread (the replay, mostly) holds it: whoever takes the
+/// lock next makes it first (`Nvn::apply_deferred`), before anything else.
+/// It is then made exactly as if its thread had taken the lock just ahead
+/// of that holder: every later NVN call that sees the state (submissions
+/// included) runs after it, the later calls on its own thread too, and
+/// nothing it changes is read without the lock. Everything it reads from
+/// the NVN state is read then; only what is not behind that lock (a
+/// texture view's bag, which workers set without it) is read when the call
+/// is made, since the thread's next calls may change it. A failure is
+/// reported by the next call or replay (`deferred_failed`).
+#[derive(Clone, Debug)]
+enum Deferred {
+    /// nvnMemoryPoolFlushMappedRange(pool, offset, size).
+    Flush { pool: u64, offset: u64, size: u64 },
+    /// nvnTexturePoolRegisterTexture / RegisterImage(pool, id, texture,
+    /// view), with the view's bag as the call found it.
+    Register {
+        name: &'static str,
+        pool: u64,
+        id: u64,
+        texture: u64,
+        view: Option<Bag>,
+    },
+}
+
+/// The calls workers deferred, oldest first, and whether there are any.
+#[derive(Debug, Default)]
+struct DeferredQueue {
+    calls: std::sync::Mutex<Vec<Deferred>>,
+    any: std::sync::atomic::AtomicBool,
+}
+
+type DeferredCalls = std::sync::Arc<DeferredQueue>;
+
+impl DeferredQueue {
+    fn push(&self, call: Deferred) {
+        let mut calls = lock_shared(&self.calls);
+        calls.push(call);
+        self.any.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn take(&self) -> Vec<Deferred> {
+        if !self.any.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut calls = lock_shared(&self.calls);
+        self.any.store(false, std::sync::atomic::Ordering::Release);
+        std::mem::take(&mut *calls)
+    }
+}
+
+/// Calls a worker may defer while another thread holds the NVN state
+/// (`Recorder::defer`).
+pub fn deferrable_call(name: &str) -> bool {
+    matches!(
+        name,
+        "nvnMemoryPoolFlushMappedRange"
+            | "nvnTexturePoolRegisterTexture"
+            | "nvnTexturePoolRegisterImage"
+    )
 }
 
 /// What the hottest object calls read (device checks, texture handles, a
@@ -2213,6 +2287,50 @@ impl Recorder {
             }
             _ => self.front_known(name, call, core),
         }
+    }
+
+    /// Hand `name` (one of `deferrable_call`) to whoever takes the NVN
+    /// state next, without waiting for it (see `Deferred`): true once
+    /// handed over. False for a null object or a view that is no texture
+    /// view, which the caller makes with the NVN state (reporting the
+    /// error as it always did).
+    pub fn defer(&self, name: &'static str, core: &mut Guest) -> bool {
+        let x = core.cpu.regs;
+        if x[0] == 0 || !deferrable_call(name) {
+            return false;
+        }
+        let call = if name == "nvnMemoryPoolFlushMappedRange" {
+            Deferred::Flush {
+                pool: x[0],
+                offset: x[1],
+                size: x[2],
+            }
+        } else {
+            let view = if x[3] == 0 {
+                None
+            } else {
+                match read_shared(self.bags.at(x[3])).get(&x[3]) {
+                    Some(bag) if bag.kind == "TextureView" => Some(bag.clone()),
+                    _ => return false,
+                }
+            };
+            Deferred::Register {
+                name,
+                pool: x[0],
+                id: x[1],
+                texture: x[2],
+                view,
+            }
+        };
+        call_watch(name, core);
+        self.deferred.push(call);
+        true
+    }
+
+    /// Whether the replay has work left (a lock-free wait for it, see
+    /// `Registry::replay_pending`).
+    pub fn replay_pending(&self) -> bool {
+        read_shared(&self.registry).replay_pending
     }
 
     fn command_buffer_state(&self) -> CommandBufferState<'_> {
@@ -2788,6 +2906,10 @@ impl Nvn {
     /// convention (X0..X7, V0..V7); a result goes to X0 (or V0). Returns
     /// Ok(false) when `name` is not implemented, so the caller stops with it.
     pub fn call(&mut self, name: &str, core: &mut Guest) -> Result<bool, Trap> {
+        self.apply_deferred();
+        if let Some(trap) = self.deferred_failed.take() {
+            return Err(trap);
+        }
         let result = self.call_inner(name, core);
         self.publish_resolve_state();
         result
@@ -3265,30 +3387,8 @@ impl Nvn {
             // offset, size): pools are coherent with host rendering. A flush
             // follows CPU writes, so cached textures in the range are stale.
             "nvnMemoryPoolFlushMappedRange" | "nvnMemoryPoolInvalidateMappedRange" => {
-                let pool = self.object(this, "MemoryPool").map_err(invalid)?;
-                let (base, size) = (pool.builder["Storage"].x[0], pool.builder["Storage"].x[1]);
-                if x[1].checked_add(x[2]).is_none_or(|end| end > size) {
-                    return Err(invalid(format!(
-                        "range {:#x}+{:#x} outside the pool",
-                        x[1], x[2]
-                    )));
-                }
-                let start = base + x[1];
-                if name == "nvnMemoryPoolFlushMappedRange" {
-                    if let Some(backend) = self.gpu() {
-                        backend.stat("stat: pool flushes", 1);
-                        backend.stat("stat: pool flush bytes", x[2]);
-                    }
-                    self.gpu_invalidate(start..start + x[2], None);
-                } else if let Err(message) = self.resolve_gpu_written(core, start..start + x[2]) {
-                    // The CPU is about to read the range: GPU results in it
-                    // come back first, stores programs made through the
-                    // page table included (a vertex program writing texels
-                    // back for the CPU).
-                    return Err(Trap::InvalidState {
-                        message: format!("{name}: dispatch results: {message}"),
-                    });
-                }
+                let core = (name == "nvnMemoryPoolInvalidateMappedRange").then_some(core);
+                self.map_range(name, this, x[1], x[2], core)?;
                 return Ok(true);
             }
             // Buffers: `registry_call` (they live in the registry only).
@@ -3717,54 +3817,7 @@ impl Nvn {
             | "nvnTexturePoolRegisterImage"
             | "nvnSamplerPoolRegisterSampler"
             | "nvnSamplerPoolRegisterSamplerBuilder" => {
-                let (kind, rest) = split_name(name).unwrap();
-                let count = self.object(this, kind).map_err(invalid)?.builder["Storage"].x[2] as u32;
-                let id = x[1] as u32;
-                if id >= count {
-                    return Err(invalid(format!("descriptor {id} outside a pool of {count}")));
-                }
-                let mut entry = Args::default();
-                let (sampler, view) = match rest {
-                    "RegisterSamplerBuilder" => {
-                        let props = self.bag(x[2], "SamplerBuilder").map_err(invalid)?;
-                        (Some(Self::sampler_from_properties(&props)), None)
-                    }
-                    "RegisterSampler" => {
-                        let object = self.object(x[2], "Sampler").map_err(invalid)?;
-                        (Some(Self::sampler_from_properties(&object.builder)), None)
-                    }
-                    _ => {
-                        self.object(x[2], "Texture").map_err(invalid)?;
-                        let view = if x[3] != 0 {
-                            self.bag(x[3], "TextureView").map_err(invalid)?;
-                            Some(read_shared(self.bags.at(x[3]))[&x[3]].clone())
-                        } else {
-                            None
-                        };
-                        (None, Some(view))
-                    }
-                };
-                entry.x[0] = x[2];
-                entry.x[1] = u64::from(rest == "RegisterImage");
-                // A hardware descriptor captures the texture as it is now:
-                // its storage and format tell a later reuse of the
-                // structure apart.
-                let (storage, format) = self.texture_identity(x[2]).unwrap_or((0, 0));
-                // The format, and the present it was registered in (high
-                // half, for ECHORA_HANDLE_LOG).
-                entry.x[2] = storage;
-                entry.x[3] = format & 0xffff_ffff | self.presented_frames << 32;
-                if sampler.is_none() {
-                    entry.v[0] = self.virtual_texture_address(x[2]).unwrap_or(0);
-                }
-                let registration = Registration {
-                    pool: this,
-                    id,
-                    sampler,
-                    entry,
-                    view,
-                };
-                self.apply_registration(registration);
+                self.register_descriptor(intern(name), this, x[1], x[2], Err(x[3]))?;
                 return Ok(true);
             }
             // nvn{Texture,Sampler}PoolGetMemoryPool / GetMemoryOffset / GetSize:
@@ -5135,6 +5188,10 @@ impl Nvn {
     /// threads' calls (recording, texture setup) run meanwhile, as the CPU
     /// does while the GPU works.
     pub fn resume_replay(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        self.apply_deferred();
+        if let Some(trap) = self.deferred_failed.take() {
+            return Err(trap);
+        }
         self.replay_budget = replay_chunk();
         let pumped = self.pump_queues(core);
         self.replay_budget = None;
@@ -7601,7 +7658,165 @@ impl Nvn {
             recordings: self.recording.clone(),
             command_buffers: self.command_buffers.clone(),
             registry: self.registry.clone(),
+            deferred: self.deferred.clone(),
         }
+    }
+
+    /// Make the calls workers deferred (`Deferred`), in their order. Done
+    /// by whoever takes the NVN state, before anything else; the first
+    /// failure waits for the next call or replay to report it.
+    pub fn apply_deferred(&mut self) {
+        for call in self.deferred.take() {
+            self.deferred_calls += 1;
+            let (name, result) = match call {
+                Deferred::Flush { pool, offset, size } => {
+                    let name = "nvnMemoryPoolFlushMappedRange";
+                    (name, self.map_range(name, pool, offset, size, None))
+                }
+                Deferred::Register {
+                    name,
+                    pool,
+                    id,
+                    texture,
+                    view,
+                } => (
+                    name,
+                    self.register_descriptor(name, pool, id, texture, Ok(view)),
+                ),
+            };
+            match result {
+                Ok(()) => *self.calls.entry(name.to_string()).or_default() += 1,
+                Err(trap) => {
+                    self.deferred_failed.get_or_insert(trap);
+                }
+            }
+        }
+    }
+
+    /// nvnMemoryPoolFlushMappedRange / InvalidateMappedRange(pool, offset,
+    /// size): pools are coherent with host rendering. A flush follows CPU
+    /// writes, so cached textures in the range are stale; an invalidate
+    /// (`core` given) precedes CPU reads, so GPU results in it come back.
+    fn map_range(
+        &mut self,
+        name: &str,
+        pool: u64,
+        offset: u64,
+        size: u64,
+        core: Option<&mut Guest>,
+    ) -> Result<(), Trap> {
+        let invalid = |message: String| Trap::InvalidState {
+            message: format!("{name}: {message}"),
+        };
+        let object = self.object(pool, "MemoryPool").map_err(invalid)?;
+        let storage = object.builder["Storage"];
+        if offset
+            .checked_add(size)
+            .is_none_or(|end| end > storage.x[1])
+        {
+            return Err(invalid(format!(
+                "range {offset:#x}+{size:#x} outside the pool"
+            )));
+        }
+        let start = storage.x[0] + offset;
+        match core {
+            None => {
+                if let Some(backend) = self.gpu() {
+                    backend.stat("stat: pool flushes", 1);
+                    backend.stat("stat: pool flush bytes", size);
+                }
+                self.gpu_invalidate(start..start + size, None);
+            }
+            // The CPU is about to read the range: GPU results in it come
+            // back first, stores programs made through the page table
+            // included (a vertex program writing texels back for the CPU).
+            Some(core) => {
+                if let Err(message) = self.resolve_gpu_written(core, start..start + size) {
+                    return Err(invalid(format!("dispatch results: {message}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// nvnTexturePoolRegisterTexture / RegisterImage(pool, int id, const
+    /// NVNtexture*, const NVNtextureView*) and
+    /// nvnSamplerPoolRegisterSampler(pool, int id, const NVNsampler*) /
+    /// RegisterSamplerBuilder(pool, int id, const NVNsamplerBuilder*): the
+    /// descriptor at `id` now describes that object. The host keeps the
+    /// registration (with the view's properties) instead of writing
+    /// hardware descriptors into the pool memory. A texture's view is
+    /// `view`: Ok with the bag a deferred call read, or Err with the view's
+    /// address (0 for none), read now.
+    fn register_descriptor(
+        &mut self,
+        name: &'static str,
+        pool: u64,
+        id: u64,
+        object: u64,
+        view: Result<Option<Bag>, u64>,
+    ) -> Result<(), Trap> {
+        let invalid = |message: String| Trap::InvalidState {
+            message: format!("{name}: {message}"),
+        };
+        let (kind, rest) = split_name(name).unwrap();
+        let count = self.object(pool, kind).map_err(invalid)?.builder["Storage"].x[2] as u32;
+        let id = id as u32;
+        if id >= count {
+            return Err(invalid(format!(
+                "descriptor {id} outside a pool of {count}"
+            )));
+        }
+        let mut entry = Args::default();
+        let (sampler, view) = match rest {
+            "RegisterSamplerBuilder" => {
+                let props = self.bag(object, "SamplerBuilder").map_err(invalid)?;
+                (Some(Self::sampler_from_properties(&props)), None)
+            }
+            "RegisterSampler" => {
+                let object = self.object(object, "Sampler").map_err(invalid)?;
+                (Some(Self::sampler_from_properties(&object.builder)), None)
+            }
+            _ => {
+                self.object(object, "Texture").map_err(invalid)?;
+                let view = match view {
+                    Ok(view) => view,
+                    Err(0) => None,
+                    Err(view) => {
+                        self.bag(view, "TextureView").map_err(invalid)?;
+                        Some(read_shared(self.bags.at(view))[&view].clone())
+                    }
+                };
+                (None, Some(view))
+            }
+        };
+        entry.x[0] = object;
+        entry.x[1] = u64::from(rest == "RegisterImage");
+        // A hardware descriptor captures the texture as it is now:
+        // its storage and format tell a later reuse of the
+        // structure apart.
+        let (storage, format) = self.texture_identity(object).unwrap_or((0, 0));
+        // The format, and the present it was registered in (high
+        // half, for ECHORA_HANDLE_LOG).
+        entry.x[2] = storage;
+        entry.x[3] = format & 0xffff_ffff | self.presented_frames << 32;
+        if sampler.is_none() {
+            entry.v[0] = self.virtual_texture_address(object).unwrap_or(0);
+        }
+        let registration = Registration {
+            pool,
+            id,
+            sampler,
+            entry,
+            view,
+        };
+        self.apply_registration(registration);
+        Ok(())
+    }
+
+    /// Whether calls deferred by workers wait to be made.
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.any.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Signal a sync, noting the GPU submission that holds the work
@@ -12169,5 +12384,288 @@ mod tests {
         assert_eq!(locked.0.len(), 2);
         assert!(locked.1.iter().all(|texel| *texel == [0.5, 0.25, 1.0, 1.0]));
         assert_eq!(locked, free);
+    }
+
+    /// An NVN state with a device, a memory pool, a texture pool of 16
+    /// descriptors at 0x3000 and textures at 0x4000.., for registrations.
+    fn registration_state() -> Nvn {
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        nvn.initialize(0x1000, "Device", BTreeMap::new()).unwrap();
+        let storage = Args {
+            x: [0x10_0000, 0x1_0000, 0, 0],
+            v: [0; 2],
+        };
+        nvn.initialize(
+            0x2000,
+            "MemoryPool",
+            BTreeMap::from([("Storage".to_string(), storage)]),
+        )
+        .unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTexturePoolInitialize",
+            &[0x3000, 0x2000, 0, 16],
+        );
+        for texture in 0..4 {
+            nvn.initialize(0x4000 + texture * 0x100, "Texture", BTreeMap::new())
+                .unwrap();
+        }
+        nvn
+    }
+
+    fn set_view(nvn: &Nvn, view: u64, levels: u64) {
+        let mut bags = write_shared(nvn.bags.at(view));
+        let bag = bags.entry(view).or_insert_with(|| Bag {
+            kind: "TextureView".into(),
+            ..Bag::default()
+        });
+        bag.set(
+            "Levels",
+            Args {
+                x: [levels, 0, 0, 0],
+                v: [0; 2],
+            },
+        );
+    }
+
+    /// What registrations and flushes left in the state.
+    fn registration_result(nvn: &Nvn) -> (Vec<(u32, Args)>, Vec<((u64, u32), Bag)>, u64, u64, u64) {
+        let mut descriptors: Vec<_> = nvn.texture_descriptors[&0x3000]
+            .iter()
+            .map(|(&id, &entry)| (id, entry))
+            .collect();
+        descriptors.sort_by_key(|&(id, _)| id);
+        let views = nvn
+            .views
+            .iter()
+            .map(|(&key, bag)| (key, bag.clone()))
+            .collect();
+        (
+            descriptors,
+            views,
+            nvn.descriptor_epoch,
+            nvn.calls
+                .get("nvnTexturePoolRegisterTexture")
+                .copied()
+                .unwrap_or(0),
+            nvn.calls
+                .get("nvnMemoryPoolFlushMappedRange")
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    /// Registrations and flushes a worker defers while another thread holds
+    /// the NVN state are made when it is taken next, as the locked calls
+    /// made at that point would have: the same descriptors, views and
+    /// epochs, with the view as it was at the call.
+    #[test]
+    fn deferred_registrations_and_flushes_match_locked_calls() {
+        let script: &[(&str, [u64; 4], Option<u64>)] = &[
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 1, 0x4000, 0],
+                None,
+            ),
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 2, 0x4100, 0x5000],
+                Some(3),
+            ),
+            (
+                "nvnMemoryPoolFlushMappedRange",
+                [0x2000, 0x100, 0x200, 0],
+                None,
+            ),
+            // The same view changed for the next registration.
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 3, 0x4200, 0x5000],
+                Some(5),
+            ),
+            ("nvnTexturePoolRegisterImage", [0x3000, 4, 0x4300, 0], None),
+            // Replaced: an epoch for work submitted before.
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 1, 0x4100, 0x5000],
+                Some(7),
+            ),
+        ];
+        let mut results = Vec::new();
+        for deferred in [false, true] {
+            let mut nvn = registration_state();
+            let recorder = nvn.recorder();
+            let mut memory = Memory::new(1 << 39);
+            let mut cpu = Cpu::default();
+            let mut core = Guest {
+                cpu: &mut cpu,
+                memory: GuestMemory::Checked(&mut memory),
+                counter: Some(0),
+            };
+            for &(name, args, levels) in script {
+                if let Some(levels) = levels {
+                    set_view(&nvn, args[3], levels);
+                }
+                core.cpu.regs[..4].copy_from_slice(&args);
+                if deferred {
+                    assert!(recorder.defer(intern(name), &mut core), "{name}");
+                } else {
+                    assert!(nvn.call(name, &mut core).unwrap(), "{name}");
+                }
+            }
+            // A view changed after the last call is not the one it registered.
+            set_view(&nvn, 0x5000, 9);
+            assert_eq!(nvn.has_deferred(), deferred);
+            // Taking the state (any call, or a replay) makes them first.
+            core.cpu.regs[0] = 0x3000;
+            assert!(nvn.call("nvnTexturePoolGetSize", &mut core).unwrap());
+            assert_eq!(core.cpu.regs[0], 16);
+            assert!(!nvn.has_deferred());
+            assert_eq!(nvn.deferred_calls, if deferred { 6 } else { 0 });
+            results.push(registration_result(&nvn));
+        }
+        // The worker's locked path counts the calls it makes (plain `call`
+        // does not); deferred calls are counted as it would.
+        let (locked, deferred) = (&results[0], &results[1]);
+        assert_eq!(
+            (&locked.0, &locked.1, locked.2),
+            (&deferred.0, &deferred.1, deferred.2)
+        );
+        assert_eq!((locked.3, locked.4), (0, 0));
+        assert_eq!((deferred.3, deferred.4), (4, 1));
+        let (descriptors, views, ..) = &results[0];
+        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors[0].1.x[0], 0x4100);
+        assert_eq!(descriptors[3].1.x[1], 1);
+        assert_eq!(views.len(), 3);
+        assert!(views.iter().all(|(_, bag)| bag.props["Levels"].x[0] != 9));
+    }
+
+    /// A deferred call that fails is reported by the next call or replay,
+    /// with the error the locked call gives; calls the recorder cannot
+    /// check (a null pool, a view that is no view) are not deferred.
+    #[test]
+    fn deferred_call_failures_are_reported_next() {
+        let mut nvn = registration_state();
+        let recorder = nvn.recorder();
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        core.cpu.regs[..4].copy_from_slice(&[0, 1, 0x4000, 0]);
+        assert!(!recorder.defer("nvnTexturePoolRegisterTexture", &mut core));
+        core.cpu.regs[..4].copy_from_slice(&[0x3000, 1, 0x4000, 0x6000]);
+        assert!(!recorder.defer("nvnTexturePoolRegisterTexture", &mut core));
+        assert!(!recorder.defer("nvnMemoryPoolInvalidateMappedRange", &mut core));
+        for (name, args, message) in [
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 99, 0x4000, 0],
+                "nvnTexturePoolRegisterTexture: descriptor 99 outside a pool of 16",
+            ),
+            (
+                "nvnTexturePoolRegisterTexture",
+                [0x3000, 1, 0x7000, 0],
+                "nvnTexturePoolRegisterTexture: Texture 0x7000 is not initialized",
+            ),
+            (
+                "nvnMemoryPoolFlushMappedRange",
+                [0x2000, 0xff00, 0x200, 0],
+                "nvnMemoryPoolFlushMappedRange: range 0xff00+0x200 outside the pool",
+            ),
+        ] {
+            core.cpu.regs[..4].copy_from_slice(&args);
+            assert!(nvn.call(name, &mut core).is_err_and(
+                |trap| matches!(trap, Trap::InvalidState { message: ref locked } if locked == message)
+            ));
+            core.cpu.regs[..4].copy_from_slice(&args);
+            assert!(recorder.defer(intern(name), &mut core));
+            core.cpu.regs[0] = 0x3000;
+            assert!(matches!(
+                nvn.resume_replay(&mut core),
+                Err(Trap::InvalidState { message: ref deferred }) if deferred == message
+            ));
+            // Reported once.
+            assert!(nvn.call("nvnTexturePoolGetSize", &mut core).unwrap());
+        }
+    }
+
+    /// Threads defer registrations and flushes while another holds the NVN
+    /// state and takes it again and again: each thread's calls are made in
+    /// its order (its last registration of an id wins), none is lost, and
+    /// each is made by whoever takes the state next.
+    #[test]
+    fn calls_deferred_on_several_threads_are_made_in_order() {
+        const THREADS: u64 = 6;
+        const ROUNDS: u64 = 200;
+        let nvn = registration_state();
+        let recorder = nvn.recorder();
+        let nvn = std::sync::Mutex::new(nvn);
+        let done = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            // A holder making calls of its own meanwhile, as the replay
+            // thread and other workers do.
+            scope.spawn(|| {
+                let mut memory = Memory::new(1 << 39);
+                let mut cpu = Cpu::default();
+                let mut core = Guest {
+                    cpu: &mut cpu,
+                    memory: GuestMemory::Checked(&mut memory),
+                    counter: Some(0),
+                };
+                while done.load(std::sync::atomic::Ordering::Acquire) < THREADS {
+                    let mut nvn = lock_shared(&nvn);
+                    core.cpu.regs[0] = 0x3000;
+                    assert!(nvn.call("nvnTexturePoolGetSize", &mut core).unwrap());
+                    std::thread::yield_now();
+                }
+            });
+            for thread in 0..THREADS {
+                let (recorder, done) = (recorder.clone(), &done);
+                scope.spawn(move || {
+                    let mut memory = Memory::new(1 << 39);
+                    let mut cpu = Cpu::default();
+                    let mut core = Guest {
+                        cpu: &mut cpu,
+                        memory: GuestMemory::Checked(&mut memory),
+                        counter: None,
+                    };
+                    // Ids 2 * thread and 2 * thread + 1 are this thread's.
+                    for round in 0..ROUNDS {
+                        let id = 2 * thread + round % 2;
+                        let texture = 0x4000 + (round % 4) * 0x100;
+                        core.cpu.regs[..4].copy_from_slice(&[0x3000, id, texture, 0]);
+                        assert!(recorder.defer("nvnTexturePoolRegisterTexture", &mut core));
+                        core.cpu.regs[..3].copy_from_slice(&[0x2000, thread * 0x100, 0x100]);
+                        assert!(recorder.defer("nvnMemoryPoolFlushMappedRange", &mut core));
+                    }
+                    done.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                });
+            }
+        });
+        let mut nvn = nvn.into_inner().unwrap();
+        nvn.apply_deferred();
+        assert!(nvn.deferred_failed.is_none());
+        assert_eq!(nvn.deferred_calls, 2 * THREADS * ROUNDS);
+        assert_eq!(nvn.calls["nvnTexturePoolRegisterTexture"], THREADS * ROUNDS);
+        assert_eq!(nvn.calls["nvnMemoryPoolFlushMappedRange"], THREADS * ROUNDS);
+        let descriptors = &nvn.texture_descriptors[&0x3000];
+        for thread in 0..THREADS {
+            // The last rounds: ROUNDS - 2 (even id) and ROUNDS - 1 (odd).
+            for (id, round) in [(2 * thread, ROUNDS - 2), (2 * thread + 1, ROUNDS - 1)] {
+                assert_eq!(descriptors[&(id as u32)].x[0], 0x4000 + (round % 4) * 0x100);
+            }
+        }
     }
 }
