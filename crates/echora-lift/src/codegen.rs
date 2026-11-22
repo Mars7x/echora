@@ -4838,6 +4838,10 @@ thread_local! {
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::arm_charges` of the region being emitted (split
+    /// ticks, without deferred charges, a local step count or the cached
+    /// stop word).
+    static ARM_CHARGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::cached_stop` of the region being emitted (split
     /// windows with split ticks, not structured, without deferred charges
     /// or a local step count).
@@ -5205,9 +5209,74 @@ fn emit_split_cases(
                 budget: THREADED_LINE_BUDGET,
                 loop_heads: loop_heads.clone(),
             });
-        expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
+        if ARM_CHARGES.get() {
+            let mut arm = String::new();
+            expand_block_copying(&mut arm, &bodies, inlined, block.start, &mut copying);
+            output.push_str(&arm_charges(&arm));
+        } else {
+            expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
+        }
         output.push_str("            }\n");
     }
+}
+
+/// With `EmitOptions::arm_charges`: an arm whose untagged blocks after
+/// its first charge (inlined and copied blocks: no dispatch, so its blocks
+/// form a tree) tests once, at its first charge, that every charge in it
+/// fits under the stop word (`arm_fast`: the steps plus the sum of all its
+/// counts, at least its longest path); each untagged charge then only adds
+/// its count, and takes the exact checks when the test failed. The steps
+/// are as before at every block; where the test passed no block's own
+/// check could have failed, so budgets and boundaries fall on the same
+/// blocks. A preemption another thread requests is seen at the next arm.
+fn arm_charges(arm: &str) -> String {
+    // (pc, count, tagged, resumable) of a split-ticks charge line.
+    let parse = |line: &str| -> Option<(u64, u64, bool, bool)> {
+        let rest = line.trim_start().strip_prefix("if !m.charge_block_at(")?;
+        let (head, slow) = rest.split_once(") { m.charge_block_slow(")?;
+        let fields: Vec<&str> = head.split(", ").collect();
+        let slow: Vec<&str> = slow.strip_suffix(")?; }")?.split(", ").collect();
+        Some((
+            u64::from_str_radix(fields.first()?.trim_start_matches("0x"), 16).ok()?,
+            fields.get(1)?.parse().ok()?,
+            *fields.get(2)? == "true",
+            *slow.get(2)? == "true",
+        ))
+    };
+    let charges: Vec<(u64, u64, bool, bool)> = arm.lines().filter_map(parse).collect();
+    if charges
+        .iter()
+        .skip(1)
+        .filter(|(_, _, tagged, _)| !tagged)
+        .count()
+        == 0
+    {
+        return arm.to_owned();
+    }
+    let total: u64 = charges.iter().map(|(_, count, _, _)| count).sum();
+    let mut out = String::with_capacity(arm.len() + 256);
+    let mut first = true;
+    for line in arm.split_inclusive('\n') {
+        let Some((pc, count, tagged, resumable)) = parse(line.trim_end()) else {
+            out.push_str(line);
+            continue;
+        };
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if first {
+            first = false;
+            out.push_str(&format!(
+                "{indent}let arm_fast = m.steps + {total} <= m.stop.load(std::sync::atomic::Ordering::Relaxed);\n"
+            ));
+        }
+        if tagged {
+            out.push_str(line);
+        } else {
+            out.push_str(&format!(
+                "{indent}if arm_fast {{ m.steps += {count}; }} else if !m.charge_block_at({pc:#x}, {count}, false) {{ m.charge_block_slow({pc:#x}, {count}, {resumable})?; }}\n"
+            ));
+        }
+    }
+    out
 }
 
 /// The match arms that run a structured window's entries through its tree.
@@ -5907,6 +5976,11 @@ pub struct EmitOptions {
     /// same blocks. A preemption another thread requests (lowering the
     /// word) is seen at the next backward dispatch or failed check.
     pub cached_stop: bool,
+    /// With split ticks (without deferred charges, a local step count or
+    /// the cached stop word): each split window arm tests once that all
+    /// its charges fit under the stop word, and its untagged blocks then
+    /// only add their counts (`arm_charges`).
+    pub arm_charges: bool,
 }
 
 thread_local! {
@@ -6506,6 +6580,7 @@ struct RegionSettings {
     known_returns: Flag,
     threaded: Flag,
     cached_stop: Flag,
+    arm_charges: Flag,
 }
 
 impl RegionSettings {
@@ -6586,6 +6661,14 @@ impl RegionSettings {
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
+            arm_charges: Flag::set(
+                &ARM_CHARGES,
+                options.arm_charges
+                    && options.split_ticks
+                    && !options.deferred_charges
+                    && !options.steps_local
+                    && !options.cached_stop,
+            ),
             cached_stop: Flag::set(
                 &CACHED_STOP,
                 options.cached_stop
@@ -9364,6 +9447,38 @@ mod tests {
             let (_, regions) = emit_rust_split_with(&translation, 16, other);
             assert!(!regions[0].1.contains("<= stop {"), "{other:?}");
         }
+    }
+
+    #[test]
+    fn arm_charges_test_the_stop_word_once_per_arm() {
+        // CBZ over an ADD (inlined both sides) to a join.
+        let words = [0xb400_0040, 0x9100_0421, 0x9100_0842, 0xd65f_03c0];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            arm_charges: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        // The arm at 0x1000 holds its own and the inlined 0x1004's charges.
+        assert!(
+            source.contains("let arm_fast = m.steps + 2 <= m.stop.load("),
+            "{source}"
+        );
+        assert!(source.contains(
+            "if arm_fast { m.steps += 1; } else if !m.charge_block_at(0x1004, 1, false)"
+        ));
+        let (_, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                arm_charges: false,
+                ..options
+            },
+        );
+        assert!(!regions[0].1.contains("arm_fast"));
     }
 
     #[test]

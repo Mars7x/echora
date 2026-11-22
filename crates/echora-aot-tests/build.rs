@@ -71,6 +71,7 @@ fn options() -> EmitOptions {
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
+        arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
         stub_windows: false,
     }
 }
@@ -279,10 +280,35 @@ fn codesize(out_dir: &std::path::Path) {
             },
         ),
     ];
+    // The game's default set, and with window calls.
+    let game = EmitOptions {
+        inline_vector: true,
+        fused_flags: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        window_memory: true,
+        untagged_blocks: true,
+        split_ticks: true,
+        float_runs: true,
+        ..EmitOptions::default()
+    };
+    let modes: Vec<(&str, EmitOptions)> = modes
+        .into_iter()
+        .chain([
+            ("game", game),
+            (
+                "game_window_calls",
+                EmitOptions {
+                    window_calls: true,
+                    ..game
+                },
+            ),
+        ])
+        .collect();
     let dir = out_dir.join("codesize");
     std::fs::create_dir_all(&dir).expect("codesize directory");
     let mut list = String::new();
-    for (name, mode) in modes {
+    for (name, mode) in modes.iter().copied() {
         MODE.set(Some(mode));
         LIFTED.set(0);
         let mut text = String::new();
@@ -3454,18 +3480,20 @@ fn deferred_charge_code(out: &mut String) {
     };
     let translation =
         discover(&[region], &[BASE, leaf, far], words.len()).expect("deferred charges");
-    for (name, deferred_charges, steps_local, cached_stop) in [
-        ("deferred_charge_code", true, false, false),
-        ("deferred_charge_reference", false, false, false),
-        ("steps_local_code", false, true, false),
-        ("cached_stop_code", false, false, true),
+    for (name, deferred_charges, steps_local, cached_stop, arm_charges) in [
+        ("deferred_charge_code", true, false, false, false),
+        ("deferred_charge_reference", false, false, false, false),
+        ("steps_local_code", false, true, false, false),
+        ("cached_stop_code", false, false, true, false),
+        ("arm_charge_code", false, false, false, true),
     ] {
         let options = EmitOptions {
             split_ticks: true,
             deferred_charges,
             steps_local,
             cached_stop,
-            untagged_blocks: steps_local || cached_stop,
+            arm_charges,
+            untagged_blocks: steps_local || cached_stop || arm_charges,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -3475,7 +3503,9 @@ fn deferred_charge_code(out: &mut String) {
             .sum();
         let cached: usize = regions
             .iter()
-            .map(|(_, source)| source.matches(" <= stop {").count())
+            .map(|(_, source)| {
+                source.matches(" <= stop {").count() + source.matches("if arm_fast {").count()
+            })
             .sum();
         writeln!(out, "pub mod {name} {{").expect("write");
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");

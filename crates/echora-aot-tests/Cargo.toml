@@ -116,6 +116,8 @@ threaded-successors = []
 # benchmark kernels under valgrind (measuring only).
 # With split ticks: the stop word in a window local (EmitOptions::cached_stop).
 cached-stop = []
+# With split ticks: one stop test per window arm (EmitOptions::arm_charges).
+arm-charges = []
 small-address-space = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
