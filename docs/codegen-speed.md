@@ -677,9 +677,18 @@ runs from a state and again with every general register, SP and NZCV it
 is said not to read changed (pointers into the data and small indices to
 other in-range values); the trap, PC, vectors, FPCR, FPSR and memory must
 come out the same, every register it may write the same in both runs and
-every other one unchanged. System register moves other than NZCV, PAuth
-helpers and the other instructions these suites do not sample are not
-covered by this check. The whole `echora-aot-tests` suite passes with
+every other one unchanged. That check does not reach system register
+moves, PAuth helpers or paths its states never take; the lifter's
+`defuse_effects_cover_every_emitted_register_access` covers them
+statically: it decodes about 4 million words (random low bits under
+every value of the top 16 and top 21 bits, every operand field of the
+system, one-source and branch-to-register spaces, and random words; every
+`Instruction` and `SimdOp` kind occurs), emits each one's Rust in both PC
+forms and requires every `m.cpu.regs[n]`, `m.cpu.sp` and `m.cpu.nzcv`
+access, flag operation and register helper argument in it to lie inside
+its effects (an index that is not a literal, or the `Cpu` handed to a
+helper not known to leave these alone, fails it too). It found no
+mismatch. The whole `echora-aot-tests` suite passes with
 every program lifted with the game set and `window-calls`.
 
 ## The step count in a window local (opt-in)
