@@ -270,6 +270,26 @@ mod imp {
         if buffer.is_null() {
             return;
         }
+        // The vDSO is no file the unwinder can open: its image goes beside
+        // the stacks (`PATH.vdso`), for its call frame information.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        if let Some((start, end)) = maps
+            .lines()
+            .find(|line| line.ends_with("[vdso]"))
+            .and_then(|line| line.split_whitespace().next()?.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((
+                    usize::from_str_radix(start, 16).ok()?,
+                    usize::from_str_radix(end, 16).ok()?,
+                ))
+            })
+        {
+            // SAFETY: the vDSO mapping is readable for the process's life.
+            let image = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+            let mut name = path.to_owned();
+            name.push(".vdso");
+            let _ = std::fs::write(name, image);
+        }
         let size = STACK_SLOT.load(Ordering::Relaxed);
         let taken = STACK_NEXT
             .load(Ordering::Relaxed)
