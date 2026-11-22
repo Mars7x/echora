@@ -96,6 +96,89 @@ pub(in crate::nvn) fn enabled() -> bool {
 /// itself, as with the planner off.
 static FAILED: AtomicBool = AtomicBool::new(false);
 
+/// What planner code the replay is in (`Phase`), and since when (ms after
+/// `phase_clock`): a monitor thread reports one that lasts.
+static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PHASE_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn phase_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Planner code the replay runs.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Phase {
+    LookAhead = 1,
+    Planning = 2,
+    ResolvingAhead = 3,
+    CheckingTextures = 4,
+    ResolvingAtCommit = 5,
+}
+
+const PHASE_NAMES: [&str; 6] = [
+    "",
+    "the look-ahead",
+    "planning (waiting for the planning threads)",
+    "resolving programs ahead",
+    "checking planned texture bindings at a draw",
+    "resolving deferred bindings at a draw",
+];
+
+/// The replay is in `phase` until this is dropped (back to the phase it
+/// was in).
+struct InPhase(u8);
+
+impl InPhase {
+    fn enter(phase: Phase) -> Self {
+        let previous = PHASE.swap(phase as u8, Ordering::AcqRel);
+        PHASE_SINCE.store(phase_clock(), Ordering::Release);
+        Self(previous)
+    }
+}
+
+impl Drop for InPhase {
+    fn drop(&mut self) {
+        PHASE.store(self.0, Ordering::Release);
+        PHASE_SINCE.store(phase_clock(), Ordering::Release);
+    }
+}
+
+/// Report planner code the replay stays in for over 2 s, every 10 s while
+/// it does (a stall's report says whether the planner holds the replay).
+fn start_phase_monitor() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("nvn-plan-watch".into())
+            .spawn(|| {
+                let mut reported = (0, 0);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let phase = PHASE.load(Ordering::Acquire);
+                    let since = PHASE_SINCE.load(Ordering::Acquire);
+                    let held = phase_clock().saturating_sub(since);
+                    if phase == 0 || held < 2000 {
+                        continue;
+                    }
+                    if reported.0 == since && held < reported.1 + 10_000 {
+                        continue;
+                    }
+                    reported = (since, held);
+                    eprintln!(
+                        "parallel draws: the replay has been in {} for {:.1} s",
+                        PHASE_NAMES[usize::from(phase).min(PHASE_NAMES.len() - 1)],
+                        held as f64 / 1000.0
+                    );
+                }
+            });
+    });
+}
+
 /// ECHORA_PARALLEL_DRAWS_VERIFY=1 (debugging): each planned draw is also
 /// planned by the replay, which uses its own result and reports a plan
 /// that differs.
@@ -946,8 +1029,10 @@ impl Nvn {
         }) {
             return;
         }
+        start_phase_monitor();
         let walk_started = std::time::Instant::now();
         let made_before = self.renderer_made();
+        let look_ahead = InPhase::enter(Phase::LookAhead);
         let pool_set = |name| self.render.state.get(name).map(|set| set.x[1]);
         if self.parallel.limit == 0 {
             self.parallel.limit = window_commands();
@@ -1009,6 +1094,7 @@ impl Nvn {
             );
             return;
         }
+        drop(look_ahead);
         let started = std::time::Instant::now();
         let walk_time = started - walk_started;
         // What the binding loop would do at its first texture first: the
@@ -1275,6 +1361,7 @@ impl Nvn {
         let results_ref = &results;
         let segments = &self.parallel.segments;
         let deferred = &self.parallel.deferred;
+        let planning = InPhase::enter(Phase::Planning);
         let ran = pool.run(chunks, &|chunk| {
             // An even share of the draws, each from its own state.
             let from = wanted.len() * chunk / chunks;
@@ -1310,6 +1397,7 @@ impl Nvn {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = out;
         });
+        drop(planning);
         drop(view);
         if let Err(error) = ran {
             // A planner bug: the replay plans every draw itself from now on.
@@ -1332,6 +1420,7 @@ impl Nvn {
     /// order) bind, from the render state each meets, as their binding
     /// loops would.
     fn resolve_ahead(&mut self, draws: &[(usize, usize)], core: &mut Guest) {
+        let _phase = InPhase::enter(Phase::ResolvingAhead);
         let mut render = self.render.clone();
         let segments = self.parallel.segments.clone();
         let mut draws = draws.iter().copied().peekable();
@@ -1419,6 +1508,7 @@ impl Nvn {
         if let Ok(plan) = &plan
             && !plan.texture_handles.is_empty()
         {
+            let _phase = InPhase::enter(Phase::CheckingTextures);
             self.refresh_binding_memo();
             for &(handle, key, sample_type) in &plan.texture_handles {
                 let Some((source, sampler)) = plan.textures.get(&key) else {
@@ -1541,6 +1631,7 @@ impl Nvn {
         out.storage_entries.extend(storage_entries);
         *out.uniform_bytes += uniform_bytes;
         *out.memo_hits += memo_hits;
+        let _phase = InPhase::enter(Phase::ResolvingAtCommit);
         for binding in deferred {
             match binding {
                 Deferred::Uniform { key, guest, size } => {
@@ -2864,5 +2955,34 @@ mod replay_tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn a_commit_wait_on_unsubmitted_work_submits_it() {
+        let Some(mut nvn) = fixture() else {
+            return;
+        };
+        // GPU work recorded and not yet submitted (an upload into a
+        // resident pool), as a draw's commit may wait for.
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.resident_buffer(GUEST, 4096).unwrap();
+        renderer.upload_resident(GUEST, 0, &[7; 64]).unwrap();
+        let serial = renderer.recorded_serial();
+        assert!(serial > renderer.completed_serial());
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _phase = InPhase::enter(Phase::ResolvingAtCommit);
+                renderer.wait_for(serial).unwrap();
+                done.send(()).unwrap();
+            });
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok(),
+                "waiting for recorded work blocked"
+            );
+        });
+        assert!(nvn.gpu.as_ref().unwrap().renderer.completed_serial() >= serial);
     }
 }
