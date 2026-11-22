@@ -11,8 +11,11 @@
 //!    on through the lists queued after it, for a window of commands:
 //!    everything up to a command that changes the render state another way
 //!    (a pool set naming another pool, a deferred bind whose array GPU work
-//!    may still write) or a queue item that is not a list (a present, a
-//!    wait). Deferred binds' arrays are read for the window, and checked
+//!    may still write), a guest wait (WaitEvent, WaitSync: what follows may
+//!    read what other work has yet to produce) or a queue item that is not
+//!    a list (a present, a sync wait). A window's length adapts: halved
+//!    after one whose plans were mostly unused, doubled after one whose
+//!    were not, and planning pauses after several wasted in a row. Deferred binds' arrays are read for the window, and checked
 //!    when they run (`check_parallel_deferred`). Other work in between
 //!    (clears, copies, dispatches) leaves the render state as it is and is
 //!    passed over. Plans outlive the replay's pieces. Why each window ended
@@ -78,10 +81,15 @@ pub(in crate::nvn) fn threads() -> usize {
     })
 }
 
-/// Whether draws are planned in parallel (`threads`).
+/// Whether draws are planned in parallel (`threads`), unless planning
+/// failed (`FAILED`).
 pub(in crate::nvn) fn enabled() -> bool {
-    threads() > 0
+    threads() > 0 && !FAILED.load(Ordering::Relaxed)
 }
+
+/// Set when a planning thread panicked: the replay then plans every draw
+/// itself, as with the planner off.
+static FAILED: AtomicBool = AtomicBool::new(false);
 
 /// ECHORA_PARALLEL_DRAWS_VERIFY=1 (debugging): each planned draw is also
 /// planned by the replay, which uses its own result and reports a plan
@@ -197,9 +205,11 @@ fn step(command: &Command) -> Step {
     }
     // Other work leaves the render state as it is; what it changes besides
     // (targets, GPU writes, waits) the commit's stamp check sees.
-    if is_work_command(rest) || matches!(rest, "WaitEvent" | "FenceSync" | "WaitSync") {
+    if is_work_command(rest) || rest == "FenceSync" {
         return Step::Pass;
     }
+    // A guest wait (WaitEvent, WaitSync) ends the window: what comes after
+    // it may read what other work has yet to produce.
     Step::End
 }
 
@@ -246,7 +256,6 @@ pub(super) struct Stamp {
     pending_storage: usize,
     dirty_removals: u64,
     resident_dirty: usize,
-    page_table_writes: bool,
     page_table_write_serial: u64,
     unbounded_write_serial: u64,
     shared_writes: (usize, u64),
@@ -626,7 +635,38 @@ pub(in crate::nvn) struct ParallelDraws {
     /// binds plan with (the commit checks it is still the one bound).
     programs: super::super::FastMap<ProgramKey, (StateSnapshots, Arc<BoundProgram>)>,
     typed_programs: super::super::FastMap<TypedKey, Arc<BoundProgram>>,
+    /// The current window's size limit (`window_commands` at most): halved
+    /// after a window whose plans were mostly not used, doubled after one
+    /// whose were.
+    limit: usize,
+    /// Plans used in the current window, and how many it made.
+    used: usize,
+    planned: usize,
+    /// Windows in a row whose plans were mostly not used; after
+    /// `WASTED_WINDOWS` planning pauses for `PAUSE_DRAWS` draws.
+    wasted: usize,
+    paused: usize,
+    /// Where the last window started, and how many windows in a row
+    /// started there (a window made again and again at one draw).
+    start: Option<(usize, usize)>,
+    restarts: usize,
+    /// Plans the last window used (`restarts` counts windows that used
+    /// none).
+    last_used: usize,
 }
+
+/// Wasted windows in a row before planning pauses.
+const WASTED_WINDOWS: usize = 3;
+/// Draws the replay plans alone after `WASTED_WINDOWS`.
+const PAUSE_DRAWS: usize = 256;
+/// The smallest window limit, in commands.
+const SMALLEST_WINDOW: usize = 64;
+/// Windows started at the same draw before that draw is left unplanned.
+const RESTARTS: usize = 2;
+/// Draws one window resolves ahead (`resolve_ahead`) at most.
+const RESOLVED_AHEAD: usize = 64;
+/// A window taking this long is reported.
+const SLOW_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The vertex and fragment programs bound and the vertex attribute
 /// snapshots' address (kept alive beside the key).
@@ -693,9 +733,30 @@ impl std::fmt::Debug for ParallelDraws {
 }
 
 impl ParallelDraws {
-    /// Drop every plan; how many were never used.
+    /// Drop every plan; how many were never used. The window's use sets
+    /// the next one's limit (`limit`, `wasted`, `paused`).
     pub fn forget(&mut self) -> usize {
         let unused = self.plans.len();
+        if self.planned > 0 {
+            let most = window_commands();
+            if self.limit == 0 {
+                self.limit = most;
+            }
+            if self.used * 4 < self.planned {
+                self.limit = (self.limit / 2).max(SMALLEST_WINDOW.min(most));
+                self.wasted += 1;
+                if self.wasted >= WASTED_WINDOWS {
+                    self.wasted = 0;
+                    self.paused = PAUSE_DRAWS;
+                }
+            } else {
+                self.limit = (self.limit * 2).min(most);
+                self.wasted = 0;
+            }
+        }
+        self.last_used = self.used;
+        self.used = 0;
+        self.planned = 0;
         self.queue = None;
         self.segments.clear();
         self.deferred.clear();
@@ -794,6 +855,8 @@ struct Window {
     pools: [Option<u64>; 2],
     /// Why it ended (`None`: it may go on).
     ended: Option<String>,
+    /// The most commands it may span (`ParallelDraws::limit`).
+    limit: usize,
 }
 
 impl Nvn {
@@ -819,7 +882,6 @@ impl Nvn {
                 .values()
                 .map(|pool| pool.gpu_dirty.len())
                 .sum(),
-            page_table_writes: backend.page_table_writes,
             page_table_write_serial: backend.page_table_write_serial,
             unbounded_write_serial: backend.unbounded_write_serial,
             shared_writes: (
@@ -864,8 +926,35 @@ impl Nvn {
             }
             // A draw met again: its list runs again.
         }
+        let paused_before = self.parallel.paused;
         let unused = self.parallel.forget();
         self.parallel.position = Some((address, index));
+        if self.parallel.paused > 0 {
+            self.parallel.paused -= 1;
+            if paused_before == 0
+                && let Some(backend) = self.gpu.as_mut()
+            {
+                backend.stat("stat: parallel planning pauses after wasted windows", 1);
+            }
+            return;
+        }
+        // A window made again and again at the same draw (its plans
+        // dropped at once each time) is not made again.
+        let start = Some((address, index));
+        if self.parallel.start == start && self.parallel.last_used == 0 {
+            self.parallel.restarts += 1;
+            if self.parallel.restarts >= RESTARTS {
+                // Planned by the replay this time; tried again after.
+                self.parallel.restarts = 0;
+                if let Some(backend) = self.gpu.as_mut() {
+                    backend.stat("stat: parallel draw windows not made again at a draw", 1);
+                }
+                return;
+            }
+        } else {
+            self.parallel.start = start;
+            self.parallel.restarts = 0;
+        }
         if self.gpu.is_none()
             || draw_switches_set()
             || matches!(core.memory, GuestMemory::Checked(_))
@@ -886,8 +975,12 @@ impl Nvn {
             return;
         }
         let pool_set = |name| self.render.state.get(name).map(|set| set.x[1]);
+        if self.parallel.limit == 0 {
+            self.parallel.limit = window_commands();
+        }
         let mut window = Window {
             pools: [pool_set("SetTexturePool"), pool_set("SetSamplerPool")],
+            limit: self.parallel.limit,
             ..Window::default()
         };
         if self.walk_window(&mut window, list, index, 0, core) {
@@ -969,6 +1062,15 @@ impl Nvn {
             })
             .map(|(key, _)| *key)
             .collect();
+        let mut unresolved = unresolved;
+        if unresolved.len() > RESOLVED_AHEAD {
+            // The rest the replay resolves at their draws.
+            unresolved.truncate(RESOLVED_AHEAD);
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: parallel draw windows with more to resolve ahead", 1);
+        }
         if !unresolved.is_empty() {
             self.resolve_ahead(&unresolved, core);
             self.refresh_binding_memo();
@@ -976,8 +1078,13 @@ impl Nvn {
             let again = if now == stamp {
                 self.plan_window(&pool, &unresolved, core)
             } else {
-                // Resolving changed what the other plans read.
+                // Resolving changed what the other plans read: all are
+                // planned once more (never again for this window).
                 stamp = now;
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: parallel draw windows planned again whole", 1);
                 self.plan_window(&pool, &draws, core)
             };
             let mut again = again.into_iter().peekable();
@@ -992,15 +1099,25 @@ impl Nvn {
             );
         }
         self.parallel.pool = Some(pool);
+        self.parallel.planned = plans.len();
         self.parallel.plans = plans.into();
         self.parallel.stamp = stamp;
+        let took = started.elapsed();
+        if took >= SLOW_WINDOW {
+            static REPORTED: AtomicUsize = AtomicUsize::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) < 20 {
+                eprintln!(
+                    "parallel draws: a window of {} draws in {} lists ({reason}) took {took:?}, {} resolved ahead",
+                    draws.len(),
+                    self.parallel.segments.len(),
+                    unresolved.len()
+                );
+            }
+        }
         let backend = self.gpu.as_mut().unwrap();
         backend.stat("stat: parallel draw windows", 1);
         backend.stat("stat: parallel draws planned", draws.len() as u64);
-        backend.stat(
-            "stat: parallel draw planning us",
-            started.elapsed().as_micros() as u64,
-        );
+        backend.stat("stat: parallel draw planning us", took.as_micros() as u64);
     }
 
     /// Add `list` from `from` (and the lists it calls, in place) to
@@ -1022,7 +1139,7 @@ impl Nvn {
             window.ended = Some("a list met again".into());
             return false;
         }
-        let most = window_commands();
+        let most = window.limit;
         let mut start = from;
         let mut at = from;
         while at < list.len() {
@@ -1171,7 +1288,7 @@ impl Nvn {
         let results_ref = &results;
         let segments = &self.parallel.segments;
         let deferred = &self.parallel.deferred;
-        pool.run(chunks, &|chunk| {
+        let ran = pool.run(chunks, &|chunk| {
             // An even share of the draws, each from its own state.
             let from = wanted.len() * chunk / chunks;
             let to = wanted.len() * (chunk + 1) / chunks;
@@ -1202,12 +1319,25 @@ impl Nvn {
                     );
                 }
             }
-            *results_ref[chunk].lock().unwrap() = out;
+            *results_ref[chunk]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = out;
         });
         drop(view);
+        if let Err(error) = ran {
+            // A planner bug: the replay plans every draw itself from now on.
+            if !FAILED.swap(true, Ordering::AcqRel) {
+                eprintln!("parallel draws: {error}; draws are planned by the replay alone");
+            }
+            return Vec::new();
+        }
         results
             .into_iter()
-            .flat_map(|result| result.into_inner().unwrap_or_default())
+            .flat_map(|result| {
+                result
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
             .collect()
     }
 
@@ -1329,6 +1459,7 @@ impl Nvn {
         match plan {
             Ok(plan) if same_program(&plan.program, program) => {
                 backend.stat("stat: parallel draws used", 1);
+                self.parallel.used += 1;
                 Some(plan)
             }
             Ok(_) => {
@@ -1741,7 +1872,10 @@ impl Pool {
                 std::hint::spin_loop();
             }
             let (chunks, job) = {
-                let mut slot = shared.slot.lock().unwrap();
+                let mut slot = shared
+                    .slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 loop {
                     if slot.stop {
                         return;
@@ -1754,13 +1888,19 @@ impl Pool {
                             break job;
                         }
                     }
-                    slot = shared.wake.wait(slot).unwrap();
+                    slot = shared
+                        .wake
+                        .wait(slot)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             };
             // SAFETY: `run` keeps the job alive until `busy` is back to 0.
             let job = unsafe { &*job };
             Self::take_chunks(shared, chunks, job);
-            let mut slot = shared.slot.lock().unwrap();
+            let mut slot = shared
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.busy -= 1;
             if slot.busy == 0 {
                 shared.done.notify_all();
@@ -1783,7 +1923,7 @@ impl Pool {
     /// Run `job` for chunks 0..chunks on the pool's threads and this one,
     /// returning when all are done.
     #[allow(unsafe_code)]
-    fn run(&self, chunks: usize, job: &Job<'_>) {
+    fn run(&self, chunks: usize, job: &Job<'_>) -> Result<(), &'static str> {
         let shared = &*self.shared;
         shared.next.store(0, Ordering::Release);
         shared.panicked.store(false, Ordering::Release);
@@ -1792,24 +1932,48 @@ impl Pool {
         let erased: *const Job<'static> =
             unsafe { std::mem::transmute::<*const Job<'_>, *const Job<'static>>(job) };
         {
-            let mut slot = shared.slot.lock().unwrap();
+            let mut slot = shared
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.generation += 1;
             slot.job = Some((chunks, erased));
             shared.generation.store(slot.generation, Ordering::Release);
         }
         shared.wake.notify_all();
         Self::take_chunks(shared, chunks, job);
-        let mut slot = shared.slot.lock().unwrap();
+        let mut slot = shared
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // No thread takes the job once it is withdrawn; those inside it
-        // finish first.
+        // finish first. (They hold the job's borrows: this cannot return
+        // before they do, so a long wait is reported, not abandoned.)
         slot.job = None;
+        let started = std::time::Instant::now();
+        let mut reported = 0;
         while slot.busy > 0 {
-            slot = shared.done.wait(slot).unwrap();
+            let (next, timeout) = shared
+                .done
+                .wait_timeout(slot, std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot = next;
+            if timeout.timed_out() && slot.busy > 0 {
+                reported += 1;
+                if reported <= 10 || reported % 60 == 0 {
+                    eprintln!(
+                        "parallel draws: {} planning threads still busy after {:?} ({chunks} chunks)",
+                        slot.busy,
+                        started.elapsed()
+                    );
+                }
+            }
         }
         drop(slot);
         if shared.panicked.load(Ordering::Acquire) {
-            panic!("a draw planning thread panicked");
+            return Err("a draw planning thread panicked");
         }
+        Ok(())
     }
 }
 
@@ -1873,7 +2037,8 @@ mod tests {
             let counts: Vec<AtomicUsize> = (0..chunks).map(|_| AtomicUsize::new(0)).collect();
             pool.run(chunks, &|chunk| {
                 counts[chunk].fetch_add(1, Ordering::Relaxed);
-            });
+            })
+            .unwrap();
             assert!(
                 counts
                     .iter()
@@ -1922,7 +2087,8 @@ mod tests {
             step(&command("nvnCommandBufferCallCommands", 0)),
             Step::Call
         );
-        assert_eq!(step(&command("nvnCommandBufferWaitEvent", 0)), Step::Pass);
+        assert_eq!(step(&command("nvnCommandBufferWaitEvent", 0)), Step::End);
+        assert_eq!(step(&command("nvnCommandBufferWaitSync", 0)), Step::End);
         assert_eq!(
             step(&command("nvnCommandBufferCopyCommands", 0)),
             Step::Call
@@ -2532,5 +2698,107 @@ mod replay_tests {
             ),
             1
         );
+    }
+
+    fn call(handles: Vec<u64>) -> Command {
+        command(
+            "nvnCommandBufferCallCommands",
+            [0, handles.len() as u64, 0, 0, 0, 0, 0, 0],
+            handles,
+        )
+    }
+
+    #[test]
+    fn lists_that_call_each_other_end_the_window() {
+        const FIRST: u64 = 0x5000;
+        const SECOND: u64 = 0x5001;
+        let Some(mut nvn) = fixture() else {
+            return;
+        };
+        let draw = command(
+            "nvnCommandBufferDrawArrays",
+            [0, 4, 0, 3, 0, 0, 0, 0],
+            vec![],
+        );
+        let first = vec![draw.clone(), call(vec![SECOND]), draw.clone()];
+        let second = vec![draw.clone(), call(vec![FIRST]), draw];
+        nvn.command_lists.insert(
+            FIRST,
+            super::super::super::CommandList::new(first.clone(), 0),
+        );
+        nvn.command_lists
+            .insert(SECOND, super::super::super::CommandList::new(second, 0));
+        let memory = memory();
+        let view = memory.view();
+        let mut cpu = Cpu::default();
+        let mut view = view;
+        let core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::View(&mut view),
+            counter: Some(0),
+        };
+        let list = nvn.command_lists[&FIRST].commands.clone();
+        let mut window = Window {
+            limit: window_commands(),
+            ..Window::default()
+        };
+        assert!(!nvn.walk_window(&mut window, &list, 0, 0, &core));
+        assert_eq!(window.ended.as_deref(), Some("a list met again"));
+        // The first list's start, the second, then the first met again.
+        assert_eq!(window.segments.len(), 2);
+        assert_eq!(window.draws, [(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn a_list_called_twice_replays_as_the_replay_alone_does() {
+        const CALLED: u64 = 0x6000;
+        let draw = command(
+            "nvnCommandBufferDrawArrays",
+            [0, 4, 0, 3, 0, 0, 0, 0],
+            vec![],
+        );
+        let texture = |slot, handle| {
+            command(
+                "nvnCommandBufferBindTexture",
+                [0, 1, slot, handle, 0, 0, 0, 0],
+                vec![],
+            )
+        };
+        // The called list rebinds a texture and draws twice.
+        let called = vec![texture(1, 22), draw.clone(), texture(1, 20), draw.clone()];
+        let mut list: Vec<Command> = batch().into_iter().take(11).collect();
+        list.extend([
+            call(vec![CALLED]),
+            texture(0, 21),
+            draw.clone(),
+            call(vec![CALLED, CALLED]),
+            draw.clone(),
+            draw,
+        ]);
+        let setup = |nvn: &mut Nvn| {
+            nvn.command_lists.insert(
+                CALLED,
+                super::super::super::CommandList::new(called.clone(), 0),
+            );
+        };
+        let lists = [list];
+        let Some((serial, _)) = replay_with(0, false, &lists, None, setup, |_| {}) else {
+            return;
+        };
+        // 1 + 2 + 1 + 2 + 2 + 2.
+        assert_eq!(serial.len(), 10);
+        for threads in [1, 3] {
+            let (parallel, nvn) = replay_with(threads, false, &lists, None, setup, |_| {}).unwrap();
+            assert_eq!(parallel, serial, "{threads} planner threads");
+            assert!(stat(&nvn, "stat: parallel draws used") > 0);
+            assert!(
+                stat(
+                    &nvn,
+                    "stat: parallel draw windows ended by a list met again"
+                ) >= 1
+            );
+            let (_, verified) = replay_with(threads, true, &lists, None, setup, |_| {}).unwrap();
+            assert_eq!(stat(&verified, "stat: parallel draws that differ"), 0);
+        }
     }
 }
