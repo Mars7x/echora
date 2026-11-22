@@ -540,10 +540,16 @@ stores only the dirty locals T may read or write, calls T's window
 directly (`enter_window_<w>` in its own region, `window_call_at(i)` of a
 per-region copy of the root's window-call table elsewhere, as
 `function-table` does for functions), and reloads only what T may write.
-The other locals stay in host registers across the call. `run_window_<w>`
-of an entered window is `enter_window()` and a tail call of
-`enter_window_<w>`, so the table and dispatcher path keep the diagnostics
-and direct calls skip them (a constant, aligned target).
+The other locals stay in host registers across the call. An entered
+window's body is an always-inlined `window_body_<w>`, held by both
+`run_window_<w>` (the table and dispatcher path, which keeps
+`enter_window()`'s diagnostics) and `enter_window_<w>` (direct calls, which
+skip them: a constant, aligned target). A wrapper calling the other would
+cost a real call: `Result<(), Trap>` returns through memory, so it is no
+tail jump. The price is a second copy of each entered window's machine
+code. The root's `install` fills every region's table; its
+`window_calls_installed()` says whether it did, and emission asserts the
+line it adds that to.
 
 **Summaries** (`window_call_summaries`). A window entered at T runs its
 blocks until its next PC leaves it. In this mode a RET (and BR X30, RETAA,
@@ -558,10 +564,27 @@ blocks hold no BLR, SVC, UDF, unsupported instruction or traced block,
 every BL in them is itself to a target with a summary, the calls form no
 cycle and nest at most `WINDOW_CALL_DEPTH_LIMIT` (16) deep (summarized
 calls take no `Core::call` depth, so the host stack is bounded here),
-and T is no PLT stub and has its own dispatch arm. The summary is the
+and T is no PLT stub and has its own dispatch arm. Unless
+`window_call_early_exits` (`window-call-early-exits`) is on, those blocks
+may also leave the window only by a return: no branch or fallthrough out
+of the window, no other indirect branch, no call whose return point lies
+outside it. Any other exit unwinds every summarized caller up to the
+window the dispatcher runs (a cost), and early exits are what the game's
+unexplained hang with call summaries had in common. The summary is the
 union of `crate::defuse` effects (general registers, SP, NZCV; FPCR and
 FPSR are stored and reloaded around every call as before) over those
 blocks and the callees' summaries.
+
+`echora lift` prints, with window calls on, the summarized targets,
+their windows and BL sites, those of them that leave early, and how many
+more early exits would add. `window_calls_audit` (`window-calls-audit`)
+checks every summary while the game runs: each summarized call stores all
+locals, fills the registers, SP and NZCV outside what the callee may
+touch with markers, and when the callee returns (or traps) raises
+`Trap::InvalidState` naming the call site and the register if one
+outside what it may write changed, then puts the caller's values back.
+Its emission is slower (every call stores and reloads everything); it is
+for one run before trusting the real one.
 
 **Why nothing else sees a stale `Core`.** While a summarized window runs,
 only its reached blocks and summarized callees run: any exit returns
@@ -592,6 +615,14 @@ five runs each), median Minstr/s per round:
 | calls2 (a frame function calling both leaves) | 317-342 | 702-787 | 2.1x to 2.5x |
 | gamecalls (game-shaped update loop) | 920-1198 | 1259-1614 | +8.5% to +71% (middle +37%) |
 
+After both entries got the inlined body (and with early exits behind
+their own option, which none of these kernels' targets need), three more
+rounds of the call kernels gave medians of 419-610 against 746-791
+(calls), 279-325 against 733-842 (calls2) and 868-984 against 1259-1388
+(gamecalls). The second copy of the four entered windows grew the bench
+binary's `.text` by 5.3 KB (1.0%); a game build pays it for every window
+a summarized call enters, which `echora lift` counts.
+
 Two full runs over every kernel moved only the call kernels' code (the
 other kernels' emitted Rust is identical between the builds); their
 changes there, -27% to +22% in both directions between rounds, are
@@ -612,21 +643,44 @@ windows, 272 call sites, random bodies using every free register, so
 large summaries): per window 640 -> 538 spills and 1,249 -> 763 reloads
 (-16%, -39%).
 
-`tests/window_calls.rs` runs that program (frames, BL and BLR, a jump
-through BR, early returns to another window, SVCs, recursion, UDF faults,
-and a caller holding a register its callee's callee's early return reads)
-lifted without window calls, with them in one region, through the table
-across 1 KiB regions and in every other region, from 36 states per
-caller, whole, sliced into host boundaries and against a budget; every
-register, SP, NZCV, PC, step count, boundary count, trap, the data memory
-and the stack must equal the default emission's. Each lift runs in its
-own process (the window table `Core::call` uses is one per process). A
-summary without the callee's writes, RETs that do not leave the window,
-a BR not reaching the whole window or a callee's early return continuing
-in place each fail it. `tests/calls.rs` runs its callers with window
-calls against the reference interpreter, and the whole `echora-aot-tests`
-suite passes with every program lifted with the game set and
-`window-calls`.
+`tests/window_calls.rs` runs that program (frames, BL and BLR, B tail
+calls, a jump through BR, BR X30 and RETAA returns, early returns to
+another window, SVCs, recursion, UDF faults, PLT stub calls and tail
+calls, scalar and vector float and SIMD instructions and moves between
+general and vector registers, a function falling through into the next
+window, a jump into a block's middle, and a caller holding a register its
+callee's callee's early return reads) in pairs without and with window
+calls: the build's options (in one region; through the table across
+1 KiB regions; in every other region; with early exits; audited) and
+those options with deferred charges, the step count in a local, dense
+dispatch, direct calls and stub windows. 63 callers from 12 states each,
+whole, sliced into host boundaries and against a budget; every general
+and vector register, SP, NZCV, FPCR, FPSR, PC, step count, boundary
+count, trap, the data memory and the stack must equal the lift without.
+Each lift runs in its own process (the window table `Core::call` uses is
+one per process); the table lift's recent-PC ring must equal the direct
+lift's and differ from the same lift without `install` (whose table calls
+return early), and every window-call lift must report its table
+installed. An integer twin of the program is checked against the
+reference interpreter without and with window calls (every run). A
+summary without the callee's writes (the audit names the call and
+register), RETs that do not leave the window, a BR not reaching the
+whole window or a callee's early return continuing in place each fail
+it. `tests/calls.rs` runs its callers with window calls against the
+reference interpreter, each lift in a child process.
+
+Summaries are only as good as `crate::defuse`. The semantic suites
+(`semantics`, `simd_semantics`, `fp_semantics`, `simd_memory_semantics`)
+check it against the lifted code of every instruction they sample
+(`tests/common/effects.rs`, 52,408 checks over 13,102 instructions): each
+runs from a state and again with every general register, SP and NZCV it
+is said not to read changed (pointers into the data and small indices to
+other in-range values); the trap, PC, vectors, FPCR, FPSR and memory must
+come out the same, every register it may write the same in both runs and
+every other one unchanged. System register moves other than NZCV, PAuth
+helpers and the other instructions these suites do not sample are not
+covered by this check. The whole `echora-aot-tests` suite passes with
+every program lifted with the game set and `window-calls`.
 
 ## The step count in a window local (opt-in)
 
