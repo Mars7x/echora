@@ -365,7 +365,7 @@ pub enum TextureSource {
 impl TextureSource {
     /// Whether two sources name the same texels: an upload by its key and
     /// generation (its texels are cached under them and never compared).
-    pub(crate) fn same_as(&self, other: &Self) -> bool {
+    pub fn same_as(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Target(a), Self::Target(b)) => a == b,
             (

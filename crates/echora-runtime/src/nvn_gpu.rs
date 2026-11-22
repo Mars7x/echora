@@ -620,15 +620,7 @@ impl GuestFileIndex {
 }
 
 /// The file bytes behind the parts of guest range `guest` that `spans`
-/// (`GuestFileIndex::spans`) hold.
-fn overlapping_spans(
-    spans: &[GuestFileSpan],
-    guest: std::ops::Range<u64>,
-) -> impl Iterator<Item = SharedRange> + '_ {
-    overlapping_spans_walked(spans, guest, || {})
-}
-
-/// `overlapping_spans`, calling `walked` for each span looked at.
+/// (`GuestFileIndex::spans`) hold, calling `walked` for each span looked at.
 fn overlapping_spans_walked<'a>(
     spans: &'a [GuestFileSpan],
     guest: std::ops::Range<u64>,
