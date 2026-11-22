@@ -2397,7 +2397,14 @@ fn call_code(out: &mut String) {
     let root = echora_lift::codegen::emit_rust_split_to_regions(
         &translation,
         10,
-        options(),
+        // Without functions whatever the build's features.
+        EmitOptions {
+            functions: false,
+            function_table: false,
+            call_summaries: false,
+            transitive_summaries: false,
+            ..options()
+        },
         EmitOptions {
             functions: true,
             function_table: true,
