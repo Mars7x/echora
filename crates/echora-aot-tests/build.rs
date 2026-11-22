@@ -401,7 +401,29 @@ fn codesize(out_dir: &std::path::Path) {
                     ..game
                 },
             ),
+            (
+                "game+window_calls",
+                EmitOptions {
+                    window_calls: true,
+                    ..game
+                },
+            ),
+            (
+                "game+long_windows",
+                EmitOptions {
+                    long_windows: true,
+                    ..game
+                },
+            ),
+            (
+                "game+known_returns",
+                EmitOptions {
+                    known_returns: true,
+                    ..game
+                },
+            ),
             ("game+recommended", recommended_set()),
+            ("game+recommended+windows", recommended_windows_set()),
         ])
         .collect();
     let dir = out_dir.join("codesize");
@@ -456,7 +478,7 @@ fn game_set() -> EmitOptions {
 }
 
 /// The game set plus the options `docs/lift-options.md` recommends turning
-/// on everywhere.
+/// on (everywhere or in the hot regions), but for the window calls.
 fn recommended_set() -> EmitOptions {
     EmitOptions {
         inline_vector_unary: true,
@@ -466,9 +488,19 @@ fn recommended_set() -> EmitOptions {
         inline_vector_misc: true,
         direct_q_pairs: true,
         vector_float_runs: true,
-        float_run_loads: true,
         steps_local: true,
         ..game_set()
+    }
+}
+
+/// The recommended set plus the window-call options
+/// `docs/lift-options.md` recommends for the hot regions.
+fn recommended_windows_set() -> EmitOptions {
+    EmitOptions {
+        window_calls: true,
+        long_windows: true,
+        known_returns: true,
+        ..recommended_set()
     }
 }
 
@@ -607,7 +639,37 @@ fn kernel_sizes(dir: &std::path::Path) {
                 ..game
             },
         ),
+        (
+            "window-calls",
+            EmitOptions {
+                window_calls: true,
+                ..game
+            },
+        ),
+        (
+            "+window-call-early-exits",
+            EmitOptions {
+                window_calls: true,
+                window_call_early_exits: true,
+                ..game
+            },
+        ),
+        (
+            "long-windows",
+            EmitOptions {
+                long_windows: true,
+                ..game
+            },
+        ),
+        (
+            "known-returns",
+            EmitOptions {
+                known_returns: true,
+                ..game
+            },
+        ),
         ("recommended", recommended_set()),
+        ("recommended+windows", recommended_windows_set()),
     ];
     let lifted = LIFTED.get();
     let mut list = String::new();
