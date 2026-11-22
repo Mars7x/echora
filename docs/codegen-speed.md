@@ -634,13 +634,14 @@ directly (`enter_window_<w>` in its own region, `window_call_at(i)` of a
 per-region copy of the root's window-call table elsewhere, as
 `function-table` does for functions), and reloads only what T may write.
 The other locals stay in host registers across the call. An entered
-window's body is an always-inlined `window_body_<w>`, held by both
-`run_window_<w>` (the table and dispatcher path, which keeps
-`enter_window()`'s diagnostics) and `enter_window_<w>` (direct calls, which
-skip them: a constant, aligned target). A wrapper calling the other would
-cost a real call: `Result<(), Trap>` returns through memory, so it is no
-tail jump. The price is a second copy of each entered window's machine
-code. The root's `install` fills every region's table; its
+window's body is compiled once, in `enter_window_<w>` (direct calls, which
+skip `enter_window()`'s diagnostics: a constant, aligned target);
+`run_window_<w>` (the table and dispatcher path) runs the diagnostics and
+calls it, one more call on that path (`Result<(), Trap>` returns through
+memory, so it is no tail jump). The body was once inlined into both, which
+doubled every entered window's machine code: on the game, bound by
+instruction fetch, 213 MB of copies with window calls (379 MB with long
+windows) in 2.7 GB of `.text`. The root's `install` fills every region's table; its
 `window_calls_installed()` says whether it did, and emission asserts the
 line it adds that to.
 
@@ -861,6 +862,21 @@ Game set plus window-calls; host instructions per guest instruction
   adds work. `tests/steps_local.rs` checks it charges and stops exactly as
   per-block charging (every host check point and budget).
 - `known-returns` (earlier): no change at `opt-level` 1.
+- `arm-charges`: an arm (no dispatch inside, so its blocks form a tree)
+  tests once that all its charges fit under the stop word, and its
+  untagged blocks then only add their counts, with the exact checks where
+  the test failed; `tests/steps_local.rs` checks it stops exactly as
+  per-block charging. No gain (gamefn 12.31 to 12.33, ldst 5.20 to 5.60):
+  few arms hold more than one untagged block, and the flag costs a
+  register.
+- One body per entered window (`enter_window_<w>`, above): the kernels'
+  `.text` 550,947 to 544,371 bytes, executed instructions the same or
+  fewer (gamecalls 14.95 to 14.73); the codesize programs with window
+  calls 206.1 to 204.4 `.text` bytes per guest instruction (they enter
+  few windows; the game's copies were 8% of its `.text`).
+- The unaligned-SP trap built in a cold helper instead of an inline
+  `format!` at every stack access: no measurable `.text` change (LLVM
+  already merged those identical cold tails).
 - `long-windows` (earlier), counted the same way: crossing 10.95 to 4.90
   host instructions per guest instruction (mispredictions 10.2 to 3.4
   per 100), every other kernel unchanged, with or without
@@ -902,7 +918,14 @@ reaches outside the window (`window_blocks`): breadth first through
 branches, both sides of conditional ones, fallthroughs and call return
 points (no BL targets, no PLT stubs, no indirect branches), within the
 same region, each block with those inlined into it, up to
-`WINDOW_EXTENSION_LIMIT` (256) extra instructions per window. Every block
+`WINDOW_EXTENSION_LIMIT` extra instructions per window, and of those only
+the ones from which the window's own blocks are reached again (loops
+across its edge; a straight run out of the window leaves it once either
+way). Window calls keep the targets plain windows give
+(`window_call_targets`), each with its long window's summary. The first
+version copied every reached block up to 256 instructions and let long
+windows add targets: about 8% slower on the game (forest), its `.text`
+4.4 GB against 2.7, fetch-bound; now 64 instructions and loops only. Every block
 keeps its arm in its own window, which the dispatcher, `Core::call` and
 resuming after a trap, boundary or budget use as before; a copy charges,
 tags and stores the PC exactly as the original, so nothing but the number
