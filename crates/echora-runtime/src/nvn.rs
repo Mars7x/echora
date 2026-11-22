@@ -2286,7 +2286,7 @@ impl Recorder {
             return Ok(false);
         };
         call_watch(name, core);
-        let x = core.cpu.regs;
+        let x = first_six(&core.cpu.regs);
         let this = x[0];
         if this == 0 {
             return Ok(false);
@@ -4468,7 +4468,18 @@ impl Nvn {
         // pointer, like builders.
         let bag_like =
             kind.ends_with("Builder") || kind == "TextureView" || kind.ends_with("State");
-        if bag_like && bag_call(&self.bags, core, name, kind, rest, this, args, x)? {
+        if bag_like
+            && bag_call(
+                &self.bags,
+                core,
+                name,
+                kind,
+                rest,
+                this,
+                args,
+                first_six(&x),
+            )?
+        {
             return Ok(true);
         }
         // Generic getters on initialized objects for properties their
@@ -8442,6 +8453,11 @@ impl Nvn {
     }
 }
 
+/// X0..X5 of the argument registers.
+fn first_six(regs: &[u64; 31]) -> [u64; 6] {
+    [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]]
+}
+
 /// A per-target setter's key, "<property>/<index>" (the first targets'
 /// without formatting one: the game sets them for every draw).
 fn per_target_key(property: &str, index: u64) -> std::borrow::Cow<'static, str> {
@@ -8512,7 +8528,8 @@ fn bag_call(
     rest: &str,
     this: u64,
     args: Args,
-    x: [u64; 31],
+    // X0..X5: no setter or getter reads further (not all 31 copied).
+    x: [u64; 6],
 ) -> Result<bool, Trap> {
     let invalid = |message: String| Trap::InvalidState {
         message: format!("{name}: {message}"),
@@ -8785,10 +8802,11 @@ fn record_command(
     let invalid = |message: String| Trap::InvalidState {
         message: format!("{name}: {message}"),
     };
-    let x = core.cpu.regs;
+    // X0..X7 only (the record log adds the return address).
+    let x: [u64; 8] = std::array::from_fn(|index| core.cpu.regs[index]);
     let mut command = Command {
         name,
-        x: std::array::from_fn(|index| x[index]),
+        x,
         v: std::array::from_fn(|index| core.cpu.vectors[index] as u64),
         captured: Vec::new(),
         states: Default::default(),
@@ -8811,7 +8829,7 @@ fn record_command(
             "record {:#x} {rest} x {:x?} from {:#x} head {head:x?}",
             x[0],
             &x[1..8],
-            x[30]
+            core.cpu.regs[30]
         );
     }
     // CallCommands / CopyCommands(cmd, int count, const
