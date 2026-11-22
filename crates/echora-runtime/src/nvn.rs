@@ -5389,10 +5389,7 @@ impl Nvn {
                 command_id: None,
                 message: format!("restore queue {queue:#x} render condition: {message}"),
             })?;
-        let result = self.run_queue_work(queue, core, force);
-        // Plans hold only while the replay keeps the NVN state.
-        self.parallel.forget();
-        result
+        self.run_queue_work(queue, core, force)
     }
 
     /// Make `queue`'s GPU state the current one.
@@ -5546,16 +5543,16 @@ impl Nvn {
                     self.select_descriptors(
                         descriptor_epoch.max(self.render.descriptors_after_wait),
                     );
-                    if gpu::parallel::enabled() {
+                    let parallel = gpu::parallel::enabled();
+                    if parallel {
                         let list = replayed_list.as_ref().unwrap();
-                        self.prepare_parallel_draws(
-                            list,
-                            index,
-                            self.replay_budget.map(|budget| budget as usize),
-                            core,
-                        );
+                        self.prepare_parallel_draws(queue, list, index, core);
                     }
-                    self.execute(command, core)?;
+                    let executed = self.execute(command, core);
+                    if parallel {
+                        self.parallel.position = None;
+                    }
+                    executed?;
                 }
                 QueueItem::Fence { sync, args } => {
                     let (sync, args) = (*sync, *args);
