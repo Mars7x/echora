@@ -6101,6 +6101,9 @@ thread_local! {
     /// window arms run the function first (`run_entry`).
     static REGALLOC_ENTRIES: std::cell::RefCell<BTreeMap<u64, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
+    /// The blocks the region's structured functions hold.
+    static REGALLOC_COVERED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
     /// `EmitOptions::float_runs` of the emission running on this thread.
     static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::float_run_loads` of the emission running on this thread.
@@ -7261,6 +7264,7 @@ pub fn emit_rust_split_to_regions<E>(
                         entries.entry(block).or_insert(entry);
                     }
                 });
+                REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
             } else {
                 emit_function(output, entry, &blocks, &inlined, &spin_heads);
             }
@@ -7289,6 +7293,7 @@ pub fn emit_rust_split_to_regions<E>(
         let mut functions_first = String::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             region_functions(region, &mut functions_first);
         }
         for (window, blocks) in region_windows {
@@ -7400,7 +7405,15 @@ pub fn emit_rust_split_to_regions<E>(
                 // instruction fetch, paid for).
                 writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    enter_window_{window:x}(m)\n}}\n\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
             } else {
-                writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+                // With regalloc, a window whose every block a structured
+                // function holds runs only next to budgets and host
+                // boundaries: cold, out of the hot code's way.
+                let cold = REGALLOC.get()
+                    && REGALLOC_COVERED.with_borrow(|covered| {
+                        blocks.iter().all(|block| covered.contains(&block.start))
+                    });
+                let cold = if cold { "#[cold]\n" } else { "" };
+                writeln!(output, "\n{cold}#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
             output.push_str(&locals.load());
             // The blocks run in a nested function so their early returns still
@@ -7475,6 +7488,7 @@ pub fn emit_rust_split_to_regions<E>(
         if REGALLOC.get() {
             source.push_str(&functions_first);
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
         } else {
             region_functions(region, &mut source);
         }

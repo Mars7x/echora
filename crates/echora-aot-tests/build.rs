@@ -304,6 +304,27 @@ fn codesize(out_dir: &std::path::Path) {
                     ..game
                 },
             ),
+            (
+                "game_functions",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    ..game
+                },
+            ),
         ])
         .collect();
     let dir = out_dir.join("codesize");

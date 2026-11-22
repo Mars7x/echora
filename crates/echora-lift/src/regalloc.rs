@@ -898,7 +898,9 @@ fn emit_tree(
     // With no `?` left every exit is a `return` in the text: each stores
     // only what may have been written before it, so registers written
     // before any exit need no load.
-    let precise = !rewritten.contains('?');
+    let precise = !rewritten
+        .lines()
+        .any(|line| without_strings(line).contains('?'));
     let mut body = if precise {
         exit_stores(&rewritten, &locals, graph, entries)
     } else {
