@@ -4,7 +4,7 @@
 //! source (`src/kernels.rs`).
 #![allow(clippy::unwrap_used)]
 
-use echora_aot_tests::kernel_code::KERNEL_CENSUS;
+use echora_aot_tests::kernel_code::{KERNEL_CENSUS, VECTOR_FLOAT_REPORT};
 
 /// The census row of `label`, by column.
 fn row(label: &str) -> Vec<&'static str> {
@@ -38,4 +38,13 @@ fn the_kernel_census_matches_the_kernels() {
     // here; its inlined operations are counted by option only when the
     // features inline them, so only the row's presence is checked.
     assert_eq!(row("intvec").len(), 13);
+}
+
+/// The vector float report of the kernels (printed with `--nocapture`):
+/// vector, vnorm, misc and fpairs hold run forms, and a run.
+#[test]
+fn the_kernels_vector_float_report() {
+    println!("{VECTOR_FLOAT_REPORT}");
+    assert!(VECTOR_FLOAT_REPORT.starts_with("vector float report (unweighted)"));
+    assert!(!VECTOR_FLOAT_REPORT.contains(" 0 in runs"));
 }

@@ -101,6 +101,8 @@ read.
 |---|---|
 | `ECHORA_LIFT_OPTIONS=a,b` | Replace the CLI's default set for `lift`: `inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs`. Use `flat` to turn off the set. See [codegen speed](codegen-speed.md) for measured options. |
 | `ECHORA_LIFT_OPTIONS_REGIONS=regions` | Comma-separated region IDs (the hex suffix of `gen-r-<id>`) or a file listing them. Apply `ECHORA_LIFT_OPTIONS` on top of the defaults for those regions only. |
+| `ECHORA_LIFT_REPORT=vector-float` | `lift` prints what keeps vector float operations out of runs (`echora_lift::vector_float_report`): run forms in runs and singles, the gaps between them by length and by instruction class, and how many would be in a run under looser rules. Over the regions of `ECHORA_LIFT_OPTIONS_REGIONS` when that is set. Nothing emitted changes. |
+| `ECHORA_LIFT_REPORT_WEIGHTS=file` | With `ECHORA_LIFT_REPORT`: weight each block by its window's line `WEIGHT REGIONHEX run_window_NAME` in the file (a profile's samples); windows not listed count nothing. |
 | `ECHORA_SHADER_CACHE=dir` | Keep the driver's compiled shader binaries in this folder between runs, so later runs skip compiling them. `echora run` sets it to `shader-cache` in the translation folder. |
 | `ECHORA_SHADER_DIR=dir` | Dump every shader stage the game creates, for the `survey` example in `echora-shader` and `shader-check` in `echora-gpu`. |
 | `ECHORA_SHADER_TRANSLATOR=plugin\|compare` | Use an installed shader plugin instead of Echora's own translator, or compare the two. `ECHORA_SHADER_PLUGIN=path` names the plugin; see [shader plugins](shader-plugin.md). |
