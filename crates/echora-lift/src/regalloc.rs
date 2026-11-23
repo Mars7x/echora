@@ -479,7 +479,12 @@ pub(super) fn emit_function(
             targets.push(target);
         }
     }
-    if size > INLINED_FUNCTION_LIMIT {
+    let own_size: usize = blocks.iter().map(|block| block.instructions.len()).sum();
+    if own_size > FUNCTION_INSTRUCTIONS {
+        capped(entry, "instructions");
+        return None;
+    }
+    if size > INLINED_FUNCTION_LIMIT || size > FUNCTION_INSTRUCTIONS {
         inlined.clear();
     } else {
         // Every call inside an inlined callee runs inlined too.
@@ -511,8 +516,9 @@ pub(super) fn emit_function(
         &inlined,
     );
     // Inlining that makes the function's Rust larger than
-    // FUNCTION_BYTES is given up: compile time and memory grow with it.
-    if emitted.is_some() && !inlined.is_empty() && output.len() - start > FUNCTION_BYTES {
+    // FUNCTION_BYTES is given up: compile time and memory grow faster than
+    // the function.
+    if emitted.is_some() && !inlined.is_empty() && output.len() - start > function_bytes() {
         output.truncate(start);
         emitted = None;
     }
@@ -532,6 +538,12 @@ pub(super) fn emit_function(
         ),
         None => return None,
     };
+    // Too large even without inlining: left to the windows.
+    if output.len() - start > function_bytes() {
+        output.truncate(start);
+        capped(entry, "bytes");
+        return None;
+    }
     let mut entered: Vec<(u64, u64)> = entries.iter().map(|&block| (block, entry)).collect();
     // After a host boundary execution resumes at a loop head through the
     // windows. An inner loop's head is no entry (it would be a second way
@@ -600,9 +612,57 @@ pub(super) fn emit_function(
     Some(entered)
 }
 
-/// The bytes of Rust a structured function may take with its inlined
-/// callees; a larger one is emitted without inlining.
-pub const FUNCTION_BYTES: usize = 1_500_000;
+/// The bytes of Rust a structured function may take: a larger one is
+/// emitted again without inlining, and if still larger not at all (its
+/// entry gets `capped_stub`, and the windows run it).
+pub const FUNCTION_BYTES: usize = 500_000;
+
+/// `FUNCTION_BYTES`, or `EmitOptions::regalloc_function_bytes`.
+fn function_bytes() -> usize {
+    match REGALLOC_FUNCTION_BYTES.get() {
+        0 => FUNCTION_BYTES,
+        bytes => bytes,
+    }
+}
+
+/// The guest instructions a structured function may hold with its
+/// inlined callees: past it, without inlining; its own past it, not at all.
+pub const FUNCTION_INSTRUCTIONS: usize = 2000;
+
+/// The functions left to the windows by the caps, and which cap.
+static CAPPED: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+fn capped(entry: u64, cap: &'static str) {
+    CAPPED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((entry, cap));
+    REGALLOC_CAPPED.with_borrow_mut(|capped| capped.insert(entry));
+}
+
+/// The functions the size caps left to the windows since the last call
+/// (entry, and `"instructions"` or `"bytes"`), sorted.
+pub fn take_capped_functions() -> Vec<(u64, &'static str)> {
+    let mut capped = std::mem::take(
+        &mut *CAPPED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    capped.sort_unstable();
+    capped
+}
+
+/// The host function of an entry the caps leave to the windows: it runs
+/// nothing and returns at once, its PC still the entry, so a caller goes
+/// on through the windows as after any early exit (and a window arm never
+/// runs it: the entry is not structured).
+pub(super) fn capped_stub(output: &mut String, entry: u64) {
+    writeln!(
+        output,
+        "\n/// Over the size caps: the windows run it.\n#[inline(never)]\npub fn run_function_{entry:x}(_m: &mut Machine) -> Result<(), Trap> {{ Ok(()) }}"
+    )
+    .unwrap();
+}
 
 /// Most guest instructions of an inner loop's resume function (its blocks
 /// up to the function's next entry).
