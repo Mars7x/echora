@@ -1278,6 +1278,9 @@ fn flush_pending(output: &mut String) {
 /// this region, the callee's window function runs directly
 /// (`Core::call_window`); otherwise, as any call, through the window table.
 fn emit_call_predicted(output: &mut String, next: u64, direct: Option<(u64, u64)>) {
+    // In crates packed by size (`regalloc_crates`) another window of the
+    // region may be in another crate.
+    let direct = direct.filter(|_| !REGALLOC_SPLIT.get());
     let Some((predicted, window)) = direct else {
         emit_call(output, next);
         return;
@@ -4240,15 +4243,10 @@ fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
         let set = functions.as_ref()?;
         let &index = set.entries.get(&target)?;
         let same_region = target >> set.region_bits == from >> set.region_bits;
-        // With regalloc's own function crates: directly only within the
-        // crate being emitted.
-        let same_crate = REGALLOC_CRATE_OF.with_borrow(|crates| {
-            crates
-                .as_ref()
-                .map(|crates| crates.get(&target) == Some(&REGALLOC_CURRENT_CRATE.get()))
-        });
-        if let Some(same_crate) = same_crate {
-            return Some((!same_crate).then_some(index));
+        // With regalloc's own crates: always through the table (the crates
+        // are packed after emission).
+        if set.table && REGALLOC_SPLIT.get() {
+            return Some(Some(index));
         }
         if set.table && !(REGALLOC.get() && same_region) {
             Some(Some(index))
@@ -4256,21 +4254,6 @@ fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
             (target >> set.region_bits == from >> set.region_bits).then_some(None)
         }
     })
-}
-
-/// Sets and restores [`REGALLOC_CRATE_OF`].
-struct RegallocCrates(Option<Arc<BTreeMap<u64, u64>>>);
-
-impl RegallocCrates {
-    fn set(crates: Option<Arc<BTreeMap<u64, u64>>>) -> Self {
-        Self(REGALLOC_CRATE_OF.replace(crates))
-    }
-}
-
-impl Drop for RegallocCrates {
-    fn drop(&mut self) {
-        REGALLOC_CRATE_OF.set(self.0.take());
-    }
 }
 
 /// Restores [`FUNCTIONS`] when it goes.
@@ -6153,20 +6136,32 @@ pub struct EmitOptions {
     /// execution resuming there after a host boundary leaves the windows
     /// at once instead of at the loop's end.
     pub regalloc_resume_loops: bool,
-    /// With `regalloc` and `function_table`: each region's lifted
-    /// functions go into crates of their own (`REGALLOC_CRATE_INSTRUCTIONS`
-    /// guest instructions each, region ids `region | k << 40`), apart from
-    /// its windows, which reach them through the function table: no rustc
-    /// process holds a whole region's windows and functions, and cargo
-    /// builds them in parallel. Calls within one such crate stay direct.
-    /// Resume functions (`regalloc_resume_loops`) are not emitted then.
+    /// With `regalloc` and `function_table`: each region is emitted as
+    /// crates of at most `REGALLOC_CRATE_BYTES` of Rust (the first keeps
+    /// the region's id, the others are `region | k << 40`): its windows,
+    /// then its lifted functions, in order. The root's tables name each
+    /// window's and function's crate; windows and functions reach
+    /// functions through the function table, and PLT stubs' predicted
+    /// targets through the window table. Resume functions
+    /// (`regalloc_resume_loops`) are not emitted then.
     pub regalloc_crates: bool,
+    /// With `regalloc_crates`: the bytes of Rust per crate, 0 for
+    /// `REGALLOC_CRATE_BYTES`.
+    pub regalloc_crate_bytes: usize,
 }
 
-/// With `EmitOptions::regalloc_crates`: the guest instructions (of the
-/// functions' own blocks) a crate of lifted functions holds at most, but
-/// for a single larger function.
-pub const REGALLOC_CRATE_INSTRUCTIONS: usize = 4096;
+/// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
+/// holds at most, but for a single larger window or function.
+pub const REGALLOC_CRATE_BYTES: usize = 10_000_000;
+
+/// One region's emission: its crates' sources, and with
+/// `EmitOptions::regalloc_crates` the crate of each window and function.
+#[derive(Default)]
+struct Placed {
+    sources: Vec<(u64, String)>,
+    windows: Vec<(u64, u64)>,
+    functions: Vec<(u64, u64)>,
+}
 
 thread_local! {
     /// `EmitOptions::regalloc` of the region being emitted (with
@@ -6178,11 +6173,9 @@ thread_local! {
     static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
     static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// With `EmitOptions::regalloc_crates`: the crate (region id) of each
-    /// lifted function, and the crate being emitted.
-    static REGALLOC_CRATE_OF: std::cell::RefCell<Option<Arc<BTreeMap<u64, u64>>>> =
-        const { std::cell::RefCell::new(None) };
-    static REGALLOC_CURRENT_CRATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `EmitOptions::regalloc_crates` of the region being emitted (with
+    /// regalloc and the function table).
+    static REGALLOC_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
     static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
@@ -7269,36 +7262,6 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|(index, &entry)| (entry, index))
             .collect(),
     );
-    // With regalloc_crates: each function's crate, per region in runs of
-    // at most REGALLOC_CRATE_INSTRUCTIONS of their own instructions.
-    let crate_of: Option<Arc<BTreeMap<u64, u64>>> =
-        used(|o| o.functions && o.function_table && o.regalloc && o.regalloc_crates).then(|| {
-            let mut crates = BTreeMap::new();
-            let (mut region, mut chunk, mut size) = (u64::MAX, 0u64, 0usize);
-            for (&entry, starts) in &lifted {
-                let options = options_of(entry >> region_bits);
-                if !(options.regalloc && options.regalloc_crates) {
-                    continue;
-                }
-                let own: usize = starts
-                    .iter()
-                    .map(|start| {
-                        translation
-                            .blocks
-                            .binary_search_by_key(start, |block| block.start)
-                            .map_or(0, |at| translation.blocks[at].instructions.len())
-                    })
-                    .sum();
-                if entry >> region_bits != region {
-                    (region, chunk, size) = (entry >> region_bits, 1, 0);
-                } else if size > 0 && size + own > REGALLOC_CRATE_INSTRUCTIONS {
-                    (chunk, size) = (chunk + 1, 0);
-                }
-                size += own;
-                crates.insert(entry, region | chunk << 40);
-            }
-            Arc::new(crates)
-        });
     // Summaries: leaves' are their own; a transitive summary only for a
     // function whose region propagates early returns.
     let summaries = used(|o| o.functions && o.call_summaries).then(|| {
@@ -7374,16 +7337,12 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|block| (block.start, block))
             .collect()
     };
-    let region_functions = |region: u64, crates: &mut BTreeMap<u64, String>| {
+    let region_functions = |region: u64, texts: &mut Vec<(u64, String)>| {
         let first = region << region_bits;
         let last = first + ((1u64 << region_bits) - 1);
         for (&entry, starts) in lifted.range(first..=last) {
-            let crate_id = crate_of
-                .as_ref()
-                .and_then(|crates| crates.get(&entry).copied())
-                .unwrap_or(region);
-            REGALLOC_CURRENT_CRATE.set(crate_id);
-            let output = crates.entry(crate_id).or_default();
+            texts.push((entry, String::new()));
+            let output = &mut texts.last_mut().expect("just pushed").1;
             let blocks: Vec<BasicBlock> =
                 starts.iter().map(|start| by_start[start].clone()).collect();
             if REGALLOC.get()
@@ -7426,17 +7385,23 @@ pub fn emit_rust_split_to_regions<E>(
             &window_calls,
         );
         let mut source = header_of(options);
-        let _crates = RegallocCrates::set(crate_of.clone().filter(|_| options.regalloc_crates));
+        let split = options.functions
+            && options.function_table
+            && options.regalloc
+            && options.regalloc_crates;
+        let _split = Flag::set(&REGALLOC_SPLIT, split);
         // With regalloc the region's functions are emitted first, so its
         // windows know which entries run structured.
-        let mut functions_first: BTreeMap<u64, String> = BTreeMap::new();
+        let mut functions_first: Vec<(u64, String)> = Vec::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             region_functions(region, &mut functions_first);
         }
-        REGALLOC_CURRENT_CRATE.set(region);
+        // Where each window's text starts in `source` (`regalloc_crates`).
+        let mut window_starts: Vec<(u64, usize)> = Vec::new();
         for (window, blocks) in region_windows {
+            window_starts.push((*window, source.len()));
             let output = &mut source;
             let extended: Vec<BasicBlock>;
             let blocks: &[BasicBlock] = match long_windows
@@ -7625,26 +7590,77 @@ pub fn emit_rust_split_to_regions<E>(
             output.push_str(&locals.store());
             output.push_str("    result\n}\n");
         }
-        let mut sources = Vec::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
         } else {
             region_functions(region, &mut functions_first);
         }
-        for (crate_id, text) in functions_first {
-            if crate_id == region {
+        let mut placed = Placed::default();
+        if !split {
+            for (_, text) in functions_first {
                 source.push_str(&text);
+            }
+            placed.sources.push((region, unindent(&source)));
+            return placed;
+        }
+        // Crates of at most REGALLOC_CRATE_BYTES of Rust each: the windows
+        // (the first crate keeps the region's own id), then the functions.
+        let header = header_of(options);
+        let budget = match options.regalloc_crate_bytes {
+            0 => REGALLOC_CRATE_BYTES,
+            bytes => bytes,
+        };
+        let mut crates: Vec<String> = vec![header.clone()];
+        let place = |crates: &mut Vec<String>, text: &str| -> u64 {
+            let last = crates.last().expect("a crate");
+            if last.len() > header.len() && last.len() + text.len() > budget {
+                crates.push(header.clone());
+            }
+            crates.last_mut().expect("a crate").push_str(text);
+            crates.len() as u64 - 1
+        };
+        let ends: Vec<usize> = window_starts
+            .iter()
+            .skip(1)
+            .map(|&(_, start)| start)
+            .chain(std::iter::once(source.len()))
+            .collect();
+        let headers = window_starts
+            .first()
+            .map_or(source.len(), |&(_, start)| start);
+        crates[0].push_str(&source[header.len().min(headers)..headers]);
+        let id = |index: u64| {
+            if index == 0 {
+                region
             } else {
-                sources.push((crate_id, unindent(&(header_of(options) + &text))));
+                region | index << 40
+            }
+        };
+        for (&(window, start), &end) in window_starts.iter().zip(&ends) {
+            let index = place(&mut crates, &source[start..end]);
+            placed.windows.push((window, id(index)));
+        }
+        crates.push(header.clone());
+        for (entry, text) in functions_first {
+            let index = place(&mut crates, &text);
+            placed.functions.push((entry, id(index)));
+        }
+        for (index, text) in crates.into_iter().enumerate() {
+            if index == 0 || text.len() > header.len() {
+                placed.sources.push((id(index as u64), unindent(&text)));
             }
         }
-        sources.insert(0, (region, unindent(&source)));
-        sources
+        placed
     };
     let groups: Vec<_> = windows
         .chunk_by(|a, b| a.0 >> shift == b.0 >> shift)
         .collect();
+    // With regalloc_crates: the crate of each window and function that is
+    // not in its region's own, and every crate emitted.
+    let mut window_crates: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut function_crates: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut crate_ids: Vec<u64> = Vec::new();
     let workers = if windows.len() < 256 {
         1
     } else {
@@ -7654,7 +7670,11 @@ pub fn emit_rust_split_to_regions<E>(
     };
     for batch in groups.chunks(workers) {
         if let [one] = batch {
-            for (region, source) in emit(one) {
+            let placed = emit(one);
+            window_crates.extend(placed.windows);
+            function_crates.extend(placed.functions);
+            for (region, source) in placed.sources {
+                crate_ids.push(region);
                 sink(region, source, groups.len())?;
             }
         } else {
@@ -7666,10 +7686,13 @@ pub fn emit_rust_split_to_regions<E>(
                 // Keep deterministic sink order and hold at most one batch
                 // of completed region sources at a time.
                 for worker in pending {
-                    let sources = worker
+                    let placed = worker
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    for (region, source) in sources {
+                    window_crates.extend(placed.windows);
+                    function_crates.extend(placed.functions);
+                    for (region, source) in placed.sources {
+                        crate_ids.push(region);
                         sink(region, source, groups.len())?;
                     }
                 }
@@ -7680,7 +7703,10 @@ pub fn emit_rust_split_to_regions<E>(
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
     for (window, _) in &windows {
-        let region = window >> shift;
+        let region = window_crates
+            .get(window)
+            .copied()
+            .unwrap_or(window >> shift);
         writeln!(
             root,
             "    ({window:#x}, gen_r_{region:x}::run_window_{window:x}),"
@@ -7748,9 +7774,9 @@ pub fn emit_rust_split_to_regions<E>(
         // gets a copy of.
         root.push_str("\nstatic FUNCTION_TABLE: &[WindowFn] = &[\n");
         for &entry in lifted.keys() {
-            let crate_id = crate_of
-                .as_ref()
-                .and_then(|crates| crates.get(&entry).copied())
+            let crate_id = function_crates
+                .get(&entry)
+                .copied()
                 .unwrap_or(entry >> region_bits);
             writeln!(root, "    gen_r_{crate_id:x}::run_function_{entry:x},").unwrap();
         }
@@ -7768,17 +7794,19 @@ pub fn emit_rust_split_to_regions<E>(
                 "    echora_guest::install_function_entries(FUNCTION_ENTRIES, FUNCTION_TABLE);\n",
             );
         }
-        let function_crates: BTreeSet<u64> = crate_of
-            .as_ref()
-            .map(|crates| crates.values().copied().collect())
-            .unwrap_or_default();
+        // Crates of their own (`regalloc_crates`) hold a table copy too.
+        let extra: Vec<u64> = crate_ids
+            .iter()
+            .copied()
+            .filter(|id| id >> 40 != 0)
+            .collect();
         for region in regions_seen
             .iter()
             .filter(|region| {
                 let options = options_of(**region);
                 options.functions && options.function_table
             })
-            .chain(&function_crates)
+            .chain(&extra)
         {
             writeln!(
                 installs,

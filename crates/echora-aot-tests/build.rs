@@ -76,6 +76,7 @@ fn options() -> EmitOptions {
         regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
         regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
         regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
+        regalloc_crate_bytes: 0,
         stub_windows: false,
     }
 }
@@ -4841,6 +4842,8 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         16,
         EmitOptions {
             regalloc_crates: true,
+            // Small crates, so that windows and functions spread over many.
+            regalloc_crate_bytes: 200_000,
             ..structured_functions
         },
     );

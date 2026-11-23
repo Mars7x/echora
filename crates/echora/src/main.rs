@@ -870,6 +870,16 @@ fn lift(
             extra.as_deref().unwrap_or("")
         );
     }
+    // ECHORA_REGALLOC_CRATE_BYTES: with regalloc-crates, the bytes of Rust
+    // per region crate (default echora_lift::codegen::REGALLOC_CRATE_BYTES).
+    if let Ok(bytes) = std::env::var("ECHORA_REGALLOC_CRATE_BYTES") {
+        let bytes: usize = bytes
+            .trim()
+            .parse()
+            .with_context(|| format!("ECHORA_REGALLOC_CRATE_BYTES {bytes:?}"))?;
+        options.regalloc_crate_bytes = bytes;
+        listed_options.regalloc_crate_bytes = bytes;
+    }
     // The blocks each window runs, as the emission decides (long windows
     // also run blocks of other windows).
     let windows = echora_lift::codegen::window_blocks(&d.translation, region_bits, &|region| {
