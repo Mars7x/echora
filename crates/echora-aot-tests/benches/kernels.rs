@@ -9,7 +9,8 @@
 //!     [--save FILE] [--compare FILE]]
 //! ```
 //!
-//! `FILTER` keeps kernels whose name contains it; `--scale` multiplies the
+//! `FILTER` keeps kernels whose name contains it (`=NAME`: that kernel
+//! alone); `--scale` multiplies the
 //! work of each kernel (default 1: about 15-140 million instructions);
 //! `--runs` sets how many times each kernel runs (default 3; the best and
 //! the median are reported). `--save` writes the results to a file and
@@ -104,6 +105,11 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
         }
         "gamefn" => {
             regs[0] = 500_000 * scale;
+            regs[1] = VECTOR_A;
+            m.core.cpu.sp = DATA_BASE + DATA_SIZE;
+        }
+        "vcalls" => {
+            regs[0] = 1_000_000 * scale;
             regs[1] = VECTOR_A;
             m.core.cpu.sp = DATA_BASE + DATA_SIZE;
         }
@@ -314,7 +320,10 @@ fn main() {
         if options
             .filter
             .as_deref()
-            .is_some_and(|filter| !name.contains(filter))
+            .is_some_and(|filter| match filter.strip_prefix('=') {
+                Some(exact) => name != exact,
+                None => !name.contains(filter),
+            })
         {
             continue;
         }

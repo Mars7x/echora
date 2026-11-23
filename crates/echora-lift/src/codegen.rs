@@ -1629,6 +1629,7 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call(", "m.call("),
     ("if let Err(trap) = m.call_window(", "m.call_window("),
     ("if let Err(trap) = run_entry(", "run_entry("),
+    ("if let Err(trap) = m.call_indirect(", "m.call_indirect("),
 ];
 
 /// With `EmitOptions::regalloc`: a window arm runs its block's structured
@@ -2772,7 +2773,20 @@ fn emit_instruction_body(
             }
             if *link {
                 output.push_str("                m.cpu.pc = target;\n");
-                emit_call(output, next);
+                if REGALLOC_BODY.get()
+                    && FUNCTIONS
+                        .with_borrow(|functions| functions.as_ref().is_some_and(|set| set.table))
+                {
+                    // A target that is a lifted function's entry runs it
+                    // directly, found through the site's cache.
+                    writeln!(
+                        output,
+                        "                static CALL_SITE_{pc:x}: echora_guest::CallCache = echora_guest::CallCache::new();\n                if let Err(trap) = m.call_indirect({next:#x}, &CALL_SITE_{pc:x}) {{ return Err(trap); }}"
+                    )
+                    .unwrap();
+                } else {
+                    emit_call(output, next);
+                }
                 output.push_str(after_call);
             } else {
                 writeln!(output, "                {successor} = target;").unwrap();
@@ -3841,6 +3855,16 @@ fn emit_block_body(
             continue;
         }
         let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
+        if REGALLOC_BODY.get()
+            && matches!(
+                instruction.instruction,
+                Instruction::ReadPhysicalCounter { .. }
+            )
+        {
+            // The counter reads the steps, which a charged block holds
+            // whole: as in window code.
+            body.push_str("                m.steps += *n; *n = 0;\n");
+        }
         if REGALLOC_BODY.get()
             && index + 1 == count
             && matches!(
@@ -6231,6 +6255,10 @@ pub struct EmitOptions {
     /// the windows at that block, whose per-block charges then take every
     /// budget and host boundary exactly where window code would.
     pub regalloc: bool,
+    /// With `regalloc`: callees of up to `regalloc::LOOP_INLINE_LIMIT`
+    /// instructions (with what they call) run inlined where they are
+    /// called inside a loop, not only those of up to `INLINE_LIMIT`.
+    pub regalloc_loop_inlining: bool,
 }
 
 thread_local! {
@@ -6241,6 +6269,8 @@ thread_local! {
     /// (`EmitOptions::regalloc`): no per-block charges, the count added
     /// to the function's local `n`, flushed into the steps before calls.
     static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
+    static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
     /// callee runs inlined: they only set X30 and branch.
     static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
@@ -6249,6 +6279,9 @@ thread_local! {
     /// window arms run the function first (`run_entry`).
     static REGALLOC_ENTRIES: std::cell::RefCell<BTreeMap<u64, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
+    /// The blocks the region's structured functions hold.
+    static REGALLOC_COVERED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
     /// `EmitOptions::float_runs` of the emission running on this thread.
     static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::float_run_loads` of the emission running on this thread.
@@ -6853,6 +6886,7 @@ struct RegionSettings {
     cached_stop: Flag,
     arm_charges: Flag,
     regalloc: Flag,
+    regalloc_loop_inlining: Flag,
 }
 
 impl RegionSettings {
@@ -6942,6 +6976,10 @@ impl RegionSettings {
                     && !options.deferred_charges
                     && !options.steps_local
                     && !options.cached_stop,
+            ),
+            regalloc_loop_inlining: Flag::set(
+                &REGALLOC_LOOP_INLINING,
+                options.regalloc_loop_inlining,
             ),
             regalloc: Flag::set(
                 &REGALLOC,
@@ -7417,6 +7455,7 @@ pub fn emit_rust_split_to_regions<E>(
                         entries.entry(block).or_insert(entry);
                     }
                 });
+                REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
             } else {
                 emit_function(output, entry, &blocks, &inlined, &spin_heads);
             }
@@ -7446,6 +7485,7 @@ pub fn emit_rust_split_to_regions<E>(
         let mut functions_first = String::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             region_functions(region, &mut functions_first);
         }
         for (window, blocks) in region_windows {
@@ -7557,7 +7597,15 @@ pub fn emit_rust_split_to_regions<E>(
                 // instruction fetch, paid for).
                 writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    enter_window_{window:x}(m)\n}}\n\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
             } else {
-                writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+                // With regalloc, a window whose every block a structured
+                // function holds runs only next to budgets and host
+                // boundaries: cold, out of the hot code's way.
+                let cold = REGALLOC.get()
+                    && REGALLOC_COVERED.with_borrow(|covered| {
+                        blocks.iter().all(|block| covered.contains(&block.start))
+                    });
+                let cold = if cold { "#[cold]\n" } else { "" };
+                writeln!(output, "\n{cold}#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
             output.push_str(&locals.load());
             // The blocks run in a nested function so their early returns still
@@ -7632,6 +7680,7 @@ pub fn emit_rust_split_to_regions<E>(
         if REGALLOC.get() {
             source.push_str(&functions_first);
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
         } else {
             region_functions(region, &mut source);
         }
@@ -7752,6 +7801,18 @@ pub fn emit_rust_split_to_regions<E>(
         }
         root.push_str("];\n");
         let mut installs = String::new();
+        if used(|o| o.functions && o.function_table && o.regalloc) {
+            // Indirect calls from structured functions enter functions by
+            // entry (`Core::call_indirect`).
+            root.push_str("\nstatic FUNCTION_ENTRIES: &[u64] = &[\n");
+            for &entry in lifted.keys() {
+                writeln!(root, "    {entry:#x},").unwrap();
+            }
+            root.push_str("];\n");
+            installs.push_str(
+                "    echora_guest::install_function_entries(FUNCTION_ENTRIES, FUNCTION_TABLE);\n",
+            );
+        }
         for region in regions_seen.iter().filter(|region| {
             let options = options_of(**region);
             options.functions && options.function_table

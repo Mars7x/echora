@@ -1252,7 +1252,11 @@ loads come between its operations.
 `0xbf59_98a9_1cf0_05b2` to `0x14cd_5b18_6741_5324`, inline-vector
 `0xcf9f_4071_0fe5_727c` to `0xdd3b_fcd4_ea31_f1ae`), only through
 `float_run_load_code`, whose programs lift with float-run-loads on in every
-mode; with the trim undone both hashes are as before. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+mode; with the trim undone both hashes are as before. Merged with
+`claude/vigilant-dirac-e24yg5` at 11d52d9 (whose own hashes are
+`0xc1cb_bbf7_f3dc_8b4b` and `0xefbe_5e0a_726e_0329`) they are
+`0x73bb_c562_6345_cce9` and `0x0946_818b_2c33_349f`, again its own with the
+trim undone. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
 checks the run's bounds; `tests/float_runs.rs` the semantics.
 
 **`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's

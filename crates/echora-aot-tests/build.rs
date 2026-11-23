@@ -75,6 +75,7 @@ fn options() -> EmitOptions {
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
         arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
         regalloc: std::env::var_os("CARGO_FEATURE_REGALLOC").is_some(),
+        regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
         stub_windows: false,
     }
 }
@@ -221,6 +222,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("smallest_normal", smallest_normal_code),
     ("memory_fault", memory_fault_code),
     ("fp_mode_group", fp_mode_group_code),
+    ("counter", counter_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -423,6 +425,39 @@ fn codesize(out_dir: &std::path::Path) {
                 "game+known_returns",
                 EmitOptions {
                     known_returns: true,
+                    ..game
+                },
+            ),
+            (
+                "game_functions",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc_loops",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    regalloc_loop_inlining: true,
                     ..game
                 },
             ),
@@ -2313,6 +2348,11 @@ fn kernel_code(out: &mut String) {
     let entries: Vec<u64> = kernels::KERNEL_ENTRIES
         .iter()
         .map(|(_, offset)| kernels::KERNEL_BASE + offset)
+        .chain(
+            kernels::VIRTUAL_TARGETS
+                .iter()
+                .map(|offset| kernels::KERNEL_BASE + offset),
+        )
         .collect();
     let translation = discover_with_tables(
         std::slice::from_ref(&image),
@@ -3085,6 +3125,7 @@ fn call_code(out: &mut String) {
         ("call_summary_table_code", true, true, true, false, false),
         ("call_transitive_code", true, true, true, true, false),
         ("call_regalloc_code", true, true, true, true, true),
+        ("call_regalloc_loops_code", true, true, true, true, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -3097,6 +3138,7 @@ fn call_code(out: &mut String) {
                     call_summaries,
                     transitive_summaries,
                     regalloc,
+                    regalloc_loop_inlining: name == "call_regalloc_loops_code",
                     ..options()
                 },
             )
@@ -4508,6 +4550,63 @@ fn two_level_code(out: &mut String) {
 /// which needs the caller's X30 in the `Core`. Lifted with functions and
 /// call summaries, directly (`svc_wrapper_code`) and through the table
 /// (`svc_wrapper_table_code`).
+/// A function reading the physical counter (derived from the step count)
+/// twice per call, from a counting loop, for `tests/counter_reads.rs`: as
+/// windows and as a structured function (regalloc).
+fn counter_code(out: &mut String) {
+    const BASE: u64 = 0x1e0_0000;
+    let words: Vec<u32> = vec![
+        0x9400_0005, // L: bl F
+        0xf100_0400, // subs x0, x0, #1
+        0x54ff_ffc1, // b.ne L
+        0xd400_00e1, // svc #7
+        0x0000_0000, // udf
+        0xd53b_e021, // F: mrs x1, cntpct_el0
+        0x8b01_0042, // add x2, x2, x1
+        0x9100_0463, // add x3, x3, #1
+        0xd53b_e024, // mrs x4, cntpct_el0
+        0xca04_0042, // eor x2, x2, x4
+        0xd65f_03c0, // ret
+    ];
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "counter".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &[BASE], words.len()).expect("counter");
+    for (name, functions) in [
+        ("counter_window_code", false),
+        ("counter_regalloc_code", true),
+    ] {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                functions,
+                function_table: functions,
+                call_summaries: functions,
+                transitive_summaries: functions,
+                regalloc: functions,
+                ..options()
+            },
+        );
+        let structured = regions
+            .iter()
+            .map(|(_, source)| source.matches("n: &mut u64) -> Result<(), Trap>").count())
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "/// Functions emitted structured.\npub const STRUCTURED_FUNCTIONS: usize = {structured};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
 fn svc_wrapper_code(out: &mut String) {
     const BASE: u64 = 0x1d0_0000;
     let wrapper = BASE + 0x400;
@@ -5265,6 +5364,14 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     };
     lift("regalloc_on", 16, structured_functions);
     lift("regalloc_regions", 10, structured_functions);
+    lift(
+        "regalloc_loops",
+        16,
+        EmitOptions {
+            regalloc_loop_inlining: true,
+            ..structured_functions
+        },
+    );
     if fp {
         lift(
             "regalloc_direct",

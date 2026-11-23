@@ -136,6 +136,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_on),
         lift!(regalloc_regions),
         lift!(regalloc_direct),
+        lift!(regalloc_loops),
     ]
 }
 
@@ -160,6 +161,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_on"),
     ("window_call_base", "regalloc_regions"),
     ("window_call_base", "regalloc_direct"),
+    ("window_call_base", "regalloc_loops"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -570,6 +572,10 @@ fn window_call_lift_child() {
                 window_call_int::regalloc_regions::dispatch,
                 window_call_int::regalloc_regions::install,
             ),
+            "regalloc_loops" => (
+                window_call_int::regalloc_loops::dispatch,
+                window_call_int::regalloc_loops::install,
+            ),
             other => panic!("unknown lift {other}"),
         };
         install();
@@ -814,6 +820,7 @@ fn window_calls_match_the_reference() {
         "function_regions",
         "regalloc_on",
         "regalloc_regions",
+        "regalloc_loops",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
