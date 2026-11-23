@@ -79,6 +79,8 @@ fn options() -> EmitOptions {
         regalloc_crate_bytes: 0,
         regalloc_function_bytes: 0,
         regalloc_span_regions: std::env::var_os("CARGO_FEATURE_REGALLOC_SPAN_REGIONS").is_some(),
+        regalloc_resume_returns: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_RETURNS")
+            .is_some(),
         stub_windows: false,
     }
 }
@@ -4909,6 +4911,29 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             ..structured_functions
         },
     );
+    // Resume functions at inner loop heads and call returns, in one crate
+    // per region and in crates of their own across region edges.
+    lift(
+        "regalloc_resume",
+        16,
+        EmitOptions {
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..structured_functions
+        },
+    );
+    lift(
+        "regalloc_resume_crates",
+        10,
+        EmitOptions {
+            regalloc_crates: true,
+            regalloc_crate_bytes: 200_000,
+            regalloc_span_regions: true,
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..structured_functions
+        },
+    );
     lift(
         "regalloc_capped",
         16,
@@ -5104,7 +5129,7 @@ pub const FUNCTION_CALLS: usize = {};",
             "/// Functions emitted structured (regalloc), and window arms running them.\n\
              pub const STRUCTURED_FUNCTIONS: usize = {};\npub const STRUCTURED_ENTRIES: usize = {};",
             count("n: &mut u64) -> Result<(), Trap>"),
-            count("= run_entry(m, ") + count("= run_entry_at(m, ")
+            count("= run_entry(m, ") + count("= run_entry_at(m, ") + count("= run_entry_pc(m")
         )
         .expect("write");
         writeln!(
