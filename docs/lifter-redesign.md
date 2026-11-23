@@ -112,6 +112,24 @@ of Rust with its inlined callees is emitted without inlining; functions with com
 are now structured too (they fell back to the window-shaped form, which
 compiles slower).
 
+**First game result** (coordinator, 20bc158 on 87 of the 89 hottest
+regions): forest 24.4/24.4/23.8 fps against 24.1: no gain. In those
+regions 24.5% of guest cycles still ran in windows and 16.6% in
+structured functions (44.4% in windows before), total instructions -3%;
+lifted functions held 39% of the translation's instructions. So coverage
+first, then the gain where covered (about 1.2x). Since then:
+
+- Exclusive accesses no longer keep a function in the window form (game
+  atomics are load/store exclusive pairs).
+- Lifted functions under regalloc may hold 1,024 blocks
+  (`REGALLOC_BLOCK_LIMIT`, 256 before); the size caps bound what they
+  emit (instructions cap raised to 4,000).
+- Every `?` in a structured body is written out as a `match` returning
+  the error, so exact exit stores (and the stores before calls filtered
+  to what was written) apply to every structured function, not only to
+  those without a fallible helper (FP fallbacks, CAS, `.at(m, pc)?`); in
+  the window-call test programs all 119 structured functions qualify now.
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and

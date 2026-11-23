@@ -116,18 +116,14 @@ fn is_call(block: &BasicBlock) -> bool {
 }
 
 /// Blocks whose per-block boundaries the window form keeps: spin-wait
-/// heads, traced blocks and exclusive accesses.
+/// heads and traced blocks. (Exclusive accesses run structured: no
+/// boundary falls between a load and store exclusive there, so the pair
+/// succeeds unless another host thread takes the reservation, as Arm
+/// allows.)
 fn plain(blocks: &[&BasicBlock], spin_heads: &BTreeSet<u64>) -> bool {
-    blocks.iter().all(|block| {
-        !spin_heads.contains(&block.start)
-            && !traced_pcs().contains(&block.start)
-            && !block.instructions.iter().any(|record| {
-                matches!(
-                    record.instruction,
-                    Instruction::LoadExclusive { .. } | Instruction::StoreExclusive { .. }
-                )
-            })
-    })
+    blocks
+        .iter()
+        .all(|block| !spin_heads.contains(&block.start) && !traced_pcs().contains(&block.start))
 }
 
 /// The body of each block as structured emission runs it, or None when
@@ -627,7 +623,7 @@ fn function_bytes() -> usize {
 
 /// The guest instructions a structured function may hold with its
 /// inlined callees: past it, without inlining; its own past it, not at all.
-pub const FUNCTION_INSTRUCTIONS: usize = 2000;
+pub const FUNCTION_INSTRUCTIONS: usize = 4000;
 
 /// The functions left to the windows by the caps, and which cap.
 static CAPPED: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
@@ -1010,6 +1006,93 @@ fn returned_results(text: &str) -> String {
     output
 }
 
+/// `text` with each `EXPR?` written out as `(match EXPR { Ok(value) =>
+/// value, Err(error) => { return Err(error); } })`, so that every exit is
+/// a `return` that `exit_stores` sees; None (and `?` stays) where an
+/// operand cannot be told apart safely: a string or a closure around it.
+fn explicit_errors(text: &str) -> Option<String> {
+    let mut output = String::with_capacity(text.len() + text.len() / 8);
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        let mut rewritten = String::with_capacity(line.len());
+        let mut copied = 0;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (at, &byte) in bytes.iter().enumerate() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => quoted = true,
+                b'?' => {
+                    // The operand: a chain of paths, calls and indexing.
+                    let mut start = at;
+                    loop {
+                        while start > 0
+                            && (bytes[start - 1].is_ascii_alphanumeric()
+                                || matches!(bytes[start - 1], b'_' | b'.' | b':'))
+                        {
+                            start -= 1;
+                        }
+                        if start > 0 && matches!(bytes[start - 1], b')' | b']') {
+                            let mut depth = 0i32;
+                            let mut open = start;
+                            loop {
+                                if open == 0 {
+                                    return None;
+                                }
+                                open -= 1;
+                                match bytes[open] {
+                                    b')' | b']' => depth += 1,
+                                    b'(' | b'[' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    b'"' | b'\'' | b'|' => return None,
+                                    _ => {}
+                                }
+                            }
+                            start = open;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Inside a closure (`|..| expr`, ending at its `;`)
+                    // `return` would leave the closure: only past one.
+                    let in_closure = line[..start]
+                        .rfind('|')
+                        .is_some_and(|bar| !line[bar..start].contains(';'));
+                    if start == at || start < copied || in_closure {
+                        return None;
+                    }
+                    rewritten.push_str(&line[copied..start]);
+                    write!(
+                        rewritten,
+                        "(match {} {{ Ok(value) => value, Err(error) => {{ return Err(error); }} }})",
+                        &line[start..at]
+                    )
+                    .unwrap();
+                    copied = at + 1;
+                }
+                _ => {}
+            }
+        }
+        rewritten.push_str(&line[copied..]);
+        output.push_str(&rewritten);
+        output.push('\n');
+    }
+    Some(output)
+}
+
 /// The NZCV local as a `cpu::LazyFlags` instead of a `cpu::Flags`: its writes `set(..)`, its
 /// reads `nzcv()`, the flag operations by the same names.
 fn lazy_flags(text: &str) -> String {
@@ -1148,6 +1231,7 @@ fn emit_tree(
     text.push_str("}\n");
     let locals = RegisterLocals::of(&text);
     let rewritten = locals.rewrite(&text);
+    let rewritten = explicit_errors(&rewritten).unwrap_or(rewritten);
     // With no `?` left every exit is a `return` in the text: each stores
     // only what may have been written before it, so registers written
     // before any exit need no load.
