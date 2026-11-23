@@ -572,10 +572,13 @@ pub(super) fn emit_function(
                 )
             })
             .collect();
+        if !next.contains_key(&head) {
+            continue;
+        }
         let mut reached = BTreeSet::from([head]);
         let mut pending = vec![head];
         while let Some(pc) = pending.pop() {
-            for &target in &next[&pc] {
+            for &target in next.get(&pc).into_iter().flatten() {
                 if next.contains_key(&target)
                     && !entries.contains(&target)
                     && reached.insert(target)
@@ -809,7 +812,10 @@ fn emit_with(
     }
     let inner: Vec<u64> = inner
         .into_iter()
-        .filter(|&head| head >> KEY_SHIFT == 0 && !entries.contains(&head))
+        .filter(|&head| {
+            // Its own blocks only: a call ending the body returns past it.
+            head >> KEY_SHIFT == 0 && graph.contains_key(&head) && !entries.contains(&head)
+        })
         .collect();
     let tree = if entries.len() > 1
         && let Some(tree) = crate::structure::function_structure(&entries, &edges)
