@@ -109,6 +109,9 @@ known-returns = []
 # Inlined float operations' exact paths cold and out of line
 # (EmitOptions::cold_fp_exact).
 cold-fp-exact = []
+# Consecutive inlined float operations test the FPCR mode and IXC once
+# (EmitOptions::hoist_fp_mode).
+hoist-fp-mode = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []
