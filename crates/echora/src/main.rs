@@ -957,6 +957,20 @@ fn lift(
         },
     )?;
     let emit_time = start.elapsed();
+    let capped = echora_lift::codegen::take_capped_functions();
+    if !capped.is_empty() {
+        let list: Vec<String> = capped
+            .iter()
+            .map(|(entry, cap)| format!("{entry:#x} ({cap})"))
+            .collect();
+        println!(
+            "regalloc: {} functions over the size caps ({} instructions, {} bytes of Rust) left to the windows: {}",
+            capped.len(),
+            echora_lift::codegen::FUNCTION_INSTRUCTIONS,
+            echora_lift::codegen::FUNCTION_BYTES,
+            list.join(", ")
+        );
+    }
     if !listed_regions.is_empty() {
         let emitted: BTreeSet<u64> = regions.iter().copied().collect();
         let (present, missing): (Vec<u64>, Vec<u64>) = listed_regions
