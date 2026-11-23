@@ -1629,6 +1629,7 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call(", "m.call("),
     ("if let Err(trap) = m.call_window(", "m.call_window("),
     ("if let Err(trap) = run_entry(", "run_entry("),
+    ("if let Err(trap) = run_entry_at(", "run_entry_at("),
     ("if let Err(trap) = m.call_indirect(", "m.call_indirect("),
 ];
 
@@ -3892,7 +3893,12 @@ fn emit_block_body(
     FUSE.set(fuse);
     if REGALLOC_BODY.get() {
         writeln!(output, "                *n += {count};").unwrap();
-        output.push_str(&body);
+        // A spin hint reads the steps (and may lower the stop word, which
+        // the function's next test sees, as a preemption).
+        output.push_str(&body.replace(
+            "m.spin_hint();",
+            "{ m.steps += *n; *n = 0; m.spin_hint(); }",
+        ));
         return;
     }
     if SPLIT_TICKS.get()
@@ -4365,12 +4371,37 @@ fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
         let set = functions.as_ref()?;
         let &index = set.entries.get(&target)?;
         let same_region = target >> set.region_bits == from >> set.region_bits;
+        // With regalloc's own function crates: directly only within the
+        // crate being emitted.
+        let same_crate = REGALLOC_CRATE_OF.with_borrow(|crates| {
+            crates
+                .as_ref()
+                .map(|crates| crates.get(&target) == Some(&REGALLOC_CURRENT_CRATE.get()))
+        });
+        if let Some(same_crate) = same_crate {
+            return Some((!same_crate).then_some(index));
+        }
         if set.table && !(REGALLOC.get() && same_region) {
             Some(Some(index))
         } else {
             (target >> set.region_bits == from >> set.region_bits).then_some(None)
         }
     })
+}
+
+/// Sets and restores [`REGALLOC_CRATE_OF`].
+struct RegallocCrates(Option<Arc<BTreeMap<u64, u64>>>);
+
+impl RegallocCrates {
+    fn set(crates: Option<Arc<BTreeMap<u64, u64>>>) -> Self {
+        Self(REGALLOC_CRATE_OF.replace(crates))
+    }
+}
+
+impl Drop for RegallocCrates {
+    fn drop(&mut self) {
+        REGALLOC_CRATE_OF.set(self.0.take());
+    }
 }
 
 /// Restores [`FUNCTIONS`] when it goes.
@@ -5440,9 +5471,14 @@ fn emit_split_cases(
         // block runs here with its per-block charge.
         let entered = REGALLOC_ENTRIES.with_borrow(|entries| entries.get(&block.start).copied());
         if let Some(function) = entered {
+            // In its own crate (`regalloc_crates`) through the table.
+            let callee = match function_call(function, function) {
+                Some(Some(index)) => format!("run_entry_at(m, {index}"),
+                _ => format!("run_entry(m, run_function_{function:x}"),
+            };
             writeln!(
                 output,
-                "                if let Err(trap) = run_entry(m, run_function_{function:x}) {{ return Err(trap); }}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
+                "                if let Err(trap) = {callee}) {{ return Err(trap); }}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
                 block.start
             )
             .unwrap();
@@ -6259,7 +6295,26 @@ pub struct EmitOptions {
     /// instructions (with what they call) run inlined where they are
     /// called inside a loop, not only those of up to `INLINE_LIMIT`.
     pub regalloc_loop_inlining: bool,
+    /// With `regalloc`: each small inner loop (up to
+    /// `regalloc::RESUME_LIMIT` instructions to the function's next entry)
+    /// gets a structured resume function its window arm runs, so that
+    /// execution resuming there after a host boundary leaves the windows
+    /// at once instead of at the loop's end.
+    pub regalloc_resume_loops: bool,
+    /// With `regalloc` and `function_table`: each region's lifted
+    /// functions go into crates of their own (`REGALLOC_CRATE_INSTRUCTIONS`
+    /// guest instructions each, region ids `region | k << 40`), apart from
+    /// its windows, which reach them through the function table: no rustc
+    /// process holds a whole region's windows and functions, and cargo
+    /// builds them in parallel. Calls within one such crate stay direct.
+    /// Resume functions (`regalloc_resume_loops`) are not emitted then.
+    pub regalloc_crates: bool,
 }
+
+/// With `EmitOptions::regalloc_crates`: the guest instructions (of the
+/// functions' own blocks) a crate of lifted functions holds at most, but
+/// for a single larger function.
+pub const REGALLOC_CRATE_INSTRUCTIONS: usize = 4096;
 
 thread_local! {
     /// `EmitOptions::regalloc` of the region being emitted (with
@@ -6271,6 +6326,13 @@ thread_local! {
     static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
     static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// With `EmitOptions::regalloc_crates`: the crate (region id) of each
+    /// lifted function, and the crate being emitted.
+    static REGALLOC_CRATE_OF: std::cell::RefCell<Option<Arc<BTreeMap<u64, u64>>>> =
+        const { std::cell::RefCell::new(None) };
+    static REGALLOC_CURRENT_CRATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
+    static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
     /// callee runs inlined: they only set X30 and branch.
     static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
@@ -6887,6 +6949,7 @@ struct RegionSettings {
     arm_charges: Flag,
     regalloc: Flag,
     regalloc_loop_inlining: Flag,
+    regalloc_resume_loops: Flag,
 }
 
 impl RegionSettings {
@@ -6981,6 +7044,7 @@ impl RegionSettings {
                 &REGALLOC_LOOP_INLINING,
                 options.regalloc_loop_inlining,
             ),
+            regalloc_resume_loops: Flag::set(&REGALLOC_RESUME_LOOPS, options.regalloc_resume_loops),
             regalloc: Flag::set(
                 &REGALLOC,
                 options.regalloc
@@ -7326,6 +7390,9 @@ pub fn emit_rust_split_to_regions<E>(
         }
         if options.functions && options.regalloc {
             header.push_str(RUN_ENTRY_HELPER);
+            if options.function_table {
+                header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n");
+            }
         }
         if options.count_fallbacks {
             header.push_str(&format!(
@@ -7358,6 +7425,36 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|(index, &entry)| (entry, index))
             .collect(),
     );
+    // With regalloc_crates: each function's crate, per region in runs of
+    // at most REGALLOC_CRATE_INSTRUCTIONS of their own instructions.
+    let crate_of: Option<Arc<BTreeMap<u64, u64>>> =
+        used(|o| o.functions && o.function_table && o.regalloc && o.regalloc_crates).then(|| {
+            let mut crates = BTreeMap::new();
+            let (mut region, mut chunk, mut size) = (u64::MAX, 0u64, 0usize);
+            for (&entry, starts) in &lifted {
+                let options = options_of(entry >> region_bits);
+                if !(options.regalloc && options.regalloc_crates) {
+                    continue;
+                }
+                let own: usize = starts
+                    .iter()
+                    .map(|start| {
+                        translation
+                            .blocks
+                            .binary_search_by_key(start, |block| block.start)
+                            .map_or(0, |at| translation.blocks[at].instructions.len())
+                    })
+                    .sum();
+                if entry >> region_bits != region {
+                    (region, chunk, size) = (entry >> region_bits, 1, 0);
+                } else if size > 0 && size + own > REGALLOC_CRATE_INSTRUCTIONS {
+                    (chunk, size) = (chunk + 1, 0);
+                }
+                size += own;
+                crates.insert(entry, region | chunk << 40);
+            }
+            Arc::new(crates)
+        });
     // Summaries: leaves' are their own; a transitive summary only for a
     // function whose region propagates early returns.
     let summaries = used(|o| o.functions && o.call_summaries).then(|| {
@@ -7433,10 +7530,16 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|block| (block.start, block))
             .collect()
     };
-    let region_functions = |region: u64, output: &mut String| {
+    let region_functions = |region: u64, crates: &mut BTreeMap<u64, String>| {
         let first = region << region_bits;
         let last = first + ((1u64 << region_bits) - 1);
         for (&entry, starts) in lifted.range(first..=last) {
+            let crate_id = crate_of
+                .as_ref()
+                .and_then(|crates| crates.get(&entry).copied())
+                .unwrap_or(region);
+            REGALLOC_CURRENT_CRATE.set(crate_id);
+            let output = crates.entry(crate_id).or_default();
             let blocks: Vec<BasicBlock> =
                 starts.iter().map(|start| by_start[start].clone()).collect();
             if REGALLOC.get()
@@ -7451,8 +7554,8 @@ pub fn emit_rust_split_to_regions<E>(
                 )
             {
                 REGALLOC_ENTRIES.with_borrow_mut(|entries| {
-                    for block in entered {
-                        entries.entry(block).or_insert(entry);
+                    for (block, function) in entered {
+                        entries.entry(block).or_insert(function);
                     }
                 });
                 REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
@@ -7480,14 +7583,16 @@ pub fn emit_rust_split_to_regions<E>(
         );
         let mut source = header_of(options);
         let header_end = source.len();
+        let _crates = RegallocCrates::set(crate_of.clone().filter(|_| options.regalloc_crates));
         // With regalloc the region's functions are emitted first, so its
         // windows know which entries run structured.
-        let mut functions_first = String::new();
+        let mut functions_first: BTreeMap<u64, String> = BTreeMap::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             region_functions(region, &mut functions_first);
         }
+        REGALLOC_CURRENT_CRATE.set(region);
         for (window, blocks) in region_windows {
             let output = &mut source;
             let extended: Vec<BasicBlock>;
@@ -7677,17 +7782,33 @@ pub fn emit_rust_split_to_regions<E>(
             output.push_str(&locals.store());
             output.push_str("    result\n}\n");
         }
+        let mut sources = Vec::new();
         if REGALLOC.get() {
-            source.push_str(&functions_first);
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
         } else {
-            region_functions(region, &mut source);
+            region_functions(region, &mut functions_first);
+        }
+        for (crate_id, text) in functions_first {
+            if crate_id == region {
+                source.push_str(&text);
+            } else {
+                // A function crate of its own (`regalloc_crates`), with its
+                // own header and, with `cold_fp_exact`, its own wrappers.
+                let header = header_of(options);
+                let header_len = header.len();
+                let mut crate_source = header + &text;
+                if options.cold_fp_exact {
+                    crate_source = cold_fp_helpers(&crate_source, header_len);
+                }
+                sources.push((crate_id, unindent(&crate_source)));
+            }
         }
         if options.cold_fp_exact {
             source = cold_fp_helpers(&source, header_end);
         }
-        (region, unindent(&source))
+        sources.insert(0, (region, unindent(&source)));
+        sources
     };
     let groups: Vec<_> = windows
         .chunk_by(|a, b| a.0 >> shift == b.0 >> shift)
@@ -7701,8 +7822,9 @@ pub fn emit_rust_split_to_regions<E>(
     };
     for batch in groups.chunks(workers) {
         if let [one] = batch {
-            let (region, source) = emit(one);
-            sink(region, source, groups.len())?;
+            for (region, source) in emit(one) {
+                sink(region, source, groups.len())?;
+            }
         } else {
             std::thread::scope(|scope| {
                 let pending: Vec<_> = batch
@@ -7712,10 +7834,12 @@ pub fn emit_rust_split_to_regions<E>(
                 // Keep deterministic sink order and hold at most one batch
                 // of completed region sources at a time.
                 for worker in pending {
-                    let (region, source) = worker
+                    let sources = worker
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    sink(region, source, groups.len())?;
+                    for (region, source) in sources {
+                        sink(region, source, groups.len())?;
+                    }
                 }
                 Ok(())
             })?;
@@ -7792,12 +7916,11 @@ pub fn emit_rust_split_to_regions<E>(
         // gets a copy of.
         root.push_str("\nstatic FUNCTION_TABLE: &[WindowFn] = &[\n");
         for &entry in lifted.keys() {
-            writeln!(
-                root,
-                "    gen_r_{:x}::run_function_{entry:x},",
-                entry >> region_bits
-            )
-            .unwrap();
+            let crate_id = crate_of
+                .as_ref()
+                .and_then(|crates| crates.get(&entry).copied())
+                .unwrap_or(entry >> region_bits);
+            writeln!(root, "    gen_r_{crate_id:x}::run_function_{entry:x},").unwrap();
         }
         root.push_str("];\n");
         let mut installs = String::new();
@@ -7813,10 +7936,18 @@ pub fn emit_rust_split_to_regions<E>(
                 "    echora_guest::install_function_entries(FUNCTION_ENTRIES, FUNCTION_TABLE);\n",
             );
         }
-        for region in regions_seen.iter().filter(|region| {
-            let options = options_of(**region);
-            options.functions && options.function_table
-        }) {
+        let function_crates: BTreeSet<u64> = crate_of
+            .as_ref()
+            .map(|crates| crates.values().copied().collect())
+            .unwrap_or_default();
+        for region in regions_seen
+            .iter()
+            .filter(|region| {
+                let options = options_of(**region);
+                options.functions && options.function_table
+            })
+            .chain(&function_crates)
+        {
             writeln!(
                 installs,
                 "    gen_r_{region:x}::install_functions(FUNCTION_TABLE);"
