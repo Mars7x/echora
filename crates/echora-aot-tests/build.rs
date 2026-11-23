@@ -78,6 +78,7 @@ fn options() -> EmitOptions {
         regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
         regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
         regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
+        regalloc_crate_bytes: 0,
         stub_windows: false,
     }
 }
@@ -4099,6 +4100,55 @@ fn plt_code(out: &mut String) {
         writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
     }
     writeln!(out, "{root}\n}}").expect("write");
+    // Structured functions (the caller is an entry, so a function) in
+    // one crate per region, and in crates of one window or function each
+    // (`regalloc_crates`, with direct window calls too): a function's call
+    // through an inlined stub names no window of another crate.
+    for (name, crates) in [("plt_regalloc_code", false), ("plt_crates_code", true)] {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = split_at(
+            &translation,
+            EmitOptions {
+                functions: true,
+                function_table: true,
+                call_summaries: true,
+                transitive_summaries: true,
+                regalloc: true,
+                regalloc_crates: crates,
+                regalloc_crate_bytes: 1,
+                direct_calls: crates,
+                ..options()
+            },
+            10,
+        );
+        let structured = regions
+            .iter()
+            .map(|(_, source)| source.matches("n: &mut u64) -> Result<(), Trap>").count())
+            .sum::<usize>();
+        // Functions naming a window of their region (one crate only).
+        let naming = regions
+            .iter()
+            .map(|(_, source)| {
+                source
+                    .split("\npub fn ")
+                    .filter(|item| {
+                        item.starts_with("run_function_") && item.contains("run_window_")
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(
+            out,
+            "pub const STRUCTURED_FUNCTIONS: usize = {structured};\npub const FUNCTIONS_NAMING_WINDOWS: usize = {naming};\npub const CRATES: usize = {};",
+            regions.len()
+        )
+        .expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
 }
 
 /// Two callers for `tests/spills.rs`, each in its own window, of one callee
@@ -5517,6 +5567,8 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         16,
         EmitOptions {
             regalloc_crates: true,
+            // Small crates, so that windows and functions spread over many.
+            regalloc_crate_bytes: 200_000,
             ..structured_functions
         },
     );
