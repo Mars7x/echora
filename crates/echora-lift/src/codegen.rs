@@ -4141,8 +4141,18 @@ pub const FUNCTION_BLOCK_LIMIT: usize = 256;
 /// returns with the PC there, and the caller's `Core::call_window`
 /// continues through the window table). By entry: its blocks, in order.
 pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, Vec<u64>> {
-    functions_with(translation, region_bits, &BTreeSet::new())
+    functions_with(
+        translation,
+        region_bits,
+        &BTreeSet::new(),
+        FUNCTION_BLOCK_LIMIT,
+    )
 }
+
+/// The blocks a lifted function may hold with `EmitOptions::regalloc`,
+/// whose size caps (`regalloc::FUNCTION_INSTRUCTIONS`, `FUNCTION_BYTES`)
+/// bound what it emits.
+pub const REGALLOC_BLOCK_LIMIT: usize = 1024;
 
 /// [`functions`], with `extra` entries besides the BL targets (with
 /// `EmitOptions::regalloc`: the translation's entries, which windows then
@@ -4151,6 +4161,7 @@ pub fn functions_with(
     translation: &Translation,
     region_bits: u32,
     extra: &BTreeSet<u64>,
+    block_limit: usize,
 ) -> BTreeMap<u64, Vec<u64>> {
     use Instruction::*;
     let by_start: BTreeMap<u64, &BasicBlock> = translation
@@ -4208,7 +4219,7 @@ pub fn functions_with(
                     && (successor == entry || !entries.contains(&successor))
                     && seen.insert(successor)
                 {
-                    if seen.len() > FUNCTION_BLOCK_LIMIT {
+                    if seen.len() > block_limit {
                         continue 'entries;
                     }
                     pending.push(successor);
@@ -7260,7 +7271,12 @@ pub fn emit_rust_split_to_regions<E>(
         } else {
             BTreeSet::new()
         };
-        functions_with(translation, region_bits, &extra)
+        let limit = if used(|o| o.functions && o.regalloc) {
+            REGALLOC_BLOCK_LIMIT
+        } else {
+            FUNCTION_BLOCK_LIMIT
+        };
+        functions_with(translation, region_bits, &extra, limit)
             .into_iter()
             .filter(|(entry, _)| options_of(entry >> region_bits).functions)
             .collect()
