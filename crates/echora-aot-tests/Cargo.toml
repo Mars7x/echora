@@ -106,6 +106,9 @@ long-windows = []
 # After a call, the return point as a constant successor; any other PC
 # leaves the window (EmitOptions::known_returns).
 known-returns = []
+# Inlined float operations' exact paths cold and out of line
+# (EmitOptions::cold_fp_exact).
+cold-fp-exact = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []
