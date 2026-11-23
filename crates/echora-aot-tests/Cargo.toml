@@ -122,6 +122,9 @@ small-address-space = []
 # With functions: lifted functions as structured host code, charged at
 # entries, loop heads and call returns (EmitOptions::regalloc).
 regalloc = []
+# With regalloc: larger callees inlined where called inside a loop
+# (EmitOptions::regalloc_loop_inlining).
+regalloc-loop-inlining = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
