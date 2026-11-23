@@ -1228,6 +1228,68 @@ and a rounding mode the float helpers trap on: every register, the data,
 FPSR and the trap must agree; the lift with the option keeps no TBL or
 structure transfer helper call.
 
+## Floating point on the regalloc set (2026-11)
+
+Counted as above (the kernels built the game's way, cachegrind, scale 2
+minus scale 1), with the game set plus window-calls ("game") and the
+regalloc set ("regalloc"); host instructions per guest instruction.
+
+**`float-run-loads` takes only loads between a run's operations.** A
+run (`float_runs_in`) no longer starts or ends with S loads: a load that
+leads or ends it runs before or after it as it would alone. The floats
+kernel's block starts with its three loads, which the run held; floatld's
+loads come between its operations.
+
+| kernel | no loads | loads before | loads now |
+|---|---|---|---|
+| floats (game) | 17.11 | 17.89 (+4.5%) | 17.11 |
+| floatld (game) | 26.00 | 18.37 (-29.3%) | 18.63 (-28.3%) |
+| floats (regalloc) | 17.05 | 17.89 (+4.9%) | 17.05 |
+| floatld (regalloc) | 25.98 | 18.36 (-29.3%) | 18.41 (-29.1%) |
+
+`.text` of the kernel binary: 538,851 to 538,707 bytes (game), 616,115 to
+616,019 (regalloc). The golden hashes moved with it (default
+`0xbf59_98a9_1cf0_05b2` to `0x14cd_5b18_6741_5324`, inline-vector
+`0xcf9f_4071_0fe5_727c` to `0xdd3b_fcd4_ea31_f1ae`), only through
+`float_run_load_code`, whose programs lift with float-run-loads on in every
+mode; with the trim undone both hashes are as before. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+checks the run's bounds; `tests/float_runs.rs` the semantics.
+
+**`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's
+exact copy is marked cold (`core::hint::cold_path`), and the exact scalar
+helpers the inline paths fall back to (`fp_binary`, `fp_ternary`,
+`fp_compare`) are called through one `#[cold] #[inline(never)]` wrapper
+per region. With float-run-loads, against the same without:
+
+| kernel | game | + cold-fp-exact | regalloc | + cold-fp-exact |
+|---|---|---|---|---|
+| floats | 17.11 | 17.06 (-0.3%) | 17.05 | 16.92 (-0.8%) |
+| floatld | 18.63 | 18.21 (-2.3%) | 18.41 | 18.28 (-0.7%) |
+| fpscalar | 66.34 | 66.34 | 65.50 | 65.43 (-0.1%) |
+| scalar | 147.88 | 148.13 (+0.2%) | 146.50 | 146.65 (+0.1%) |
+
+vector, vnorm, misc, gamefn and gamecalls are unchanged. The hot float
+windows' machine code moves by -3% to +4% (floats' function 7,440 to
+7,236 bytes; floatld's window 7,495 to 7,766 without regalloc). The exact
+helpers were already out of line (echora-simd's bodies are separate
+functions; the wrappers are 38-byte calls), so their call sites were
+small already: the hot float code is the inline fast paths' own checks
+(operands and results normal or zero, the FPCR mode and IXC test per
+operation outside runs). Not worth turning on for its gain alone.
+
+**The subtraction V flag.** Fused flags (`fused_condition`) already lower
+a subtraction's GE, LT, GT and LE to one signed host compare, as regalloc's
+`LazyFlags` do. VS and VC were the bit formula `((a ^ b) & (a ^ v)) >>
+63`, six host instructions; they are now the signed subtraction's
+overflow (`overflowing_sub`, `cmp` and `seto`, or one `jo` in a branch),
+and an addition's V (CMN, ADDS) its `overflowing_add`, a CMN's GE six
+host instructions to four. No kernel branches on VS or VC; the fused
+emission changes only there (not in the golden modes), and
+`tests/fused_flags.rs` checks every condition after every setter against
+the reference. Conditions that do not fuse in window code (a CSEL, a
+condition in another block) read the flags `echora-guest`'s `Flags`
+computed, which compute V by the formula and GE as `n == v`.
+
 ## Plain guest memory access (2026-11)
 
 A plain load or store (`wmem.load_u*`/`store_u*`, `GuestAccess` in
