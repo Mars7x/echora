@@ -112,6 +112,9 @@ cold-fp-exact = []
 # Consecutive inlined float operations test the FPCR mode and IXC once
 # (EmitOptions::hoist_fp_mode).
 hoist-fp-mode = []
+# With inline-vector on x86-64: vector float groups checked by the host's
+# exception flags (EmitOptions::mxcsr_groups).
+mxcsr-groups = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []

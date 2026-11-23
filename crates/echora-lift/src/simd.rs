@@ -4191,6 +4191,186 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
     (code, finals)
 }
 
+/// The forms an MXCSR group takes (`EmitOptions::mxcsr_groups`): vector
+/// FADD, FSUB, FMUL, FDIV, FMLA and FMLS, whole vectors or by element, in
+/// single or double precision.
+pub fn mxcsr_group_op(op: &SimdOp) -> bool {
+    matches!(
+        *op,
+        SimdOp::VecFp {
+            op: VecFpOp::Add
+                | VecFpOp::Sub
+                | VecFpOp::Mul
+                | VecFpOp::Div
+                | VecFpOp::MulAdd
+                | VecFpOp::MulSub,
+            size: FpSize::S | FpSize::D,
+            scalar: false,
+            ..
+        } | SimdOp::VecFpElement {
+            op: VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub,
+            size: FpSize::S | FpSize::D,
+            scalar: false,
+            ..
+        }
+    )
+}
+
+/// The fast copy of a vector float group with `EmitOptions::mxcsr_groups`
+/// (`crate::codegen`'s `emit_vector_run`): every operation as native host
+/// arithmetic, with no operand tests; the host's own exception flags say
+/// whether the result is the Arm one. The group clears MXCSR's flags
+/// (`mxcsr_clear`, after which it loads its operands), and each result's
+/// lanes add to `bad` where they are a NaN, a denormal or exactly the
+/// smallest normal: x86 detects tininess after rounding and raises nothing
+/// for an exact denormal result, where Arm detects it before rounding and,
+/// under FZ, flushes and raises UFC. Then one read of MXCSR (`mxcsr_read`,
+/// which takes `bad` as an operand, so every result is computed before
+/// it): the group commits when IE, DE, ZE, OE and UE are all clear and no
+/// lane was bad. A denormal operand raises DE, an invalid operation or a
+/// signalling NaN IE, a division by zero ZE, an overflow OE, a tiny
+/// inexact result UE; infinities and zeros otherwise give the IEEE results
+/// Arm gives and raise nothing; a quiet NaN operand gives a NaN result.
+/// Returns the code computing `good`, the registers written with their
+/// final values' locals, and whether the group fuses (it then needs the
+/// host's FMA: `fmaf` in software rounds through double).
+pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
+    let mut values: std::collections::BTreeMap<u8, String> = Default::default();
+    let mut code = String::from("mxcsr_clear(); let mut bad = 0u64; ");
+    let mut written: Vec<u8> = Vec::new();
+    let mut fused_group = false;
+    let read =
+        |code: &mut String, values: &mut std::collections::BTreeMap<u8, String>, register: u8| {
+            values
+                .entry(register)
+                .or_insert_with(|| {
+                    code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
+                    format!("v{register}")
+                })
+                .clone()
+        };
+    for (index, op) in ops.iter().enumerate() {
+        let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
+            SimdOp::VecFp {
+                op: fp_op,
+                size,
+                q,
+                rd,
+                rn,
+                rm,
+                ..
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                (
+                    fp_op,
+                    size,
+                    if q { 128 / width } else { 64 / width },
+                    rd,
+                    rn,
+                    rm,
+                    None,
+                )
+            }
+            SimdOp::VecFpElement {
+                op: fp_op,
+                size,
+                q,
+                rd,
+                rn,
+                rm,
+                index,
+                ..
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                (
+                    fp_op,
+                    size,
+                    if q { 128 / width } else { 64 / width },
+                    rd,
+                    rn,
+                    rm,
+                    Some(index),
+                )
+            }
+            _ => unreachable!("mxcsr_group_op checked {op:?}"),
+        };
+        let (float, int, width) = if size == FpSize::S {
+            ("f32", "u32", 32u32)
+        } else {
+            ("f64", "u64", 64u32)
+        };
+        let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+        fused_group |= fused;
+        let n = read(&mut code, &mut values, rn);
+        let v = read(&mut code, &mut values, rm);
+        let d = if fused {
+            read(&mut code, &mut values, rd)
+        } else {
+            "0u128".to_owned()
+        };
+        let y = match element {
+            Some(lane) => format!("({v} >> {}) as {int}", u32::from(lane) * width),
+            None => format!("({v} >> (lane * {width})) as {int}"),
+        };
+        let (value, _) = arith_lane(fp_op, float);
+        let lanes_code = format!(
+            "let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
+             let x = ({n} >> (lane * {width})) as {int}; let y = {y}; let z = ({d} >> (lane * {width})) as {int}; let _ = z; \
+             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out"
+        );
+        let computed = if width == 32 && lanes == 4 {
+            let p = "echora_guest::simd";
+            let second = if element.is_some() {
+                format!(
+                    "u128::from(({v} >> {}) as u32)",
+                    u32::from(element.unwrap_or(0)) * width
+                )
+            } else {
+                v.clone()
+            };
+            format!(
+                "{p}::vector_fp_arithmetic_4s::<{}>({p}::VecFpOp::{fp_op:?}, {n}, {second}, {d}).unwrap_or_else(|| {{ {lanes_code} }})",
+                element.is_some()
+            )
+        } else {
+            format!("{{ {lanes_code} }}")
+        };
+        // A lane is suspect when |lane| - 1 is below the smallest normal
+        // (a denormal or exactly the smallest normal) or |lane| is above
+        // infinity (a NaN).
+        let (sign_clear, smallest, infinity) = if width == 32 {
+            ("0x7fff_ffffu32", "0x0080_0000u32", "0x7f80_0000u32")
+        } else {
+            (
+                "0x7fff_ffff_ffff_ffffu64",
+                "0x0010_0000_0000_0000u64",
+                "0x7ff0_0000_0000_0000u64",
+            )
+        };
+        // Single precision with SSE2 (`mxcsr_suspect_4s`; a 2S vector's
+        // upper lanes are zero); doubles lane by lane.
+        let suspect = if width == 32 {
+            format!("bad |= mxcsr_suspect_4s(o{index}); ")
+        } else {
+            format!(
+                "for lane in 0..{lanes}u32 {{ let a = (o{index} >> (lane * {width})) as {int} & {sign_clear}; \
+                 bad |= u64::from((a.wrapping_sub(1) < {smallest}) | (a > {infinity})); }} "
+            )
+        };
+        code.push_str(&format!("let o{index} = {computed}; {suspect}"));
+        values.insert(rd, format!("o{index}"));
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    code.push_str("let good = mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ");
+    let finals = written
+        .iter()
+        .map(|&register| (register, values[&register].clone()))
+        .collect();
+    (code, finals, fused_group)
+}
+
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every
 /// operation as plain host single-precision arithmetic on locals, with
 /// `good` cleared where an operand read from the run's start or a result
