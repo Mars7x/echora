@@ -349,7 +349,26 @@ split, and so does a direct window call (`direct-calls`).
 crate per region and in crates of one window or function each (with
 direct calls), and asserts that the former names windows from functions
 and the latter does not; without the fix it fails to compile as the game
-did. `tests/window_calls.rs`'s `regalloc_crates` lift packs into crates of
+did. Packing cannot split one function: 7101b9 held a structured function
+(`run_function_7101b9935c`) of 7.75 MB of Rust, past 22 GB of rustc.
+Structured functions are therefore capped
+(`regalloc::FUNCTION_INSTRUCTIONS`, 2,000 guest instructions;
+`regalloc::FUNCTION_BYTES`, 500 KB of Rust, or
+`EmitOptions::regalloc_function_bytes`): over either with its inlined
+callees, it is emitted again without inlining; its own instructions over
+the first, or its Rust without inlining over the second, and it is left to
+the windows: its entry's host function is a stub that returns at once
+(its PC still the entry), so a caller goes on through the windows as
+after any early exit, and no window arm delegates to it. `echora lift`
+prints the functions the caps left to the windows
+(`codegen::take_capped_functions`). The 1,001-instruction function above
+is 236 KB of structured Rust (about 3 s and 300 MB of rustc for its
+region), so 500 KB keeps such a function well under the superlinear
+range. `tests/window_calls.rs`'s `regalloc_capped` lift caps at 4 KB
+(52 functions left to the windows) and runs against the function-free
+lift like the others.
+
+`tests/window_calls.rs`'s `regalloc_crates` lift packs into crates of
 200 KB (ten crates: five of windows, five of functions) and runs against
 the function-free lift like the others.
 
