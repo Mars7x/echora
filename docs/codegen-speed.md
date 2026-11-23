@@ -1360,7 +1360,9 @@ lifted test programs) `0x9047_f551_4f90_3869` and
 `0xe217_ba2b_c432_2edf`. Merged with 5db8463 (its own hashes
 `0x5903_28ef_ed10_45e4` and `0x00d8_4736_2f4d_2c4a`, which this tree
 reproduces with the trim and the upper-case names undone):
-`0xa480_c0ef_6f90_8bd2` and `0xb832_7cb2_b09e_bf28`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+`0xa480_c0ef_6f90_8bd2` and `0xb832_7cb2_b09e_bf28`. Merged with 20bc158
+(its own `0x9e84_3648_63e5_219a` and `0xc443_a540_49d7_6f08`, reproduced the same way): `0x2b43_4d11_deee_88f8`
+and `0xedda_60da_f011_faae`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
 checks the run's bounds; `tests/float_runs.rs` the semantics.
 
 **`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's
