@@ -6637,10 +6637,12 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
                     format!("(v >> {sign}) & 1 != 0"),
                     format!("(v >> {sign}) & 1 == 0"),
                 ),
-                3 => (
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 != 0"),
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 == 0"),
-                ),
+                // V: the signed subtraction overflows (one host subtract
+                // and its overflow flag).
+                3 => {
+                    let overflows = format!("{}.overflowing_sub({}).1", signed("a"), signed("b"));
+                    (overflows.clone(), format!("!{overflows}"))
+                }
                 4 => (compare(">", false), compare("<=", false)),
                 5 => (compare(">=", true), compare("<", true)),
                 _ => (compare(">", true), compare("<=", true)),
@@ -6654,7 +6656,9 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
         Some(false) => format!(
             "let a = lhs & {mask}; let b = rhs & {mask}; let v = value & {mask}; \
              let n = (v >> {sign}) & 1 != 0; let z = v == 0; let c = v < a; \
-             let o = (!(a ^ b) & (a ^ v)) >> {sign} & 1 != 0;"
+             let o = {}.overflowing_add({}).1;",
+            signed("a"),
+            signed("b")
         ),
         // ANDS (TST): N and Z from the result, C and V clear.
         None => format!(
