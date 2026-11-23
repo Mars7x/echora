@@ -77,6 +77,8 @@ Every split test program compiled as a game region
 | game_window_calls | 339.2 | 200 | 215.2 |
 | game_functions | 343.4 | 201 | 217.0 |
 | game_regalloc | 720.5 | 365 | 351.7 |
+| game_regalloc (later run, more lifts) | 732.2 | 391 | 357.2 |
+| game_regalloc_loops (same run) | 732.4 | 414 | 357.3 |
 
 The structured functions' Rust is about as large as the windows' (30 MB
 against 34 MB here: every program entry is a function), and compiles to
