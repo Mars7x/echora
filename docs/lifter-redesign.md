@@ -103,9 +103,12 @@ windows of covered blocks for `.text` waits on the step-accounting
 decision ("Which windows stay").
 
 **Build cost** (below, "Compile time and memory"): `regalloc-crates`
-puts each region's lifted functions into crates of their own (about 4,096
-guest instructions each), so a region's windows and functions compile in
-parallel and no rustc process holds both; functions with compare-and-swap
+emits each region as crates of at most 10 MB of Rust
+(`REGALLOC_CRATE_BYTES`, or `ECHORA_REGALLOC_CRATE_BYTES`): its windows,
+then its lifted functions, packed in order by emitted size, so the game's
+largest region (83 MB of Rust, past 25 GB of rustc) becomes about nine
+crates that cargo builds in parallel; a structured function over 1.5 MB
+of Rust with its inlined callees is emitted without inlining; functions with compare-and-swap
 are now structured too (they fell back to the window-shaped form, which
 compiles slower).
 
@@ -321,15 +324,29 @@ function without its calls): game code with atomics took that path. A
 spin hint now has the count flushed into the steps first, and the stop
 word it may lower is seen at the function's next test, as a preemption.
 
-With `regalloc-crates` a region emits its windows as before (crate
-`gen-r-<region>`) and its functions in crates `gen-r-<region | k << 40>`
-(k from 1), each a run of the region's functions of at most
-`REGALLOC_CRATE_INSTRUCTIONS` own instructions; the windows call and
-enter them through the function table (`function_at`, `run_entry_at`),
-calls within one functions crate stay direct, and the root installs the
-table into every crate. Resume functions are not emitted then. The sink
-gets the extra crates as regions, so the game's workspace and bundles
-take them as they are.
+With `regalloc-crates` a region is emitted as crates packed by size: the
+region's own id (`gen-r-<region>`) for the first, `gen-r-<region | k <<
+40>` (k from 1) for the others, each at most `REGALLOC_CRATE_BYTES` (10
+MB; `EmitOptions::regalloc_crate_bytes`, from `ECHORA_REGALLOC_CRATE_BYTES`
+in `echora lift`) of Rust but for a single larger window or function: the
+region's windows in order, then its lifted functions in order. Nothing in
+one crate names a window or function of another: the root's window table
+and function table name each one's crate; windows enter structured
+functions and every function calls the others through the function table
+(`function_at`, `run_entry_at`); an inlined PLT stub's predicted call goes
+through the window table instead of naming its window; and the root
+installs the function table into every crate. Resume functions are not
+emitted then. The sink gets the extra crates as regions, so the game's
+workspace and bundles take them as they are. Independently, a structured
+function whose Rust with its inlined callees passes
+`regalloc::FUNCTION_BYTES` (1.5 MB) is emitted again without inlining.
+`tests/window_calls.rs`'s `regalloc_crates` lift packs into crates of
+200 KB (ten crates: five of windows, five of functions) and runs against
+the function-free lift like the others.
+
+At the game's rate (7101b9: 83 MB of Rust, past 25 GB of rustc RSS, about
+0.3 GB per MB) a 10 MB crate should stay near 3 GB; lower
+`ECHORA_REGALLOC_CRATE_BYTES` if not.
 
 The game's regions of 10-20 minutes and up to 12.8 GB are not reproduced
 by these programs (the whole set of test programs, about six regions'
