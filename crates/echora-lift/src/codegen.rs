@@ -2781,7 +2781,7 @@ fn emit_instruction_body(
                     // directly, found through the site's cache.
                     writeln!(
                         output,
-                        "                static CALL_SITE_{pc:x}: echora_guest::CallCache = echora_guest::CallCache::new();\n                if let Err(trap) = m.call_indirect({next:#x}, &CALL_SITE_{pc:x}) {{ return Err(trap); }}"
+                        "                static CALL_SITE_{pc:X}: echora_guest::CallCache = echora_guest::CallCache::new();\n                if let Err(trap) = m.call_indirect({next:#x}, &CALL_SITE_{pc:X}) {{ return Err(trap); }}"
                     )
                     .unwrap();
                 } else {
