@@ -837,7 +837,12 @@ fn lifted_functions_cover_the_game_s_cases() {
     // Deferred roots as entries: more functions.
     assert!(regalloc_indirect::FUNCTIONS > regalloc_on::FUNCTIONS);
     // Resume functions: more window arms run structured code.
-    assert!(regalloc_resume::STRUCTURED_ENTRIES > regalloc_on::STRUCTURED_ENTRIES);
+    // (With the resume features on, `regalloc_on` has them too.)
+    if cfg!(feature = "regalloc-resume-loops") || cfg!(feature = "regalloc-resume-returns") {
+        assert!(regalloc_resume::STRUCTURED_ENTRIES >= regalloc_on::STRUCTURED_ENTRIES);
+    } else {
+        assert!(regalloc_resume::STRUCTURED_ENTRIES > regalloc_on::STRUCTURED_ENTRIES);
+    }
     assert!(regalloc_resume_crates::STRUCTURED_ENTRIES > 0);
     // Bodies across region edges exist (and run in `regalloc_span`).
     assert!(window_call_program::SPANNING > 0);
