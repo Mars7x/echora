@@ -1228,6 +1228,81 @@ and a rounding mode the float helpers trap on: every register, the data,
 FPSR and the trap must agree; the lift with the option keeps no TBL or
 structure transfer helper call.
 
+## Vector float groups checked by the host's flags (opt-in)
+
+**The game's hottest structured functions** (the regalloc candidate on the
+forest) are 4S multiplies, adds and subtracts: their special-value guards
+took about a quarter of their cycles, 2.3 times the arithmetic they
+protect, and their slow paths almost never ran.
+
+**`mxcsr-groups` (`EmitOptions::mxcsr_groups`, with `inline-vector`, on an
+x86-64 host).** A group (the consecutive operations `vector_runs_in` takes,
+or a single FADD, FSUB, FMUL, FDIV, FMLA or FMLS: `vector_groups_in`)
+whose operations are all vector FADD, FSUB, FMUL, FDIV, FMLA or FMLS
+(whole vectors or by element; 4S, 2S, 2D) computes natively with no
+operand tests (`crate::simd::vector_group_mxcsr`):
+
+- one test of the FPCR mode and the sticky IXC for the group;
+- `mxcsr_clear` clears MXCSR's flags, then the operands load (the clear
+  may write memory, so no load moves above it);
+- each operation's result lanes add to `bad` where they are a NaN, a
+  denormal or exactly the smallest normal (`mxcsr_suspect_4s`: SSE2
+  compares and a movemask; doubles lane by lane);
+- `mxcsr_read(bad)` reads MXCSR (with `bad` as an operand, so every result
+  is computed before it); the group commits when IE, DE, ZE, OE and UE are
+  clear and no lane was bad, else the exact copy reruns it from the
+  unchanged registers.
+
+Why that is exact: a denormal operand raises DE (the host's DAZ and FTZ
+are off), an invalid operation or a signalling NaN IE, a division by zero
+ZE, an overflow OE, a tiny inexact result UE; infinities and zeros
+otherwise give the IEEE results Arm gives and raise nothing; a quiet NaN
+operand gives a NaN result, which the lane test sees (so do DN's default
+NaNs). The lane test covers what the flags miss: x86 detects tininess
+after rounding and raises nothing for an exact denormal result, where Arm
+detects it before rounding and, under FZ, flushes and raises UFC, also for
+a value overwritten later in the group (every result is tested, not only
+the final ones). Groups with FMLA or FMLS need the host's FMA (`fmaf` in
+software rounds through double): without `target_feature = "fma"` they
+always take the exact copy. Groups with other operations keep the runs'
+own fast copy.
+
+`tests/mxcsr_groups.rs` lifts each form alone and a chain reusing
+registers, with the option, against the helpers alone: 60,000 runs from
+lanes drawn from normal, inexact, denormal, smallest normal, values
+rounding to it, zeros, infinities, quiet and signalling NaNs and values
+that overflow or underflow, under FZ, DN, round toward minus infinity and
+FPSR with and without IXC; vectors, FPCR, FPSR and the trap must agree
+(with and without FMA, and with regalloc). Dropping the lane test,
+ignoring the flags, or ignoring UE alone each fail it.
+
+Counted as above (`x86-64-v3`, so with FMA), the game set plus
+`window-calls` ("game") and the regalloc set, each with
+`vector-float-runs`, against the same with `mxcsr-groups`. `vchain` is a
+new kernel shaped like the game's functions: two vectors in, twelve 4S
+multiplies, adds and subtracts reusing V2-V5, one vector out:
+
+| kernel | game | + mxcsr-groups | regalloc | + mxcsr-groups |
+|---|---|---|---|---|
+| vector | 21.72 | 12.86 (-41%) | 20.94 | 12.27 (-41%) |
+| vchain | 13.24 | 10.24 (-23%) | 12.87 | 10.01 (-22%) |
+| vnorm, fpairs, misc, floats, gamefn | | unchanged | | unchanged |
+
+vnorm, fpairs and misc hold forms the groups do not take (FRSQRTE,
+pairwise operations, FABD, FMAXV), so their runs keep their own fast copy.
+The kernel binary's `.text` shrank 4.5 KB (game) and 8.9 KB (regalloc).
+The golden hashes moved by the new lifts alone (the `vchain` kernel and
+`mxcsr_group_code`'s programs; with both removed they are as before):
+`0x279a_09f4_0a57_d429` to `0xa3b3_121e_c0e4_5cd6`, and
+`0x153e_e794_08c5_1d4b` to `0xfdab_2aea_d9c7_830f`.
+
+A first version tested the result lanes in a `for` loop over the `u128`:
+at `opt-level` 1 the host compiler neither unrolls nor vectorizes it, and
+vchain went from 13.2 to 30.8. What remains in vchain is mostly moving
+each value between the `u128` the generated code holds and the SSE
+registers the arithmetic uses; keeping a group's values as `__m128`
+would be the next step.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's
