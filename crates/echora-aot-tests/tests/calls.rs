@@ -31,8 +31,8 @@ mod lifted {
 use echora_lift::aarch64::{Instruction, decode};
 use lifted::{
     call_code, call_function_code, call_function_table_code, call_mixed_code, call_regalloc_code,
-    call_summary_code, call_summary_table_code, call_transitive_code, call_window_code,
-    call_window_table_code,
+    call_regalloc_loops_code, call_summary_code, call_summary_table_code, call_transitive_code,
+    call_window_code, call_window_table_code,
 };
 
 const STATES_PER_CALLER: usize = 16;
@@ -239,6 +239,8 @@ fn lifted_functions_with_transitive_summaries_match_the_reference() {
 fn structured_functions_match_the_reference() {
     call_regalloc_code::install();
     check(call_regalloc_code::dispatch);
+    call_regalloc_loops_code::install();
+    check(call_regalloc_loops_code::dispatch);
 }
 
 /// Every other region with functions, the table and summaries, the others

@@ -73,6 +73,7 @@ fn options() -> EmitOptions {
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
         arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
         regalloc: std::env::var_os("CARGO_FEATURE_REGALLOC").is_some(),
+        regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
         stub_windows: false,
     }
 }
@@ -323,6 +324,18 @@ fn codesize(out_dir: &std::path::Path) {
                     call_summaries: true,
                     transitive_summaries: true,
                     regalloc: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc_loops",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    regalloc_loop_inlining: true,
                     ..game
                 },
             ),
@@ -2471,6 +2484,7 @@ fn call_code(out: &mut String) {
         ("call_summary_table_code", true, true, true, false, false),
         ("call_transitive_code", true, true, true, true, false),
         ("call_regalloc_code", true, true, true, true, true),
+        ("call_regalloc_loops_code", true, true, true, true, true),
     ] {
         let (root, regions) = if functions {
             LIFTED.set(LIFTED.get() + translation.instructions.len());
@@ -2483,6 +2497,7 @@ fn call_code(out: &mut String) {
                     call_summaries,
                     transitive_summaries,
                     regalloc,
+                    regalloc_loop_inlining: name == "call_regalloc_loops_code",
                     ..options()
                 },
             )
@@ -4683,6 +4698,14 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     };
     lift("regalloc_on", 16, structured_functions);
     lift("regalloc_regions", 10, structured_functions);
+    lift(
+        "regalloc_loops",
+        16,
+        EmitOptions {
+            regalloc_loop_inlining: true,
+            ..structured_functions
+        },
+    );
     if fp {
         lift(
             "regalloc_direct",

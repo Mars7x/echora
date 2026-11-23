@@ -47,6 +47,13 @@ is the game set plus `window-calls`, regalloc the game set plus
 | memset | 8.33 | 8.33 | | 8.41 | | 8.41 |
 | switch | 7.18 (27.3) | | | | | 2.73 (9.1) |
 
+With `regalloc-loop-inlining` as well (callees of up to 96 instructions,
+with what they call, inlined where they are called inside a loop):
+gamefn 2.57, gamecalls 2.12, crossing 2.30, the rest unchanged; kernel
+machine code 170,134 against 170,759 bytes (an inlined body replaces
+the call's own code). Its size on the game depends on how many loop call
+sites there are; opt-in so that the forest decides.
+
 (`calls` was measured with a substring filter before, which also ran
 calls2 and gamecalls; the benchmark now takes `=NAME` for one kernel, and
 the row shows the kernel alone. `vcalls`, new: an update loop calling
@@ -166,6 +173,13 @@ into the caller's graph under their own keys, the BL sets X30 and goes
 to the copy, and the callee's return goes on in the caller when the
 target is the return address (any other target leaves, as the RET would).
 Counts, traps and tests are those of the copied blocks.
+
+With `EmitOptions::regalloc_loop_inlining` (`regalloc-loop-inlining`),
+a call site on a cycle of the caller's blocks inlines callees of up to
+`LOOP_INLINE_LIMIT` (96) instructions with what they call; every call
+inside an inlined callee runs inlined too. Tests: `regalloc_loops` in
+`tests/window_calls.rs` and `call_regalloc_loops_code` in
+`tests/calls.rs`.
 
 ### Indirect calls
 

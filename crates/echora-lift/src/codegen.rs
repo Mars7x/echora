@@ -6107,6 +6107,10 @@ pub struct EmitOptions {
     /// the windows at that block, whose per-block charges then take every
     /// budget and host boundary exactly where window code would.
     pub regalloc: bool,
+    /// With `regalloc`: callees of up to `regalloc::LOOP_INLINE_LIMIT`
+    /// instructions (with what they call) run inlined where they are
+    /// called inside a loop, not only those of up to `INLINE_LIMIT`.
+    pub regalloc_loop_inlining: bool,
 }
 
 thread_local! {
@@ -6117,6 +6121,8 @@ thread_local! {
     /// (`EmitOptions::regalloc`): no per-block charges, the count added
     /// to the function's local `n`, flushed into the steps before calls.
     static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
+    static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
     /// callee runs inlined: they only set X30 and branch.
     static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
@@ -6726,6 +6732,7 @@ struct RegionSettings {
     cached_stop: Flag,
     arm_charges: Flag,
     regalloc: Flag,
+    regalloc_loop_inlining: Flag,
 }
 
 impl RegionSettings {
@@ -6813,6 +6820,10 @@ impl RegionSettings {
                     && !options.deferred_charges
                     && !options.steps_local
                     && !options.cached_stop,
+            ),
+            regalloc_loop_inlining: Flag::set(
+                &REGALLOC_LOOP_INLINING,
+                options.regalloc_loop_inlining,
             ),
             regalloc: Flag::set(
                 &REGALLOC,
