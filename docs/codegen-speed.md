@@ -1228,6 +1228,104 @@ and a rounding mode the float helpers trap on: every register, the data,
 FPSR and the trap must agree; the lift with the option keeps no TBL or
 structure transfer helper call.
 
+## Step accounting: what needs exact counts (2026-11)
+
+**Who uses the step count.** Generated code charges each block's
+instructions to `Core::steps`; with `regalloc` a structured function counts
+them in a local and tests the stop word (`steps + n + ahead > stop`) at its
+entries, loop heads and call returns, leaving to the windows, which take
+budgets and host boundaries on the same block as window code. The users:
+
+- **Guest-visible values: none by default.** `MRS CNTPCT`/`CNTVCT`
+  (`physical_counter_ticks`) reads host time (`PhysicalCounter` with no
+  rate: `epoch.elapsed()`); steps feed it only with the debug variable
+  `ECHORA_VIRTUAL_CLOCK`, where only monotonic and roughly proportional
+  values matter. NVN timestamps come from the same counter.
+  `GetSystemTick` (SVC 0x1E) is not implemented; `SleepThread` and timed
+  waits use host `Instant` deadlines. No SVC returns a value derived from
+  steps.
+- **Approximate progress accounting:**
+  - scheduler slices (1,000 steps, 50,000 with parallel workers), the
+    timed-wait and audio polling cadence (`HOST_TIMER_CHECK_INSTRUCTIONS`,
+    100,000);
+  - wake-scan throttling (5,000), spin backoff and density (200,000 and
+    64), `spin_hint`'s slice end;
+  - per-thread instruction credits, which are only reported.
+  Cross-worker preemption is driven by priority, not steps (another thread
+  sets `preempt` and stores 0 into the stop word), and the run report
+  already states that switch points depend on the generated block
+  partition, not exact instruction positions.
+- **Budget:** `u64::MAX` for players (the launcher); 1e9 by default for
+  CLI test runs, and synthesised from wall-clock limits. A test stop, not
+  semantics.
+- **Exactness only for tests and diagnostics:** budget traps at exact
+  steps and PCs, every host boundary's PC and step count compared between
+  lift options (`steps_local`, `counter_reads`, `kernel_calls`,
+  `window_calls`, the runtime's unit tests), the per-instruction refund of
+  a trapping block (`settle_block_trap`), trace hits.
+
+The one hard requirement is where execution stops, not the count: a host
+boundary or budget must leave the PC at a block start that can be resumed,
+with the state consistent at SVCs and traps.
+
+**What it costs with regalloc.** Kernels lifted with the regalloc set and
+`regalloc-loop-inlining`, counted as above; "no stop tests" removes the
+structured functions' stop word tests and "no step adds" also their
+per-block `*n += count` (`ECHORA_KERNEL_ABLATE=stop` and `stop,steps`,
+measuring only: neither is faithful):
+
+| kernel | regalloc | no stop tests | no stop tests, no step adds |
+|---|---|---|---|
+| gamefn | 2.67 | 2.63 (-1%) | 2.60 (-3%) |
+| gamecalls | 2.12 | 2.24 (+6%) | 2.05 (-3%) |
+| crossing | 2.30 | 1.88 (-18%) | 1.68 (-27%) |
+| calls2 | 1.39 | 1.31 (-6%) | 1.23 (-12%) |
+| calls | 1.23 | 0.36 (-71%) | 0.36 |
+| vcalls | 11.81 | 9.43 (-20%) | 8.90 (-25%) |
+| arith | 2.43 | 1.39 (-43%) | 1.39 |
+| ldst | 4.86 | 2.60 (-46%) | 2.60 |
+| memset | 7.21 | 5.67 (-21%) | 4.00 (-45%) |
+| switch | 2.55 | 2.18 (-15%) | 1.91 (-25%) |
+
+The game-shaped kernels (gamefn, gamecalls) move by 3%. The large figures
+are tight loops that, with no test left, have no side effect in the loop,
+so the host compiler collapses, unrolls or vectorizes them (calls -71%,
+arith -43%); a thread that must stay preemptible cannot have that. What a
+test actually costs shows in the machine code: in the ldst loop the stop
+word's pointer and the step count are already in registers (LLVM hoisted
+the `Arc` load), and the test is `mov 0x10(%r14), %rax; add $5, %rdx; cmp;
+ja`: one relaxed load and two or three instructions per iteration, plus
+the add of the count. Testing the stop word through a pointer kept in a
+local (tried as an option: the window body's `let stop_word = &*m.stop`)
+changed no kernel (gamefn 2.67 to 2.71, the rest identical) and was
+dropped.
+
+**The poll-flag design, and why it is not built.** A loop head testing
+only a per-thread flag (one relaxed load and a branch, about one
+instruction less than today's test) would end a slice only when something
+set the flag: slices are measured in steps (`host_check_at`), and nothing
+but the steps reaching it ends one today. It needs a host-side source of
+slice ends, such as a timer thread storing 0 into each running core's
+stop word every slice (the cross-worker preemption path already does that
+store), with steps then charged coarsely for the reports and the wait and
+spin heuristics (per call and per loop iteration, an estimate). That is
+an echora-runtime change, and it would make every exact-step test
+compare differently (each would need the exact accounting kept as a
+mode). The gain it can buy is the one instruction per loop iteration
+above, plus the per-block adds (memset's 21% to 45% is the most; the
+game-shaped kernels 1% to 3%). Not worth it before the game shows tight
+loops of this kind dominating.
+
+**A finding on the way: the alignment branch under regalloc.** In the
+structured ldst loop, unlike window code, LLVM did not merge the view's
+aligned (relaxed atomic) and misaligned (`read_unaligned`) paths: each
+access is `test $7, %reg; je` over two identical `mov`s. That is the
+branch the one-instruction access lowering ("Plain guest memory access"
+below) removed, and why it gained 7.4% on ldst with regalloc while losing
+on the window kernels. An inline accessor in `echora-guest` choosing the
+same instruction for both (or a single `asm!` access, as that lowering
+did) would remove it for regalloc; that is a guest change, for the batch.
+
 ## Floating point on the regalloc set (2026-11)
 
 Counted as above (the kernels built the game's way, cachegrind, scale 2
