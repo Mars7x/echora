@@ -1290,6 +1290,46 @@ the reference. Conditions that do not fuse in window code (a CSEL, a
 condition in another block) read the flags `echora-guest`'s `Flags`
 computed, which compute V by the formula and GE as `n == v`.
 
+**`hoist-fp-mode` (opt-in, `EmitOptions::hoist_fp_mode`).** Two or
+more consecutive inlined float operations in a block, outside float runs,
+test the inline paths' FPCR mode and sticky IXC once, before the first
+(`let fp_mode_<pc> = (mode && IXC, FPCR != 0 && mode && IXC)`), and each
+operation reads that instead of testing again; each keeps its operand and
+result tests and its exact fallback. No helper writes FPCR or clears an
+FPSR flag (echora-simd's writes of either are in its tests), so a test
+true before the group stays true, and one false stays false: the group's
+operations then take their exact helpers, as each would until IXC was
+raised. The fallback needs no restart. An MSR, or any instruction without
+the test, ends a group. Groups are per block (`emit_block_body`, which
+windows and regalloc's structured functions share); a structured
+function's straight-line stretch across blocks would need regalloc's own
+emission.
+
+`tests/fp_mode_groups.rs` lifts groups of FMUL, FADD, FDIV, FMADD and
+FSUB (singles and doubles, alone and with an MSR FPSR, which can clear
+IXC, or an MSR FPCR between them, and with FCMP and FMAX among them) with
+every inline path and the option, against the helpers alone: 7,120 runs
+from normal, inexact, denormal, zero, infinite, NaN and overflowing
+operands under FZ, DN, round-toward-minus-infinity, FPSR with and without
+IXC and each value the MSRs write; vectors, FPCR, FPSR, NZCV and the trap
+must agree, with and without regalloc. A hoisted test forced true fails
+`tests/float_runs.rs`; groups running past an instruction without the test
+(an MSR) fail it with 8 mismatches.
+
+| kernel | game | + hoist-fp-mode | regalloc | + hoist-fp-mode |
+|---|---|---|---|---|
+| vnorm | 93.79 | 93.49 (-0.3%) | 94.11 | 93.33 (-0.8%) |
+| fpscalar, floats, floatld, misc, gamefn | | unchanged | | unchanged |
+
+With `inline-fp-scalar` too (fpscalar 19.74, or 18.11 with regalloc,
+against 66.34 without it) nothing more moves: its conversions, FSQRT and
+FRINT test FPCR without IXC, and FMAX and FCMP do not use this test, so
+they form no group. The kernels hold three groups (vector, scalar, vnorm);
+the kernels' window and function code grows 203 bytes without regalloc
+and not at all with it. The per-operation mode test is not where the
+float kernels spend: it is a few predictable instructions on locals, and
+the operand and result tests dominate. Not worth turning on.
+
 ## Plain guest memory access (2026-11)
 
 A plain load or store (`wmem.load_u*`/`store_u*`, `GuestAccess` in
