@@ -500,7 +500,8 @@ pub(super) fn emit_function(
             }
         }
     }
-    let emitted = emit_with(
+    let start = output.len();
+    let mut emitted = emit_with(
         output,
         entry,
         &own,
@@ -509,6 +510,12 @@ pub(super) fn emit_function(
         by_start,
         &inlined,
     );
+    // Inlining that makes the function's Rust larger than
+    // FUNCTION_BYTES is given up: compile time and memory grow with it.
+    if emitted.is_some() && !inlined.is_empty() && output.len() - start > FUNCTION_BYTES {
+        output.truncate(start);
+        emitted = None;
+    }
     let (inlined, (entries, inner)) = match emitted {
         Some(emitted) => (inlined, emitted),
         None if !inlined.is_empty() => (
@@ -532,7 +539,7 @@ pub(super) fn emit_function(
     // `EmitOptions::regalloc_resume_loops` a small inner loop gets a resume
     // function of its own: its blocks reached from its head before any of
     // the function's entries, which it leaves to.
-    let inner = if REGALLOC_RESUME_LOOPS.get() && REGALLOC_CRATE_OF.with_borrow(Option::is_none) {
+    let inner = if REGALLOC_RESUME_LOOPS.get() && !REGALLOC_SPLIT.get() {
         inner
     } else {
         Vec::new()
@@ -592,6 +599,10 @@ pub(super) fn emit_function(
     }
     Some(entered)
 }
+
+/// The bytes of Rust a structured function may take with its inlined
+/// callees; a larger one is emitted without inlining.
+pub const FUNCTION_BYTES: usize = 1_500_000;
 
 /// Most guest instructions of an inner loop's resume function (its blocks
 /// up to the function's next entry).
