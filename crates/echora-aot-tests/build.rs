@@ -74,6 +74,7 @@ fn options() -> EmitOptions {
         arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
         regalloc: std::env::var_os("CARGO_FEATURE_REGALLOC").is_some(),
         regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
+        regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
         stub_windows: false,
     }
 }
@@ -2498,6 +2499,7 @@ fn call_code(out: &mut String) {
                     transitive_summaries,
                     regalloc,
                     regalloc_loop_inlining: name == "call_regalloc_loops_code",
+                    regalloc_resume_loops: name == "call_regalloc_loops_code",
                     ..options()
                 },
             )
@@ -4703,6 +4705,7 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         16,
         EmitOptions {
             regalloc_loop_inlining: true,
+            regalloc_resume_loops: true,
             ..structured_functions
         },
     );

@@ -6111,6 +6111,12 @@ pub struct EmitOptions {
     /// instructions (with what they call) run inlined where they are
     /// called inside a loop, not only those of up to `INLINE_LIMIT`.
     pub regalloc_loop_inlining: bool,
+    /// With `regalloc`: each small inner loop (up to
+    /// `regalloc::RESUME_LIMIT` instructions to the function's next entry)
+    /// gets a structured resume function its window arm runs, so that
+    /// execution resuming there after a host boundary leaves the windows
+    /// at once instead of at the loop's end.
+    pub regalloc_resume_loops: bool,
 }
 
 thread_local! {
@@ -6123,6 +6129,8 @@ thread_local! {
     static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
     static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
+    static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
     /// callee runs inlined: they only set X30 and branch.
     static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
@@ -6733,6 +6741,7 @@ struct RegionSettings {
     arm_charges: Flag,
     regalloc: Flag,
     regalloc_loop_inlining: Flag,
+    regalloc_resume_loops: Flag,
 }
 
 impl RegionSettings {
@@ -6825,6 +6834,7 @@ impl RegionSettings {
                 &REGALLOC_LOOP_INLINING,
                 options.regalloc_loop_inlining,
             ),
+            regalloc_resume_loops: Flag::set(&REGALLOC_RESUME_LOOPS, options.regalloc_resume_loops),
             regalloc: Flag::set(
                 &REGALLOC,
                 options.regalloc
@@ -7295,8 +7305,8 @@ pub fn emit_rust_split_to_regions<E>(
                 )
             {
                 REGALLOC_ENTRIES.with_borrow_mut(|entries| {
-                    for block in entered {
-                        entries.entry(block).or_insert(entry);
+                    for (block, function) in entered {
+                        entries.entry(block).or_insert(function);
                     }
                 });
                 REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
