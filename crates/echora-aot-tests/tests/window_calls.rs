@@ -139,6 +139,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_loops),
         lift!(regalloc_crates),
         lift!(regalloc_capped),
+        lift!(regalloc_span),
     ]
 }
 
@@ -166,6 +167,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_loops"),
     ("window_call_base", "regalloc_crates"),
     ("window_call_base", "regalloc_capped"),
+    ("window_call_base", "regalloc_span"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -584,6 +586,10 @@ fn window_call_lift_child() {
                 window_call_int::regalloc_crates::dispatch,
                 window_call_int::regalloc_crates::install,
             ),
+            "regalloc_span" => (
+                window_call_int::regalloc_span::dispatch,
+                window_call_int::regalloc_span::install,
+            ),
             other => panic!("unknown lift {other}"),
         };
         install();
@@ -813,6 +819,8 @@ fn lifted_functions_cover_the_game_s_cases() {
     // In crates of their own, the windows reach them through the table.
     assert!(regalloc_crates::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_crates::FUNCTION_CRATES > 0);
+    // Bodies across region edges exist (and run in `regalloc_span`).
+    assert!(window_call_program::SPANNING > 0);
     // Over the size cap: stubs, the windows run them.
     assert!(regalloc_capped::CAPPED_FUNCTIONS > 0);
     assert!(regalloc_capped::STRUCTURED_FUNCTIONS > 0);
@@ -837,6 +845,7 @@ fn window_calls_match_the_reference() {
         "regalloc_regions",
         "regalloc_loops",
         "regalloc_crates",
+        "regalloc_span",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([

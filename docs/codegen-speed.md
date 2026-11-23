@@ -1362,7 +1362,10 @@ lifted test programs) `0x9047_f551_4f90_3869` and
 reproduces with the trim and the upper-case names undone):
 `0xa480_c0ef_6f90_8bd2` and `0xb832_7cb2_b09e_bf28`. Merged with 20bc158
 (its own `0x9e84_3648_63e5_219a` and `0xc443_a540_49d7_6f08`, reproduced the same way): `0x2b43_4d11_deee_88f8`
-and `0xedda_60da_f011_faae`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+and `0xedda_60da_f011_faae`. Merged with d463ae0 (which names call-site
+caches in upper case too; its own `0x7cf4_cca0_c48c_5dc6` and
+`0x3974_9197_5f6e_b628`, reproduced with the trim undone):
+`0xf2d8_5f49_31a5_18a0` and `0x3cbf_5c35_44e7_725a`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
 checks the run's bounds; `tests/float_runs.rs` the semantics.
 
 **`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's

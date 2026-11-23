@@ -112,6 +112,37 @@ of Rust with its inlined callees is emitted without inlining; functions with com
 are now structured too (they fell back to the window-shaped form, which
 compiles slower).
 
+**First game result** (coordinator, 20bc158 on 87 of the 89 hottest
+regions): forest 24.4/24.4/23.8 fps against 24.1: no gain. In those
+regions 24.5% of guest cycles still ran in windows and 16.6% in
+structured functions (44.4% in windows before), total instructions -3%;
+lifted functions held 39% of the translation's instructions. So coverage
+first, then the gain where covered (about 1.2x). Since then:
+
+- Exclusive accesses no longer keep a function in the window form (game
+  atomics are load/store exclusive pairs).
+- Lifted functions under regalloc may hold 1,024 blocks
+  (`REGALLOC_BLOCK_LIMIT`, 256 before); the size caps bound what they
+  emit (instructions cap raised to 4,000).
+- Every `?` in a structured body is written out as a `match` returning
+  the error, so exact exit stores (and the stores before calls filtered
+  to what was written) apply to every structured function, not only to
+  those without a fallible helper (FP fallbacks, CAS, `.at(m, pc)?`); in
+  the window-call test programs all 119 structured functions qualify now.
+
+Coverage table from the game (coordinator, guest cycles still in
+windows inside the regalloc regions) and what answers each:
+
+| share | cause | answer |
+|---|---|---|
+| 9.91% | function dropped for the 256-block limit | `REGALLOC_BLOCK_LIMIT` 1,024 under regalloc (6db3c3a), the size caps the bound |
+| 5.90% | reached only from another region (bodies stopped at 64 KiB edges) | `regalloc-span-regions` (opt-in, with `regalloc-crates`): bodies run on past their region's edge |
+| 4.94% + 1.84% | inside a structured function but resumed mid-function or handed back | next: resume entries at call returns and window-entered blocks |
+| 1.52% | reached only by indirect branches | next: indirect targets as entries |
+
+A capped function's stub cannot run the function through the window
+table to its return instead of handing back (see `capped_stub`).
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and
