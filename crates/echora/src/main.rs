@@ -691,6 +691,29 @@ fn translation_dir(input: &std::path::Path, cache: &std::path::Path) -> Result<(
     Ok((exefs, cache.join("translations").join(key)))
 }
 
+/// `echora lift`'s defaults before the regalloc set
+/// (`ECHORA_LIFT_OPTIONS=legacy`).
+const LEGACY_OPTIONS: &str = "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs";
+/// `echora lift`'s defaults: `LEGACY_OPTIONS` plus window calls, lifted
+/// functions with summaries, structured functions with loop inlining in
+/// crates of their own, and loads in float runs (docs/lift-options.md).
+const DEFAULT_OPTIONS: &str = "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs,window-calls,functions,function-table,call-summaries,transitive-summaries,regalloc,regalloc-loop-inlining,regalloc-crates,float-run-loads";
+
+/// An `ECHORA_LIFT_OPTIONS` list with `legacy` replaced by
+/// `LEGACY_OPTIONS`.
+fn expand_legacy(list: &str) -> String {
+    list.split(',')
+        .map(|option| {
+            if option.trim() == "legacy" {
+                LEGACY_OPTIONS
+            } else {
+                option
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn lift(
     input: PathBuf,
     cache: Option<PathBuf>,
@@ -767,15 +790,17 @@ fn lift(
         .context("locate the echora-simd crate")?;
     let simd = simd.to_string_lossy().into_owned();
 
-    // Code generation options: inline-vector, fused-flags,
-    // whole-vector-checks, fp-status-locals, window-memory, untagged-blocks,
-    // split-ticks and float-runs by default (the set
-    // docs/codegen-speed.md measured: vector code about 5x, scalar FP about
-    // 2x); ECHORA_LIFT_OPTIONS, comma-separated, replaces them (with
-    // structured among the choices, and `flat` for none).
-    // The default options (the set docs/codegen-speed.md measured).
-    const DEFAULT_OPTIONS: &str = "inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs";
+    // Code generation options. The defaults: the set docs/codegen-speed.md
+    // measured (inline-vector, fused-flags, whole-vector-checks,
+    // fp-status-locals, window-memory, untagged-blocks, split-ticks,
+    // float-runs: `legacy`, the defaults before) plus window calls, lifted
+    // functions with summaries, structured functions (regalloc) with loop
+    // inlining in crates of their own, and loads in float runs, the set the
+    // game measured best (docs/lift-options.md). ECHORA_LIFT_OPTIONS,
+    // comma-separated, replaces them (with structured among the choices,
+    // `flat` for none and `legacy` for the old defaults).
     let apply = |options: &mut EmitOptions, list: &str| -> Result<()> {
+        let list = expand_legacy(list);
         for option in list
             .split(',')
             .map(str::trim)
@@ -962,6 +987,9 @@ fn lift(
 
     let start = Instant::now();
     let mut crate_sizes = Vec::new();
+    // Crates holding structured functions (`regalloc`), built with more
+    // codegen units (the workspace manifest below).
+    let mut structured_crates = BTreeSet::new();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
     let root = emit_rust_split_to_regions(
@@ -978,6 +1006,9 @@ fn lift(
             );
             write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
             source_bytes += source.len() as u64;
+            if source.contains("fn tail(") {
+                structured_crates.insert(region);
+            }
             if size_report {
                 crate_sizes.push(echora_lift::size_report::crate_size(region, &source));
             }
@@ -1150,14 +1181,28 @@ fn lift(
     // cores, total CPU time decides the build, and splitting a region costs
     // CPU without helping it (its windows reach each other only through
     // function pointers). The three fully optimized crates keep the default.
+    // A crate with structured functions (`regalloc`) gets
+    // `STRUCTURED_CODEGEN_UNITS`: its functions are large host functions,
+    // and its rustc time and memory are the build's longest pole.
+    const STRUCTURED_CODEGEN_UNITS: usize = 8;
+    let structured_profiles: String = structured_crates
+        .iter()
+        .map(|region| {
+            format!(
+                "\n[profile.release.package.gen-r-{region:x}]\ncodegen-units = {STRUCTURED_CODEGEN_UNITS}\n"
+            )
+        })
+        .collect();
     write_if_changed(
         &out.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
+        &(String::from(
+            "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
          [profile.release]\nopt-level = 1\ncodegen-units = 1\nrpath = true\n\n\
          [profile.release.package.echora-guest]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.echora-runtime]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.rav1d]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.echora-gpu]\nopt-level = 3\n\n[profile.release.package.echora-shader]\nopt-level = 3\n\n[profile.release.package.echora-shader-abi]\nopt-level = 3\n\n[profile.release.package.echora-simd]\nopt-level = 3\n\n[profile.release.package.echora-av1]\nopt-level = 3\n\n[profile.release.package.echora-audio]\nopt-level = 3\n\n[profile.release.package.echora-loader]\nopt-level = 3\n\n[profile.release.package.echora-nup]\nopt-level = 3\n\n[profile.release.package.ash]\nopt-level = 3\n\n[profile.release.package.astc-decode]\nopt-level = 3\n\n[profile.release.package.miniz_oxide]\nopt-level = 3\n\n[profile.release.package.zstd]\nopt-level = 3\n\n[profile.release.package.unsafe-libopus]\nopt-level = 3\n\n[profile.release.package.sha2]\nopt-level = 3\n",
+        ) + &structured_profiles),
     )?;
     // Linking the bundles as shared libraries needs the standard library
     // linked dynamically too; on Unix the runner records where it lives.
@@ -1402,5 +1447,37 @@ fn print_inventory(inv: &ContentInventory) {
     }
     for n in &inv.notes {
         println!("note: {n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_hold_the_legacy_set_and_legacy_expands_to_it() {
+        assert!(DEFAULT_OPTIONS.starts_with(LEGACY_OPTIONS));
+        for option in [
+            "window-calls",
+            "functions",
+            "function-table",
+            "call-summaries",
+            "transitive-summaries",
+            "regalloc",
+            "regalloc-loop-inlining",
+            "regalloc-crates",
+            "float-run-loads",
+        ] {
+            assert!(
+                DEFAULT_OPTIONS.split(',').any(|entry| entry == option),
+                "{option}"
+            );
+        }
+        assert_eq!(expand_legacy("legacy"), LEGACY_OPTIONS);
+        assert_eq!(
+            expand_legacy("legacy, steps-local"),
+            format!("{LEGACY_OPTIONS}, steps-local")
+        );
+        assert_eq!(expand_legacy("flat"), "flat");
     }
 }

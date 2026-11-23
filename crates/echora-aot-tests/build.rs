@@ -636,7 +636,9 @@ fn codesize(out_dir: &std::path::Path) {
     .expect("write");
 }
 
-/// The game build's default options (`echora lift`'s `DEFAULT_OPTIONS`).
+/// The game build's former default options (`echora lift`'s
+/// `LEGACY_OPTIONS`, `ECHORA_LIFT_OPTIONS=legacy`), against which the
+/// options here were measured.
 fn game_set() -> EmitOptions {
     EmitOptions {
         inline_vector: true,
