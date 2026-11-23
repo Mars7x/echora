@@ -38,6 +38,43 @@ fn pc_of(key: u64) -> u64 {
 /// Most guest instructions a callee may hold to run inlined.
 pub const INLINE_LIMIT: usize = 24;
 
+/// With `EmitOptions::regalloc_loop_inlining`: most guest instructions a
+/// callee called inside a loop may hold to run inlined.
+pub const LOOP_INLINE_LIMIT: usize = 96;
+
+/// The blocks of `blocks` on a cycle among them.
+fn in_cycles(blocks: &[BasicBlock], jump_tables: &BTreeMap<u64, Vec<u64>>) -> BTreeSet<u64> {
+    let next: BTreeMap<u64, Vec<u64>> = blocks
+        .iter()
+        .map(|block| {
+            (
+                block.start,
+                successors(block, jump_tables)
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut cyclic = BTreeSet::new();
+    for &start in next.keys() {
+        let mut seen = BTreeSet::new();
+        let mut pending: Vec<u64> = next[&start].clone();
+        while let Some(pc) = pending.pop() {
+            if pc == start {
+                cyclic.insert(start);
+                break;
+            }
+            if let Some(targets) = next.get(&pc)
+                && seen.insert(pc)
+            {
+                pending.extend(targets.iter().copied());
+            }
+        }
+    }
+    cyclic
+}
+
 /// Most guest instructions a function may hold with its inlined copies.
 pub const INLINED_FUNCTION_LIMIT: usize = 1024;
 
@@ -110,13 +147,7 @@ fn bodies(blocks: &[&BasicBlock], inlined_calls: &BTreeSet<u64>) -> Option<BTree
     REGALLOC_INLINED.set(outer_inlined);
     REGALLOC_BODY.set(outer_body);
     IN_FUNCTION.set(outer);
-    let observes = [
-        "physical_counter",
-        "spin_hint",
-        "trace_hit",
-        "m.steps",
-        "enter_window",
-    ];
+    let observes = ["spin_hint", "trace_hit", "m.steps", "enter_window"];
     let observed = bodies.values().any(|body| {
         let body = body.replace("m.steps += *n; *n = 0;", "");
         observes.iter().any(|text| body.contains(text))
@@ -398,14 +429,36 @@ pub(super) fn emit_function(
         return None;
     }
     // Callees small enough to run inlined, with what they call.
+    // Call sites whose callee runs inlined: those of at most
+    // `INLINE_LIMIT` instructions with what they call, and with
+    // `EmitOptions::regalloc_loop_inlining` those of at most
+    // `LOOP_INLINE_LIMIT` called inside a loop; then every call inside an
+    // inlined callee.
+    let loops = REGALLOC_LOOP_INLINING.get();
+    let cap = if loops {
+        LOOP_INLINE_LIMIT
+    } else {
+        INLINE_LIMIT
+    };
+    let cyclic = if loops {
+        in_cycles(blocks, jump_tables)
+    } else {
+        BTreeSet::new()
+    };
     let mut memo = BTreeMap::new();
     let mut inlined: BTreeSet<u64> = BTreeSet::new();
+    let mut targets: Vec<u64> = Vec::new();
     let mut size: usize = blocks.iter().map(|block| block.instructions.len()).sum();
     for block in blocks {
         let last = block
             .instructions
             .last()
             .expect("blocks have an instruction");
+        let limit = if cyclic.contains(&block.start) {
+            cap
+        } else {
+            INLINE_LIMIT
+        };
         if let Instruction::Branch { target, link: true } = last.instruction
             && target != entry
             && let Some(callee) = inlinable(
@@ -413,23 +466,37 @@ pub(super) fn emit_function(
                 functions,
                 by_start,
                 spin_heads,
+                cap,
                 &mut memo,
                 &mut Vec::new(),
             )
+            && callee <= limit
         {
             size += callee;
-            inlined.insert(target);
+            inlined.insert(last.pc);
+            targets.push(target);
         }
     }
     if size > INLINED_FUNCTION_LIMIT {
         inlined.clear();
     } else {
-        // What the inlined callees call runs inlined too.
-        inlined.extend(
-            memo.iter()
-                .filter(|&(&target, size)| size.is_some() && target != entry)
-                .map(|(&target, _)| target),
-        );
+        // Every call inside an inlined callee runs inlined too.
+        let mut seen = BTreeSet::new();
+        while let Some(target) = targets.pop() {
+            if !seen.insert(target) {
+                continue;
+            }
+            for start in &functions[&target] {
+                let last = by_start[start]
+                    .instructions
+                    .last()
+                    .expect("blocks have an instruction");
+                if let Instruction::Branch { target, link: true } = last.instruction {
+                    inlined.insert(last.pc);
+                    targets.push(target);
+                }
+            }
+        }
     }
     emit_with(
         output,
@@ -459,13 +526,15 @@ pub(super) fn emit_function(
 
 /// The instructions `target` runs inlined (its own and those of what it
 /// calls, all inlined), when it can: a lifted function, plain, calling
-/// only such functions (no BLR), none of them recursive, at most
-/// `INLINE_LIMIT` instructions in all.
+/// only such functions (no BLR), none of them recursive, at most `cap`
+/// instructions in all.
+#[allow(clippy::too_many_arguments)]
 fn inlinable(
     target: u64,
     functions: &BTreeMap<u64, Vec<u64>>,
     by_start: &BTreeMap<u64, &BasicBlock>,
     spin_heads: &BTreeSet<u64>,
+    cap: usize,
     memo: &mut BTreeMap<u64, Option<usize>>,
     stack: &mut Vec<u64>,
 ) -> Option<usize> {
@@ -484,7 +553,7 @@ fn inlinable(
         .then(|| blocks.iter().map(|block| block.instructions.len()).sum());
     stack.push(target);
     for block in &blocks {
-        if size.is_none_or(|size| size > INLINE_LIMIT) {
+        if size.is_none_or(|size| size > cap) {
             break;
         }
         if !is_call(block) {
@@ -496,14 +565,14 @@ fn inlinable(
             .expect("blocks have an instruction");
         let callee = match last.instruction {
             Instruction::Branch { target, link: true } => {
-                inlinable(target, functions, by_start, spin_heads, memo, stack)
+                inlinable(target, functions, by_start, spin_heads, cap, memo, stack)
             }
             _ => None,
         };
         size = size.zip(callee).map(|(size, callee)| size + callee);
     }
     stack.pop();
-    let size = size.filter(|&size| size <= INLINE_LIMIT);
+    let size = size.filter(|&size| size <= cap);
     memo.insert(target, size);
     size
 }
@@ -541,7 +610,7 @@ fn emit_with(
                 .map(|target| target.map(key))
                 .collect();
             if let Instruction::Branch { target, link: true } = last.instruction
-                && inlined.contains(&target)
+                && inlined.contains(&last.pc)
             {
                 copies += 1;
                 let copy = copies << KEY_SHIFT;
@@ -757,6 +826,37 @@ fn exit_stores(
     output
 }
 
+/// A call's result returned as it is on its error path (`if
+/// called.is_err() { .. return called; }`) instead of moved into a new
+/// `Err`: the host compiler then keeps the `Result` where the callee wrote
+/// it instead of copying it around every call.
+fn returned_results(text: &str) -> String {
+    const HEAD: &str = "if let Err(trap) = called { ";
+    const TAIL: &str = "return Err(trap); }";
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(HEAD) {
+        let after = &rest[at + HEAD.len()..];
+        let Some(end) = after.find(TAIL) else {
+            break;
+        };
+        let stores = &after[..end];
+        output.push_str(&rest[..at]);
+        if stores.contains('}') || stores.contains('{') {
+            // Not a plain error path: unchanged.
+            output.push_str(HEAD);
+            rest = after;
+            continue;
+        }
+        output.push_str("if called.is_err() { ");
+        output.push_str(stores);
+        output.push_str("return called; }");
+        rest = &after[end + TAIL.len()..];
+    }
+    output.push_str(rest);
+    output
+}
+
 /// The NZCV local as a `cpu::LazyFlags` instead of a `cpu::Flags`: its writes `set(..)`, its
 /// reads `nzcv()`, the flag operations by the same names.
 fn lazy_flags(text: &str) -> String {
@@ -898,7 +998,9 @@ fn emit_tree(
     // With no `?` left every exit is a `return` in the text: each stores
     // only what may have been written before it, so registers written
     // before any exit need no load.
-    let precise = !rewritten.contains('?');
+    let precise = !rewritten
+        .lines()
+        .any(|line| without_strings(line).contains('?'));
     let mut body = if precise {
         exit_stores(&rewritten, &locals, graph, entries)
     } else {
@@ -913,7 +1015,7 @@ fn emit_tree(
             .replace("m.memory.load_u", "wmem.load_u")
             .replace("m.memory.store_u", "wmem.store_u");
     }
-    let body = lazy_flags(&body);
+    let body = lazy_flags(&returned_results(&body));
     writeln!(
         output,
         "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unreachable_code, unused_labels)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{"

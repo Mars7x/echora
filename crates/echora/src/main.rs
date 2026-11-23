@@ -811,6 +811,7 @@ fn lift(
                 "cached-stop" => options.cached_stop = true,
                 "arm-charges" => options.arm_charges = true,
                 "regalloc" => options.regalloc = true,
+                "regalloc-loop-inlining" => options.regalloc_loop_inlining = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
