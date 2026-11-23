@@ -128,6 +128,9 @@ regalloc-loop-inlining = []
 # With regalloc: structured resume functions for small inner loops
 # (EmitOptions::regalloc_resume_loops).
 regalloc-resume-loops = []
+# With regalloc: each region's lifted functions in crates of their own
+# (EmitOptions::regalloc_crates).
+regalloc-crates = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

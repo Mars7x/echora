@@ -813,6 +813,7 @@ fn lift(
                 "regalloc" => options.regalloc = true,
                 "regalloc-loop-inlining" => options.regalloc_loop_inlining = true,
                 "regalloc-resume-loops" => options.regalloc_resume_loops = true,
+                "regalloc-crates" => options.regalloc_crates = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
