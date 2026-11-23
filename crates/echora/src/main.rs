@@ -997,9 +997,6 @@ fn lift(
 
     let start = Instant::now();
     let mut crate_sizes = Vec::new();
-    // Crates holding structured functions (`regalloc`), built with more
-    // codegen units (the workspace manifest below).
-    let mut structured_crates = BTreeSet::new();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
     let root = emit_rust_split_to_regions(
@@ -1016,9 +1013,6 @@ fn lift(
             );
             write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
             source_bytes += source.len() as u64;
-            if source.contains("fn tail(") {
-                structured_crates.insert(region);
-            }
             if size_report {
                 crate_sizes.push(echora_lift::size_report::crate_size(region, &source));
             }
@@ -1191,28 +1185,17 @@ fn lift(
     // cores, total CPU time decides the build, and splitting a region costs
     // CPU without helping it (its windows reach each other only through
     // function pointers). The three fully optimized crates keep the default.
-    // A crate with structured functions (`regalloc`) gets
-    // `STRUCTURED_CODEGEN_UNITS`: its functions are large host functions,
-    // and its rustc time and memory are the build's longest pole.
-    const STRUCTURED_CODEGEN_UNITS: usize = 8;
-    let structured_profiles: String = structured_crates
-        .iter()
-        .map(|region| {
-            format!(
-                "\n[profile.release.package.gen-r-{region:x}]\ncodegen-units = {STRUCTURED_CODEGEN_UNITS}\n"
-            )
-        })
-        .collect();
+    // Crates with structured functions keep one unit too: more units run
+    // LLVM's code generation of the units in parallel and multiply its
+    // memory (docs/lift-options.md).
     write_if_changed(
         &out.join("Cargo.toml"),
-        &(String::from(
-            "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
+        "[workspace]\nresolver = \"3\"\nmembers = [\"guest\", \"dispatch\", \"runner\", \"bundles/*\", \"regions/*\"]\n\n\
          [profile.release]\nopt-level = 1\ncodegen-units = 1\nrpath = true\n\n\
          [profile.release.package.echora-guest]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.echora-runtime]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.rav1d]\nopt-level = 3\ncodegen-units = 16\n\n\
          [profile.release.package.echora-gpu]\nopt-level = 3\n\n[profile.release.package.echora-shader]\nopt-level = 3\n\n[profile.release.package.echora-shader-abi]\nopt-level = 3\n\n[profile.release.package.echora-simd]\nopt-level = 3\n\n[profile.release.package.echora-av1]\nopt-level = 3\n\n[profile.release.package.echora-audio]\nopt-level = 3\n\n[profile.release.package.echora-loader]\nopt-level = 3\n\n[profile.release.package.echora-nup]\nopt-level = 3\n\n[profile.release.package.ash]\nopt-level = 3\n\n[profile.release.package.astc-decode]\nopt-level = 3\n\n[profile.release.package.miniz_oxide]\nopt-level = 3\n\n[profile.release.package.zstd]\nopt-level = 3\n\n[profile.release.package.unsafe-libopus]\nopt-level = 3\n\n[profile.release.package.sha2]\nopt-level = 3\n",
-        ) + &structured_profiles),
     )?;
     // Linking the bundles as shared libraries needs the standard library
     // linked dynamically too; on Unix the runner records where it lives.

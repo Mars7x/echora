@@ -26,12 +26,14 @@ and 25 GB of rustc in one crate).
 The former defaults stay one word away: `ECHORA_LIFT_OPTIONS=legacy`
 (with more options after it, comma-separated, as before).
 
-Crates holding structured functions build with 8 codegen units (a
-`[profile.release.package.gen-r-<id>]` section per such crate in the
-generated workspace's `Cargo.toml`); every other region crate keeps one.
-Their functions are large host functions, and their rustc time and memory
-are the build's longest pole, which one unit per crate serializes.
-`ECHORA_LIFT_REPORT=sizes` estimates each crate's rustc memory.
+Every region crate keeps one codegen unit, those with structured
+functions too. An earlier version of this branch gave those crates 8
+units; on the game, a hot window crate (7101d7) then went from 3.5 GB to
+20 GB of rustc within 15 seconds and was killed: LLVM generates the units'
+code in parallel, and each unit's memory adds up. With `regalloc-crates`
+packing crates to at most 10 MB of Rust (5fba752), the largest crates no
+longer need it. `ECHORA_LIFT_REPORT=sizes` estimates each crate's rustc
+memory (at one unit).
 
 The library's `EmitOptions::default()` and the golden hashes are
 unchanged: they are the lifter's own defaults, not the CLI's.
