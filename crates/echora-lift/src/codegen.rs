@@ -10624,9 +10624,7 @@ mod tests {
         words[0x100] = 0x9100_0400; // 0x1400: add x0, x0, #1 (F's return point)
         words[0x101] = 0xd65f_03c0; // 0x1404: ret
         // 0x1408: G, too long to run inlined: 30 ADDs, RET.
-        for at in 0x102..0x102 + 30 {
-            words[at] = 0x9100_0400;
-        }
+        words[0x102..0x102 + 30].fill(0x9100_0400);
         words[0x102 + 30] = 0xd65f_03c0;
         let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
         let options = EmitOptions {
