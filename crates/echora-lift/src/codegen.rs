@@ -10109,6 +10109,51 @@ mod tests {
         discover(&[region(&words)], &[0x1000], words.len()).unwrap()
     }
 
+    /// A function whose last block is a BL at the end of its 1 KiB region:
+    /// the call returns past its body (into the next region), to a block no
+    /// function starts at, so it gets no resume function (it once panicked
+    /// looking that block up).
+    #[test]
+    fn a_call_returning_past_the_function_gets_no_resume_function() {
+        let mut words = vec![0u32; 0x130];
+        words[0] = 0x9400_0000 | 0xff; // 0x1000: bl F (0x13fc)
+        words[1] = 0xd400_00e1; // 0x1004: svc #7
+        words[0xff] = 0x9400_0000 | 0x3; // 0x13fc: F: bl G (0x1408)
+        words[0x100] = 0x9100_0400; // 0x1400: add x0, x0, #1 (F's return point)
+        words[0x101] = 0xd65f_03c0; // 0x1404: ret
+        // 0x1408: G, too long to run inlined: 30 ADDs, RET.
+        for at in 0x102..0x102 + 30 {
+            words[at] = 0x9100_0400;
+        }
+        words[0x102 + 30] = 0xd65f_03c0;
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            regalloc: true,
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..EmitOptions::default()
+        };
+        for crates in [false, true] {
+            let (_, regions) = emit_rust_split_with(
+                &translation,
+                10,
+                EmitOptions {
+                    regalloc_crates: crates,
+                    ..options
+                },
+            );
+            let text: String = regions.iter().map(|(_, source)| source.as_str()).collect();
+            // F is structured, and nothing runs from its return point.
+            let f = &text[text.find("pub fn run_function_13fc(").unwrap()..];
+            assert!(f[..f.find("\npub fn ").unwrap_or(f.len())].contains("n: &mut u64"));
+            assert!(!text.contains("pub fn run_function_1400("));
+        }
+    }
+
     #[test]
     fn lifted_functions_hold_their_jump_tables_cases() {
         let translation = switch_program();
