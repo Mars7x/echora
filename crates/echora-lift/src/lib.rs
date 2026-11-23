@@ -36,6 +36,7 @@ pub mod simd;
 mod simd_int;
 mod simd_misc;
 mod simd_scalar;
+pub mod size_report;
 pub mod spin;
 pub mod structure;
 pub mod vector_float_report;

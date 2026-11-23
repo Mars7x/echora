@@ -861,8 +861,14 @@ fn lift(
     // (`echora_lift::vector_float_report`), over the regions of
     // ECHORA_LIFT_OPTIONS_REGIONS when that is set, weighted by window when
     // ECHORA_LIFT_REPORT_WEIGHTS names a file of `WEIGHT REGIONHEX
-    // run_window_NAME` lines.
+    // run_window_NAME` lines. `sizes`: every emitted crate's Rust bytes,
+    // functions and largest function (`echora_lift::size_report`), the
+    // largest printed and all of them in `lift-sizes.txt`.
     let reports = std::env::var("ECHORA_LIFT_REPORT").unwrap_or_default();
+    let size_report = reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "sizes");
     if reports
         .split(',')
         .map(str::trim)
@@ -955,6 +961,7 @@ fn lift(
     }
 
     let start = Instant::now();
+    let mut crate_sizes = Vec::new();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
     let root = emit_rust_split_to_regions(
@@ -971,6 +978,9 @@ fn lift(
             );
             write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
             source_bytes += source.len() as u64;
+            if size_report {
+                crate_sizes.push(echora_lift::size_report::crate_size(region, &source));
+            }
             written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
             regions.push(region);
             if report_progress {
@@ -980,6 +990,20 @@ fn lift(
         },
     )?;
     let emit_time = start.elapsed();
+    if size_report {
+        let all = echora_lift::size_report::SizeReport {
+            crates: crate_sizes,
+            top: usize::MAX,
+        };
+        std::fs::write(out.join("lift-sizes.txt"), all.to_string())
+            .context("write lift-sizes.txt")?;
+        let report = echora_lift::size_report::SizeReport {
+            crates: all.crates,
+            top: 30,
+        };
+        print!("{report}");
+        println!("(every crate in {})", out.join("lift-sizes.txt").display());
+    }
     if !listed_regions.is_empty() {
         let emitted: BTreeSet<u64> = regions.iter().copied().collect();
         let (present, missing): (Vec<u64>, Vec<u64>) = listed_regions
