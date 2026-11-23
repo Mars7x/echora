@@ -3936,7 +3936,7 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             index += 1;
             continue;
         }
-        let start = index;
+        let mut start = index;
         let mut arithmetic = 0;
         while index + 1 < count
             && let Some(counts) = kind(&block.instructions[index])
@@ -3944,8 +3944,18 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             arithmetic += usize::from(counts);
             index += 1;
         }
+        // With `loads`, only loads between the run's operations: one that
+        // leads or ends the run runs before or after it as it would alone.
+        let load = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::float_run_load(op));
+        let mut end = index;
+        while start < end && load(&block.instructions[start]) {
+            start += 1;
+        }
+        while start < end && load(&block.instructions[end - 1]) {
+            end -= 1;
+        }
         if arithmetic >= FLOAT_RUN_MINIMUM {
-            runs.push((start, index));
+            runs.push((start, end));
         }
     }
     runs
@@ -8419,6 +8429,25 @@ mod tests {
                 emit(&crossing, winner)
             );
         }
+    }
+
+    #[test]
+    fn float_runs_hold_only_loads_between_their_operations() {
+        // NOP; LDR S0, [X1]; LDR S1, [X1, #4]; four FMUL S2, S0, S1;
+        // LDR S3, [X1, #8]; four FADD S2, S2, S3; LDR S4, [X1, #12]; SVC.
+        let mut words = vec![0xd503_201f, 0xbd40_0020, 0xbd40_0421];
+        words.extend([0x1e21_0802; 4]);
+        words.push(0xbd40_0823);
+        words.extend([0x1e23_2842; 4]);
+        words.extend([0xbd40_0c24, 0xd400_00e1]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let block = &translation.blocks[0];
+        assert_eq!(block.instructions.len(), words.len());
+        // The leading and trailing loads stay outside; the one between
+        // operations is held.
+        assert_eq!(float_runs_in(block, true), [(3, 12)]);
+        // Without loads, no eight consecutive operations.
+        assert!(float_runs_in(block, false).is_empty());
     }
 
     #[test]
