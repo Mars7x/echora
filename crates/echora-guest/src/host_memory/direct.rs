@@ -3,6 +3,12 @@
 //! the guest's permissions, so a forbidden access faults in the host.
 #![allow(unsafe_code)]
 
+/// A value read at any alignment (`GuestAccess::load` on x86-64).
+#[cfg(target_arch = "x86_64")]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Unaligned<T>(T);
+
 /// Generated code's path into guest memory: the guest view's base and the
 /// address space size.
 #[derive(Clone, Copy, Debug)]
@@ -37,15 +43,24 @@ impl GuestAccess {
 
     /// A guest load. Naturally aligned accesses of up to 8 bytes are
     /// single-copy atomic on AArch64, and other guest threads (workers) may
-    /// write the same memory: they are relaxed host atomics, the same
-    /// instruction as a plain access, which the compiler may not merge,
-    /// split or keep in a register across other code. Misaligned and wider
-    /// accesses are plain.
+    /// write the same memory: the compiler may not merge, split or keep
+    /// them in a register across other code. On x86-64 every load of up to
+    /// 8 bytes is one volatile `mov` at any alignment (`Unaligned`), which
+    /// is single-copy atomic when aligned, as a relaxed atomic is there,
+    /// with no branch on the alignment; elsewhere aligned loads are relaxed
+    /// host atomics. Misaligned loads elsewhere, and wider ones, are plain.
     #[inline(always)]
     pub(crate) fn load<T: Copy>(&self, address: u64) -> T {
         use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
         let pointer = self.at::<T>(address);
         let size = size_of::<T>();
+        #[cfg(target_arch = "x86_64")]
+        if size <= 8 {
+            // SAFETY: inside the guest reservation (the view's protections
+            // fault on anything the guest may not read); `Unaligned<T>` has
+            // T's size and alignment 1.
+            return unsafe { std::ptr::read_volatile(pointer.cast::<Unaligned<T>>()).0 };
+        }
         if size <= 8 && address & (size as u64 - 1) == 0 {
             // SAFETY: inside the guest reservation (the view's protections
             // fault on anything the guest may not read), aligned to `size`
@@ -80,13 +95,46 @@ impl GuestAccess {
         unsafe { std::ptr::read_unaligned(pointer) }
     }
 
-    /// A guest store: relaxed host atomics for aligned accesses of up to 8
-    /// bytes, as in `load`.
+    /// A guest store, as `load`: on x86-64 one `mov` at any alignment (an
+    /// `asm!` store at the base plus the address, which the compiler may
+    /// not merge or drop; a volatile store of a packed value goes through
+    /// the stack), elsewhere relaxed host atomics for aligned accesses of up
+    /// to 8 bytes.
     #[inline(always)]
     pub(crate) fn store<T: Copy>(&self, address: u64, value: T) {
         use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
         let pointer = self.at::<T>(address);
         let size = size_of::<T>();
+        #[cfg(target_arch = "x86_64")]
+        if size <= 8 {
+            // SAFETY: inside the guest reservation (the view's protections
+            // fault on anything the guest may not write, as `pointer` was
+            // checked to be); T is `size` bytes.
+            unsafe {
+                use std::arch::asm;
+                let (base, offset) = (self.base, address as usize);
+                match size {
+                    1 => {
+                        let value: u8 = std::mem::transmute_copy(&value);
+                        asm!("mov byte ptr [{b} + {o}], {v}", b = in(reg) base, o = in(reg) offset, v = in(reg_byte) value, options(nostack, preserves_flags));
+                    }
+                    2 => {
+                        let value: u16 = std::mem::transmute_copy(&value);
+                        asm!("mov word ptr [{b} + {o}], {v:x}", b = in(reg) base, o = in(reg) offset, v = in(reg) value, options(nostack, preserves_flags));
+                    }
+                    4 => {
+                        let value: u32 = std::mem::transmute_copy(&value);
+                        asm!("mov dword ptr [{b} + {o}], {v:e}", b = in(reg) base, o = in(reg) offset, v = in(reg) value, options(nostack, preserves_flags));
+                    }
+                    _ => {
+                        let value: u64 = std::mem::transmute_copy(&value);
+                        asm!("mov qword ptr [{b} + {o}], {v}", b = in(reg) base, o = in(reg) offset, v = in(reg) value, options(nostack, preserves_flags));
+                    }
+                }
+            }
+            let _ = pointer;
+            return;
+        }
         if size <= 8 && address & (size as u64 - 1) == 0 {
             // SAFETY: as in `load`, for writes.
             unsafe {
