@@ -142,6 +142,8 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_span),
         lift!(regalloc_resume),
         lift!(regalloc_resume_crates),
+        lift!(regalloc_indirect_base),
+        lift!(regalloc_indirect),
     ]
 }
 
@@ -172,6 +174,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_span"),
     ("window_call_base", "regalloc_resume"),
     ("window_call_base", "regalloc_resume_crates"),
+    ("regalloc_indirect_base", "regalloc_indirect"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -594,6 +597,14 @@ fn window_call_lift_child() {
                 window_call_int::regalloc_span::dispatch,
                 window_call_int::regalloc_span::install,
             ),
+            "regalloc_indirect_base" => (
+                window_call_int::regalloc_indirect_base::dispatch,
+                window_call_int::regalloc_indirect_base::install,
+            ),
+            "regalloc_indirect" => (
+                window_call_int::regalloc_indirect::dispatch,
+                window_call_int::regalloc_indirect::install,
+            ),
             other => panic!("unknown lift {other}"),
         };
         install();
@@ -823,6 +834,8 @@ fn lifted_functions_cover_the_game_s_cases() {
     // In crates of their own, the windows reach them through the table.
     assert!(regalloc_crates::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_crates::FUNCTION_CRATES > 0);
+    // Deferred roots as entries: more functions.
+    assert!(regalloc_indirect::FUNCTIONS > regalloc_on::FUNCTIONS);
     // Resume functions: more window arms run structured code.
     assert!(regalloc_resume::STRUCTURED_ENTRIES > regalloc_on::STRUCTURED_ENTRIES);
     assert!(regalloc_resume_crates::STRUCTURED_ENTRIES > 0);
@@ -853,6 +866,8 @@ fn window_calls_match_the_reference() {
         "regalloc_loops",
         "regalloc_crates",
         "regalloc_span",
+        "regalloc_indirect_base",
+        "regalloc_indirect",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([

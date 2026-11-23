@@ -137,6 +137,9 @@ regalloc-span-regions = []
 # With regalloc: resume functions at call return points
 # (EmitOptions::regalloc_resume_returns).
 regalloc-resume-returns = []
+# With regalloc: every deferred root of discovery a function entry
+# (EmitOptions::regalloc_indirect_entries).
+regalloc-indirect-entries = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
