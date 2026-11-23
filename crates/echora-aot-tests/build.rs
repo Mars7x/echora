@@ -70,6 +70,7 @@ fn options() -> EmitOptions {
         known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
         cold_fp_exact: std::env::var_os("CARGO_FEATURE_COLD_FP_EXACT").is_some(),
         hoist_fp_mode: std::env::var_os("CARGO_FEATURE_HOIST_FP_MODE").is_some(),
+        mxcsr_groups: std::env::var_os("CARGO_FEATURE_MXCSR_GROUPS").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -231,6 +232,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("smallest_normal", smallest_normal_code),
     ("memory_fault", memory_fault_code),
     ("fp_mode_group", fp_mode_group_code),
+    ("mxcsr_group", mxcsr_group_code),
     ("counter", counter_code),
 ];
 
@@ -2260,6 +2262,91 @@ fn fp_mode_group_code(out: &mut String) {
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
         writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/mxcsr_groups.rs`: each vector form an MXCSR group
+/// takes (`EmitOptions::mxcsr_groups`), alone (a group of one), and a chain
+/// of them reusing registers, lifted with the build's options, every
+/// inline path, vector float runs and MXCSR groups (`mxcsr_group_code`),
+/// and with the helpers alone (`mxcsr_group_reference`).
+fn mxcsr_group_code(out: &mut String) {
+    const BASE: u64 = 0x300_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let programs: Vec<(&str, bool, Vec<u32>)> = vec![
+        ("fadd 4s", true, vec![0x4e22_d420]),
+        ("fsub 4s", true, vec![0x4ea2_d420]),
+        ("fmul 4s", true, vec![0x6e22_dc20]),
+        ("fdiv 4s", true, vec![0x6e22_fc20]),
+        ("fmla 4s", true, vec![0x4e22_cc20]),
+        ("fmls 4s", true, vec![0x4ea2_cc20]),
+        ("fmul 2s", true, vec![0x2e22_dc20]),
+        ("fmul 4s by element", true, vec![0x4fa2_9020]),
+        ("fmla 4s by element", true, vec![0x4fa2_1820]),
+        ("fadd 2d", false, vec![0x4e62_d420]),
+        ("fmul 2d", false, vec![0x6e62_dc20]),
+        ("fdiv 2d", false, vec![0x6e62_fc20]),
+        ("fmla 2d", false, vec![0x4e62_cc20]),
+        ("fmul 2d by element", false, vec![0x4fc2_9820]),
+        (
+            "chain 4s",
+            true,
+            vec![
+                0x6e22_dc23,
+                0x4e21_d464,
+                0x4ea2_d483,
+                0x6e23_dc64,
+                0x4e21_cc80,
+            ],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    let mut singles = Vec::new();
+    for (name, single, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        singles.push(*single);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "mxcsr_group".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("mxcsr_group");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        vector_float_runs: true,
+        mxcsr_groups: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("mxcsr_group_code", grouped),
+        ("mxcsr_group_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "pub const SINGLES: &[bool] = &{singles:?};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

@@ -3835,7 +3835,9 @@ fn emit_block_body(
         Vec::new()
     };
     // Vector float runs hold no scalar float run's operation: disjoint.
-    let vector_runs = if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
+    let vector_runs = if MXCSR_GROUPS.get() {
+        vector_groups_in(block)
+    } else if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
         vector_runs_in(block)
     } else {
         Vec::new()
@@ -4221,6 +4223,83 @@ pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether `EmitOptions::mxcsr_groups` is in effect: with `inline_vector`,
+/// on an x86-64 host (the translation builds on the machine that runs it).
+pub fn mxcsr_groups_on(options: &EmitOptions) -> bool {
+    options.mxcsr_groups && options.inline_vector && cfg!(target_arch = "x86_64")
+}
+
+/// Vector float groups in `block` (`EmitOptions::mxcsr_groups`): the runs
+/// `vector_runs_in` finds, and a single operation an MXCSR group takes
+/// (`crate::simd::mxcsr_group_op`) where no run holds it.
+pub(crate) fn vector_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
+    let single = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::mxcsr_group_op(op));
+    let count = block.instructions.len();
+    let mut groups = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if !held(&block.instructions[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < count && held(&block.instructions[index]) {
+            index += 1;
+        }
+        if index - start >= 2 || single(&block.instructions[start]) {
+            groups.push((start, index));
+        }
+    }
+    groups
+}
+
+/// With `EmitOptions::mxcsr_groups`, written into a region's header: the
+/// host's floating-point exception flags, cleared before a group and read
+/// after it. `mxcsr_read` takes a value computed from every result of the
+/// group as an operand, so the host compiler computes them first; the
+/// group loads its operands after `mxcsr_clear`, which may write memory.
+const MXCSR_HELPER: &str = r#"/// MXCSR's IE, DE, ZE, OE and UE flags (`EmitOptions::mxcsr_groups`).
+#[allow(dead_code)]
+const MXCSR_EXCEPTIONS: u32 = 0x1f;
+/// Clears MXCSR's exception flags.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_clear() {
+    let mut csr = 0u32;
+    // SAFETY: stores, changes and loads MXCSR through a local; only the
+    // sticky flags (bits 0-5) change.
+    unsafe { core::arch::asm!("stmxcsr [{p}]", "and dword ptr [{p}], -64", "ldmxcsr [{p}]", p = in(reg) &mut csr, options(nostack)) }
+}
+/// The lanes of a 4S (or 2S, upper lanes zero) result an MXCSR group
+/// cannot trust: a denormal, exactly the smallest normal, or a NaN (a bit
+/// per lane; `crate::simd::vector_group_mxcsr`). With the sign cleared the
+/// signed compares order the magnitudes.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_4s(value: u128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target; the transmutes keep
+    // all 128 bits in lane order.
+    unsafe {
+        let v: __m128i = core::mem::transmute::<u128, __m128i>(value);
+        let a = _mm_and_si128(v, _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// MXCSR, read after `after` is computed.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_read(after: u64) -> u32 {
+    let mut csr = 0u32;
+    // SAFETY: stores MXCSR into a local; `after` only orders the read.
+    unsafe { core::arch::asm!("/* {a} */", "stmxcsr [{p}]", a = in(reg) after, p = in(reg) &mut csr, options(nostack)) }
+    csr
+}
+"#;
+
 /// A vector float run (`vector_runs_in`), emitted twice: the fast copy
 /// (`crate::simd::vector_run_fast`), committed only when FPCR is in the
 /// inline paths' mode, FPSR already holds the sticky IXC and every lane is
@@ -4241,17 +4320,38 @@ fn emit_vector_run(
             _ => unreachable!("vector runs hold SIMD operations"),
         })
         .collect();
-    let (fast, finals) = crate::simd::vector_run_fast(&ops);
-    let commits: String = finals
-        .iter()
-        .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
-        .collect();
-    writeln!(
-        output,
-        "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
-        crate::simd::FP_MODE
-    )
-    .unwrap();
+    if MXCSR_GROUPS.get() && ops.iter().all(crate::simd::mxcsr_group_op) {
+        let (fast, finals, fused) = crate::simd::vector_group_mxcsr(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        // Fused operations need the host's FMA (`fmaf` in software rounds
+        // through double): without it the exact copy runs.
+        let fma = if fused {
+            " && cfg!(target_feature = \"fma\")"
+        } else {
+            ""
+        };
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0{fma} && {{ {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    } else {
+        let (fast, finals) = crate::simd::vector_run_fast(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    }
     // The exact copy, marked for `crate::census` (which counts the tests of
     // the path taken when the fast copy commits).
     let (open, close) = if crate::simd::census_on() {
@@ -5109,6 +5209,9 @@ thread_local! {
     static COLD_FP_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::hoist_fp_mode` of the region being emitted.
     static HOIST_FP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::mxcsr_groups` of the region being emitted, on an
+    /// x86-64 host.
+    static MXCSR_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6258,6 +6361,14 @@ pub struct EmitOptions {
     /// FPSR flag, so the test cannot turn false inside the group, and each
     /// operation keeps its own exact fallback.
     pub hoist_fp_mode: bool,
+    /// With `inline_vector`, on an x86-64 host: vector float groups
+    /// (consecutive operations `vector_runs_in` takes, and single FADD,
+    /// FSUB, FMUL, FDIV, FMLA or FMLS) whose operations are all
+    /// `crate::simd::mxcsr_group_op` compute natively with no operand
+    /// tests, checked once by the host's exception flags and a test of
+    /// each result's lanes (`crate::simd::vector_group_mxcsr`); any hit
+    /// reruns the group exactly from its unchanged registers.
+    pub mxcsr_groups: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -6997,6 +7108,7 @@ struct RegionSettings {
     known_returns: Flag,
     cold_fp_exact: Flag,
     hoist_fp_mode: Flag,
+    mxcsr_groups: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -7085,6 +7197,7 @@ impl RegionSettings {
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
             cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
             hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
+            mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
@@ -7459,6 +7572,9 @@ pub fn emit_rust_split_to_regions<E>(
             if options.function_table {
                 header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_pc(m: &mut Machine) -> Result<(), Trap> { m.run_function_at_pc() }\n");
             }
+        }
+        if mxcsr_groups_on(&options) {
+            header.push_str(MXCSR_HELPER);
         }
         if options.count_fallbacks {
             header.push_str(&format!(
