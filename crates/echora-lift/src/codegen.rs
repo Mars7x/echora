@@ -6489,7 +6489,9 @@ thread_local! {
 /// (`EmitOptions::direct_calls`): `target`'s, when it is a block with a
 /// dispatch arm in `from`'s region.
 fn direct_call_window(from: u64, target: u64) -> Option<u64> {
-    if !DIRECT_ON.get() {
+    // In crates packed by size (`regalloc_crates`) the target's window may
+    // be in another crate.
+    if !DIRECT_ON.get() || REGALLOC_SPLIT.get() {
         return None;
     }
     EMISSION_ANALYSES.with_borrow(|analysis| {
