@@ -96,6 +96,12 @@ trapping PC, as the block tag would name it (blocks do not overlap); a
 preemption another thread requests is seen up to the look-ahead later;
 a `?` in a string no longer turns precise exit stores off.
 
+**Opt-in on top** (both measured below): `regalloc-loop-inlining`
+(gamefn 2.57, gamecalls 2.12, crossing 2.30; size flat on the kernels)
+and `regalloc-resume-loops` (ldst 4.80; kernel code +28%). Dropping the
+windows of covered blocks for `.text` waits on the step-accounting
+decision ("Which windows stay").
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and
