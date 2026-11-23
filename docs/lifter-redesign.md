@@ -183,6 +183,46 @@ inside an inlined callee runs inlined too. Tests: `regalloc_loops` in
 `tests/window_calls.rs` and `call_regalloc_loops_code` in
 `tests/calls.rs`.
 
+With `EmitOptions::regalloc_resume_loops` (`regalloc-resume-loops`),
+each inner loop of at most `RESUME_LIMIT` (64) instructions up to the
+function's next entry gets a resume function, `run_function_<head>`, which
+its head's window arm runs: after a host boundary at an inner loop's head
+execution is structured again at once, not at the loop's end. ldst (a
+loop around a word loop, a boundary every 100,000 instructions): 5.09 to
+4.80, the window share gone (20% of the run now in the resume function);
+but kernel machine code 170,759 to 218,885 bytes, most of it the vector
+kernels' inner loops, so opt-in.
+
+### Which windows stay
+
+The windows cannot shrink to the blocks execution resumes at from
+outside (SVC and trap returns, indirect and table targets, entries) while
+host boundaries and budgets stay exact: after a structured function
+leaves at a test that the look-ahead failed, the next blocks run with
+per-block charges until the boundary falls where window code takes it,
+and that can be any block of the next `L` instructions, so every block
+needs code that charges it alone. Two ways to drop the windows of the
+blocks structured functions hold:
+
+- Take the boundary at the test itself: a test that fails because the
+  boundary is near returns `Trap::HostBoundary` (or the budget's trap)
+  there, before the block, at most `L` instructions earlier than window
+  code would. The guest sees nothing (no instruction runs differently);
+  the host's slices end a few instructions sooner, and a budgeted run
+  stops before its exact limit. Every test point must then be enterable
+  by structured code: entries and outermost loop heads are, call return
+  points and inner loop heads would need resume functions (above). The
+  windows keep only the arms of blocks no structured function holds and
+  the delegating arms.
+- Count steps differently altogether (back-edge polls instead of exact
+  counts), as the other lifter session is studying: the same
+  consequence for windows.
+
+Either is a change of what the runtime may assume about where boundaries
+fall (tests compare boundary PCs and steps with window code), so it waits
+for that design note; with it, the windows of covered blocks go and
+`.text` falls back to about the functions' own size.
+
 ### Indirect calls
 
 A BLR in a structured function calls `Core::call_indirect` with a static
