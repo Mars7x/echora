@@ -340,7 +340,16 @@ emitted then. The sink gets the extra crates as regions, so the game's
 workspace and bundles take them as they are. Independently, a structured
 function whose Rust with its inlined callees passes
 `regalloc::FUNCTION_BYTES` (1.5 MB) is emitted again without inlining.
-`tests/window_calls.rs`'s `regalloc_crates` lift packs into crates of
+Builds on `5db8463` failed on the game here: a structured function's
+call through an inlined PLT stub named the predicted target's window
+(`m.call_window(.., run_window_<w>)`), which another crate held; from
+`5fba752` that call goes through the window table when the crates are
+split, and so does a direct window call (`direct-calls`).
+`tests/plt.rs` runs every PLT case also with structured functions in one
+crate per region and in crates of one window or function each (with
+direct calls), and asserts that the former names windows from functions
+and the latter does not; without the fix it fails to compile as the game
+did. `tests/window_calls.rs`'s `regalloc_crates` lift packs into crates of
 200 KB (ten crates: five of windows, five of functions) and runs against
 the function-free lift like the others.
 
