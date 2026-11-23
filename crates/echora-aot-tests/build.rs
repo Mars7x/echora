@@ -80,6 +80,7 @@ fn options() -> EmitOptions {
         regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
         regalloc_crate_bytes: 0,
         regalloc_function_bytes: 0,
+        regalloc_span_regions: std::env::var_os("CARGO_FEATURE_REGALLOC_SPAN_REGIONS").is_some(),
         stub_windows: false,
     }
 }
@@ -5573,6 +5574,17 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             ..structured_functions
         },
     );
+    // Functions across 1 KiB region edges, in crates of their own.
+    lift(
+        "regalloc_span",
+        10,
+        EmitOptions {
+            regalloc_crates: true,
+            regalloc_crate_bytes: 200_000,
+            regalloc_span_regions: true,
+            ..structured_functions
+        },
+    );
     lift(
         "regalloc_capped",
         16,
@@ -5666,7 +5678,19 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         echora_lift::codegen::window_call_summaries(&translation, &|_| Some(true))
             .into_keys()
             .collect();
+    // Functions whose bodies run across a 1 KiB region edge when allowed.
+    let spanning = echora_lift::codegen::functions_with(
+        &translation,
+        10,
+        &Default::default(),
+        echora_lift::codegen::REGALLOC_BLOCK_LIMIT,
+        true,
+    )
+    .iter()
+    .filter(|(entry, starts)| starts.iter().any(|start| start >> 10 != *entry >> 10))
+    .count();
     writeln!(out, "pub mod window_call_program {{").expect("write");
+    writeln!(out, "/// Lifted functions across a 1 KiB region edge (regalloc_span).\npub const SPANNING: usize = {spanning};").expect("write");
     writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
     writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
     writeln!(out, "pub const CALLERS: &[u64] = &{callers:#x?};").expect("write");
