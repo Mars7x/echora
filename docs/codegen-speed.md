@@ -1256,7 +1256,10 @@ mode; with the trim undone both hashes are as before. Merged with
 `claude/vigilant-dirac-e24yg5` at 11d52d9 (whose own hashes are
 `0xc1cb_bbf7_f3dc_8b4b` and `0xefbe_5e0a_726e_0329`) they are
 `0x73bb_c562_6345_cce9` and `0x0946_818b_2c33_349f`, again its own with the
-trim undone. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+trim undone; with the indirect call sites' statics named in upper-case hex
+(`CALL_SITE_{pc:X}`, so clippy's `non_upper_case_globals` passes on the
+lifted test programs) `0x9047_f551_4f90_3869` and
+`0xe217_ba2b_c432_2edf`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
 checks the run's bounds; `tests/float_runs.rs` the semantics.
 
 **`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's
