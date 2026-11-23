@@ -69,6 +69,7 @@ fn options() -> EmitOptions {
         long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
         known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
         cold_fp_exact: std::env::var_os("CARGO_FEATURE_COLD_FP_EXACT").is_some(),
+        hoist_fp_mode: std::env::var_os("CARGO_FEATURE_HOIST_FP_MODE").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -219,6 +220,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("window_call", window_call_code),
     ("smallest_normal", smallest_normal_code),
     ("memory_fault", memory_fault_code),
+    ("fp_mode_group", fp_mode_group_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -1984,6 +1986,98 @@ fn memory_fault_code(out: &mut String) {
     {
         let name = "memory_fault_code";
         let (root, regions) = split(&translation, options());
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/fp_mode_groups.rs`: consecutive scalar float
+/// operations `EmitOptions::hoist_fp_mode` groups, alone, with an MSR FPSR
+/// (which can clear IXC) or MSR FPCR among them, in double precision, and
+/// with a compare and FMAX; lifted with the build's options, every inline
+/// path and `hoist_fp_mode` (`fp_mode_group_code`), and with the helpers
+/// alone (`fp_mode_group_reference`).
+fn fp_mode_group_code(out: &mut String) {
+    const BASE: u64 = 0x2f0_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const SINGLES: [u32; 5] = [
+        0x1e22_0820, // FMUL S0, S1, S2
+        0x1e21_2803, // FADD S3, S0, S1
+        0x1e22_1864, // FDIV S4, S3, S2
+        0x1f01_0c85, // FMADD S5, S4, S1, S3
+        0x1e20_38a6, // FSUB S6, S5, S0
+    ];
+    const MSR_FPSR_X5: u32 = 0xd51b_4425;
+    const MSR_FPCR_X6: u32 = 0xd51b_4406;
+    let with = |at: usize, word: u32| {
+        let mut program = SINGLES.to_vec();
+        program.insert(at, word);
+        program
+    };
+    let programs: Vec<(&str, Vec<u32>)> = vec![
+        ("singles", SINGLES.to_vec()),
+        ("msr fpsr inside", with(2, MSR_FPSR_X5)),
+        ("msr fpcr inside", with(2, MSR_FPCR_X6)),
+        ("msr fpsr after the first", with(1, MSR_FPSR_X5)),
+        (
+            "doubles",
+            vec![
+                0x1e62_0820, // FMUL D0, D1, D2
+                0x1e61_2803, // FADD D3, D0, D1
+                0x1e62_1864, // FDIV D4, D3, D2
+            ],
+        ),
+        (
+            "compare and max",
+            vec![
+                0x1e22_0820, // FMUL S0, S1, S2
+                0x1e22_2020, // FCMP S1, S2
+                0x1e22_4827, // FMAX S7, S1, S2
+                0x1e21_2803, // FADD S3, S0, S1
+            ],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    for (name, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "fp_mode_group".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("fp_mode_group");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        inline_fp_scalar: true,
+        fp_status_locals: true,
+        hoist_fp_mode: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("fp_mode_group_code", grouped),
+        ("fp_mode_group_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
         writeln!(out, "pub mod {name} {{").expect("write");
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");

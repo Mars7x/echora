@@ -3798,7 +3798,6 @@ fn emit_block_body(
     }
     let count = block.instructions.len();
     let fuse = FUSE.replace(fusion(block));
-    let mut body = String::new();
     let runs = if FLOAT_RUNS.get() {
         float_runs_in(block, FLOAT_RUN_LOADS.get() && INLINE_VECTOR.get())
     } else {
@@ -3811,10 +3810,14 @@ fn emit_block_body(
         Vec::new()
     };
     let mut skip_to = 0;
+    // Each instruction's code, and whether it is an inlined float operation
+    // `hoist_fp_mode` may group (with its PC).
+    let mut pieces: Vec<(String, Option<u64>)> = Vec::new();
     for (index, instruction) in block.instructions.iter().enumerate() {
         if index < skip_to {
             continue;
         }
+        let mut body = String::new();
         if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
             emit_float_run(
                 &mut body,
@@ -3823,6 +3826,7 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
         if let Some(&(_, end)) = vector_runs.iter().find(|&&(start, _)| start == index) {
@@ -3833,6 +3837,7 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
         let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
@@ -3855,7 +3860,11 @@ fn emit_block_body(
             check_entry,
             resumable,
         );
+        let grouped = (HOIST_FP_MODE.get() && index > 0 && fp_mode_test(&body).is_some())
+            .then_some(instruction.pc);
+        pieces.push((body, grouped));
     }
+    let body = hoist_fp_mode(pieces);
     FUSE.set(fuse);
     if REGALLOC_BODY.get() {
         writeln!(output, "                *n += {count};").unwrap();
@@ -3957,6 +3966,61 @@ fn emit_block_body(
     } else {
         output.push_str(&body);
     }
+}
+
+/// The inline paths' FPCR mode and sticky IXC test as an instruction's
+/// code spells it (on `m.cpu` or, with FPCR and FPSR in locals, `r`), if
+/// it holds one.
+fn fp_mode_test(code: &str) -> Option<String> {
+    let test = format!(
+        "{} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0",
+        crate::simd::FP_MODE
+    );
+    let local = test.replace("m.cpu.", "r.");
+    [test, local]
+        .into_iter()
+        .find(|test| code.contains(test.as_str()))
+}
+
+/// A block's instructions' code (`emit_block_body`), with
+/// `EmitOptions::hoist_fp_mode`: two or more consecutive inlined float
+/// operations test the FPCR mode and IXC once, before the first. The test
+/// is all a group's operations share: each keeps its operand and result
+/// tests and its exact fallback. No helper writes FPCR or clears an FPSR
+/// flag (they only add flags), so a test true before the group stays
+/// true; one false stays false, and the group's operations take their
+/// exact helpers, as each would have alone until IXC was raised.
+fn hoist_fp_mode(pieces: Vec<(String, Option<u64>)>) -> String {
+    let mut body = String::new();
+    let mut index = 0;
+    while index < pieces.len() {
+        let end = (index..pieces.len())
+            .find(|&at| pieces[at].1.is_none())
+            .unwrap_or(pieces.len());
+        let Some(first) = pieces[index].1.filter(|_| end - index >= 2) else {
+            body.push_str(&pieces[index].0);
+            index += 1;
+            continue;
+        };
+        let name = format!("fp_mode_{first:x}");
+        let test = fp_mode_test(&pieces[index].0).expect("a grouped operation tests the mode");
+        let fpcr = test.split(" & (").next().expect("the mode test reads FPCR");
+        let nonzero = format!("{fpcr} != 0 && {test}");
+        writeln!(
+            body,
+            "                let {name} = ({test}, {fpcr} != 0 && {test});"
+        )
+        .unwrap();
+        for (code, _) in &pieces[index..end] {
+            body.push_str(
+                &code
+                    .replace(&nonzero, &format!("{name}.1"))
+                    .replace(&test, &format!("{name}.0")),
+            );
+        }
+        index = end;
+    }
+    body
 }
 
 /// Scalar single-precision operations a float run needs at least.
@@ -4979,6 +5043,8 @@ thread_local! {
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::cold_fp_exact` of the region being emitted.
     static COLD_FP_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::hoist_fp_mode` of the region being emitted.
+    static HOIST_FP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6114,6 +6180,12 @@ pub struct EmitOptions {
     /// through one cold, never-inlined wrapper per region
     /// (`COLD_FP_HELPERS`), so the inline fast paths stay small.
     pub cold_fp_exact: bool,
+    /// Consecutive inlined float operations in a block (outside float
+    /// runs) test the inline paths' FPCR mode and sticky IXC once, before
+    /// the first (`hoist_fp_mode`): no helper writes FPCR or clears an
+    /// FPSR flag, so the test cannot turn false inside the group, and each
+    /// operation keeps its own exact fallback.
+    pub hoist_fp_mode: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -6776,6 +6848,7 @@ struct RegionSettings {
     audit: Flag,
     known_returns: Flag,
     cold_fp_exact: Flag,
+    hoist_fp_mode: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -6860,6 +6933,7 @@ impl RegionSettings {
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
             cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
+            hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
