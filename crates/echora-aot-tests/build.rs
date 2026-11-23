@@ -81,6 +81,10 @@ fn options() -> EmitOptions {
         regalloc_crate_bytes: 0,
         regalloc_function_bytes: 0,
         regalloc_span_regions: std::env::var_os("CARGO_FEATURE_REGALLOC_SPAN_REGIONS").is_some(),
+        regalloc_resume_returns: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_RETURNS")
+            .is_some(),
+        regalloc_indirect_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_INDIRECT_ENTRIES")
+            .is_some(),
         stub_windows: false,
     }
 }
@@ -5585,6 +5589,62 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             ..structured_functions
         },
     );
+    // Resume functions at inner loop heads and call returns, in one crate
+    // per region and in crates of their own across region edges.
+    lift(
+        "regalloc_resume",
+        16,
+        EmitOptions {
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..structured_functions
+        },
+    );
+    lift(
+        "regalloc_resume_crates",
+        10,
+        EmitOptions {
+            regalloc_crates: true,
+            regalloc_crate_bytes: 200_000,
+            regalloc_span_regions: true,
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..structured_functions
+        },
+    );
+    let mut rooted_lifts = Vec::new();
+    // Every fifth block also a deferred root (as relocation targets and
+    // prologues reached first by other code are): many more entries.
+    {
+        let mut rooted = translation.clone();
+        rooted.deferred_roots = translation
+            .blocks
+            .iter()
+            .step_by(5)
+            .map(|block| block.start)
+            .collect();
+        LIFTED.set(LIFTED.get() + 2 * rooted.instructions.len());
+        // The windows alone with the same arms (every root keeps one), for
+        // the same host boundaries.
+        let (root, regions) = emit_rust_split_with(
+            &rooted,
+            16,
+            EmitOptions {
+                regalloc_indirect_entries: true,
+                ..plain
+            },
+        );
+        rooted_lifts.push(("regalloc_indirect_base", root, regions));
+        let (root, regions) = emit_rust_split_with(
+            &rooted,
+            16,
+            EmitOptions {
+                regalloc_indirect_entries: true,
+                ..structured_functions
+            },
+        );
+        rooted_lifts.push(("regalloc_indirect", root, regions));
+    }
     lift(
         "regalloc_capped",
         16,
@@ -5673,6 +5733,7 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         .expect("no sink errors");
         lifts.push(("window_call_mixed", root, regions));
     }
+    lifts.extend(rooted_lifts);
     // Targets with summaries, early exits allowed, for the tests.
     let targets: Vec<u64> =
         echora_lift::codegen::window_call_summaries(&translation, &|_| Some(true))
@@ -5780,7 +5841,7 @@ pub const FUNCTION_CALLS: usize = {};",
             "/// Functions emitted structured (regalloc), and window arms running them.\n\
              pub const STRUCTURED_FUNCTIONS: usize = {};\npub const STRUCTURED_ENTRIES: usize = {};",
             count("n: &mut u64) -> Result<(), Trap>"),
-            count("= run_entry(m, ") + count("= run_entry_at(m, ")
+            count("= run_entry(m, ") + count("= run_entry_at(m, ") + count("= run_entry_pc(m")
         )
         .expect("write");
         writeln!(

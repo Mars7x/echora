@@ -384,6 +384,19 @@ impl Core {
         }
     }
 
+    /// Runs the lifted function (or resume function) installed for the
+    /// current PC, if any (`install_function_entries`); none leaves the PC
+    /// as it is.
+    #[inline]
+    pub fn run_function_at_pc(&mut self) -> Result<(), Trap> {
+        match function_entry(self.cpu.pc) {
+            Some(index) if let Some(table) = FUNCTION_ENTRIES.get() => {
+                (table.functions[index])(self)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The rest of a `call_window` whose callee left its window before
     /// returning: as `call`, through the window table.
     #[cold]

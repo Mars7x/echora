@@ -137,8 +137,8 @@ windows inside the regalloc regions) and what answers each:
 |---|---|---|
 | 9.91% | function dropped for the 256-block limit | `REGALLOC_BLOCK_LIMIT` 1,024 under regalloc (6db3c3a), the size caps the bound |
 | 5.90% | reached only from another region (bodies stopped at 64 KiB edges) | `regalloc-span-regions` (opt-in, with `regalloc-crates`): bodies run on past their region's edge |
-| 4.94% + 1.84% | inside a structured function but resumed mid-function or handed back | next: resume entries at call returns and window-entered blocks |
-| 1.52% | reached only by indirect branches | next: indirect targets as entries |
+| 4.94% + 1.84% | inside a structured function but resumed mid-function or handed back | `regalloc-resume-returns` (opt-in): resume functions at call return points too (`regalloc-resume-loops` gives them to inner loops), now also with `regalloc-crates` (window arms run them by PC, `Core::run_function_at_pc`); resume functions up to 128 instructions |
+| 1.52% | reached only by indirect branches | `regalloc-indirect-entries` (opt-in): every deferred root of discovery that starts a block (relocation targets such as vtable slots, address constants, prologues: `Translation::deferred_roots`) is a function entry, not only those discovery had not reached first; each keeps a window arm, so a structured function can hand back there (with the option on, sliced runs therefore take host boundaries at those blocks too) |
 
 A capped function's stub cannot run the function through the window
 table to its return instead of handing back (see `capped_stub`).
