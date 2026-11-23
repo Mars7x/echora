@@ -85,6 +85,11 @@ pub struct Translation {
     /// prediction only chooses a guarded fast path (see `plt_stubs`); the
     /// word in guest memory decides where execution goes.
     pub got_words: BTreeMap<u64, u64>,
+    /// The deferred roots discovery was given (relocation targets, address
+    /// constants, prologue candidates) that start translated code, whether
+    /// or not discovery had reached them first (`entries` holds only those
+    /// it had not).
+    pub deferred_roots: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -313,6 +318,11 @@ pub fn discover_with_tables(
             });
         }
     }
+    let deferred_roots: BTreeSet<u64> = deferred
+        .iter()
+        .copied()
+        .filter(|root| instructions.contains_key(root))
+        .collect();
     Ok(Translation {
         instructions,
         blocks,
@@ -323,6 +333,7 @@ pub fn discover_with_tables(
         indirect_targets,
         jump_table_cases,
         got_words: BTreeMap::new(),
+        deferred_roots,
     })
 }
 
@@ -6179,6 +6190,12 @@ pub struct EmitOptions {
     /// loops), so execution that comes back there through the windows (a
     /// failed test after a call, a resumed boundary) is structured again.
     pub regalloc_resume_returns: bool,
+    /// With `regalloc`: every deferred root of discovery that starts a
+    /// block is a function entry too (`Translation::deferred_roots`:
+    /// relocation targets such as vtable slots, address constants,
+    /// prologues), not only those discovery had not reached otherwise, so
+    /// code reached only through BLR runs structured.
+    pub regalloc_indirect_entries: bool,
 }
 
 /// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
@@ -7180,7 +7197,15 @@ pub fn emit_rust_split_to_regions<E>(
     };
     let used =
         |pick: fn(&EmitOptions) -> bool| pick(&base) || (!regions.is_empty() && pick(&listed));
-    let inlined = inlined_blocks(translation);
+    let mut inlined = inlined_blocks(translation);
+    // With regalloc-indirect-entries every deferred root is an entry a
+    // structured function can hand back at: its window keeps an arm.
+    // (Also without functions: a window lift to compare with.)
+    if used(|o| o.regalloc_indirect_entries) {
+        for root in &translation.deferred_roots {
+            inlined.remove(root);
+        }
+    }
     let resume = used(|o| o.deferred_charges && o.split_ticks).then(|| resume_blocks(translation));
     let analyses = Arc::new(EmissionAnalyses {
         pending: resume
@@ -7291,11 +7316,16 @@ pub fn emit_rust_split_to_regions<E>(
     // Lifted functions, emitted after their region's windows: only those of
     // regions whose options have them.
     let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
-        let extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
+        let mut extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
             translation.entries.iter().copied().collect()
         } else {
             BTreeSet::new()
         };
+        // With regalloc-indirect-entries, every deferred root (function
+        // pointers, vtable slots, prologues), reached first or not.
+        if used(|o| o.functions && o.regalloc && o.regalloc_indirect_entries) {
+            extra.extend(translation.deferred_roots.iter().copied());
+        }
         let limit = if used(|o| o.functions && o.regalloc) {
             REGALLOC_BLOCK_LIMIT
         } else {
