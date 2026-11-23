@@ -5,6 +5,40 @@ what it costs in generated code and compile time, and whether it should
 go into the next relift of the game. Measured 2026-11-22 on main (466d858)
 on the aot-tests kernels and programs; the game was not run.
 
+## The defaults since the regalloc set (cloud/lift-defaults)
+
+`echora lift`'s defaults are now the former set (`inline-vector,
+fused-flags, whole-vector-checks, fp-status-locals, window-memory,
+untagged-blocks, split-ticks, float-runs`) plus:
+
+- `window-calls`;
+- `functions`, `function-table`, `call-summaries`, `transitive-summaries`;
+- `regalloc`, `regalloc-loop-inlining`, `regalloc-crates`;
+- `float-run-loads`.
+
+That is the set the game's candidate build ran with, from the regalloc
+redesign (docs/lifter-redesign.md: game-shaped kernels from 12-15 to
+about 2-3 host instructions per guest instruction) and the float-run-loads
+fix below (floatld -28%, floats unchanged). `regalloc-crates` keeps the
+largest region crate at 20 MB of Rust (the game's region 7101b9 was 83 MB
+and 25 GB of rustc in one crate).
+
+The former defaults stay one word away: `ECHORA_LIFT_OPTIONS=legacy`
+(with more options after it, comma-separated, as before).
+
+Crates holding structured functions build with 8 codegen units (a
+`[profile.release.package.gen-r-<id>]` section per such crate in the
+generated workspace's `Cargo.toml`); every other region crate keeps one.
+Their functions are large host functions, and their rustc time and memory
+are the build's longest pole, which one unit per crate serializes.
+`ECHORA_LIFT_REPORT=sizes` estimates each crate's rustc memory.
+
+The library's `EmitOptions::default()` and the golden hashes are
+unchanged: they are the lifter's own defaults, not the CLI's.
+
+The sections below were written against the former defaults (they call
+them "the game set").
+
 ## Recommendation
 
 Relift with `align-windows` and these options on:
