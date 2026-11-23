@@ -130,6 +130,19 @@ first, then the gain where covered (about 1.2x). Since then:
   those without a fallible helper (FP fallbacks, CAS, `.at(m, pc)?`); in
   the window-call test programs all 119 structured functions qualify now.
 
+Coverage table from the game (coordinator, guest cycles still in
+windows inside the regalloc regions) and what answers each:
+
+| share | cause | answer |
+|---|---|---|
+| 9.91% | function dropped for the 256-block limit | `REGALLOC_BLOCK_LIMIT` 1,024 under regalloc (6db3c3a), the size caps the bound |
+| 5.90% | reached only from another region (bodies stopped at 64 KiB edges) | `regalloc-span-regions` (opt-in, with `regalloc-crates`): bodies run on past their region's edge |
+| 4.94% + 1.84% | inside a structured function but resumed mid-function or handed back | next: resume entries at call returns and window-entered blocks |
+| 1.52% | reached only by indirect branches | next: indirect targets as entries |
+
+A capped function's stub cannot run the function through the window
+table to its return instead of handing back (see `capped_stub`).
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and

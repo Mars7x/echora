@@ -650,8 +650,13 @@ pub fn take_capped_functions() -> Vec<(u64, &'static str)> {
 
 /// The host function of an entry the caps leave to the windows: it runs
 /// nothing and returns at once, its PC still the entry, so a caller goes
-/// on through the windows as after any early exit (and a window arm never
-/// runs it: the entry is not structured).
+/// on through the windows as after any early exit, having stored every
+/// local it holds (and a window arm never runs it: the entry is not
+/// structured). Running the function through the window table to X30
+/// instead (`Core::call`) is not safe: a window runs on past a RET into
+/// whatever of the caller shares the window, reading registers a
+/// summarized caller still holds in locals (`tests/window_calls.rs`'s
+/// `regalloc_capped` lift fails that way).
 pub(super) fn capped_stub(output: &mut String, entry: u64) {
     writeln!(
         output,
