@@ -147,7 +147,7 @@ fn bodies(blocks: &[&BasicBlock], inlined_calls: &BTreeSet<u64>) -> Option<BTree
     REGALLOC_INLINED.set(outer_inlined);
     REGALLOC_BODY.set(outer_body);
     IN_FUNCTION.set(outer);
-    let observes = ["spin_hint", "trace_hit", "m.steps", "enter_window"];
+    let observes = ["trace_hit", "m.steps", "enter_window"];
     let observed = bodies.values().any(|body| {
         let body = body.replace("m.steps += *n; *n = 0;", "");
         observes.iter().any(|text| body.contains(text))
@@ -532,7 +532,7 @@ pub(super) fn emit_function(
     // `EmitOptions::regalloc_resume_loops` a small inner loop gets a resume
     // function of its own: its blocks reached from its head before any of
     // the function's entries, which it leaves to.
-    let inner = if REGALLOC_RESUME_LOOPS.get() {
+    let inner = if REGALLOC_RESUME_LOOPS.get() && REGALLOC_CRATE_OF.with_borrow(Option::is_none) {
         inner
     } else {
         Vec::new()
