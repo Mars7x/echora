@@ -2265,7 +2265,11 @@ fn vector_run_code(out: &mut String) {
 ///   (an inlined successor's, and the window loop's after each block; a
 ///   window still stores the PC when it leaves);
 /// - `memory`: guest loads and stores without the reservation and
-///   alignment tests (volatile accesses at the host address).
+///   alignment tests (volatile accesses at the host address);
+/// - `stop`: structured functions (`regalloc`) without their stop word
+///   tests at entries, loop heads and call returns;
+/// - `steps`: structured functions without their per-block step adds
+///   (`*n += count`).
 fn ablate(source: &str, ablations: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let on = |name: &str| ablations.split(',').any(|a| a.trim() == name);
@@ -2273,6 +2277,12 @@ fn ablate(source: &str, ablations: &str) -> String {
     for (index, line) in lines.iter().enumerate() {
         let next = lines.get(index + 1).copied().unwrap_or("");
         if on("charges") && line.starts_with("if !m.charge_block_at(") {
+            continue;
+        }
+        if on("stop") && line.starts_with("if m.steps + *n + ") && line.contains("m.stop.load(") {
+            continue;
+        }
+        if on("steps") && line.starts_with("*n += ") && line.ends_with(';') {
             continue;
         }
         if on("pc") {
