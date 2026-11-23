@@ -68,6 +68,7 @@ fn options() -> EmitOptions {
         window_calls_audit: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS_AUDIT").is_some(),
         long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
         known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
+        cold_fp_exact: std::env::var_os("CARGO_FEATURE_COLD_FP_EXACT").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),

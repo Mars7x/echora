@@ -820,6 +820,7 @@ fn lift(
                 "window-calls-audit" => options.window_calls_audit = true,
                 "long-windows" => options.long_windows = true,
                 "known-returns" => options.known_returns = true,
+                "cold-fp-exact" => options.cold_fp_exact = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }

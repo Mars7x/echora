@@ -2513,6 +2513,53 @@ impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora
 /// The trap of a stack access with SP not 16-byte aligned (`SP_ALIGNMENT_CHECK`).\n\
 #[allow(dead_code)]\n#[cold]\n#[inline(never)]\nfn unaligned_sp(pc: u64) -> Trap { Trap::InvalidState { message: format!(\"unaligned SP memory access at {pc:#x}\") } }\n";
 
+/// With `EmitOptions::cold_fp_exact`, written into a region's source: the
+/// exact scalar float helpers the inline paths fall back to, each behind
+/// one cold, never-inlined wrapper the region's call sites share (the
+/// helpers are inlinable, so each site would otherwise hold a copy).
+const COLD_FP_HELPERS: &[(&str, &str, &str)] = &[
+    (
+        "fp_binary",
+        "op: echora_guest::simd::FpBinaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8",
+        "op, size, rd, rn, rm",
+    ),
+    (
+        "fp_ternary",
+        "op: echora_guest::simd::FpTernaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8, ra: u8",
+        "op, size, rd, rn, rm, ra",
+    ),
+    (
+        "fp_compare",
+        "size: echora_guest::simd::FpSize, rn: u8, rm: Option<u8>, signaling: bool",
+        "size, rn, rm, signaling",
+    ),
+];
+
+/// A region's source with `EmitOptions::cold_fp_exact`: its calls of the
+/// helpers in `COLD_FP_HELPERS` through the region's cold wrappers
+/// (written after the header, `header_end` bytes in, for the helpers it
+/// calls).
+fn cold_fp_helpers(source: &str, header_end: usize) -> String {
+    let (header, body) = source.split_at(header_end);
+    let mut body = body.to_owned();
+    let mut wrappers = String::new();
+    for (name, parameters, arguments) in COLD_FP_HELPERS {
+        let call = format!("echora_guest::simd::{name}(");
+        if !body.contains(&call) {
+            continue;
+        }
+        body = body.replace(&call, &format!("cold_{name}("));
+        writeln!(
+            wrappers,
+            "/// `echora_guest::simd::{name}` out of the hot code (`EmitOptions::cold_fp_exact`).\n\
+             #[cold]\n#[inline(never)]\n\
+             fn cold_{name}(cpu: &mut echora_guest::cpu::Cpu, {parameters}) -> Result<(), Trap> {{ echora_guest::simd::{name}(cpu, {arguments}) }}"
+        )
+        .unwrap();
+    }
+    format!("{header}{wrappers}{body}")
+}
+
 /// Whether an instruction's emitted code might observe `m.cpu.pc`: it can
 /// trap or return early, reads the PC, or calls a CPU or SIMD helper other
 /// than the pure arithmetic ones.
@@ -4025,7 +4072,12 @@ fn emit_float_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -4097,7 +4149,12 @@ fn emit_vector_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -4920,6 +4977,8 @@ thread_local! {
     static RET_LEAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::known_returns` of the region being emitted.
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::cold_fp_exact` of the region being emitted.
+    static COLD_FP_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6048,6 +6107,13 @@ pub struct EmitOptions {
     /// limit) leaves the window, and its caller or the dispatcher goes on
     /// from the PC as with any exit.
     pub known_returns: bool,
+    /// The exact paths of inlined float operations out of the hot code: a
+    /// float run's exact copy is marked cold (`core::hint::cold_path`), and
+    /// each exact scalar helper the inline paths fall back to (`fp_binary`,
+    /// `fp_ternary`, `fp_compare`, inlinable in echora-simd) is called
+    /// through one cold, never-inlined wrapper per region
+    /// (`COLD_FP_HELPERS`), so the inline fast paths stay small.
+    pub cold_fp_exact: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -6705,6 +6771,7 @@ struct RegionSettings {
     ret_leaves: Flag,
     audit: Flag,
     known_returns: Flag,
+    cold_fp_exact: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -6788,6 +6855,7 @@ impl RegionSettings {
                         && options.call_summaries_audit),
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
+            cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
@@ -7294,6 +7362,7 @@ pub fn emit_rust_split_to_regions<E>(
             &window_calls,
         );
         let mut source = header_of(options);
+        let header_end = source.len();
         // With regalloc the region's functions are emitted first, so its
         // windows know which entries run structured.
         let mut functions_first = String::new();
@@ -7487,6 +7556,9 @@ pub fn emit_rust_split_to_regions<E>(
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
         } else {
             region_functions(region, &mut source);
+        }
+        if options.cold_fp_exact {
+            source = cold_fp_helpers(&source, header_end);
         }
         (region, unindent(&source))
     };
@@ -8429,6 +8501,80 @@ mod tests {
                 emit(&crossing, winner)
             );
         }
+    }
+
+    #[test]
+    fn cold_fp_exact_moves_the_exact_paths_out_of_line() {
+        // A float run of eight FMUL S2, S0, S1 between NOPs, an FADD S2,
+        // S2, S3, an FCMP S0, S1 and an FMADD S0, S1, S2, S3; SVC.
+        let mut words = vec![0xd503_201f];
+        words.extend([0x1e21_0802; 8]);
+        words.extend([
+            0xd503_201f,
+            0x1e23_2842,
+            0x1e21_2000,
+            0x1f02_0c20,
+            0xd400_00e1,
+        ]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let emit = |cold_fp_exact| {
+            let options = EmitOptions {
+                inline_vector: true,
+                float_runs: true,
+                split_ticks: true,
+                cold_fp_exact,
+                ..EmitOptions::default()
+            };
+            let (_, regions) = emit_rust_split_with(&translation, 16, options);
+            regions
+                .into_iter()
+                .map(|(_, source)| source)
+                .collect::<String>()
+        };
+        let (plain, cold) = (emit(false), emit(true));
+        for name in ["fp_binary", "fp_ternary", "fp_compare"] {
+            let direct = format!("echora_guest::simd::{name}(&mut m.cpu");
+            assert!(plain.contains(&direct), "{name}");
+            assert!(!cold.contains(&direct), "{name}");
+            assert_eq!(
+                cold.matches(&format!("fn cold_{name}(")).count(),
+                1,
+                "{name}: one wrapper per region"
+            );
+            assert_eq!(
+                cold.matches(&format!("cold_{name}(&mut m.cpu")).count(),
+                plain.matches(&direct).count(),
+                "{name}: every call through it"
+            );
+        }
+        assert!(cold.contains("if !committed { core::hint::cold_path();"));
+        assert!(!plain.contains("cold_path") && !plain.contains("fn cold_"));
+        // Nothing else changes.
+        let undone = COLD_FP_HELPERS.iter().fold(
+            cold.replace(" core::hint::cold_path();", ""),
+            |text, (name, _, _)| {
+                text.replace(
+                    &format!("cold_{name}("),
+                    &format!("echora_guest::simd::{name}("),
+                )
+            },
+        );
+        let without_wrappers: String = undone
+            .lines()
+            .filter(|line| {
+                !line.contains("out of the hot code (`EmitOptions::cold_fp_exact`)")
+                    && *line != "#[cold]"
+                    && *line != "#[inline(never)]"
+                    && !line.starts_with("fn echora_guest::simd::")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let plain_lines: String = plain
+            .lines()
+            .filter(|line| *line != "#[cold]" && *line != "#[inline(never)]")
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(without_wrappers, plain_lines);
     }
 
     #[test]
