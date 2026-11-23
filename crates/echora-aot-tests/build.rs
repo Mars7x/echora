@@ -76,6 +76,8 @@ fn options() -> EmitOptions {
         arm_charges: std::env::var_os("CARGO_FEATURE_ARM_CHARGES").is_some(),
         regalloc: std::env::var_os("CARGO_FEATURE_REGALLOC").is_some(),
         regalloc_loop_inlining: std::env::var_os("CARGO_FEATURE_REGALLOC_LOOP_INLINING").is_some(),
+        regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
+        regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
         stub_windows: false,
     }
 }
@@ -262,6 +264,100 @@ fn golden(out_dir: &std::path::Path) {
         ),
     )
     .expect("write golden hashes");
+}
+
+/// A game-shaped function of about `blocks` blocks (`FUNCTION_BLOCK_LIMIT`
+/// is 256) for the codesize benchmark: a frame, random bodies over loads,
+/// stores and arithmetic, forward CBZ skips, one-block loops, calls of two
+/// small leaves and of a larger function, and BLRs; and its instruction
+/// count.
+fn big_function(blocks: usize) -> (echora_lift::codegen::Translation, usize) {
+    const BASE: u64 = 0x40_0000;
+    const LEAVES: u64 = BASE + 0x8000;
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 16) as u32
+    };
+    let reserved = |instruction: &echora_lift::aarch64::Instruction| {
+        let writes = echora_lift::defuse::effects(instruction).writes;
+        [19, 20, 27, 28, 29, 30].iter().any(|&n| writes.has_gpr(n)) || writes.sp
+    };
+    let mut words: Vec<u32> = vec![0xa9bf_7bfd, 0xa9bf_53f3]; // the frame
+    // (word of a CBZ to patch, its target block)
+    let mut skips: Vec<(usize, usize)> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    for block in 0..blocks {
+        starts.push(words.len());
+        for _ in 0..2 + next() % 4 {
+            words.push(body_instruction(&mut next, &reserved));
+        }
+        let pc = BASE + 4 * words.len() as u64;
+        match next() % 20 {
+            0..=7 if block + 2 < blocks => {
+                skips.push((words.len(), block + 1 + (next() % 8) as usize));
+                words.push(0xb400_0000 | (9 + next() % 7));
+            }
+            8..=10 => {
+                let leaf = LEAVES + 0x40 * u64::from(next() % 2);
+                let offset = (leaf.wrapping_sub(pc) as i64 / 4) as u32 & 0x03ff_ffff;
+                words.push(0x9400_0000 | offset);
+            }
+            12 | 13 => {
+                // A call of a function too large to inline.
+                let middle = LEAVES + 0x100;
+                let offset = (middle.wrapping_sub(pc) as i64 / 4) as u32 & 0x03ff_ffff;
+                words.push(0x9400_0000 | offset);
+            }
+            14 => words.push(0xd63f_0200), // blr x16
+            11 => {
+                // subs x9, x9, #1; b.ne to the block's start (a loop
+                // nothing else enters but at its head: reducible)
+                words.push(0xf100_0529);
+                let target = BASE + 4 * starts[block] as u64;
+                let from = BASE + 4 * words.len() as u64;
+                let offset = ((target.wrapping_sub(from) as i64 / 4) as u32) & 0x7_ffff;
+                words.push(0x5400_0001 | offset << 5);
+            }
+            _ => {}
+        }
+    }
+    let end = words.len();
+    words.extend([0xa8c1_53f3, 0xa8c1_7bfd, 0xd65f_03c0]);
+    for (at, block) in skips {
+        let target = starts.get(block).copied().unwrap_or(end);
+        let offset = (target as i64 - at as i64) as u32 & 0x7_ffff;
+        words[at] |= offset << 5;
+    }
+    let image_words = ((LEAVES - BASE) / 4) as usize + 0x80;
+    assert!(
+        words.len() < ((LEAVES - BASE) / 4) as usize,
+        "the function fits"
+    );
+    words.resize(image_words, 0);
+    for leaf in 0..2 {
+        let at = ((LEAVES - BASE) / 4) as usize + 16 * leaf;
+        for index in 0..3 {
+            words[at + index] = body_instruction(&mut next, &reserved);
+        }
+        words[at + 3] = 0xd65f_03c0;
+    }
+    let middle = ((LEAVES - BASE) / 4) as usize + 0x40;
+    for index in 0..40 {
+        words[middle + index] = body_instruction(&mut next, &reserved);
+    }
+    words[middle + 40] = 0xd65f_03c0;
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: "big function".into(),
+        base: BASE,
+        bytes,
+    };
+    let translation = discover(&[region], &[BASE], words.len()).expect("big function");
+    let instructions = translation.instructions.len();
+    (translation, instructions)
 }
 
 /// With the `codesize` feature: the split programs once per emission mode,
@@ -482,6 +578,45 @@ fn codesize(out_dir: &std::path::Path) {
     MODE.set(None);
     std::fs::write(dir.join("modes.txt"), list).expect("write");
     kernel_sizes(&dir);
+    // One game-shaped function at the block limit, alone, per mode: what
+    // one large structured function costs to compile.
+    let mut list = String::new();
+    for blocks in [60, 120, 240] {
+        let (translation, instructions) = big_function(blocks);
+        for (name, mode) in modes
+            .iter()
+            .copied()
+            .filter(|(name, _)| blocks == 240 || name.starts_with("game"))
+        {
+            let name = format!("{name}_{blocks}");
+            let (root, regions) = emit_rust_split_with(&translation, 16, mode);
+            let mut text = String::new();
+            for (region, source) in regions {
+                writeln!(text, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+            }
+            let source = format!(
+                "#[allow(unused_imports)]\nuse echora_guest::{{Core as Machine, Trap}};\npub mod big {{\n{text}{root}\n}}\n"
+            );
+            writeln!(list, "{name} {instructions} {}", source.len()).expect("write");
+            std::fs::write(dir.join(format!("big_{name}.rs")), source).expect("write");
+        }
+    }
+    std::fs::write(dir.join("big_modes.txt"), list).expect("write");
+    // The largest one with its functions in crates of their own: each
+    // crate alone, as cargo builds them (`big_crates_<id>.rs`).
+    let (translation, _) = big_function(240);
+    let mode = modes
+        .iter()
+        .find(|(name, _)| *name == "game_regalloc")
+        .map(|&(_, mode)| EmitOptions {
+            regalloc_crates: true,
+            ..mode
+        })
+        .expect("the regalloc mode");
+    let (_, regions) = emit_rust_split_with(&translation, 16, mode);
+    for (region, source) in regions {
+        std::fs::write(dir.join(format!("big_crates_{region:x}.rs")), source).expect("write");
+    }
     // Each mode lifted the same programs: one mode's share.
     let dead = DEAD.get();
     let per_mode = |count: usize| count / modes.len();
@@ -3149,6 +3284,7 @@ fn call_code(out: &mut String) {
                     transitive_summaries,
                     regalloc,
                     regalloc_loop_inlining: name == "call_regalloc_loops_code",
+                    regalloc_resume_loops: name == "call_regalloc_loops_code",
                     ..options()
                 },
             )
@@ -3252,7 +3388,9 @@ fn call_code(out: &mut String) {
         .sum::<usize>();
     let unlisted_functions = regions
         .iter()
-        .filter(|(region, _)| !listed.contains(region))
+        // A crate of a listed region's functions (`regalloc_crates`) counts
+        // as its region.
+        .filter(|(region, _)| !listed.contains(&(region & ((1 << 40) - 1))))
         .map(|(_, source)| {
             source.matches("run_function_").count() + source.matches("function_at(").count()
         })
@@ -5375,10 +5513,19 @@ fn window_call_lifts(out: &mut String, fp: bool) {
     lift("regalloc_on", 16, structured_functions);
     lift("regalloc_regions", 10, structured_functions);
     lift(
+        "regalloc_crates",
+        16,
+        EmitOptions {
+            regalloc_crates: true,
+            ..structured_functions
+        },
+    );
+    lift(
         "regalloc_loops",
         16,
         EmitOptions {
             regalloc_loop_inlining: true,
+            regalloc_resume_loops: true,
             ..structured_functions
         },
     );
@@ -5547,7 +5694,13 @@ pub const FUNCTION_CALLS: usize = {};",
             "/// Functions emitted structured (regalloc), and window arms running them.\n\
              pub const STRUCTURED_FUNCTIONS: usize = {};\npub const STRUCTURED_ENTRIES: usize = {};",
             count("n: &mut u64) -> Result<(), Trap>"),
-            count("= run_entry(m, run_function_")
+            count("= run_entry(m, ") + count("= run_entry_at(m, ")
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Crates of lifted functions apart from their windows (`regalloc_crates`).\npub const FUNCTION_CRATES: usize = {};",
+            regions.iter().filter(|(region, _)| region >> 40 != 0).count()
         )
         .expect("write");
         for (region, source) in regions {

@@ -96,6 +96,19 @@ trapping PC, as the block tag would name it (blocks do not overlap); a
 preemption another thread requests is seen up to the look-ahead later;
 a `?` in a string no longer turns precise exit stores off.
 
+**Opt-in on top** (both measured below): `regalloc-loop-inlining`
+(gamefn 2.57, gamecalls 2.12, crossing 2.30; size flat on the kernels)
+and `regalloc-resume-loops` (ldst 4.80; kernel code +28%). Dropping the
+windows of covered blocks for `.text` waits on the step-accounting
+decision ("Which windows stay").
+
+**Build cost** (below, "Compile time and memory"): `regalloc-crates`
+puts each region's lifted functions into crates of their own (about 4,096
+guest instructions each), so a region's windows and functions compile in
+parallel and no rustc process holds both; functions with compare-and-swap
+are now structured too (they fell back to the window-shaped form, which
+compiles slower).
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and
@@ -183,6 +196,46 @@ inside an inlined callee runs inlined too. Tests: `regalloc_loops` in
 `tests/window_calls.rs` and `call_regalloc_loops_code` in
 `tests/calls.rs`.
 
+With `EmitOptions::regalloc_resume_loops` (`regalloc-resume-loops`),
+each inner loop of at most `RESUME_LIMIT` (64) instructions up to the
+function's next entry gets a resume function, `run_function_<head>`, which
+its head's window arm runs: after a host boundary at an inner loop's head
+execution is structured again at once, not at the loop's end. ldst (a
+loop around a word loop, a boundary every 100,000 instructions): 5.09 to
+4.80, the window share gone (20% of the run now in the resume function);
+but kernel machine code 170,759 to 218,885 bytes, most of it the vector
+kernels' inner loops, so opt-in.
+
+### Which windows stay
+
+The windows cannot shrink to the blocks execution resumes at from
+outside (SVC and trap returns, indirect and table targets, entries) while
+host boundaries and budgets stay exact: after a structured function
+leaves at a test that the look-ahead failed, the next blocks run with
+per-block charges until the boundary falls where window code takes it,
+and that can be any block of the next `L` instructions, so every block
+needs code that charges it alone. Two ways to drop the windows of the
+blocks structured functions hold:
+
+- Take the boundary at the test itself: a test that fails because the
+  boundary is near returns `Trap::HostBoundary` (or the budget's trap)
+  there, before the block, at most `L` instructions earlier than window
+  code would. The guest sees nothing (no instruction runs differently);
+  the host's slices end a few instructions sooner, and a budgeted run
+  stops before its exact limit. Every test point must then be enterable
+  by structured code: entries and outermost loop heads are, call return
+  points and inner loop heads would need resume functions (above). The
+  windows keep only the arms of blocks no structured function holds and
+  the delegating arms.
+- Count steps differently altogether (back-edge polls instead of exact
+  counts), as the other lifter session is studying: the same
+  consequence for windows.
+
+Either is a change of what the runtime may assume about where boundaries
+fall (tests compare boundary PCs and steps with window code), so it waits
+for that design note; with it, the windows of covered blocks go and
+`.text` falls back to about the functions' own size.
+
 ### Indirect calls
 
 A BLR in a structured function calls `Core::call_indirect` with a static
@@ -238,6 +291,55 @@ into the branch. ADCS/SBCS and MSR keep the flags themselves. A unit test
 in `echora-guest` checks every operation and condition against
 `cpu::Flags` on edge and random operands.
 
+## Compile time and memory
+
+Measured with rustc as for a game region (opt-level 1, one codegen unit,
+`x86-64-v3`), peak RSS of the rustc process, on one game-shaped function
+at the block limit from the codesize build (`big_function`: 240 blocks,
+1,001 instructions, loads, stores, CAS, forward skips, one-block loops,
+calls of two leaves and of a 40-instruction function, BLRs):
+
+| lift of that function's region | rustc s | peak RSS | `.text` |
+|---|---|---|---|
+| game set | 2.5 | 187 MB | 182,570 |
+| regalloc, one crate | 5.1 | 284 MB | 361,769 |
+| regalloc-crates: the windows' crate | 3.0 | 198 MB | 216,369 |
+| regalloc-crates: the functions' crate | 2.6 | 220 MB | 147,783 |
+
+Smaller versions of the same function (60, 120 blocks) cost the game set
+0.5 and 1.1 s and regalloc 0.8 and 1.9 s: about linear. LLVM's passes are
+nearly all of it (`-Z time-llvm-passes`: greedy register allocation, the
+register coalescer, InstCombine and instruction selection lead); the
+structured function is one large host function holding every guest
+register as a value, with a summarized call's stores and reloads at each
+call (28 and 17 here).
+
+Before CAS was handled, every function holding one (its emitted code may
+call `m.spin_hint()`) fell back to the window-shaped function form, which
+compiled slower than the structured one (4.8 s against 3.3 s for this
+function without its calls): game code with atomics took that path. A
+spin hint now has the count flushed into the steps first, and the stop
+word it may lower is seen at the function's next test, as a preemption.
+
+With `regalloc-crates` a region emits its windows as before (crate
+`gen-r-<region>`) and its functions in crates `gen-r-<region | k << 40>`
+(k from 1), each a run of the region's functions of at most
+`REGALLOC_CRATE_INSTRUCTIONS` own instructions; the windows call and
+enter them through the function table (`function_at`, `run_entry_at`),
+calls within one functions crate stay direct, and the root installs the
+table into every crate. Resume functions are not emitted then. The sink
+gets the extra crates as regions, so the game's workspace and bundles
+take them as they are.
+
+The game's regions of 10-20 minutes and up to 12.8 GB are not reproduced
+by these programs (the whole set of test programs, about six regions'
+worth in one crate, takes 338 s and 6.2 GB with the game set). To find
+what one of those regions holds, the size of its largest functions:
+
+```bash
+python3 -c 'import re,sys; t=open(sys.argv[1]).read(); ends=[m.start() for m in re.finditer(r"\npub fn ", t)]+[len(t)]; fns=[(e-m.start(), m.group(1)) for m in re.finditer(r"\npub fn (\w+)\(", t) for e in [min(x for x in ends if x > m.start())]]; print(*sorted(fns, reverse=True)[:15], sep=chr(10))' regions/7101c7/src/lib.rs
+```
+
 ## Tests
 
 `tests/window_calls.rs` lifts its game-shaped programs (random bodies,
@@ -268,5 +370,8 @@ For the game (`ECHORA_LIFT_OPTIONS` replaces the defaults, so they are
 listed too):
 
 ```bash
-ECHORA_LIFT_OPTIONS=inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs,functions,function-table,call-summaries,transitive-summaries,regalloc
+ECHORA_LIFT_OPTIONS=inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs,functions,function-table,call-summaries,transitive-summaries,regalloc,regalloc-crates
 ```
+
+(`regalloc-loop-inlining` and `regalloc-resume-loops` are further
+opt-ins; resume functions are off with `regalloc-crates`.)

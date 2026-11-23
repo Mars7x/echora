@@ -147,7 +147,7 @@ fn bodies(blocks: &[&BasicBlock], inlined_calls: &BTreeSet<u64>) -> Option<BTree
     REGALLOC_INLINED.set(outer_inlined);
     REGALLOC_BODY.set(outer_body);
     IN_FUNCTION.set(outer);
-    let observes = ["spin_hint", "trace_hit", "m.steps", "enter_window"];
+    let observes = ["trace_hit", "m.steps", "enter_window"];
     let observed = bodies.values().any(|body| {
         let body = body.replace("m.steps += *n; *n = 0;", "");
         observes.iter().any(|text| body.contains(text))
@@ -411,7 +411,9 @@ fn loop_heads(tree: &crate::structure::Structured, heads: &mut BTreeSet<u64>, ou
 }
 
 /// A lifted function as structured host code: the blocks it can be
-/// entered at (its entry and its outermost loop heads), or None, writing
+/// entered at (its entry, its outermost loop heads and its small inner
+/// loops' heads), each with the host function to run there (the entry's,
+/// or an inner loop's resume function), or None, writing
 /// nothing, when it does not qualify (an irreducible graph; a spin-wait head, a
 /// traced block, an exclusive access or anything reading the step count),
 /// and the caller emits the window form.
@@ -423,7 +425,7 @@ pub(super) fn emit_function(
     jump_tables: &BTreeMap<u64, Vec<u64>>,
     functions: &BTreeMap<u64, Vec<u64>>,
     by_start: &BTreeMap<u64, &BasicBlock>,
-) -> Option<Vec<u64>> {
+) -> Option<Vec<(u64, u64)>> {
     let own: Vec<&BasicBlock> = blocks.iter().collect();
     if !plain(&own, spin_heads) {
         return None;
@@ -498,7 +500,7 @@ pub(super) fn emit_function(
             }
         }
     }
-    emit_with(
+    let emitted = emit_with(
         output,
         entry,
         &own,
@@ -506,11 +508,11 @@ pub(super) fn emit_function(
         functions,
         by_start,
         &inlined,
-    )
-    .or_else(|| {
-        if inlined.is_empty() {
-            None
-        } else {
+    );
+    let (inlined, (entries, inner)) = match emitted {
+        Some(emitted) => (inlined, emitted),
+        None if !inlined.is_empty() => (
+            BTreeSet::new(),
             emit_with(
                 output,
                 entry,
@@ -519,10 +521,81 @@ pub(super) fn emit_function(
                 functions,
                 by_start,
                 &BTreeSet::new(),
-            )
+            )?,
+        ),
+        None => return None,
+    };
+    let mut entered: Vec<(u64, u64)> = entries.iter().map(|&block| (block, entry)).collect();
+    // After a host boundary execution resumes at a loop head through the
+    // windows. An inner loop's head is no entry (it would be a second way
+    // into the loop around it), so with
+    // `EmitOptions::regalloc_resume_loops` a small inner loop gets a resume
+    // function of its own: its blocks reached from its head before any of
+    // the function's entries, which it leaves to.
+    let inner = if REGALLOC_RESUME_LOOPS.get() && REGALLOC_CRATE_OF.with_borrow(Option::is_none) {
+        inner
+    } else {
+        Vec::new()
+    };
+    for head in inner {
+        // Not a function's entry, nor a block another function already
+        // runs (both would name a second `run_function_<head>`).
+        if functions.contains_key(&head)
+            || REGALLOC_ENTRIES.with_borrow(|entries| entries.contains_key(&head))
+        {
+            continue;
         }
-    })
+        let next: BTreeMap<u64, Vec<u64>> = own
+            .iter()
+            .map(|block| {
+                (
+                    block.start,
+                    successors(block, jump_tables)
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut reached = BTreeSet::from([head]);
+        let mut pending = vec![head];
+        while let Some(pc) = pending.pop() {
+            for &target in &next[&pc] {
+                if next.contains_key(&target)
+                    && !entries.contains(&target)
+                    && reached.insert(target)
+                {
+                    pending.push(target);
+                }
+            }
+        }
+        let part: Vec<&BasicBlock> = own
+            .iter()
+            .copied()
+            .filter(|block| reached.contains(&block.start))
+            .collect();
+        let size: usize = part.iter().map(|block| block.instructions.len()).sum();
+        if size > RESUME_LIMIT {
+            continue;
+        }
+        if let Some((resumed, _)) = emit_with(
+            output,
+            head,
+            &part,
+            jump_tables,
+            functions,
+            by_start,
+            &inlined,
+        ) {
+            entered.extend(resumed.into_iter().map(|block| (block, head)));
+        }
+    }
+    Some(entered)
 }
+
+/// Most guest instructions of an inner loop's resume function (its blocks
+/// up to the function's next entry).
+pub const RESUME_LIMIT: usize = 64;
 
 /// The instructions `target` runs inlined (its own and those of what it
 /// calls, all inlined), when it can: a lifted function, plain, calling
@@ -585,7 +658,7 @@ fn emit_with(
     functions: &BTreeMap<u64, Vec<u64>>,
     by_start: &BTreeMap<u64, &BasicBlock>,
     inlined: &BTreeSet<u64>,
-) -> Option<Vec<u64>> {
+) -> Option<(Vec<u64>, Vec<u64>)> {
     // The graph: the function's own blocks, then a copy of each inlined
     // callee for each call of it (the calls inside a copy too).
     let mut graph: BTreeMap<u64, Vec<Option<u64>>> = BTreeMap::new();
@@ -654,6 +727,13 @@ fn emit_with(
                 .filter(|&head| head != entry && head >> KEY_SHIFT == 0),
         )
         .collect();
+    // The heads of its own inner loops.
+    let mut inner = BTreeSet::new();
+    loop_heads(&single, &mut inner, false);
+    let inner: Vec<u64> = inner
+        .into_iter()
+        .filter(|&head| head >> KEY_SHIFT == 0 && !entries.contains(&head))
+        .collect();
     let tree = if entries.len() > 1
         && let Some(tree) = crate::structure::function_structure(&entries, &edges)
     {
@@ -670,7 +750,8 @@ fn emit_with(
             &returns,
             &unique_blocks(own, &emitted),
             &inlined_calls,
-        );
+        )
+        .map(|entries| (entries, inner));
     };
     emit_tree(
         output,
@@ -684,6 +765,7 @@ fn emit_with(
         &unique_blocks(own, &emitted),
         &inlined_calls,
     )
+    .map(|entries| (entries, inner))
 }
 
 /// Whether every SP write in `blocks` adds or subtracts a multiple of 16

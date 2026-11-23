@@ -137,6 +137,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_regions),
         lift!(regalloc_direct),
         lift!(regalloc_loops),
+        lift!(regalloc_crates),
     ]
 }
 
@@ -162,6 +163,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_regions"),
     ("window_call_base", "regalloc_direct"),
     ("window_call_base", "regalloc_loops"),
+    ("window_call_base", "regalloc_crates"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -576,6 +578,10 @@ fn window_call_lift_child() {
                 window_call_int::regalloc_loops::dispatch,
                 window_call_int::regalloc_loops::install,
             ),
+            "regalloc_crates" => (
+                window_call_int::regalloc_crates::dispatch,
+                window_call_int::regalloc_crates::install,
+            ),
             other => panic!("unknown lift {other}"),
         };
         install();
@@ -802,6 +808,9 @@ fn lifted_functions_cover_the_game_s_cases() {
     assert!(regalloc_on::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_regions::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_on::STRUCTURED_ENTRIES > 0);
+    // In crates of their own, the windows reach them through the table.
+    assert!(regalloc_crates::STRUCTURED_FUNCTIONS > 0);
+    assert!(regalloc_crates::FUNCTION_CRATES > 0);
 }
 
 /// The integer twin, without and with window calls (in one region and
@@ -821,6 +830,7 @@ fn window_calls_match_the_reference() {
         "regalloc_on",
         "regalloc_regions",
         "regalloc_loops",
+        "regalloc_crates",
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
