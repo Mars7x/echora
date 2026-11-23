@@ -26,6 +26,7 @@ pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
 
 #[path = "regalloc.rs"]
 mod regalloc;
+pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
 
 #[derive(Clone, Debug)]
 pub struct CodeRegion {
@@ -6296,6 +6297,9 @@ pub struct EmitOptions {
     /// With `regalloc_crates`: the bytes of Rust per crate, 0 for
     /// `REGALLOC_CRATE_BYTES`.
     pub regalloc_crate_bytes: usize,
+    /// With `regalloc`: the bytes of Rust a structured function may take,
+    /// 0 for `regalloc::FUNCTION_BYTES`.
+    pub regalloc_function_bytes: usize,
 }
 
 /// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
@@ -6324,6 +6328,12 @@ thread_local! {
     /// `EmitOptions::regalloc_crates` of the region being emitted (with
     /// regalloc and the function table).
     static REGALLOC_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_function_bytes` of the region being emitted.
+    static REGALLOC_FUNCTION_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Functions of the region the size caps left to the windows
+    /// (`regalloc::capped`).
+    static REGALLOC_CAPPED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
     /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
     static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
@@ -7520,6 +7530,8 @@ pub fn emit_rust_split_to_regions<E>(
                     }
                 });
                 REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
+            } else if REGALLOC_CAPPED.with_borrow(|capped| capped.contains(&entry)) {
+                regalloc::capped_stub(output, entry);
             } else {
                 emit_function(output, entry, &blocks, &inlined, &spin_heads);
             }
@@ -7549,12 +7561,14 @@ pub fn emit_rust_split_to_regions<E>(
             && options.regalloc
             && options.regalloc_crates;
         let _split = Flag::set(&REGALLOC_SPLIT, split);
+        let outer_bytes = REGALLOC_FUNCTION_BYTES.replace(options.regalloc_function_bytes);
         // With regalloc the region's functions are emitted first, so its
         // windows know which entries run structured.
         let mut functions_first: Vec<(u64, String)> = Vec::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
+            REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
             region_functions(region, &mut functions_first);
         }
         // Where each window's text starts in `source` (`regalloc_crates`).
@@ -7752,6 +7766,7 @@ pub fn emit_rust_split_to_regions<E>(
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
+            REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
         } else {
             region_functions(region, &mut functions_first);
         }
@@ -7764,6 +7779,7 @@ pub fn emit_rust_split_to_regions<E>(
                 source = cold_fp_helpers(&source, header_end);
             }
             placed.sources.push((region, unindent(&source)));
+            REGALLOC_FUNCTION_BYTES.set(outer_bytes);
             return placed;
         }
         // Crates of at most REGALLOC_CRATE_BYTES of Rust each: the windows
@@ -7820,6 +7836,7 @@ pub fn emit_rust_split_to_regions<E>(
                 placed.sources.push((id(index as u64), unindent(&text)));
             }
         }
+        REGALLOC_FUNCTION_BYTES.set(outer_bytes);
         placed
     };
     let groups: Vec<_> = windows

@@ -138,6 +138,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_direct),
         lift!(regalloc_loops),
         lift!(regalloc_crates),
+        lift!(regalloc_capped),
     ]
 }
 
@@ -164,6 +165,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_direct"),
     ("window_call_base", "regalloc_loops"),
     ("window_call_base", "regalloc_crates"),
+    ("window_call_base", "regalloc_capped"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -811,6 +813,10 @@ fn lifted_functions_cover_the_game_s_cases() {
     // In crates of their own, the windows reach them through the table.
     assert!(regalloc_crates::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_crates::FUNCTION_CRATES > 0);
+    // Over the size cap: stubs, the windows run them.
+    assert!(regalloc_capped::CAPPED_FUNCTIONS > 0);
+    assert!(regalloc_capped::STRUCTURED_FUNCTIONS > 0);
+    assert!(regalloc_capped::CAPPED_FUNCTIONS > regalloc_on::CAPPED_FUNCTIONS);
 }
 
 /// The integer twin, without and with window calls (in one region and

@@ -79,6 +79,7 @@ fn options() -> EmitOptions {
         regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
         regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
         regalloc_crate_bytes: 0,
+        regalloc_function_bytes: 0,
         stub_windows: false,
     }
 }
@@ -5575,6 +5576,15 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         },
     );
     lift(
+        "regalloc_capped",
+        16,
+        EmitOptions {
+            // Most functions over the cap: left to the windows.
+            regalloc_function_bytes: 4_000,
+            ..structured_functions
+        },
+    );
+    lift(
         "regalloc_loops",
         16,
         EmitOptions {
@@ -5749,6 +5759,12 @@ pub const FUNCTION_CALLS: usize = {};",
              pub const STRUCTURED_FUNCTIONS: usize = {};\npub const STRUCTURED_ENTRIES: usize = {};",
             count("n: &mut u64) -> Result<(), Trap>"),
             count("= run_entry(m, ") + count("= run_entry_at(m, ")
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Functions the size caps left to the windows.\npub const CAPPED_FUNCTIONS: usize = {};",
+            count("/// Over the size caps")
         )
         .expect("write");
         writeln!(
