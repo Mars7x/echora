@@ -134,6 +134,9 @@ regalloc-crates = []
 # With regalloc-crates: function bodies across region edges
 # (EmitOptions::regalloc_span_regions).
 regalloc-span-regions = []
+# With regalloc: resume functions at call return points
+# (EmitOptions::regalloc_resume_returns).
+regalloc-resume-returns = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

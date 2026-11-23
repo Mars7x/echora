@@ -140,6 +140,8 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_crates),
         lift!(regalloc_capped),
         lift!(regalloc_span),
+        lift!(regalloc_resume),
+        lift!(regalloc_resume_crates),
     ]
 }
 
@@ -168,6 +170,8 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_crates"),
     ("window_call_base", "regalloc_capped"),
     ("window_call_base", "regalloc_span"),
+    ("window_call_base", "regalloc_resume"),
+    ("window_call_base", "regalloc_resume_crates"),
 ];
 
 /// How a run is driven: to its end, in slices of this many instructions
@@ -819,6 +823,9 @@ fn lifted_functions_cover_the_game_s_cases() {
     // In crates of their own, the windows reach them through the table.
     assert!(regalloc_crates::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_crates::FUNCTION_CRATES > 0);
+    // Resume functions: more window arms run structured code.
+    assert!(regalloc_resume::STRUCTURED_ENTRIES > regalloc_on::STRUCTURED_ENTRIES);
+    assert!(regalloc_resume_crates::STRUCTURED_ENTRIES > 0);
     // Bodies across region edges exist (and run in `regalloc_span`).
     assert!(window_call_program::SPANNING > 0);
     // Over the size cap: stubs, the windows run them.
