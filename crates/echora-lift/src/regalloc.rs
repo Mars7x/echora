@@ -110,13 +110,7 @@ fn bodies(blocks: &[&BasicBlock], inlined_calls: &BTreeSet<u64>) -> Option<BTree
     REGALLOC_INLINED.set(outer_inlined);
     REGALLOC_BODY.set(outer_body);
     IN_FUNCTION.set(outer);
-    let observes = [
-        "physical_counter",
-        "spin_hint",
-        "trace_hit",
-        "m.steps",
-        "enter_window",
-    ];
+    let observes = ["spin_hint", "trace_hit", "m.steps", "enter_window"];
     let observed = bodies.values().any(|body| {
         let body = body.replace("m.steps += *n; *n = 0;", "");
         observes.iter().any(|text| body.contains(text))

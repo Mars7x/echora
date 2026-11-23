@@ -120,8 +120,13 @@ branches on its own condition; leaving the body (a return, a branch out,
 BR to an unknown target) stores the PC and returns.
 
 Functions holding spin-wait heads, traced blocks, exclusive accesses or
-anything reading the step count (counter reads, spin hints) keep the old
-form: their per-block boundaries matter.
+spin hints keep the old form: their per-block boundaries matter. A
+counter read (MRS CNTPCT, which follows the steps with
+`ECHORA_VIRTUAL_CLOCK`) has the count flushed into the steps right
+before it, so it reads what it reads in window code (a charged block
+counts whole); `tests/counter_reads.rs` compares registers, steps and
+every host boundary with the window form, whole and in every slice up
+to 23 steps.
 
 ### Steps
 

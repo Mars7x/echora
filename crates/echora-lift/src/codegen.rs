@@ -3804,6 +3804,16 @@ fn emit_block_body(
         }
         let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
         if REGALLOC_BODY.get()
+            && matches!(
+                instruction.instruction,
+                Instruction::ReadPhysicalCounter { .. }
+            )
+        {
+            // The counter reads the steps, which a charged block holds
+            // whole: as in window code.
+            body.push_str("                m.steps += *n; *n = 0;\n");
+        }
+        if REGALLOC_BODY.get()
             && index + 1 == count
             && matches!(
                 instruction.instruction,
