@@ -547,7 +547,7 @@ pub(super) fn emit_function(
     // `EmitOptions::regalloc_resume_loops` a small inner loop gets a resume
     // function of its own: its blocks reached from its head before any of
     // the function's entries, which it leaves to.
-    let inner = if REGALLOC_RESUME_LOOPS.get() && !REGALLOC_SPLIT.get() {
+    let inner = if REGALLOC_RESUME_LOOPS.get() || REGALLOC_RESUME_RETURNS.get() {
         inner
     } else {
         Vec::new()
@@ -667,7 +667,7 @@ pub(super) fn capped_stub(output: &mut String, entry: u64) {
 
 /// Most guest instructions of an inner loop's resume function (its blocks
 /// up to the function's next entry).
-pub const RESUME_LIMIT: usize = 64;
+pub const RESUME_LIMIT: usize = 128;
 
 /// The instructions `target` runs inlined (its own and those of what it
 /// calls, all inlined), when it can: a lifted function, plain, calling
@@ -802,6 +802,11 @@ fn emit_with(
     // The heads of its own inner loops.
     let mut inner = BTreeSet::new();
     loop_heads(&single, &mut inner, false);
+    // With regalloc_resume_returns, also the blocks its calls return to
+    // (a failed test there hands back to the windows).
+    if REGALLOC_RESUME_RETURNS.get() {
+        inner.extend(returns.iter().copied());
+    }
     let inner: Vec<u64> = inner
         .into_iter()
         .filter(|&head| head >> KEY_SHIFT == 0 && !entries.contains(&head))

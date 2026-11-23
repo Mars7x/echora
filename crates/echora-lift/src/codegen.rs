@@ -85,6 +85,11 @@ pub struct Translation {
     /// prediction only chooses a guarded fast path (see `plt_stubs`); the
     /// word in guest memory decides where execution goes.
     pub got_words: BTreeMap<u64, u64>,
+    /// The deferred roots discovery was given (relocation targets, address
+    /// constants, prologue candidates) that start translated code, whether
+    /// or not discovery had reached them first (`entries` holds only those
+    /// it had not).
+    pub deferred_roots: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -313,6 +318,11 @@ pub fn discover_with_tables(
             });
         }
     }
+    let deferred_roots: BTreeSet<u64> = deferred
+        .iter()
+        .copied()
+        .filter(|root| instructions.contains_key(root))
+        .collect();
     Ok(Translation {
         instructions,
         blocks,
@@ -323,6 +333,7 @@ pub fn discover_with_tables(
         indirect_targets,
         jump_table_cases,
         got_words: BTreeMap::new(),
+        deferred_roots,
     })
 }
 
@@ -1634,6 +1645,7 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call_window(", "m.call_window("),
     ("if let Err(trap) = run_entry(", "run_entry("),
     ("if let Err(trap) = run_entry_at(", "run_entry_at("),
+    ("if let Err(trap) = run_entry_pc(", "run_entry_pc("),
     ("if let Err(trap) = m.call_indirect(", "m.call_indirect("),
 ];
 
@@ -5471,6 +5483,9 @@ fn emit_split_cases(
             // In its own crate (`regalloc_crates`) through the table.
             let callee = match function_call(function, function) {
                 Some(Some(index)) => format!("run_entry_at(m, {index}"),
+                // A resume function in a crate of its own: by PC, through
+                // the installed entries.
+                _ if REGALLOC_SPLIT.get() => "run_entry_pc(m".to_owned(),
                 _ => format!("run_entry(m, run_function_{function:x}"),
             };
             writeln!(
@@ -6318,6 +6333,17 @@ pub struct EmitOptions {
     /// region stays in the function); it is emitted with its entry's
     /// region, and reaches everything else through the tables.
     pub regalloc_span_regions: bool,
+    /// With `regalloc`: the blocks structured functions' calls return to
+    /// get resume functions too (as `regalloc_resume_loops` gives inner
+    /// loops), so execution that comes back there through the windows (a
+    /// failed test after a call, a resumed boundary) is structured again.
+    pub regalloc_resume_returns: bool,
+    /// With `regalloc`: every deferred root of discovery that starts a
+    /// block is a function entry too (`Translation::deferred_roots`:
+    /// relocation targets such as vtable slots, address constants,
+    /// prologues), not only those discovery had not reached otherwise, so
+    /// code reached only through BLR runs structured.
+    pub regalloc_indirect_entries: bool,
 }
 
 /// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
@@ -6331,6 +6357,8 @@ struct Placed {
     sources: Vec<(u64, String)>,
     windows: Vec<(u64, u64)>,
     functions: Vec<(u64, u64)>,
+    /// Resume functions (`regalloc_resume_*`) and their crates.
+    resumes: Vec<(u64, u64)>,
 }
 
 thread_local! {
@@ -6352,6 +6380,8 @@ thread_local! {
     /// (`regalloc::capped`).
     static REGALLOC_CAPPED: std::cell::RefCell<BTreeSet<u64>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
+    /// `EmitOptions::regalloc_resume_returns` of the region being emitted.
+    static REGALLOC_RESUME_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
     static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The BLs of the structured lifted function being emitted whose
@@ -6973,6 +7003,7 @@ struct RegionSettings {
     regalloc: Flag,
     regalloc_loop_inlining: Flag,
     regalloc_resume_loops: Flag,
+    regalloc_resume_returns: Flag,
 }
 
 impl RegionSettings {
@@ -7068,6 +7099,10 @@ impl RegionSettings {
                 options.regalloc_loop_inlining,
             ),
             regalloc_resume_loops: Flag::set(&REGALLOC_RESUME_LOOPS, options.regalloc_resume_loops),
+            regalloc_resume_returns: Flag::set(
+                &REGALLOC_RESUME_RETURNS,
+                options.regalloc_resume_returns,
+            ),
             regalloc: Flag::set(
                 &REGALLOC,
                 options.regalloc
@@ -7318,7 +7353,15 @@ pub fn emit_rust_split_to_regions<E>(
     };
     let used =
         |pick: fn(&EmitOptions) -> bool| pick(&base) || (!regions.is_empty() && pick(&listed));
-    let inlined = inlined_blocks(translation);
+    let mut inlined = inlined_blocks(translation);
+    // With regalloc-indirect-entries every deferred root is an entry a
+    // structured function can hand back at: its window keeps an arm.
+    // (Also without functions: a window lift to compare with.)
+    if used(|o| o.regalloc_indirect_entries) {
+        for root in &translation.deferred_roots {
+            inlined.remove(root);
+        }
+    }
     let resume = used(|o| o.deferred_charges && o.split_ticks).then(|| resume_blocks(translation));
     let analyses = Arc::new(EmissionAnalyses {
         pending: resume
@@ -7414,7 +7457,7 @@ pub fn emit_rust_split_to_regions<E>(
         if options.functions && options.regalloc {
             header.push_str(RUN_ENTRY_HELPER);
             if options.function_table {
-                header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n");
+                header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_pc(m: &mut Machine) -> Result<(), Trap> { m.run_function_at_pc() }\n");
             }
         }
         if options.count_fallbacks {
@@ -7429,11 +7472,16 @@ pub fn emit_rust_split_to_regions<E>(
     // Lifted functions, emitted after their region's windows: only those of
     // regions whose options have them.
     let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
-        let extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
+        let mut extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
             translation.entries.iter().copied().collect()
         } else {
             BTreeSet::new()
         };
+        // With regalloc-indirect-entries, every deferred root (function
+        // pointers, vtable slots, prologues), reached first or not.
+        if used(|o| o.functions && o.regalloc && o.regalloc_indirect_entries) {
+            extra.extend(translation.deferred_roots.iter().copied());
+        }
         let limit = if used(|o| o.functions && o.regalloc) {
             REGALLOC_BLOCK_LIMIT
         } else {
@@ -7538,7 +7586,11 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|block| (block.start, block))
             .collect()
     };
-    let region_functions = |region: u64, texts: &mut Vec<(u64, String)>| {
+    // Each resume function (`regalloc_resume_*`) with the function whose
+    // text holds it.
+    let region_functions = |region: u64,
+                            texts: &mut Vec<(u64, String)>,
+                            resumes: &mut Vec<(u64, u64)>| {
         let first = region << region_bits;
         let last = first + ((1u64 << region_bits) - 1);
         for (&entry, starts) in lifted.range(first..=last) {
@@ -7557,6 +7609,11 @@ pub fn emit_rust_split_to_regions<E>(
                     &by_start,
                 )
             {
+                for &(_, function) in &entered {
+                    if function != entry && !resumes.iter().any(|(head, _)| *head == function) {
+                        resumes.push((function, entry));
+                    }
+                }
                 REGALLOC_ENTRIES.with_borrow_mut(|entries| {
                     for (block, function) in entered {
                         entries.entry(block).or_insert(function);
@@ -7598,11 +7655,12 @@ pub fn emit_rust_split_to_regions<E>(
         // With regalloc the region's functions are emitted first, so its
         // windows know which entries run structured.
         let mut functions_first: Vec<(u64, String)> = Vec::new();
+        let mut resumes: Vec<(u64, u64)> = Vec::new();
         if REGALLOC.get() {
             REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
-            region_functions(region, &mut functions_first);
+            region_functions(region, &mut functions_first, &mut resumes);
         }
         // Where each window's text starts in `source` (`regalloc_crates`).
         let mut window_starts: Vec<(u64, usize)> = Vec::new();
@@ -7801,9 +7859,12 @@ pub fn emit_rust_split_to_regions<E>(
             REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
             REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
         } else {
-            region_functions(region, &mut functions_first);
+            region_functions(region, &mut functions_first, &mut resumes);
         }
         let mut placed = Placed::default();
+        for &(head, _) in &resumes {
+            placed.resumes.push((head, region));
+        }
         if !split {
             for (_, text) in functions_first {
                 source.push_str(&text);
@@ -7856,6 +7917,14 @@ pub fn emit_rust_split_to_regions<E>(
         for (entry, text) in functions_first {
             let index = place(&mut crates, &text);
             placed.functions.push((entry, id(index)));
+            for resume in placed.resumes.iter_mut() {
+                if resumes
+                    .iter()
+                    .any(|&(head, of)| head == resume.0 && of == entry)
+                {
+                    resume.1 = id(index);
+                }
+            }
         }
         for (index, text) in crates.into_iter().enumerate() {
             if index == 0 || text.len() > header.len() {
@@ -7880,6 +7949,7 @@ pub fn emit_rust_split_to_regions<E>(
     let mut window_crates: BTreeMap<u64, u64> = BTreeMap::new();
     let mut function_crates: BTreeMap<u64, u64> = BTreeMap::new();
     let mut crate_ids: Vec<u64> = Vec::new();
+    let mut resume_crates: BTreeMap<u64, u64> = BTreeMap::new();
     let workers = if windows.len() < 256 {
         1
     } else {
@@ -7892,6 +7962,7 @@ pub fn emit_rust_split_to_regions<E>(
             let placed = emit(one);
             window_crates.extend(placed.windows);
             function_crates.extend(placed.functions);
+            resume_crates.extend(placed.resumes);
             for (region, source) in placed.sources {
                 crate_ids.push(region);
                 sink(region, source, groups.len())?;
@@ -7910,6 +7981,7 @@ pub fn emit_rust_split_to_regions<E>(
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     window_crates.extend(placed.windows);
                     function_crates.extend(placed.functions);
+                    resume_crates.extend(placed.resumes);
                     for (region, source) in placed.sources {
                         crate_ids.push(region);
                         sink(region, source, groups.len())?;
@@ -8004,13 +8076,33 @@ pub fn emit_rust_split_to_regions<E>(
         if used(|o| o.functions && o.function_table && o.regalloc) {
             // Indirect calls from structured functions enter functions by
             // entry (`Core::call_indirect`).
+            // ... and resume functions (`regalloc_resume_*`) by their head.
+            let mut entries: BTreeMap<u64, u64> = lifted
+                .keys()
+                .map(|&entry| {
+                    (
+                        entry,
+                        function_crates
+                            .get(&entry)
+                            .copied()
+                            .unwrap_or(entry >> region_bits),
+                    )
+                })
+                .collect();
+            for (&head, &crate_id) in &resume_crates {
+                entries.entry(head).or_insert(crate_id);
+            }
             root.push_str("\nstatic FUNCTION_ENTRIES: &[u64] = &[\n");
-            for &entry in lifted.keys() {
+            for &entry in entries.keys() {
                 writeln!(root, "    {entry:#x},").unwrap();
+            }
+            root.push_str("];\nstatic ENTRY_FUNCTIONS: &[WindowFn] = &[\n");
+            for (&entry, &crate_id) in &entries {
+                writeln!(root, "    gen_r_{crate_id:x}::run_function_{entry:x},").unwrap();
             }
             root.push_str("];\n");
             installs.push_str(
-                "    echora_guest::install_function_entries(FUNCTION_ENTRIES, FUNCTION_TABLE);\n",
+                "    echora_guest::install_function_entries(FUNCTION_ENTRIES, ENTRY_FUNCTIONS);\n",
             );
         }
         // Crates of their own (`regalloc_crates`) hold a table copy too.
