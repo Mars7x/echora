@@ -965,6 +965,18 @@ fn lift(
         options.regalloc_crate_bytes = bytes;
         listed_options.regalloc_crate_bytes = bytes;
     }
+    // ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT: with regalloc-split-capped, the
+    // blocks a lifted function may hold (default
+    // echora_lift::codegen::REGALLOC_SPLIT_BLOCK_LIMIT; 1024 splits only
+    // the functions regalloc alone lifts).
+    if let Ok(blocks) = std::env::var("ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT") {
+        let blocks: usize = blocks
+            .trim()
+            .parse()
+            .with_context(|| format!("ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT {blocks:?}"))?;
+        options.regalloc_split_block_limit = blocks;
+        listed_options.regalloc_split_block_limit = blocks;
+    }
     // The blocks each window runs, as the emission decides (long windows
     // also run blocks of other windows).
     let windows = echora_lift::codegen::window_blocks(&d.translation, region_bits, &|region| {

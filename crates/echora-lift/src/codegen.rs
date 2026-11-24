@@ -6777,6 +6777,11 @@ pub struct EmitOptions {
     /// structured pieces under a driver (`regalloc::split_capped`) instead
     /// of left to the windows.
     pub regalloc_split_capped: bool,
+    /// With `regalloc_split_capped`: the blocks a lifted function may
+    /// hold, 0 for `REGALLOC_SPLIT_BLOCK_LIMIT` (`REGALLOC_BLOCK_LIMIT`
+    /// keeps the functions of `regalloc` alone, splitting only those over
+    /// the size caps).
+    pub regalloc_split_block_limit: usize,
     /// With `regalloc`: the blocks a structured function's own calls
     /// return to outside its loops are entries of the function (window
     /// arms there run it), not only resume points.
@@ -7958,7 +7963,13 @@ pub fn emit_rust_split_to_regions<E>(
             extra.extend(translation.deferred_roots.iter().copied());
         }
         let limit = if used(|o| o.functions && o.regalloc && o.regalloc_split_capped) {
-            REGALLOC_SPLIT_BLOCK_LIMIT
+            match base
+                .regalloc_split_block_limit
+                .max(listed.regalloc_split_block_limit)
+            {
+                0 => REGALLOC_SPLIT_BLOCK_LIMIT,
+                limit => limit,
+            }
         } else if used(|o| o.functions && o.regalloc) {
             REGALLOC_BLOCK_LIMIT
         } else {
@@ -11066,7 +11077,7 @@ mod tests {
             split.matches("n: &mut u64) -> Result<(), Trap>").count() - 1,
             pieces
         );
-        assert_eq!(driver.matches("=> run_piece_1008_").count(), pieces);
+        assert_eq!(driver.matches("=> { run_piece_1008_").count(), pieces);
         assert_eq!(take_split_functions(), vec![0x1008]);
     }
 

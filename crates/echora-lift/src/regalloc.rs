@@ -652,10 +652,11 @@ pub(super) fn emit_function(
 /// A function over the size caps as several structured pieces
 /// (`EmitOptions::regalloc_split_capped`), each under the caps, and a
 /// driver under the function's own name that runs the piece holding the
-/// PC until the PC leaves them all (a return, a hand-back) or a piece
-/// comes back where it was entered (its stop-word test failed there): the
-/// caller sets the PC to the entry before a call, and a window arm runs
-/// the driver at its own block, so the driver always starts at the PC.
+/// PC, and goes on only where that piece left by one of its own edges to
+/// another piece: anywhere else (a return, a callee or the piece handing
+/// back, a stop-word test that failed) it returns, as a function does
+/// there. The caller sets the PC to the entry before a call, and a window
+/// arm runs the driver at its own block, so the driver starts at the PC.
 ///
 /// The pieces: the function's blocks cut into units in topological order
 /// of their strongly connected components, a component too large for a
@@ -714,7 +715,15 @@ fn split_capped(
     let ratio = (function_bytes() as f64 / FUNCTION_BYTES as f64).min(1.0);
     let budget = ((FUNCTION_INSTRUCTIONS / 3) as f64 * ratio).max(8.0) as usize;
     let mut units = Vec::new();
-    split_units(&all, &next, &predecessors, &sizes, budget, &mut units);
+    split_units(
+        entry,
+        &all,
+        &next,
+        &predecessors,
+        &sizes,
+        budget,
+        &mut units,
+    );
     let mut pending: Vec<(BTreeSet<u64>, usize)> =
         with_predecessors(pack(&units, &sizes, budget), armless, &predecessors)
             .into_iter()
@@ -761,6 +770,7 @@ fn split_capped(
             // Cut again: its pieces in order, the first emitted first.
             let mut units = Vec::new();
             split_units(
+                entry,
                 &blocks,
                 &next,
                 &predecessors,
@@ -792,7 +802,27 @@ fn split_capped(
         );
         bodies.push_str(&text);
         let pattern: Vec<String> = piece_entries.iter().map(|pc| format!("{pc:#x}")).collect();
-        writeln!(arms, "            {} => {name}(m)?,", pattern.join(" | ")).unwrap();
+        // Where it leaves to another piece: the driver goes on only there.
+        let exits: BTreeSet<u64> = blocks
+            .iter()
+            .flat_map(|block| next[block].iter().copied())
+            .filter(|target| next.contains_key(target) && !blocks.contains(target))
+            .collect();
+        let on = if exits.is_empty() {
+            "return Ok(());".to_owned()
+        } else {
+            let targets: Vec<String> = exits.iter().map(|pc| format!("{pc:#x}")).collect();
+            format!(
+                "if !matches!(m.cpu.pc, {}) {{ return Ok(()); }}",
+                targets.join(" | ")
+            )
+        };
+        writeln!(
+            arms,
+            "            {} => {{ {name}(m)?; {on} }}",
+            pattern.join(" | ")
+        )
+        .unwrap();
         entered.extend(piece_entries.into_iter().map(|block| (block, entry)));
     }
     if entered.is_empty() {
@@ -805,7 +835,7 @@ fn split_capped(
         .push(entry);
     writeln!(
         output,
-        "\n/// In pieces, over the size caps (`regalloc_split_capped`).\n#[inline(never)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{\n    loop {{\n        let pc = m.cpu.pc;\n        match pc {{\n{arms}            _ => return Ok(()),\n        }}\n        if m.cpu.pc == pc {{\n            return Ok(());\n        }}\n    }}\n}}"
+        "\n/// In pieces, over the size caps (`regalloc_split_capped`).\n#[inline(never)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{\n    loop {{\n        match m.cpu.pc {{\n{arms}            _ => return Ok(()),\n        }}\n    }}\n}}"
     )
     .unwrap();
     output.push_str(&bodies);
@@ -833,6 +863,7 @@ pub fn take_split_functions() -> Vec<u64> {
 /// with one header (its only block entered from outside it) as the
 /// header alone and then the units of the rest.
 fn split_units(
+    entry: u64,
     set: &BTreeSet<u64>,
     next: &BTreeMap<u64, Vec<u64>>,
     predecessors: &BTreeMap<u64, Vec<u64>>,
@@ -856,9 +887,11 @@ fn split_units(
             })
             .collect();
         let header = match headers.as_slice() {
-            [header] => *header,
-            // Entered only from outside the function's blocks (its entry).
-            [] => *component.first().expect("components are not empty"),
+            // (A component holding the function's entry is entered there
+            // too: with another header it stays whole.)
+            [header] if !component.contains(&entry) || *header == entry => *header,
+            // Entered only from outside the function's blocks: at its entry.
+            [] if component.contains(&entry) => entry,
             _ => {
                 units.push(component);
                 continue;
@@ -867,7 +900,7 @@ fn split_units(
         units.push(BTreeSet::from([header]));
         let mut rest = component;
         rest.remove(&header);
-        split_units(&rest, next, predecessors, sizes, budget, units);
+        split_units(entry, &rest, next, predecessors, sizes, budget, units);
     }
 }
 
