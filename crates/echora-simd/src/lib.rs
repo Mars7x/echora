@@ -726,9 +726,13 @@ fn native_arith_lane(fp: &mut Fp<'_>, op: Arith, a: u64, b: u64, c: u64) -> Opti
     };
     let magnitude = raw & !sign;
     let field = raw & exponent;
+    // A finite nonzero number divided by zero: the infinity of the
+    // operands' signs, raising DZC (FPDiv).
+    let divide_by_zero = op == Arith::Div && zero(b) && !zero(a) && !infinite(a);
     let accepted = if field == exponent {
         // Infinite (a NaN never).
-        magnitude == exponent && (infinite(a) || infinite(b) || fused && infinite(c))
+        magnitude == exponent
+            && (infinite(a) || infinite(b) || fused && infinite(c) || divide_by_zero)
     } else if field != 0 {
         !(magnitude == format.smallest_normal() && op != Arith::Add && op != Arith::Sub)
     } else if magnitude == 0 {
@@ -758,6 +762,9 @@ fn native_arith_lane(fp: &mut Fp<'_>, op: Arith, a: u64, b: u64, c: u64) -> Opti
     }
     if flushed {
         fp.raise(FPSR_IDC);
+    }
+    if divide_by_zero {
+        fp.raise(FPSR_DZC);
     }
     Some(raw)
 }
