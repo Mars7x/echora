@@ -4536,6 +4536,201 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
     (code, finals, fused_group)
 }
 
+/// The scalar forms an MXCSR group takes (`EmitOptions::mxcsr_groups`):
+/// FADD, FSUB, FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT,
+/// FABS, FNEG and FMOV in single or double precision, and FCVT between
+/// them.
+pub fn scalar_group_op(op: &SimdOp) -> bool {
+    match *op {
+        SimdOp::FpBinary { op, size, .. } => {
+            matches!(size, FpSize::S | FpSize::D)
+                && matches!(
+                    op,
+                    FpBinaryOp::Add
+                        | FpBinaryOp::Sub
+                        | FpBinaryOp::Mul
+                        | FpBinaryOp::Div
+                        | FpBinaryOp::NegMul
+                )
+        }
+        SimdOp::FpTernary { size, .. } => matches!(size, FpSize::S | FpSize::D),
+        SimdOp::FpUnary { op, size, .. } => {
+            matches!(size, FpSize::S | FpSize::D)
+                && matches!(
+                    op,
+                    FpUnaryOp::Sqrt | FpUnaryOp::Abs | FpUnaryOp::Neg | FpUnaryOp::Mov
+                )
+        }
+        SimdOp::FpConvert { from, to, .. } => {
+            matches!((from, to), (FpSize::S, FpSize::D) | (FpSize::D, FpSize::S))
+        }
+        _ => false,
+    }
+}
+
+/// The fast copy of a scalar float group with `EmitOptions::mxcsr_groups`
+/// (`crate::codegen`'s `emit_scalar_group`): as `vector_group_mxcsr`, every
+/// operation as the host's scalar SSE instruction with no operand tests,
+/// MXCSR cleared before and read once after, and each arithmetic result's
+/// magnitude tracked (`mx_track_scalar32`, `mx_track_scalar64`) so one test
+/// at the end sees a denormal, exactly the smallest normal or a NaN. FABS,
+/// FNEG and FMOV are bit operations on both sides, raise nothing and are
+/// not tracked. A scalar result is written zero-extended, as Arm writes it.
+/// Returns the code computing `good`, the registers written with their
+/// final values, and whether the group fuses (it then needs the host's
+/// FMA).
+pub fn scalar_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
+    let mut values: std::collections::BTreeMap<u8, String> = Default::default();
+    let mut code = String::from(
+        "mxcsr_clear(); let (mut lo32, mut hi32) = (u32::MAX, 0u32); let (mut lo64, mut hi64) = (u64::MAX, 0u64); ",
+    );
+    let mut written: Vec<u8> = Vec::new();
+    let mut fused_group = false;
+    let read =
+        |code: &mut String, values: &mut std::collections::BTreeMap<u8, String>, register: u8| {
+            values
+                .entry(register)
+                .or_insert_with(|| {
+                    code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
+                    format!("v{register}")
+                })
+                .clone()
+        };
+    for (index, op) in ops.iter().enumerate() {
+        // (destination, the result's bits, its size, whether it is tracked)
+        let (rd, value, size, tracked) = match *op {
+            SimdOp::FpBinary {
+                op: fp_op,
+                size,
+                rd,
+                rn,
+                rm,
+            } => {
+                let (float, int) = if size == FpSize::S {
+                    ("f32", "u32")
+                } else {
+                    ("f64", "u64")
+                };
+                let x = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rn)
+                );
+                let y = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rm)
+                );
+                let value = match fp_op {
+                    FpBinaryOp::Add => format!("({x} + {y})"),
+                    FpBinaryOp::Sub => format!("({x} - {y})"),
+                    FpBinaryOp::Mul => format!("({x} * {y})"),
+                    FpBinaryOp::Div => format!("({x} / {y})"),
+                    _ => format!("(-({x} * {y}))"),
+                };
+                (rd, format!("{value}.to_bits()"), size, true)
+            }
+            SimdOp::FpTernary {
+                op: fp_op,
+                size,
+                rd,
+                rn,
+                rm,
+                ra,
+            } => {
+                fused_group = true;
+                let (float, int) = if size == FpSize::S {
+                    ("f32", "u32")
+                } else {
+                    ("f64", "u64")
+                };
+                let n = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rn)
+                );
+                let m = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rm)
+                );
+                let a = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, ra)
+                );
+                // Negations are exact: one rounding, as Arm's.
+                let value = match fp_op {
+                    FpTernaryOp::MulAdd => format!("{n}.mul_add({m}, {a})"),
+                    FpTernaryOp::MulSub => format!("(-{n}).mul_add({m}, {a})"),
+                    FpTernaryOp::NegMulAdd => format!("(-{n}).mul_add({m}, -{a})"),
+                    FpTernaryOp::NegMulSub => format!("{n}.mul_add({m}, -{a})"),
+                };
+                (rd, format!("{value}.to_bits()"), size, true)
+            }
+            SimdOp::FpUnary {
+                op: unary,
+                size,
+                rd,
+                rn,
+            } => {
+                let (float, int, sign) = if size == FpSize::S {
+                    ("f32", "u32", "0x8000_0000u32")
+                } else {
+                    ("f64", "u64", "0x8000_0000_0000_0000u64")
+                };
+                let x = format!("({} as {int})", read(&mut code, &mut values, rn));
+                match unary {
+                    FpUnaryOp::Sqrt => (
+                        rd,
+                        format!("{float}::from_bits({x}).sqrt().to_bits()"),
+                        size,
+                        true,
+                    ),
+                    FpUnaryOp::Abs => (rd, format!("({x} & !{sign})"), size, false),
+                    FpUnaryOp::Neg => (rd, format!("({x} ^ {sign})"), size, false),
+                    _ => (rd, x, size, false),
+                }
+            }
+            SimdOp::FpConvert { rd, rn, from, .. } => {
+                let x = read(&mut code, &mut values, rn);
+                if from == FpSize::S {
+                    (
+                        rd,
+                        format!("f64::from(f32::from_bits({x} as u32)).to_bits()"),
+                        FpSize::D,
+                        true,
+                    )
+                } else {
+                    (
+                        rd,
+                        format!("(f64::from_bits({x} as u64) as f32).to_bits()"),
+                        FpSize::S,
+                        true,
+                    )
+                }
+            }
+            _ => unreachable!("scalar_group_op checked {op:?}"),
+        };
+        let width = if size == FpSize::S { 32 } else { 64 };
+        code.push_str(&format!("let r{index} = {value}; "));
+        if tracked {
+            code.push_str(&format!(
+                "mx_track_scalar{width}(r{index}, &mut lo{width}, &mut hi{width}); "
+            ));
+        }
+        code.push_str(&format!("let o{index} = u128::from(r{index}); "));
+        values.insert(rd, format!("o{index}"));
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    code.push_str(
+        "let bad = u64::from(lo32 < 0x0080_0000 || hi32 > 0x7f80_0000 || lo64 < 0x0010_0000_0000_0000 || hi64 > 0x7ff0_0000_0000_0000); \
+         let good = mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ",
+    );
+    let finals = written
+        .iter()
+        .map(|&register| (register, values[&register].clone()))
+        .collect();
+    (code, finals, fused_group)
+}
+
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every
 /// operation as plain host single-precision arithmetic on locals, with
 /// `good` cleared where an operand read from the run's start or a result

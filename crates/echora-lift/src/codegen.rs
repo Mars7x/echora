@@ -3834,6 +3834,24 @@ fn emit_block_body(
     } else {
         Vec::new()
     };
+    // With MXCSR groups, scalar groups take the scalar float operations; a
+    // float run holding a load keeps its own copy (no group overlaps it),
+    // the others give way.
+    let (runs, scalar_groups) = if MXCSR_GROUPS.get() {
+        let holds_load = |&(start, end): &(usize, usize)| {
+            block.instructions[start..end].iter().any(|record| {
+                matches!(&record.instruction, Instruction::Simd(op) if crate::simd::float_run_load(op))
+            })
+        };
+        let kept: Vec<(usize, usize)> = runs.iter().copied().filter(holds_load).collect();
+        let groups = scalar_groups_in(block)
+            .into_iter()
+            .filter(|&(start, end)| kept.iter().all(|&(s, e)| end <= s || e <= start))
+            .collect();
+        (kept, groups)
+    } else {
+        (runs, Vec::new())
+    };
     // Vector float runs hold no scalar float run's operation: disjoint.
     let vector_runs = if MXCSR_GROUPS.get() {
         vector_groups_in(block)
@@ -3851,6 +3869,17 @@ fn emit_block_body(
             continue;
         }
         let mut body = String::new();
+        if let Some(&(_, end)) = scalar_groups.iter().find(|&&(start, _)| start == index) {
+            emit_scalar_group(
+                &mut body,
+                &block.instructions[index..end],
+                check_entry,
+                resumable,
+            );
+            skip_to = end;
+            pieces.push((body, None));
+            continue;
+        }
         if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
             emit_float_run(
                 &mut body,
@@ -4254,6 +4283,88 @@ pub(crate) fn vector_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     groups
 }
 
+/// Scalar float groups in `block` (`EmitOptions::mxcsr_groups`): maximal
+/// sequences of `crate::simd::scalar_group_op` operations, neither the
+/// block's first instruction (its charge) nor its last, holding at least
+/// one that is not a bit operation (FABS, FNEG, FMOV).
+pub(crate) fn scalar_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::scalar_group_op(op));
+    let arithmetic = |record: &TranslatedInstruction| {
+        !matches!(
+            &record.instruction,
+            Instruction::Simd(SimdOp::FpUnary {
+                op: crate::simd::FpUnaryOp::Abs
+                    | crate::simd::FpUnaryOp::Neg
+                    | crate::simd::FpUnaryOp::Mov,
+                ..
+            })
+        )
+    };
+    let count = block.instructions.len();
+    let mut groups = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if !held(&block.instructions[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < count && held(&block.instructions[index]) {
+            index += 1;
+        }
+        if block.instructions[start..index].iter().any(arithmetic) {
+            groups.push((start, index));
+        }
+    }
+    groups
+}
+
+/// A scalar float group (`scalar_groups_in`), emitted as a vector group
+/// is: the fast copy (`crate::simd::scalar_group_mxcsr`), committed when
+/// FPCR is in the inline paths' mode, FPSR holds the sticky IXC (and, for a
+/// fused group, the host has FMA) and the host's flags and the tracked
+/// results are clean; else the exact copy from the group's start.
+fn emit_scalar_group(
+    output: &mut String,
+    run: &[TranslatedInstruction],
+    check_entry: bool,
+    resumable: bool,
+) {
+    let ops: Vec<SimdOp> = run
+        .iter()
+        .map(|record| match &record.instruction {
+            Instruction::Simd(op) => *op,
+            _ => unreachable!("scalar groups hold SIMD operations"),
+        })
+        .collect();
+    let (fast, finals, fused) = crate::simd::scalar_group_mxcsr(&ops);
+    let commits: String = finals
+        .iter()
+        .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+        .collect();
+    let fma = if fused {
+        " && cfg!(target_feature = \"fma\")"
+    } else {
+        ""
+    };
+    writeln!(
+        output,
+        "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0{fma} && {{ {fast}if good {{ {commits}}} good }};",
+        crate::simd::FP_MODE
+    )
+    .unwrap();
+    let (open, close) = if crate::simd::census_on() {
+        ("/*exact*/", "/*end exact*/")
+    } else {
+        ("", "")
+    };
+    writeln!(output, "                if !committed {{{open}").unwrap();
+    for record in run {
+        emit_instruction(output, record, false, None, check_entry, resumable);
+    }
+    writeln!(output, "                }}{close}\n                }}").unwrap();
+}
+
 /// With `EmitOptions::mxcsr_groups`, written into a region's header: the
 /// host's floating-point exception flags, cleared before a group and read
 /// after it. `mxcsr_read` takes a value computed from every result of the
@@ -4516,6 +4627,23 @@ fn mx_track_bad(lo: core::arch::x86_64::__m128i, hi: core::arch::x86_64::__m128i
         let nan = _mm_cmpeq_epi32(mx_max_u32(hi, _mm_set1_epi32(0x7f80_0001)), hi);
         _mm_movemask_epi8(_mm_or_si128(tiny, nan)) as u64
     }
+}
+/// A scalar result's magnitude into a group's extremes (`mx_track`'s
+/// scalar form): single precision.
+#[allow(dead_code)]
+#[inline(always)]
+fn mx_track_scalar32(bits: u32, lo: &mut u32, hi: &mut u32) {
+    let a = bits & 0x7fff_ffff;
+    *lo = (*lo).min(a.wrapping_sub(1));
+    *hi = (*hi).max(a);
+}
+/// Double precision.
+#[allow(dead_code)]
+#[inline(always)]
+fn mx_track_scalar64(bits: u64, lo: &mut u64, hi: &mut u64) {
+    let a = bits & 0x7fff_ffff_ffff_ffff;
+    *lo = (*lo).min(a.wrapping_sub(1));
+    *hi = (*hi).max(a);
 }
 /// MXCSR, read after `after` is computed.
 #[allow(dead_code, unsafe_code)]
