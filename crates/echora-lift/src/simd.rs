@@ -4191,6 +4191,351 @@ pub fn vector_run_fast(ops: &[SimdOp]) -> (String, RegisterValues) {
     (code, finals)
 }
 
+/// The forms an MXCSR group takes (`EmitOptions::mxcsr_groups`): vector
+/// FADD, FSUB, FMUL, FDIV, FMLA and FMLS, whole vectors or by element, in
+/// single or double precision.
+pub fn mxcsr_group_op(op: &SimdOp) -> bool {
+    matches!(
+        *op,
+        SimdOp::VecFp {
+            op: VecFpOp::Add
+                | VecFpOp::Sub
+                | VecFpOp::Mul
+                | VecFpOp::Div
+                | VecFpOp::MulAdd
+                | VecFpOp::MulSub,
+            size: FpSize::S | FpSize::D,
+            scalar: false,
+            ..
+        } | SimdOp::VecFpElement {
+            op: VecFpOp::Add | VecFpOp::Sub | VecFpOp::Mul | VecFpOp::MulAdd | VecFpOp::MulSub,
+            size: FpSize::S | FpSize::D,
+            scalar: false,
+            ..
+        }
+    ) || mxcsr_singles_only_op(op)
+}
+
+/// The forms an MXCSR group takes in four singles only (`mx_*` on
+/// `__m128`): FABD, FMULX, FMAX, FMIN, FMAXNM, FMINNM, FRECPS, FRSQRTS,
+/// and the pairwise FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP.
+fn mxcsr_singles_only_op(op: &SimdOp) -> bool {
+    matches!(
+        *op,
+        SimdOp::VecFp {
+            op: VecFpOp::AbsDiff
+                | VecFpOp::MulExtended
+                | VecFpOp::Max
+                | VecFpOp::Min
+                | VecFpOp::MaxNum
+                | VecFpOp::MinNum
+                | VecFpOp::RecipStep
+                | VecFpOp::RSqrtStep,
+            size: FpSize::S,
+            q: true,
+            scalar: false,
+            ..
+        } | SimdOp::VecFpPairwise {
+            op: VecFpOp::Add | VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum,
+            size: FpSize::S,
+            q: true,
+            scalar: false,
+            ..
+        }
+    )
+}
+
+/// Whether `ops` can be an MXCSR group: every operation one it computes
+/// (`mxcsr_group_op`) or one a vector run's fast copy computes with its
+/// own tests (`run_other_op`), and at least one of the first kind.
+pub fn mxcsr_group(ops: &[SimdOp]) -> bool {
+    ops.iter().any(mxcsr_group_op) && ops.iter().all(|op| mxcsr_group_op(op) || run_other_op(op))
+}
+
+/// The fast copy of a vector float group with `EmitOptions::mxcsr_groups`
+/// (`crate::codegen`'s `emit_vector_run`): every operation as native host
+/// arithmetic, with no operand tests; the host's own exception flags say
+/// whether the result is the Arm one. The group clears MXCSR's flags
+/// (`mxcsr_clear`, after which it loads its operands), and each result's
+/// lanes add to `bad` where they are a NaN, a denormal or exactly the
+/// smallest normal: x86 detects tininess after rounding and raises nothing
+/// for an exact denormal result, where Arm detects it before rounding and,
+/// under FZ, flushes and raises UFC. Then one read of MXCSR (`mxcsr_read`,
+/// which takes `bad` as an operand, so every result is computed before
+/// it): the group commits when IE, DE, ZE, OE and UE are all clear and no
+/// lane was bad. A denormal operand raises DE, an invalid operation or a
+/// signalling NaN IE, a division by zero ZE, an overflow OE, a tiny
+/// inexact result UE; infinities and zeros otherwise give the IEEE results
+/// Arm gives and raise nothing; a quiet NaN operand gives a NaN result.
+/// Returns the code computing `good`, the registers written with their
+/// final values' locals, and whether the group fuses (it then needs the
+/// host's FMA: `fmaf` in software rounds through double).
+/// The `element` of a pairwise operation in `vector_group_mxcsr` (no lane
+/// is 255).
+const PAIRWISE: u8 = 255;
+
+pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
+    /// A register's value in the group: as a `u128`, as an `__m128` of
+    /// four singles, or both.
+    #[derive(Clone, Default)]
+    struct Value {
+        bits: Option<String>,
+        singles: Option<String>,
+    }
+    let mut values: std::collections::BTreeMap<u8, Value> = Default::default();
+    let mut code = String::from("mxcsr_clear(); let mut bad = 0u64; let mut good = true; ");
+    let mut written: Vec<u8> = Vec::new();
+    let mut fused_group = false;
+    let mut conversions = 0usize;
+    // Whether a 4S result was tracked (`mx_track`).
+    let mut tracked = false;
+    // The register as a `u128` (loaded, or converted from its `__m128`).
+    let mut bits = |code: &mut String,
+                    values: &mut std::collections::BTreeMap<u8, Value>,
+                    register: u8|
+     -> String {
+        let value = values.entry(register).or_default();
+        if let Some(bits) = &value.bits {
+            return bits.clone();
+        }
+        let name = match &value.singles {
+            Some(singles) => {
+                conversions += 1;
+                let name = format!("u{register}_{conversions}");
+                code.push_str(&format!("let {name} = mx_bits({singles}); "));
+                name
+            }
+            None => {
+                let name = format!("v{register}");
+                code.push_str(&format!("let {name} = m.cpu.vectors[{register}]; "));
+                name
+            }
+        };
+        value.bits = Some(name.clone());
+        name
+    };
+    // The register as an `__m128` (loaded as one, or converted).
+    let singles = |code: &mut String,
+                   values: &mut std::collections::BTreeMap<u8, Value>,
+                   register: u8|
+     -> String {
+        let value = values.entry(register).or_default();
+        if let Some(singles) = &value.singles {
+            return singles.clone();
+        }
+        let source = value
+            .bits
+            .clone()
+            .unwrap_or_else(|| format!("m.cpu.vectors[{register}]"));
+        let name = format!("s{register}");
+        code.push_str(&format!("let {name} = mx_singles({source}); "));
+        value.singles = Some(name.clone());
+        name
+    };
+    for (index, op) in ops.iter().enumerate() {
+        let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
+            SimdOp::VecFp {
+                op: fp_op,
+                size,
+                q,
+                rd,
+                rn,
+                rm,
+                ..
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                (
+                    fp_op,
+                    size,
+                    if q { 128 / width } else { 64 / width },
+                    rd,
+                    rn,
+                    rm,
+                    None,
+                )
+            }
+            SimdOp::VecFpElement {
+                op: fp_op,
+                size,
+                q,
+                rd,
+                rn,
+                rm,
+                index,
+                ..
+            } => {
+                let width = if size == FpSize::S { 32 } else { 64 };
+                (
+                    fp_op,
+                    size,
+                    if q { 128 / width } else { 64 / width },
+                    rd,
+                    rn,
+                    rm,
+                    Some(index),
+                )
+            }
+            SimdOp::VecFpPairwise {
+                op: fp_op,
+                rd,
+                rn,
+                rm,
+                ..
+            } if mxcsr_group_op(op) => (fp_op, FpSize::S, 4, rd, rn, rm, Some(PAIRWISE)),
+            _ => {
+                // An operation a vector run's fast copy computes with its
+                // own tests (`run_other`), from the group's values so far.
+                let mut run_values: RunValues = Default::default();
+                for (&register, value) in values.iter_mut() {
+                    let name = match (&value.bits, &value.singles) {
+                        (Some(bits), _) => bits.clone(),
+                        (None, Some(singles)) => {
+                            let name = format!("u{register}_x{index}");
+                            code.push_str(&format!("let {name} = mx_bits({singles}); "));
+                            value.bits = Some(name.clone());
+                            name
+                        }
+                        (None, None) => continue,
+                    };
+                    run_values.insert(register, (name, None));
+                }
+                let (rd, _) = run_other(op, index, &mut run_values, &mut code);
+                for (register, (name, _)) in run_values {
+                    values.entry(register).or_insert_with(|| Value {
+                        bits: Some(name),
+                        singles: None,
+                    });
+                }
+                values.insert(
+                    rd,
+                    Value {
+                        bits: Some(format!("o{index}")),
+                        singles: None,
+                    },
+                );
+                if !written.contains(&rd) {
+                    written.push(rd);
+                }
+                continue;
+            }
+        };
+        let fused = matches!(
+            fp_op,
+            VecFpOp::MulAdd | VecFpOp::MulSub | VecFpOp::RecipStep | VecFpOp::RSqrtStep
+        );
+        fused_group |= fused;
+        if size == FpSize::S && lanes == 4 {
+            // Four singles: `__m128` arithmetic, kept as `__m128`.
+            let n = singles(&mut code, &mut values, rn);
+            let v = singles(&mut code, &mut values, rm);
+            // Pairwise: the pairs of Vm:Vn as evens and odds.
+            let (n, y) = if element == Some(PAIRWISE) {
+                (format!("mx_evens({n}, {v})"), format!("mx_odds({n}, {v})"))
+            } else {
+                (
+                    n,
+                    match element {
+                        Some(lane) => format!("mx_lane({v}, {lane})"),
+                        None => v,
+                    },
+                )
+            };
+            let value = match fp_op {
+                VecFpOp::Add => format!("mx_add({n}, {y})"),
+                VecFpOp::Sub => format!("mx_sub({n}, {y})"),
+                VecFpOp::Mul | VecFpOp::MulExtended => format!("mx_mul({n}, {y})"),
+                VecFpOp::Div => format!("mx_div({n}, {y})"),
+                VecFpOp::AbsDiff => format!("mx_abs(mx_sub({n}, {y}))"),
+                VecFpOp::Max | VecFpOp::MaxNum => format!("mx_max({n}, {y})"),
+                VecFpOp::Min | VecFpOp::MinNum => format!("mx_min({n}, {y})"),
+                VecFpOp::RecipStep => format!("mx_recip_step({n}, {y})"),
+                VecFpOp::RSqrtStep => format!("mx_rsqrt_step({n}, {y})"),
+                VecFpOp::MulAdd => {
+                    let d = singles(&mut code, &mut values, rd);
+                    format!("mx_mul_add({n}, {y}, {d})")
+                }
+                _ => {
+                    let d = singles(&mut code, &mut values, rd);
+                    format!("mx_mul_sub({n}, {y}, {d})")
+                }
+            };
+            if !tracked {
+                code.push_str("let (mut lo, mut hi) = mx_track_start(); ");
+                tracked = true;
+            }
+            code.push_str(&format!(
+                "let q{index} = {value}; mx_track(q{index}, &mut lo, &mut hi); "
+            ));
+            values.insert(
+                rd,
+                Value {
+                    bits: None,
+                    singles: Some(format!("q{index}")),
+                },
+            );
+        } else {
+            // Two singles or doubles: lane by lane on `u128`s.
+            let (float, int, width) = if size == FpSize::S {
+                ("f32", "u32", 32u32)
+            } else {
+                ("f64", "u64", 64u32)
+            };
+            let n = bits(&mut code, &mut values, rn);
+            let v = bits(&mut code, &mut values, rm);
+            let d = if fused {
+                bits(&mut code, &mut values, rd)
+            } else {
+                "0u128".to_owned()
+            };
+            let y = match element {
+                Some(lane) => format!("({v} >> {}) as {int}", u32::from(lane) * width),
+                None => format!("({v} >> (lane * {width})) as {int}"),
+            };
+            let (value, _) = arith_lane(fp_op, float);
+            let suspect = if width == 32 {
+                format!("bad |= mxcsr_suspect_4s(o{index}); ")
+            } else {
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let a = (o{index} >> (lane * 64)) as u64 & 0x7fff_ffff_ffff_ffffu64; \
+                     bad |= u64::from((a.wrapping_sub(1) < 0x0010_0000_0000_0000u64) | (a > 0x7ff0_0000_0000_0000u64)); }} "
+                )
+            };
+            code.push_str(&format!(
+                "let o{index} = {{ let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
+                 let x = ({n} >> (lane * {width})) as {int}; let y = {y}; let z = ({d} >> (lane * {width})) as {int}; let _ = z; \
+                 out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out }}; {suspect}"
+            ));
+            values.insert(
+                rd,
+                Value {
+                    bits: Some(format!("o{index}")),
+                    singles: None,
+                },
+            );
+        }
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    if tracked {
+        code.push_str("bad |= mx_track_bad(lo, hi); ");
+    }
+    code.push_str("let good = good && mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ");
+    let finals = written
+        .iter()
+        .map(|&register| {
+            let value = &values[&register];
+            let committed = match (&value.bits, &value.singles) {
+                (Some(bits), _) => bits.clone(),
+                (None, Some(singles)) => format!("mx_bits({singles})"),
+                (None, None) => unreachable!("a written register has a value"),
+            };
+            (register, committed)
+        })
+        .collect();
+    (code, finals, fused_group)
+}
+
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every
 /// operation as plain host single-precision arithmetic on locals, with
 /// `good` cleared where an operand read from the run's start or a result
@@ -4912,5 +5257,69 @@ mod tests {
         assert_eq!(cpu.vectors[6], 0x7788_7788_7788_7788);
         modify_immediate(&mut cpu, 6, 0xff, true, false);
         assert_eq!(cpu.vectors[6], 0x7788_7788_7788_7700);
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    /// With every inline option on, no SIMD word is taken by two of the
+    /// per-instruction emitters (`emit_inline`'s int, pairwise, fp-scalar
+    /// and misc, the base forms with `inline-vector-unary`, and the
+    /// structure transfers): turning several on together changes no
+    /// instruction's emission from what each option alone gives it, so
+    /// the only overlaps are with the run options (`vector-float-runs`,
+    /// `float-runs`), whose exact copies are these emissions.
+    #[test]
+    fn inline_emitters_take_disjoint_forms() {
+        let saved = (
+            crate::simd_int::set_inline_vector_int(true),
+            crate::simd_int::set_inline_vector_pairwise(true),
+            crate::simd_scalar::set_inline_fp_scalar(true),
+            crate::simd_misc::set_inline_vector_misc(true),
+            set_inline_vector_unary(true),
+        );
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut taken = [0usize; 6];
+        let mut overlaps = Vec::new();
+        for _ in 0..4_000_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let raw = (seed >> 32) as u32;
+            // SIMD and FP data processing (op0 x111) or SIMD loads and
+            // stores (x1x0 with V set), half each.
+            let word = if raw & 1 == 0 {
+                raw | 0x0e00_0000
+            } else {
+                (raw & !0x0200_0000) | 0x0c00_0000
+            };
+            let Some(op) = decode(word, 0x1000) else {
+                continue;
+            };
+            let takers = [
+                crate::simd_int::emit_int(&op).is_some(),
+                crate::simd_int::emit_pairwise(&op).is_some(),
+                crate::simd_scalar::emit_fp_scalar(&op).is_some(),
+                crate::simd_misc::emit_misc(&op).is_some(),
+                crate::simd_misc::emit_transfer(&op).is_some(),
+                emit_inline_base(&op).is_some(),
+            ];
+            for (count, took) in taken.iter_mut().zip(takers) {
+                *count += usize::from(took);
+            }
+            if takers.iter().filter(|&&took| took).count() > 1 && overlaps.len() < 8 {
+                overlaps.push(format!("{word:#010x} {op:?}: {takers:?}"));
+            }
+        }
+        crate::simd_int::set_inline_vector_int(saved.0);
+        crate::simd_int::set_inline_vector_pairwise(saved.1);
+        crate::simd_scalar::set_inline_fp_scalar(saved.2);
+        crate::simd_misc::set_inline_vector_misc(saved.3);
+        set_inline_vector_unary(saved.4);
+        // Every emitter took a share of the sample.
+        assert!(taken.iter().all(|&count| count > 1000), "{taken:?}");
+        assert!(overlaps.is_empty(), "{}", overlaps.join("\n"));
     }
 }

@@ -68,6 +68,9 @@ fn options() -> EmitOptions {
         window_calls_audit: std::env::var_os("CARGO_FEATURE_WINDOW_CALLS_AUDIT").is_some(),
         long_windows: std::env::var_os("CARGO_FEATURE_LONG_WINDOWS").is_some(),
         known_returns: std::env::var_os("CARGO_FEATURE_KNOWN_RETURNS").is_some(),
+        cold_fp_exact: std::env::var_os("CARGO_FEATURE_COLD_FP_EXACT").is_some(),
+        hoist_fp_mode: std::env::var_os("CARGO_FEATURE_HOIST_FP_MODE").is_some(),
+        mxcsr_groups: std::env::var_os("CARGO_FEATURE_MXCSR_GROUPS").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -142,6 +145,38 @@ fn split_at(
     emit_rust_split_with(translation, region_bits, options)
 }
 
+/// Split emission of `translation` with `listed` for every other 1 KiB
+/// region (the even ones) and `base` for the rest, counting its
+/// instructions: options that overlap on the same forms are tried both
+/// with and without each other in one lift.
+fn split_alternate(
+    translation: &echora_lift::codegen::Translation,
+    base: EmitOptions,
+    listed: EmitOptions,
+) -> (String, Vec<(u64, String)>) {
+    let regions: std::collections::BTreeSet<u64> = translation
+        .blocks
+        .iter()
+        .map(|block| block.start >> region_bits())
+        .filter(|region| region % 2 == 0)
+        .collect();
+    LIFTED.set(LIFTED.get() + translation.instructions.len());
+    let mut sources = Vec::new();
+    let root = echora_lift::codegen::emit_rust_split_to_regions(
+        translation,
+        region_bits(),
+        base,
+        listed,
+        &regions,
+        &mut |region, source, _| {
+            sources.push((region, source));
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .expect("no sink errors");
+    (root, sources)
+}
+
 /// Every program lifted through split emission (what real builds use).
 fn split_programs(out: &mut String) {
     for (_, generate) in SPLIT_PROGRAMS {
@@ -194,6 +229,10 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("vector_run", vector_run_code),
     ("rounded_up", rounded_up_code),
     ("window_call", window_call_code),
+    ("smallest_normal", smallest_normal_code),
+    ("memory_fault", memory_fault_code),
+    ("fp_mode_group", fp_mode_group_code),
+    ("mxcsr_group", mxcsr_group_code),
     ("counter", counter_code),
 ];
 
@@ -386,18 +425,9 @@ fn codesize(out_dir: &std::path::Path) {
             },
         ),
     ];
-    // The game's default set, and with window calls.
-    let game = EmitOptions {
-        inline_vector: true,
-        fused_flags: true,
-        whole_vector_checks: true,
-        fp_status_locals: true,
-        window_memory: true,
-        untagged_blocks: true,
-        split_ticks: true,
-        float_runs: true,
-        ..EmitOptions::default()
-    };
+    // The game set, and the game set plus each option
+    // `docs/lift-options.md` weighs for the next relift.
+    let game = game_set();
     let modes: Vec<(&str, EmitOptions)> = modes
         .into_iter()
         .chain([
@@ -406,6 +436,100 @@ fn codesize(out_dir: &std::path::Path) {
                 "game_window_calls",
                 EmitOptions {
                     window_calls: true,
+                    ..game
+                },
+            ),
+            (
+                "game+unary",
+                EmitOptions {
+                    inline_vector_unary: true,
+                    ..game
+                },
+            ),
+            (
+                "game+int",
+                EmitOptions {
+                    inline_vector_int: true,
+                    ..game
+                },
+            ),
+            (
+                "game+pairwise",
+                EmitOptions {
+                    inline_vector_pairwise: true,
+                    ..game
+                },
+            ),
+            (
+                "game+fp_scalar",
+                EmitOptions {
+                    inline_fp_scalar: true,
+                    ..game
+                },
+            ),
+            (
+                "game+misc",
+                EmitOptions {
+                    inline_vector_misc: true,
+                    ..game
+                },
+            ),
+            (
+                "game+q_pairs",
+                EmitOptions {
+                    direct_q_pairs: true,
+                    ..game
+                },
+            ),
+            (
+                "game+vector_runs",
+                EmitOptions {
+                    vector_float_runs: true,
+                    ..game
+                },
+            ),
+            (
+                "game+run_loads",
+                EmitOptions {
+                    float_run_loads: true,
+                    ..game
+                },
+            ),
+            (
+                "game+steps_local",
+                EmitOptions {
+                    steps_local: true,
+                    ..game
+                },
+            ),
+            (
+                "game+functions_all",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    ..game
+                },
+            ),
+            (
+                "game+window_calls",
+                EmitOptions {
+                    window_calls: true,
+                    ..game
+                },
+            ),
+            (
+                "game+long_windows",
+                EmitOptions {
+                    long_windows: true,
+                    ..game
+                },
+            ),
+            (
+                "game+known_returns",
+                EmitOptions {
+                    known_returns: true,
                     ..game
                 },
             ),
@@ -442,6 +566,8 @@ fn codesize(out_dir: &std::path::Path) {
                     ..game
                 },
             ),
+            ("game+recommended", recommended_set()),
+            ("game+recommended+windows", recommended_windows_set()),
         ])
         .collect();
     let dir = out_dir.join("codesize");
@@ -460,6 +586,7 @@ fn codesize(out_dir: &std::path::Path) {
     }
     MODE.set(None);
     std::fs::write(dir.join("modes.txt"), list).expect("write");
+    kernel_sizes(&dir);
     // One game-shaped function at the block limit, alone, per mode: what
     // one large structured function costs to compile.
     let mut list = String::new();
@@ -516,6 +643,228 @@ fn codesize(out_dir: &std::path::Path) {
         ),
     )
     .expect("write");
+}
+
+/// The game build's default options (`echora lift`'s `DEFAULT_OPTIONS`).
+fn game_set() -> EmitOptions {
+    EmitOptions {
+        inline_vector: true,
+        fused_flags: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        window_memory: true,
+        untagged_blocks: true,
+        split_ticks: true,
+        float_runs: true,
+        ..EmitOptions::default()
+    }
+}
+
+/// The game set plus the options `docs/lift-options.md` recommends turning
+/// on (everywhere or in the hot regions), but for the window calls.
+fn recommended_set() -> EmitOptions {
+    EmitOptions {
+        inline_vector_unary: true,
+        inline_vector_int: true,
+        inline_vector_pairwise: true,
+        inline_fp_scalar: true,
+        inline_vector_misc: true,
+        direct_q_pairs: true,
+        vector_float_runs: true,
+        steps_local: true,
+        ..game_set()
+    }
+}
+
+/// The recommended set plus the window-call options
+/// `docs/lift-options.md` recommends for the hot regions.
+fn recommended_windows_set() -> EmitOptions {
+    EmitOptions {
+        window_calls: true,
+        long_windows: true,
+        known_returns: true,
+        ..recommended_set()
+    }
+}
+
+/// With the `codesize` feature: the generated Rust of the benchmark
+/// kernels (`kernel_code`) with the game set and with the game set plus
+/// each opt-in option (and what it needs), as `name bytes lines` in
+/// `kernels.txt` for `benches/codesize.rs` to print.
+fn kernel_sizes(dir: &std::path::Path) {
+    let game = game_set();
+    let functions = EmitOptions {
+        functions: true,
+        ..game
+    };
+    let table = EmitOptions {
+        function_table: true,
+        ..functions
+    };
+    let summaries = EmitOptions {
+        call_summaries: true,
+        ..table
+    };
+    let options: Vec<(&str, EmitOptions)> = vec![
+        ("game-set", game),
+        (
+            "inline-vector-unary",
+            EmitOptions {
+                inline_vector_unary: true,
+                ..game
+            },
+        ),
+        (
+            "inline-vector-int",
+            EmitOptions {
+                inline_vector_int: true,
+                ..game
+            },
+        ),
+        (
+            "inline-vector-pairwise",
+            EmitOptions {
+                inline_vector_pairwise: true,
+                ..game
+            },
+        ),
+        (
+            "inline-fp-scalar",
+            EmitOptions {
+                inline_fp_scalar: true,
+                ..game
+            },
+        ),
+        (
+            "inline-vector-misc",
+            EmitOptions {
+                inline_vector_misc: true,
+                ..game
+            },
+        ),
+        (
+            "direct-q-pairs",
+            EmitOptions {
+                direct_q_pairs: true,
+                ..game
+            },
+        ),
+        (
+            "vector-float-runs",
+            EmitOptions {
+                vector_float_runs: true,
+                ..game
+            },
+        ),
+        (
+            "float-run-loads",
+            EmitOptions {
+                float_run_loads: true,
+                ..game
+            },
+        ),
+        (
+            "steps-local",
+            EmitOptions {
+                steps_local: true,
+                ..game
+            },
+        ),
+        (
+            "deferred-charges",
+            EmitOptions {
+                deferred_charges: true,
+                ..game
+            },
+        ),
+        ("functions", functions),
+        ("+function-table", table),
+        ("+call-summaries", summaries),
+        (
+            "+transitive-summaries",
+            EmitOptions {
+                transitive_summaries: true,
+                ..summaries
+            },
+        ),
+        (
+            "direct-calls",
+            EmitOptions {
+                direct_calls: true,
+                ..game
+            },
+        ),
+        (
+            "dense-dispatch",
+            EmitOptions {
+                dense_dispatch: true,
+                ..game
+            },
+        ),
+        (
+            "stub-windows",
+            EmitOptions {
+                stub_windows: true,
+                ..game
+            },
+        ),
+        (
+            "structured",
+            EmitOptions {
+                structured: true,
+                ..game
+            },
+        ),
+        (
+            "count-fallbacks",
+            EmitOptions {
+                count_fallbacks: true,
+                ..game
+            },
+        ),
+        (
+            "window-calls",
+            EmitOptions {
+                window_calls: true,
+                ..game
+            },
+        ),
+        (
+            "+window-call-early-exits",
+            EmitOptions {
+                window_calls: true,
+                window_call_early_exits: true,
+                ..game
+            },
+        ),
+        (
+            "long-windows",
+            EmitOptions {
+                long_windows: true,
+                ..game
+            },
+        ),
+        (
+            "known-returns",
+            EmitOptions {
+                known_returns: true,
+                ..game
+            },
+        ),
+        ("recommended", recommended_set()),
+        ("recommended+windows", recommended_windows_set()),
+    ];
+    let lifted = LIFTED.get();
+    let mut list = String::new();
+    for (name, mode) in options {
+        MODE.set(Some(mode));
+        let mut text = String::new();
+        kernel_code(&mut text);
+        writeln!(list, "{name} {} {}", text.len(), text.lines().count()).expect("write");
+    }
+    MODE.set(None);
+    LIFTED.set(lifted);
+    std::fs::write(dir.join("kernels.txt"), list).expect("write");
 }
 
 include!("src/programs.rs");
@@ -1651,6 +2000,396 @@ fn q_pair_code(out: &mut String) {
 /// splits the run), each followed by an SVC. Lifted with
 /// `EmitOptions::vector_float_runs` (`vector_run_code`) and without
 /// (`vector_run_reference`), with the game's other options.
+/// Programs for `tests/smallest_normal.rs`: each multiply, divide, fused
+/// operation and narrowing conversion the inline options take natively,
+/// alone, and a vector float run and a scalar float run of multiplies,
+/// lifted with every inline and run option on and with none (the helpers
+/// alone).
+fn smallest_normal_code(out: &mut String) {
+    const BASE: u64 = 0x2c0_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const NOP: u32 = 0xd503_201f;
+    let single: &[u32] = &[
+        0x1e22_0820, // FMUL S0, S1, S2
+        0x1e22_8820, // FNMUL S0, S1, S2
+        0x1e22_1820, // FDIV S0, S1, S2
+        0x1f02_0c20, // FMADD S0, S1, S2, S3
+        0x1f22_0c20, // FNMADD S0, S1, S2, S3
+        0x1f02_8c20, // FMSUB S0, S1, S2, S3
+        0x1e62_0820, // FMUL D0, D1, D2
+        0x1e62_1820, // FDIV D0, D1, D2
+        0x1f42_0c20, // FMADD D0, D1, D2, D3
+        0x6e22_dc20, // FMUL V0.4S, V1.4S, V2.4S
+        0x6e62_dc20, // FMUL V0.2D, V1.2D, V2.2D
+        0x4e22_cc20, // FMLA V0.4S, V1.4S, V2.4S
+        0x4ea2_cc20, // FMLS V0.4S, V1.4S, V2.4S
+        0x4f82_1020, // FMLA V0.4S, V1.4S, V2.S[0]
+        0x6e22_fc20, // FDIV V0.4S, V1.4S, V2.4S
+        0x4e22_dc20, // FMULX V0.4S, V1.4S, V2.4S
+        0x4e62_dc20, // FMULX V0.2D, V1.2D, V2.2D
+        0x5e22_dc20, // FMULX S0, S1, S2
+        0x4f82_9020, // FMUL V0.4S, V1.4S, V2.S[0]
+        0x4e22_fc20, // FRECPS V0.4S, V1.4S, V2.4S
+        0x4ea2_fc20, // FRSQRTS V0.4S, V1.4S, V2.4S
+        0x1e62_4020, // FCVT S0, D1
+    ];
+    let mut programs: Vec<Vec<u32>> = single.iter().map(|&word| vec![word]).collect();
+    // A vector float run (FMUL V0.4S and V4.4S, the same operands) and a
+    // scalar float run of eight FMUL S, neither first nor last in its
+    // block.
+    programs.push(vec![NOP, 0x6e22_dc20, 0x6e22_dc24, NOP]);
+    let mut run = vec![NOP];
+    for index in 0..8 {
+        run.push(if index % 2 == 0 {
+            0x1e22_0820
+        } else {
+            0x1e22_0824
+        });
+    }
+    run.push(NOP);
+    programs.push(run);
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    for program in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "smallest_normal".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("smallest_normal");
+    for (name, on) in [
+        ("smallest_normal_code", true),
+        ("smallest_normal_reference", false),
+    ] {
+        let options = EmitOptions {
+            inline_vector: on,
+            whole_vector_checks: on,
+            inline_vector_unary: on,
+            inline_vector_int: on,
+            inline_vector_pairwise: on,
+            inline_fp_scalar: on,
+            inline_vector_misc: on,
+            vector_float_runs: on,
+            float_runs: on,
+            fp_status_locals: on,
+            ..EmitOptions::default()
+        };
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/memory_faults.rs`: every plain load and store form
+/// (each size, sign extension, writeback, S/D/Q, pairs) and the exclusive,
+/// ordered, atomic and SP-based forms, each alone (an exclusive pair
+/// together), lifted with the build's options.
+fn memory_fault_code(out: &mut String) {
+    const BASE: u64 = 0x2e0_0000;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let forms: &[(&str, &[u32])] = &[
+        ("ldrb w0, [x1]", &[0x3940_0020]),
+        ("ldrh w0, [x1]", &[0x7940_0020]),
+        ("ldr w0, [x1]", &[0xb940_0020]),
+        ("ldr x0, [x1]", &[0xf940_0020]),
+        ("ldrsb x0, [x1]", &[0x3980_0020]),
+        ("ldrsh w0, [x1]", &[0x79c0_0020]),
+        ("ldrsw x0, [x1]", &[0xb980_0020]),
+        ("strb w2, [x1]", &[0x3900_0022]),
+        ("strh w2, [x1]", &[0x7900_0022]),
+        ("str w2, [x1]", &[0xb900_0022]),
+        ("str x2, [x1]", &[0xf900_0022]),
+        ("ldr x0, [x1, #8]!", &[0xf840_8c20]),
+        ("str x2, [x1], #-8", &[0xf81f_8422]),
+        ("ldur x0, [x1, #-1]", &[0xf85f_f020]),
+        ("ldr s0, [x1]", &[0xbd40_0020]),
+        ("ldr d0, [x1]", &[0xfd40_0020]),
+        ("ldr q0, [x1]", &[0x3dc0_0020]),
+        ("str d0, [x1]", &[0xfd00_0020]),
+        ("str q0, [x1]", &[0x3d80_0020]),
+        ("ldp x0, x3, [x1]", &[0xa940_0c20]),
+        ("stp x2, x3, [x1]", &[0xa900_0c22]),
+        ("ldp w0, w3, [x1]", &[0x2940_0c20]),
+        ("ldxr x0, [x1]", &[0xc85f_7c20]),
+        ("ldxr w0, [x1]", &[0x885f_7c20]),
+        ("ldaxr x0, [x1]", &[0xc85f_fc20]),
+        ("stxr w4, x2, [x1]", &[0xc804_7c22]),
+        (
+            "ldxr x0, [x1]; stxr w4, x2, [x1]",
+            &[0xc85f_7c20, 0xc804_7c22],
+        ),
+        ("ldar x0, [x1]", &[0xc8df_fc20]),
+        ("stlr x2, [x1]", &[0xc89f_fc22]),
+        ("ldapr x0, [x1]", &[0xf8bf_c020]),
+        ("cas x0, x2, [x1]", &[0xc8a0_7c22]),
+        ("ldadd x2, x0, [x1]", &[0xf822_0020]),
+        ("swp x2, x0, [x1]", &[0xf822_8020]),
+        ("ldr x0, [sp]", &[0xf940_03e0]),
+        ("str x2, [sp, #8]", &[0xf900_07e2]),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    for (name, program) in forms {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "memory_fault".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("memory_fault");
+    {
+        let name = "memory_fault_code";
+        let (root, regions) = split(&translation, options());
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/fp_mode_groups.rs`: consecutive scalar float
+/// operations `EmitOptions::hoist_fp_mode` groups, alone, with an MSR FPSR
+/// (which can clear IXC) or MSR FPCR among them, in double precision, and
+/// with a compare and FMAX; lifted with the build's options, every inline
+/// path and `hoist_fp_mode` (`fp_mode_group_code`), and with the helpers
+/// alone (`fp_mode_group_reference`).
+fn fp_mode_group_code(out: &mut String) {
+    const BASE: u64 = 0x2f0_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    const SINGLES: [u32; 5] = [
+        0x1e22_0820, // FMUL S0, S1, S2
+        0x1e21_2803, // FADD S3, S0, S1
+        0x1e22_1864, // FDIV S4, S3, S2
+        0x1f01_0c85, // FMADD S5, S4, S1, S3
+        0x1e20_38a6, // FSUB S6, S5, S0
+    ];
+    const MSR_FPSR_X5: u32 = 0xd51b_4425;
+    const MSR_FPCR_X6: u32 = 0xd51b_4406;
+    let with = |at: usize, word: u32| {
+        let mut program = SINGLES.to_vec();
+        program.insert(at, word);
+        program
+    };
+    let programs: Vec<(&str, Vec<u32>)> = vec![
+        ("singles", SINGLES.to_vec()),
+        ("msr fpsr inside", with(2, MSR_FPSR_X5)),
+        ("msr fpcr inside", with(2, MSR_FPCR_X6)),
+        ("msr fpsr after the first", with(1, MSR_FPSR_X5)),
+        (
+            "doubles",
+            vec![
+                0x1e62_0820, // FMUL D0, D1, D2
+                0x1e61_2803, // FADD D3, D0, D1
+                0x1e62_1864, // FDIV D4, D3, D2
+            ],
+        ),
+        (
+            "compare and max",
+            vec![
+                0x1e22_0820, // FMUL S0, S1, S2
+                0x1e22_2020, // FCMP S1, S2
+                0x1e22_4827, // FMAX S7, S1, S2
+                0x1e21_2803, // FADD S3, S0, S1
+            ],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    for (name, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "fp_mode_group".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("fp_mode_group");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        inline_fp_scalar: true,
+        fp_status_locals: true,
+        hoist_fp_mode: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("fp_mode_group_code", grouped),
+        ("fp_mode_group_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/mxcsr_groups.rs`: each vector form an MXCSR group
+/// takes (`EmitOptions::mxcsr_groups`), alone (a group of one), and a chain
+/// of them reusing registers, lifted with the build's options, every
+/// inline path, vector float runs and MXCSR groups (`mxcsr_group_code`),
+/// and with the helpers alone (`mxcsr_group_reference`).
+fn mxcsr_group_code(out: &mut String) {
+    const BASE: u64 = 0x300_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let programs: Vec<(&str, bool, Vec<u32>)> = vec![
+        ("fadd 4s", true, vec![0x4e22_d420]),
+        ("fsub 4s", true, vec![0x4ea2_d420]),
+        ("fmul 4s", true, vec![0x6e22_dc20]),
+        ("fdiv 4s", true, vec![0x6e22_fc20]),
+        ("fmla 4s", true, vec![0x4e22_cc20]),
+        ("fmls 4s", true, vec![0x4ea2_cc20]),
+        ("fmul 2s", true, vec![0x2e22_dc20]),
+        ("fmul 4s by element", true, vec![0x4fa2_9020]),
+        ("fmla 4s by element", true, vec![0x4fa2_1820]),
+        ("fadd 2d", false, vec![0x4e62_d420]),
+        ("fmul 2d", false, vec![0x6e62_dc20]),
+        ("fdiv 2d", false, vec![0x6e62_fc20]),
+        ("fmla 2d", false, vec![0x4e62_cc20]),
+        ("fmul 2d by element", false, vec![0x4fc2_9820]),
+        (
+            "chain 4s",
+            true,
+            vec![
+                0x6e22_dc23,
+                0x4e21_d464,
+                0x4ea2_d483,
+                0x6e23_dc64,
+                0x4e21_cc80,
+            ],
+        ),
+        ("fabd 4s", true, vec![0x6ea2_d420]),
+        ("fmulx 4s", true, vec![0x4e22_dc20]),
+        ("fmax 4s", true, vec![0x4e22_f420]),
+        ("fmin 4s", true, vec![0x4ea2_f420]),
+        ("fmaxnm 4s", true, vec![0x4e22_c420]),
+        ("fminnm 4s", true, vec![0x4ea2_c420]),
+        ("frecps 4s", true, vec![0x4e22_fc20]),
+        ("frsqrts 4s", true, vec![0x4ea2_fc20]),
+        ("faddp 4s", true, vec![0x6e22_d420]),
+        ("fmaxp 4s", true, vec![0x6e22_f420]),
+        ("fminnmp 4s", true, vec![0x6ea2_c420]),
+        ("fmaxnmp 4s", true, vec![0x6e22_c420]),
+        // Groups shaped like the vnorm, fpairs and misc kernels: forms the
+        // group computes and forms the runs' fast copy computes (FRSQRTE,
+        // scalar FADDP, FMAXV) together.
+        (
+            "vnorm-like",
+            true,
+            vec![
+                0x6e20_dc01,
+                0x6ea1_d822,
+                0x6e22_dc43,
+                0x4ea3_fc23,
+                0x6e23_dc42,
+            ],
+        ),
+        (
+            "fpairs-like",
+            true,
+            vec![0x6e21_d402, 0x6e22_f403, 0x6ea1_c464, 0x7e30_d884],
+        ),
+        (
+            "misc-like",
+            true,
+            vec![0x6ea1_d403, 0x4e21_dc64, 0x6e30_f884, 0x4e24_d400],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    let mut singles = Vec::new();
+    for (name, single, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        singles.push(*single);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "mxcsr_group".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("mxcsr_group");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        vector_float_runs: true,
+        mxcsr_groups: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("mxcsr_group_code", grouped),
+        ("mxcsr_group_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "pub const SINGLES: &[bool] = &{singles:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
 fn vector_run_code(out: &mut String) {
     use echora_lift::aarch64::{Instruction, decode};
 
@@ -1737,7 +2476,25 @@ fn vector_run_code(out: &mut String) {
             vector_float_runs: runs,
             ..options()
         };
-        let (root, regions) = split(&translation, options);
+        // The runs' lift has every per-instruction inline option in every
+        // other region as well, so a run's exact copy is in some regions
+        // those options' code and in the others the helpers'.
+        let (root, regions) = if runs {
+            split_alternate(
+                &translation,
+                options,
+                EmitOptions {
+                    inline_vector_unary: true,
+                    inline_vector_int: true,
+                    inline_vector_pairwise: true,
+                    inline_fp_scalar: true,
+                    inline_vector_misc: true,
+                    ..options
+                },
+            )
+        } else {
+            split(&translation, options)
+        };
         let formed: usize = regions
             .iter()
             .map(|(_, source)| source.matches("let o0 = ").count())
@@ -1773,7 +2530,11 @@ fn vector_run_code(out: &mut String) {
 ///   (an inlined successor's, and the window loop's after each block; a
 ///   window still stores the PC when it leaves);
 /// - `memory`: guest loads and stores without the reservation and
-///   alignment tests (volatile accesses at the host address).
+///   alignment tests (volatile accesses at the host address);
+/// - `stop`: structured functions (`regalloc`) without their stop word
+///   tests at entries, loop heads and call returns;
+/// - `steps`: structured functions without their per-block step adds
+///   (`*n += count`).
 fn ablate(source: &str, ablations: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let on = |name: &str| ablations.split(',').any(|a| a.trim() == name);
@@ -1781,6 +2542,12 @@ fn ablate(source: &str, ablations: &str) -> String {
     for (index, line) in lines.iter().enumerate() {
         let next = lines.get(index + 1).copied().unwrap_or("");
         if on("charges") && line.starts_with("if !m.charge_block_at(") {
+            continue;
+        }
+        if on("stop") && line.starts_with("if m.steps + *n + ") && line.contains("m.stop.load(") {
+            continue;
+        }
+        if on("steps") && line.starts_with("*n += ") && line.ends_with(';') {
             continue;
         }
         if on("pc") {
@@ -1960,6 +2727,13 @@ fn kernel_code(out: &mut String) {
     }
     // Not in the golden hashes' emissions (which hash this module's text).
     if MODE.get().is_none() {
+        writeln!(
+            out,
+            "/// What keeps the kernels' vector float operations out of runs (`echora_lift::vector_float_report`).\npub const VECTOR_FLOAT_REPORT: &str = {:?};",
+            echora_lift::vector_float_report::vector_float_report(&translation, 16, None, None)
+                .to_string()
+        )
+        .expect("write");
         writeln!(
             out,
             "/// The census of the kernels' windows (`echora_lift::census::table`).\npub const KERNEL_CENSUS: &str = {:?};",
@@ -3405,7 +4179,17 @@ fn plt_code(out: &mut String) {
     );
     let direct = regions
         .iter()
-        .map(|(_, source)| source.matches("m.call_window(").count())
+        .map(|(_, source)| {
+            source
+                .split("m.call_window(")
+                .skip(1)
+                .filter(|call| {
+                    call.split(')')
+                        .next()
+                        .is_some_and(|arguments| arguments.contains(", run_window_"))
+                })
+                .count()
+        })
         .sum::<usize>();
     // The direct call runs only when X17 holds the predicted word.
     let guarded = regions
@@ -3669,7 +4453,22 @@ fn float_run_code(out: &mut String) {
             float_runs,
             ..options()
         };
-        let (root, regions) = split(&translation, options);
+        // The runs' lift (not in the golden emissions) has
+        // `inline-fp-scalar` in every other region as well, so a run's
+        // FSQRT in its exact copy is in some regions that option's code.
+        let (root, regions) = if float_runs && MODE.get().is_none() {
+            split_alternate(
+                &translation,
+                options,
+                EmitOptions {
+                    inline_vector: true,
+                    inline_fp_scalar: true,
+                    ..options
+                },
+            )
+        } else {
+            split(&translation, options)
+        };
         writeln!(out, "pub mod {name} {{").expect("write");
         writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
         writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");

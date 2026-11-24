@@ -53,10 +53,11 @@ pub const KERNEL_ENTRIES: &[(&str, u64)] = &[
     ("crossing", 0x5800),
     ("gamefn", 0x6400),
     ("vcalls", 0x6c00),
+    ("vchain", 0x7400),
 ];
 
 /// Bytes of the image: whole 1 KiB windows.
-pub const KERNEL_SIZE: u64 = 0x7400;
+pub const KERNEL_SIZE: u64 = 0x7800;
 
 /// The functions `vcalls` calls through its table of function pointers
 /// (their own window): entries for discovery, which cannot see them.
@@ -879,6 +880,41 @@ fn assemble() -> Assembler {
         ; str w1, [x0, 4]
         ; add x0, x1, 7
         ; ret
+    );
+    align(&mut ops, 1024);
+    dynasm!(ops
+        ; .arch aarch64
+        // Long straight chains of 4S multiplies, adds and subtracts, V
+        // registers reused, as the game's hottest structured functions
+        // compute: two vectors in, twelve operations, one vector out. x0 =
+        // repetitions, x1 = source, x2 = destination, x3 = elements.
+        ; ->vchain:
+        ; l1:
+        ; mov x6, x1
+        ; mov x7, x2
+        ; mov x8, x3
+        ; l2:
+        ; ldr q0, [x6], 16
+        ; ldr q1, [x6], 16
+        ; fmul v2.s4, v0.s4, v1.s4
+        ; fadd v3.s4, v2.s4, v0.s4
+        ; fsub v4.s4, v3.s4, v1.s4
+        ; fmul v5.s4, v4.s4, v2.s4
+        ; fadd v2.s4, v5.s4, v3.s4
+        ; fsub v3.s4, v2.s4, v4.s4
+        ; fmul v4.s4, v3.s4, v0.s4
+        ; fadd v5.s4, v4.s4, v1.s4
+        ; fsub v2.s4, v5.s4, v3.s4
+        ; fmul v3.s4, v2.s4, v1.s4
+        ; fadd v4.s4, v3.s4, v5.s4
+        ; fsub v5.s4, v4.s4, v0.s4
+        ; str q5, [x7], 16
+        ; subs x8, x8, 1
+        ; b.ne <l2
+        ; subs x0, x0, 1
+        ; b.ne <l1
+        ; svc 7
+        ; udf 0
     );
     ops
 }
