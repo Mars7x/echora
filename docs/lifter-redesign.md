@@ -219,6 +219,52 @@ functions run as 334 pieces, none left to the windows, and every run
 (whole, sliced, budgets) ends with the default emission's state; a
 lifter test splits a 1,600-block loop.
 
+**Hang with `regalloc-split-capped` (coordinator, candidate 6, cloud/lift
+da4ab9f): not reproduced yet.** The game hangs after the opening movie
+with guest-worker-1 in `run_function_7101692860` (crate
+gen-r-10000710169) and FP fallbacks; candidate 3 without the option runs.
+What was checked:
+
+- `tests/split_loops.rs` (new): a loop crossing piece boundaries, its
+  exit decided by an FCMP, a mid-loop exit decided by another, branches
+  inside the body; and a 1,200-block function (past the old block
+  limit) with a frame, leaf calls storing and loading memory inside the
+  loop, called three times by a caller holding a register across the
+  calls. Each as windows, as functions without pieces, and in pieces
+  under the default cap and three smaller ones: registers, vector
+  registers, flags, FPSR, memory, steps and every host boundary agree,
+  whole and in slices of many lengths (every piece boundary crossed both
+  ways, every entry resumed at).
+- The whole `echora-aot-tests` suite with the game set, every regalloc
+  option and `regalloc-split-capped` with a new test-only feature,
+  `regalloc-tiny-caps` (every structured function capped at 6 KB of
+  Rust, so every program's functions run in pieces), and again with
+  `mxcsr-groups` and `small-address-space` on the semantic, SIMD, FP,
+  loop, call, switch, exclusive, atomic, stress and kernel-call suites:
+  all equivalence tests pass (only count checks of how much is emitted
+  structured move).
+
+Changed meanwhile: the driver goes on only where the piece it ran left
+by one of its own edges to another piece; anywhere else (a return, a
+callee or the piece handing back, a failed stop-word test) it returns,
+as a function does. Before it also re-entered pieces at any entry, also
+after a callee handed back there; I found no case where that ran wrong,
+but it was not the design. A component holding the function's entry is
+now cut below that entry. And `ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT`
+(EmitOptions::regalloc_split_block_limit) sets the block limit under the
+option: `1024` keeps exactly the functions of candidate 3 and splits
+only those over the size caps, which tells the two halves of the option
+apart.
+
+To find it: rerun candidate 6 with `ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT=1024`
+(hang gone: the newly lifted functions past 1,024 blocks or their
+callers; still there: the pieces of capped functions), and with the
+option on only for region 0x710169; the lift log lists the functions run
+in pieces ("run in structured pieces"), so whether 0x7101692860 is one
+of them, or calls one, says which code to look at. Its guest code (the
+function's blocks and the pieces' entries from the emitted crate) is
+what a reproduction needs.
+
 For the third (structured code run as windows), two opt-in options:
 
 - `regalloc-return-entries`: the blocks a structured function's own
