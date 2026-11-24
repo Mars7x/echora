@@ -1367,6 +1367,172 @@ misc (FRSQRTE, scalar FADDP and FMAXV among the group's own operations):
 Without the signed-zero correction of FMAX, with the pairs' evens taken as
 odds, or with FABD's sign kept, it fails.
 
+**A fix: forms the group does not compute.** From 10d9d8f, when groups
+took the runs' own forms (`run_other_op`), `vector_group_mxcsr` sent every
+vector and by-element float form down its arithmetic path, whose
+catch-all arms were FMLS's (`mx_mul_sub`, and `arith_lane`'s `(-x) * y +
+z`): a committed group computed FCMGT, FCMGE, FCMEQ, 2S and 2D FMAX and
+FMIN, FABD and FMULX as a negated product (a game's angle-wrap loop of
+FRINTM, FMUL, FSUB, FCMGT, BSL, FMAX and FCMEQ hung on it). Those arms now
+take only `mxcsr_group_op`'s forms, the rest go to `run_other`, and the
+arithmetic matches name each form (`unreachable!` otherwise), as the
+scalar groups' do. `tests/mxcsr_forms.rs` covers every form a group
+admits (649, found by decoding the SIMD space), each alone, after an FMUL
+and before an FADD, and the angle-wrap block in 2S and 4S, from normal
+operands with IXC set so the groups commit: 389,800 runs, without regalloc
+and with it, none differing; before the fix 73 programs differed, both
+angle-wrap blocks among them.
+
+**Scalar groups.** With `mxcsr-groups`, consecutive scalar FADD, FSUB,
+FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT, FABS, FNEG and FMOV
+(single and double) and FCVT between single and double form a scalar
+group (`scalar_groups_in`, `crate::simd::scalar_group_mxcsr`): one mode
+test, MXCSR cleared, each operation as the host's scalar SSE instruction
+(the negated fused forms as `mul_add` of negated operands: negation is
+exact, so still one rounding), each arithmetic result's magnitude tracked
+in scalar extremes per precision (`mx_track_scalar32`,
+`mx_track_scalar64`), one test and one MXCSR read at the end, the exact
+copy on any hit. FCVT to double raises DE for a denormal single; to
+single it raises IE, DE, OE and UE, and the extremes see a result that
+rounds to the smallest normal. FABS, FNEG and FMOV are bit operations on
+both sides (NaNs included) and are not tracked. A result is written
+zero-extended, as Arm writes a scalar. A float run holding a load keeps
+its own fast copy (no group overlaps it); the other float runs give way.
+
+| kernel | c58f197 | + scalar groups | regalloc | + scalar groups |
+|---|---|---|---|---|
+| floats | 16.50 | 10.00 (-39%) | 16.33 | 10.17 (-38%) |
+| scalar | 23.50 | 15.63 (-34%) | 23.49 | 16.29 (-31%) |
+| fpscalar | 66.07 | 45.47 (-31%) | 64.96 | 44.24 (-32%) |
+| floatld, vchain | | unchanged | | unchanged |
+
+(Both sides with `vector-float-runs`, `float-run-loads` and
+`mxcsr-groups`.) fpscalar gains from its FCVT and FSQRT although its
+conversions to and from integers (SCVTF, FCVTZS) still take their own
+paths; floatld's run holds its loads. `.text` within 400 bytes. The
+test holds every scalar form alone, a floats-shaped chain of twelve and
+doubles with conversions to single and back: 196,000 runs, with FMA,
+without it and with regalloc, none differing; it fails without the
+scalar tracking or with FMSUB's product sign kept.
+
+**Conversions and compares in scalar groups.** A scalar group also takes
+SCVTF and UCVTF (from a general register or a SIMD one), FCVT{N,P,M,Z,A}
+{S,U} to a general register and FCMP and FCMPE, single and double; these
+join a group but form none alone (each inline path tests as cheaply on
+its own, and a group of them would only add the MXCSR clear and read).
+SCVTF and UCVTF are the host's conversions, which round to nearest as
+Arm's do and raise nothing but the inexact flag the group requires
+sticky. A conversion to an integer is the inline path's: its operand
+normal or zero and its rounded value in range, accumulated into the
+group's `good`; its general register is written with the group's other
+results, and a later SCVTF in the group reads it back. FCMP needs both
+operands zero, normal or infinite and writes NZCV with the other results.
+A register holding a result the group tracked needs neither test again:
+the final test passes it only if it is zero, normal or infinite. The
+counts below are against 0898c4d, the line above with mxcsr-groups.
+
+| kernel | 0898c4d | + conversions, FCMP | regalloc | + conversions, FCMP |
+|---|---|---|---|---|
+| fpscalar | 45.47 | 36.00 (-21%) | 44.24 | 34.76 (-21%) |
+| scalar | 15.63 | 15.00 (-4%) | 16.29 | 14.56 (-11%) |
+| floats, vchain, convert | | unchanged | | unchanged |
+
+scalar's FCMP compares the group's own FMADD result with a load. Without
+the skip of a tracked operand's test it measured 16.13 (+3%) and 16.12
+(-1%). `.text` grew under 1 KB. The test adds
+each form after an FMUL of an unrelated register, a chain whose FCVTZS
+result a later SCVTF reads, and an FCMP feeding the block's branch; X0-X4
+hold integers at each width's edges, the float pools add the conversions'
+limits, ties and -0.5, and the general registers and NZCV are compared
+too: 276,000 runs, without regalloc and with it, none differing. It fails
+without the range test, the operand tests of FCVT and FCMP, the flags'
+order, the read back of a written general register, either commit, or
+with every register taken as tracked. Two checks back each other up: the
+range test's upper bound (2^63 and 2^64 also raise the host's IE) and
+the IE flag (every IE in a scalar group also fails a range or operand
+test or makes a NaN the tracking sees). Each mutated alone passes; both
+together fail. The test first ran each form after an FMUL of its own
+operands, whose NaNs and denormals sent every such group to the exact
+copy: the operand tests' mutations passed until the FMUL read V3.
+
+**Special lanes.** A lane holding an infinity, a zero result of one, a
+NaN or a denormal (as a vector's padding lane often does) fails the
+inline paths' test and takes the exact single-lane helper. Two changes
+make those lanes cheaper; their results and flags are the exact path's.
+
+The helpers (`echora_simd::native_arith_lane`, always on: the helpers'
+results are unchanged) compute a lane of FADD, FSUB, FMUL, FDIV and the
+fused forms natively, with FPSR.IXC set, when IEEE's result is Arm's and
+raises nothing new: denormal operands flushed to zeros of their sign
+under FZ (raising IDC) and else computed as they are; a result that is
+normal (not the smallest normal of a product, quotient or fused result),
+infinite only from an infinite operand (an infinity divided by zero
+included), or an exact zero (of a sum, of a zero operand, of a quotient
+by an infinity, of a fused sum that cancels in single precision); and
+quiet NaN operands, whose result is FPProcessNaNs's (the first in Arm's
+order, the addend first and FMLS's operand negated, or the default NaN
+under DN). A signalling NaN, a NaN the operation makes (IOC), a quiet NaN
+addend of an infinity times zero, a denormal result, an overflow and a
+division by zero take the exact path. `binary_lane` used this in place of
+its narrower test, `ternary_lane` (which had none) uses it, the
+whole-vector helpers' per-lane fallback (`mixed_lane`) no longer tests an
+arithmetic lane twice, and the mode test's trap is out of line.
+
+`special-lanes` (`EmitOptions::special_lanes`, with `inline-vector` and
+`whole-vector-checks`) takes the same lanes in the lifted per-lane loop of
+FADD, FSUB, FMUL, FDIV, FMLA and FMLS: after the ordinary test refuses a
+lane, infinite operands (no NaN or denormal) whose result is an infinity
+or a quotient's zero by an infinite divisor keep the host's result, and
+quiet NaN operands (no signalling NaN or denormal; no infinity times zero
+with a NaN addend) take FPProcessNaNs's; only the rest call the helper.
+The extra tests run only for refused lanes.
+
+Counted on the vector kernels and on the same kernels with every fourth
+single lane, in turn, an infinity, a zero, a quiet NaN and a denormal
+(`-special`, `SPECIAL_KERNELS` in the bench), against da4ab9f:
+
+| kernel | da4ab9f | helpers | + special-lanes | regalloc | helpers | + special-lanes |
+|---|---|---|---|---|---|---|
+| vector-special | 239.21 | 231.82 (-3%) | 196.51 (-18%) | 236.21 | 228.82 (-3%) | 194.35 (-18%) |
+| vchain-special | 394.21 | 357.81 (-9%) | 299.31 (-24%) | 390.41 | 354.00 (-9%) | 298.79 (-23%) |
+| vnorm-special | 323.21 | 300.09 (-7%) | 269.45 (-17%) | 320.31 | 297.19 (-7%) | 267.89 (-16%) |
+| misc-special | 265.19 | 263.67 (-1%) | 258.13 (-3%) | 262.60 | 261.08 (-1%) | 255.32 (-3%) |
+| fpairs-special | 169.66 | 165.76 (-2%) | 165.76 (-2%) | 168.44 | 164.54 (-2%) | 164.54 (-2%) |
+| vchain | 8.18 | 8.18 | 8.30 (+1%) | 7.95 | 7.95 | 8.04 (+1%) |
+| vnorm | 20.30 | 20.30 | 20.10 (-1%) | 20.80 | 20.80 | 20.14 (-3%) |
+| vector, misc, fpairs | | unchanged | within 1% | | unchanged | within 1% |
+
+The special kernels cost 20 to 50 times the plain ones: most of it is
+the lifted per-lane loop around each helper call (62% of vector-special's
+instructions) and the call's entry (about 57 instructions). The first
+version of the helper rule computed every lane before refusing its NaN
+result and tested again inside the lifted loop for every lane: it made
+vector-special 7% and vchain-special 7% slower and, with special-lanes,
+16% and 21%; testing quiet NaN operands first and the special tests only
+for refused lanes reversed it. `.text` grew under 1 KB (helpers) and
+about 5 KB (special-lanes, game set).
+
+The helper rule is tested in `echora-simd`
+(`special_lanes_run_natively_as_the_exact_path`): every pair and triple
+of 21 single and 17 double values (normal, smallest normal, denormal,
+zero, infinite, signalling and quiet NaN, overflowing and underflowing)
+in every FZ/DN mode, vector FADD, FSUB, FMUL, FDIV, FABD, FMULX, FMLA,
+FMLS and scalar FMADD, FMSUB, FNMADD, FNMSUB, against the exact path
+(FPSR.IXC clear): 96,174 lanes native, none differing. It fails without
+the FZ flush, IDC, the infinite-operand condition, the smallest-normal
+exclusion, any of the zero rules, the fused negations' order, the NaN
+order, the negated NaN operands, the signalling NaN or invalid product
+exclusions, IDC on the NaN path or the default NaN. Three checks first
+written proved redundant under mutation and went: a zero divisor
+(normal / 0 makes an infinity of no infinite operand; infinity / 0 is
+exact), NaN operands (they make NaNs) and the refusal of denormals
+without FZ (the host rounds them as Arm does). `tests/special_lanes.rs`
+lifts each form (4S, 2S, 2D, by element, a chain) with special-lanes
+against the helpers: 64,000 runs, none differing; it fails without the
+infinite-operand condition, the quotient's divisor test, the operand
+tests, the signalling NaN or denormal exclusions, the invalid product,
+the NaN order, FMLS's negation or the default NaN.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's

@@ -11,7 +11,9 @@
 //! infinities, quiet and signalling NaNs and values that overflow, under
 //! FPCR with FZ, DN and round toward minus infinity on and off and FPSR
 //! with and without IXC: the vector registers, FPCR, FPSR and the trap
-//! must agree.
+//! must agree. The scalar groups' conversions and compares run from X0-X4
+//! holding integers at every width's edges, and the general registers and
+//! NZCV must agree as well.
 #![cfg(target_arch = "x86_64")]
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
@@ -44,6 +46,8 @@ const FPSR_IXC: u32 = 1 << 4;
 #[derive(Debug, PartialEq)]
 struct Outcome {
     vectors: [u128; 5],
+    regs: [u64; 5],
+    nzcv: u8,
     fpcr: u32,
     fpsr: u32,
     trap: String,
@@ -53,11 +57,13 @@ fn run(
     dispatch: fn(&mut echora_guest::Core) -> Result<(), Trap>,
     m: &mut Machine,
     entry: u64,
-    vectors: [u128; 5],
+    (vectors, regs): ([u128; 5], [u64; 5]),
     (fpcr, fpsr): (u32, u32),
 ) -> Outcome {
     m.core.cpu.vectors = [0; 32];
     m.core.cpu.vectors[..5].copy_from_slice(&vectors);
+    m.core.cpu.regs[..5].copy_from_slice(&regs);
+    m.core.cpu.nzcv = 0;
     m.core.cpu.fpcr = fpcr;
     m.core.cpu.fpsr = fpsr;
     m.core.cpu.pc = entry;
@@ -67,6 +73,8 @@ fn run(
     };
     Outcome {
         vectors: std::array::from_fn(|index| m.core.cpu.vectors[index]),
+        regs: std::array::from_fn(|index| m.core.cpu.regs[index]),
+        nzcv: m.core.cpu.nzcv,
         fpcr: m.core.cpu.fpcr,
         fpsr: m.core.cpu.fpsr,
         trap,
@@ -93,6 +101,13 @@ const SINGLES: &[u32] = &[
     0x7f80_0001, // a signalling NaN
     0x7f00_0000, // 2^127: products overflow
     0x0100_0000, // 2^-125: products underflow
+    0x4f00_0000, // 2^31, 2^32, 2^63, 2^64, -2^31: conversions' limits
+    0x4f80_0000,
+    0x5f00_0000,
+    0x5f80_0000,
+    0xcf00_0000,
+    0xbf00_0000, // -0.5
+    0x4020_0000, // 2.5: a tie
 ];
 /// The same in double precision.
 const DOUBLES: &[u64] = &[
@@ -112,6 +127,34 @@ const DOUBLES: &[u64] = &[
     0x7ff0_0000_0000_0001,
     0x7fe0_0000_0000_0000,
     0x0020_0000_0000_0000,
+    0x41df_ffff_ffc0_0000, // 2^31 - 1, and less a half
+    0x41df_ffff_ffe0_0000,
+    0x41e0_0000_0000_0000, // 2^31, 2^32 - 1, 2^32, 2^63, -2^63, 2^64
+    0x41ef_ffff_ffe0_0000,
+    0x41f0_0000_0000_0000,
+    0x43e0_0000_0000_0000,
+    0xc3e0_0000_0000_0000,
+    0x43f0_0000_0000_0000,
+    0xbfe0_0000_0000_0000, // -0.5
+    0x4004_0000_0000_0000, // 2.5: a tie
+];
+
+/// General register values: exact and inexact as either float, at the
+/// edges of every integer width, and a bit pattern.
+const INTEGERS: &[u64] = &[
+    0,
+    1,
+    3,
+    0xffff_ffff_ffff_fffd, // -3
+    0x0100_0001,           // 2^24 + 1: inexact as a single
+    0x0020_0000_0000_0001, // 2^53 + 1: inexact as a double
+    0x7fff_ffff,
+    0x8000_0000,
+    0xffff_ffff,
+    0x7fff_ffff_ffff_ffff,
+    0x8000_0000_0000_0000,
+    0xffff_ffff_ffff_ffff,
+    0x1234_5678_9abc_def1,
 ];
 
 /// A xorshift stream, so every run is the same.
@@ -174,13 +217,15 @@ fn groups_match_the_helpers() {
                     random.vector(DOUBLES, 64)
                 }
             });
+            let regs: [u64; 5] =
+                std::array::from_fn(|_| INTEGERS[(random.next() % INTEGERS.len() as u64) as usize]);
             let status = statuses[(random.next() % statuses.len() as u64) as usize];
-            let expected = run(reference::dispatch, &mut m, entry, vectors, status);
-            let actual = run(code::dispatch, &mut m, entry, vectors, status);
+            let expected = run(reference::dispatch, &mut m, entry, (vectors, regs), status);
+            let actual = run(code::dispatch, &mut m, entry, (vectors, regs), status);
             runs += 1;
             if actual != expected && failures.len() < 8 {
                 failures.push(format!(
-                    "{} from {vectors:x?}, {status:x?}: expected {expected:x?}, got {actual:x?}",
+                    "{} from {vectors:x?}, {regs:x?}, {status:x?}: expected {expected:x?}, got {actual:x?}",
                     code::NAMES[index]
                 ));
             }

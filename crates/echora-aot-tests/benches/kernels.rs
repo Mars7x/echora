@@ -217,8 +217,33 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
     None
 }
 
+/// Kernels run again from inputs whose every fourth single-precision lane
+/// (a vector's padding lane) holds, in turn, an infinity, a zero, a quiet
+/// NaN and a denormal: lanes the float paths cannot take as normal numbers.
+/// Each is named after the kernel it runs, with `-special`.
+const SPECIAL_KERNELS: &[&str] = &["vector", "vchain", "vnorm", "misc", "fpairs"];
+
+/// The special-lane inputs (`SPECIAL_KERNELS`): 1.0 in the other lanes.
+fn special_lanes(bytes: usize) -> Vec<u8> {
+    const SPECIAL: [u32; 4] = [0x7f80_0000, 0x0000_0000, 0x7fc0_0000, 0x0001_16c2];
+    (0..bytes / 4)
+        .map(|lane| {
+            if lane % 4 == 3 {
+                SPECIAL[(lane / 4) % 4]
+            } else {
+                1.0_f32.to_bits()
+            }
+        })
+        .flat_map(u32::to_le_bytes)
+        .collect()
+}
+
 /// One run: guest instructions retired and the time taken.
 fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
+    let (name, special) = match name.strip_suffix("-special") {
+        Some(base) => (base, true),
+        None => (name, false),
+    };
     let image = kernels::image();
     let mut m = Machine::with_layout(
         KERNEL_BASE,
@@ -228,9 +253,13 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
         DATA_SIZE,
     );
     // A float pattern for the vector kernel: 1.0 in every lane.
-    let ones: Vec<u8> = std::iter::repeat_n(1.0_f32.to_le_bytes(), (2 * BUFFER / 4) as usize)
-        .flatten()
-        .collect();
+    let ones: Vec<u8> = if special {
+        special_lanes((2 * BUFFER) as usize)
+    } else {
+        std::iter::repeat_n(1.0_f32.to_le_bytes(), (2 * BUFFER / 4) as usize)
+            .flatten()
+            .collect()
+    };
     m.memory
         .write(VECTOR_A, &ones)
         .expect("vector inputs are mapped");
@@ -325,7 +354,22 @@ fn main() {
         "kernel", "instructions", "best ms", "best Minstr/s", "median Minstr/s"
     );
     let mut results: Vec<Result> = Vec::new();
-    for &(name, entry) in KERNEL_ENTRIES {
+    let special: Vec<(String, u64)> = SPECIAL_KERNELS
+        .iter()
+        .map(|&base| {
+            let entry = KERNEL_ENTRIES
+                .iter()
+                .find(|&&(name, _)| name == base)
+                .expect("a special kernel is a kernel")
+                .1;
+            (format!("{base}-special"), entry)
+        })
+        .collect();
+    let all = KERNEL_ENTRIES
+        .iter()
+        .map(|&(name, entry)| (name, entry))
+        .chain(special.iter().map(|(name, entry)| (name.as_str(), *entry)));
+    for (name, entry) in all {
         if options
             .filter
             .as_deref()

@@ -115,6 +115,9 @@ hoist-fp-mode = []
 # With inline-vector on x86-64: vector float groups checked by the host's
 # exception flags (EmitOptions::mxcsr_groups).
 mxcsr-groups = []
+# With inline-vector and whole-vector-checks: lanes with infinite operands
+# whose results are exact run natively (EmitOptions::special_lanes).
+special-lanes = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []

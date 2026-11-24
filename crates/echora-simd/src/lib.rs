@@ -60,24 +60,33 @@ struct Mode {
 
 fn mode(cpu: &Cpu) -> Result<Mode, Trap> {
     let fpcr = cpu.fpcr;
-    if fpcr & FPCR_RMODE != 0 {
-        return Err(Trap::InvalidState {
-            message: format!(
-                "FPCR rounding mode {} is not implemented at {:#x}",
-                (fpcr >> 22) & 3,
-                cpu.pc
-            ),
-        });
-    }
-    if fpcr & (FPCR_AH | FPCR_FZ16) != 0 {
-        return Err(Trap::InvalidState {
-            message: format!("FPCR.AH/FZ16 behaviour is not implemented at {:#x}", cpu.pc),
-        });
+    if fpcr & (FPCR_RMODE | FPCR_AH | FPCR_FZ16) != 0 {
+        return Err(mode_error(cpu));
     }
     Ok(Mode {
         fz: fpcr & FPCR_FZ != 0,
         dn: fpcr & FPCR_DN != 0,
     })
+}
+
+/// The trap for an FPCR `mode` does not implement (out of the hot path).
+#[cold]
+#[inline(never)]
+fn mode_error(cpu: &Cpu) -> Trap {
+    let fpcr = cpu.fpcr;
+    if fpcr & FPCR_RMODE != 0 {
+        Trap::InvalidState {
+            message: format!(
+                "FPCR rounding mode {} is not implemented at {:#x}",
+                (fpcr >> 22) & 3,
+                cpu.pc
+            ),
+        }
+    } else {
+        Trap::InvalidState {
+            message: format!("FPCR.AH/FZ16 behaviour is not implemented at {:#x}", cpu.pc),
+        }
+    }
 }
 
 /// Raw-bit view of one IEEE format.
@@ -404,6 +413,9 @@ fn rounded(format: Format, size: FpSize, op: FpBinaryOp, a: u64, b: u64, raw: u6
 
 pub fn fp_unary(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> Result<(), Trap> {
     let value = read_fp(cpu, rn, size);
+    if stats::enabled() {
+        stats::note_scalar("fp_unary", &format!("{op:?}"), cpu, size, &[value]);
+    }
     let format = Format::of(size);
     let result = match op {
         // FMOV, FABS and FNEG are bitwise and never trap or flush.
@@ -475,6 +487,10 @@ fn round<T: Rint>(value: T, rounding: Rounding) -> T {
 }
 
 pub fn fp_convert(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Result<(), Trap> {
+    if stats::enabled() {
+        let value = read_fp(cpu, rn, from);
+        stats::note_scalar("fp_convert", &format!("to {to:?}"), cpu, from, &[value]);
+    }
     let mode = mode(cpu)?;
     let source = Format::of(from);
     let target = Format::of(to);
@@ -597,52 +613,172 @@ fn fp_binary_exact(
     Ok(())
 }
 
-/// One lane of a two-operand FP operation (FPProcessNaNs, then the op).
-fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
-    let size = fp.size;
+/// The arithmetic `native_arith_lane` computes: a two-operand operation, or
+/// the fused `(±n) * m + (±a)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// `negate_product`, `negate_addend`.
+    Fused(bool, bool),
+}
+
+/// One lane natively when that is Arm's exact result and raises nothing
+/// new: FPSR.IXC set (sticky); denormal operands flushed to zeros of their
+/// sign under FPCR.FZ (FPUnpack, raising IDC), and else computed as they
+/// are (the host rounds them as Arm does); and a result that is normal (not
+/// the smallest normal of a product, quotient or fused result, which may
+/// have been tiny before rounding), infinite only from an infinite operand
+/// (IEEE's arithmetic on infinities is exact and raises nothing, an
+/// infinity divided by zero included; an overflow, or a finite number
+/// divided by zero, raises OFC or DZC), or zero only when exact (a sum's, a
+/// product's or quotient's of a zero operand, a quotient by an infinity, a
+/// fused result of a zero product and a zero addend). Every other result
+/// takes the exact path: a denormal (an underflow), and a NaN, whose
+/// default and propagated values on the host differ from Arm's (a NaN
+/// operand always makes one).
+fn native_arith_lane(fp: &mut Fp<'_>, op: Arith, a: u64, b: u64, c: u64) -> Option<u64> {
+    if fp.cpu.fpsr & FPSR_IXC == 0 {
+        return None;
+    }
     let format = fp.format;
-    // With FPSR.IXC already set (it is sticky), the arithmetic of normal
-    // numbers and zeros with a normal or exact zero result raises nothing
-    // new, and the host's round-to-nearest result is the Arm one (FPCR's
-    // other rounding modes stop in `mode`): no flag or NaN work is needed.
-    // A zero result is exact when an operand is zero or an addition cancels
-    // exactly; from a product or quotient of normals it is an underflow.
-    // Anything else (division by zero, denormals, infinities, NaNs,
-    // overflow, underflow) takes the exact path.
-    if matches!(
-        op,
-        FpBinaryOp::Add | FpBinaryOp::Sub | FpBinaryOp::Mul | FpBinaryOp::Div
-    ) && fp.cpu.fpsr & FPSR_IXC != 0
-    {
-        let exponent = format.exponent_mask();
-        let normal = |value: u64| {
-            let field = value & exponent;
-            field != 0 && field != exponent
-        };
-        let zero = |value: u64| value & !format.sign_bit() == 0;
-        let divide = op == FpBinaryOp::Div;
-        let usable_b = if divide {
-            normal(b)
+    let sign = format.sign_bit();
+    let exponent = format.exponent_mask();
+    let fused = matches!(op, Arith::Fused(..));
+    let mut flushed = false;
+    let fz = fp.mode.fz;
+    let mut operand = |value: u64| {
+        if fz && value & exponent == 0 && value & !sign != 0 {
+            flushed = true;
+            value & sign
         } else {
-            normal(b) || zero(b)
+            value
+        }
+    };
+    let a = operand(a);
+    let b = operand(b);
+    let c = if fused { operand(c) } else { 0 };
+    let zero = |value: u64| value & !sign == 0;
+    let infinite = |value: u64| value & !sign == exponent;
+    // Quiet NaN operands raise nothing: FPProcessNaNs returns the first in
+    // Arm's order (the addend first for the fused forms, FMLS's operand
+    // negated), or the default NaN under FPCR.DN. A signalling NaN raises
+    // IOC, and a quiet NaN addend of an infinity times zero IOC and the
+    // default NaN: the exact path.
+    let nan = |value: u64| value & !sign > exponent;
+    if nan(a) || nan(b) || fused && nan(c) {
+        let quiet = format.quiet_bit();
+        let signalling = |value: u64| nan(value) && value & quiet == 0;
+        if signalling(a) || signalling(b) || fused && signalling(c) {
+            return None;
+        }
+        let picked = match op {
+            Arith::Fused(negate_product, negate_addend) => {
+                if (infinite(a) && zero(b) || zero(a) && infinite(b)) && nan(c) {
+                    return None;
+                }
+                if nan(c) {
+                    if negate_addend { c ^ sign } else { c }
+                } else if nan(a) {
+                    if negate_product { a ^ sign } else { a }
+                } else {
+                    b
+                }
+            }
+            _ => {
+                if nan(a) {
+                    a
+                } else {
+                    b
+                }
+            }
         };
-        if (normal(a) || zero(a)) && usable_b {
-            let raw = match op {
-                FpBinaryOp::Add => native!(size, a, b, |x, y| x + y),
-                FpBinaryOp::Sub => native!(size, a, b, |x, y| x - y),
-                FpBinaryOp::Mul => native!(size, a, b, |x, y| x * y),
-                _ => native!(size, a, b, |x, y| x / y),
-            };
-            let exact_zero = zero(raw)
-                && (zero(a) || zero(b) || matches!(op, FpBinaryOp::Add | FpBinaryOp::Sub));
-            // A product or quotient rounded to the smallest normal may have
-            // been tiny before rounding (an underflow); a sum cannot be.
-            let rounded_up = matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div)
-                && raw & !format.sign_bit() == format.smallest_normal();
-            if (normal(raw) && !rounded_up) || exact_zero {
-                return raw;
+        if flushed {
+            fp.raise(FPSR_IDC);
+        }
+        return Some(if fp.mode.dn {
+            format.default_nan()
+        } else {
+            picked
+        });
+    }
+    let raw = match op {
+        Arith::Add => native!(fp.size, a, b, |x, y| x + y),
+        Arith::Sub => native!(fp.size, a, b, |x, y| x - y),
+        Arith::Mul => native!(fp.size, a, b, |x, y| x * y),
+        Arith::Div => native!(fp.size, a, b, |x, y| x / y),
+        Arith::Fused(negate_product, negate_addend) => {
+            let n = if negate_product { a ^ sign } else { a };
+            let addend = if negate_addend { c ^ sign } else { c };
+            match fp.size {
+                FpSize::S => u64::from(
+                    f32::from_bits(n as u32)
+                        .fused(f32::from_bits(b as u32), f32::from_bits(addend as u32))
+                        .to_bits(),
+                ),
+                FpSize::D => f64::from_bits(n)
+                    .fused(f64::from_bits(b), f64::from_bits(addend))
+                    .to_bits(),
             }
         }
+    };
+    let magnitude = raw & !sign;
+    let field = raw & exponent;
+    let accepted = if field == exponent {
+        // Infinite (a NaN never).
+        magnitude == exponent && (infinite(a) || infinite(b) || fused && infinite(c))
+    } else if field != 0 {
+        !(magnitude == format.smallest_normal() && op != Arith::Add && op != Arith::Sub)
+    } else if magnitude == 0 {
+        match op {
+            Arith::Add | Arith::Sub => true,
+            Arith::Mul => zero(a) || zero(b),
+            Arith::Div => zero(a) || infinite(b),
+            // Also a single-precision sum that cancels: the product is
+            // exact in double and a nonzero sum cannot round to zero there.
+            Arith::Fused(negate_product, negate_addend) => {
+                (zero(a) || zero(b)) && zero(c)
+                    || fp.size == FpSize::S && {
+                        let x = f64::from(f32::from_bits(a as u32));
+                        let z = f64::from(f32::from_bits(c as u32));
+                        let x = if negate_product { -x } else { x };
+                        let z = if negate_addend { -z } else { z };
+                        x * f64::from(f32::from_bits(b as u32)) + z == 0.0
+                    }
+            }
+        }
+    } else {
+        // A denormal result: an underflow (flushed under FZ).
+        false
+    };
+    if !accepted {
+        return None;
+    }
+    if flushed {
+        fp.raise(FPSR_IDC);
+    }
+    Some(raw)
+}
+
+/// One lane of a two-operand FP operation (FPProcessNaNs, then the op).
+fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
+    let format = fp.format;
+    // With FPSR.IXC already set (it is sticky), arithmetic whose result is
+    // exact or rounds as the host's does raises nothing new
+    // (`native_arith_lane`); the rest takes the exact path.
+    let arith = match op {
+        FpBinaryOp::Add => Some(Arith::Add),
+        FpBinaryOp::Sub => Some(Arith::Sub),
+        FpBinaryOp::Mul => Some(Arith::Mul),
+        FpBinaryOp::Div => Some(Arith::Div),
+        _ => None,
+    };
+    if let Some(arith) = arith
+        && let Some(raw) = native_arith_lane(fp, arith, a, b, 0)
+    {
+        return raw;
     }
     if matches!(
         op,
@@ -668,7 +804,6 @@ fn binary_lane(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
     binary_lane_fallback(fp, op, a, b)
 }
 
-#[cold]
 #[inline(never)]
 fn binary_lane_fallback(fp: &mut Fp<'_>, op: FpBinaryOp, a: u64, b: u64) -> u64 {
     let size = fp.size;
@@ -850,6 +985,9 @@ fn ternary_lane(fp: &mut Fp<'_>, op: FpTernaryOp, n: u64, m: u64, a: u64) -> u64
         FpTernaryOp::NegMulAdd => (true, true),
         FpTernaryOp::NegMulSub => (true, false),
     };
+    if let Some(raw) = native_arith_lane(fp, Arith::Fused(negate_product, negate_addend), n, m, a) {
+        return raw;
+    }
     let n = fp.input(n);
     let m = fp.input(m);
     let a = fp.input(a);
@@ -960,6 +1098,10 @@ fn fp_compare_exact(
 ) -> Result<(), Trap> {
     let a = read_fp(cpu, rn, size);
     let b = rm.map_or(0, |rm| read_fp(cpu, rm, size));
+    if stats::enabled() {
+        let form = if signaling { "fcmpe" } else { "fcmp" };
+        stats::note_scalar("fp_compare_exact", form, cpu, size, &[a, b]);
+    }
     let mut fp = Fp::new(cpu, size)?;
     let a = fp.input(a);
     let b = fp.input(b);
@@ -1074,6 +1216,13 @@ pub fn fp_to_int(
     rounding: Rounding,
 ) -> Result<(), Trap> {
     let raw = read_fp(cpu, rn, size);
+    if stats::enabled() {
+        let form = format!(
+            "{rounding:?} {} {gp_bits}",
+            if signed { "signed" } else { "unsigned" }
+        );
+        stats::note_scalar("fp_to_int", &form, cpu, size, &[raw]);
+    }
     let mut fp = Fp::new(cpu, size)?;
     let raw = fp.input(raw);
     let format = fp.format;
@@ -1543,7 +1692,19 @@ fn fast_vec_fp_lane(
 /// Lanes are independent and flags only accumulate, so a NaN or an
 /// underflow in one lane leaves the others native.
 fn mixed_lane(fp: &mut Fp<'_>, op: VecFpOp, a: u64, b: u64, d: u64) -> u64 {
-    if fp.cpu.fpsr & FPSR_IXC != 0
+    // The arithmetic's own lanes test once, in `native_arith_lane`.
+    let arithmetic = matches!(
+        op,
+        VecFpOp::Add
+            | VecFpOp::Sub
+            | VecFpOp::AbsDiff
+            | VecFpOp::Mul
+            | VecFpOp::Div
+            | VecFpOp::MulAdd
+            | VecFpOp::MulSub
+    );
+    if !arithmetic
+        && fp.cpu.fpsr & FPSR_IXC != 0
         && let Some(value) = fast_vec_fp_lane(fp.format, fp.size, op, a, b, d)
     {
         return value;
@@ -5335,6 +5496,158 @@ mod sticky_inexact_tests {
         }
     }
 
+    /// `native_arith_lane`: every pair and triple of normal, smallest
+    /// normal, denormal, zero, infinite, NaN, overflowing and underflowing
+    /// values, in every FZ/DN mode: with FPSR.IXC set (the native lanes on)
+    /// the result and flags are those of the exact path (IXC clear).
+    #[test]
+    fn special_lanes_run_natively_as_the_exact_path() {
+        let singles: &[u64] = &[
+            0,
+            0x8000_0000,
+            1,
+            0x807f_ffff,
+            0x0080_0000,
+            0x8080_0001,
+            0x00ff_ffff,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x3fc0_0000,
+            0x3f00_0000,
+            0x3f7f_ffff,
+            0x0c00_0000,
+            0x7200_0000,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+            0x7fc0_0000,
+            0xffc0_1234,
+        ];
+        let doubles: &[u64] = &[
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            0x800f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x001f_ffff_ffff_ffff,
+            0x3ff0_0000_0000_0000,
+            0xbff8_0000_0000_0000,
+            0x3fe0_0000_0000_0000,
+            0x3fef_ffff_ffff_ffff,
+            0x2000_0000_0000_0000,
+            0x6000_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0x7ff8_0000_0000_0000,
+        ];
+        let ops = [
+            VecFpOp::Add,
+            VecFpOp::Sub,
+            VecFpOp::Mul,
+            VecFpOp::Div,
+            VecFpOp::AbsDiff,
+            VecFpOp::MulExtended,
+            VecFpOp::MulAdd,
+            VecFpOp::MulSub,
+        ];
+        let mut native = 0u64;
+        for (size, pool) in [(FpSize::S, singles), (FpSize::D, doubles)] {
+            for op in ops {
+                let fused = matches!(op, VecFpOp::MulAdd | VecFpOp::MulSub);
+                let addends: &[u64] = if fused { pool } else { &[0] };
+                for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN] {
+                    for &a in pool {
+                        for &b in pool {
+                            for &d in addends {
+                                let run = |fpsr| {
+                                    let mut cpu = Cpu {
+                                        fpcr,
+                                        fpsr,
+                                        ..Cpu::default()
+                                    };
+                                    let value =
+                                        vec_fp_lane_exact(&mut cpu, op, size, a, b, d).unwrap();
+                                    (value, cpu.fpsr)
+                                };
+                                let (exact, flags) = run(0);
+                                assert_eq!(
+                                    run(FPSR_IXC),
+                                    (exact, flags | FPSR_IXC),
+                                    "{op:?} {size:?} fpcr {fpcr:#x}: {a:#x} {b:#x} {d:#x}"
+                                );
+                                // Count what the native lanes take (no flag
+                                // beyond IDC).
+                                let mut cpu = Cpu {
+                                    fpcr,
+                                    fpsr: FPSR_IXC,
+                                    ..Cpu::default()
+                                };
+                                let mut fp = Fp::new(&mut cpu, size).unwrap();
+                                let arith = match op {
+                                    VecFpOp::Add => Some(Arith::Add),
+                                    VecFpOp::Sub | VecFpOp::AbsDiff => Some(Arith::Sub),
+                                    VecFpOp::Mul => Some(Arith::Mul),
+                                    VecFpOp::Div => Some(Arith::Div),
+                                    VecFpOp::MulAdd => Some(Arith::Fused(false, false)),
+                                    VecFpOp::MulSub => Some(Arith::Fused(true, false)),
+                                    _ => None,
+                                };
+                                if let Some(arith) = arith
+                                    && native_arith_lane(&mut fp, arith, a, b, d).is_some()
+                                {
+                                    native += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The scalar fused forms (FNMADD, FNMSUB negate the addend too).
+        for (size, pool) in [(FpSize::S, singles), (FpSize::D, doubles)] {
+            for op in [
+                FpTernaryOp::MulAdd,
+                FpTernaryOp::MulSub,
+                FpTernaryOp::NegMulAdd,
+                FpTernaryOp::NegMulSub,
+            ] {
+                for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN] {
+                    for &a in pool {
+                        for &b in pool {
+                            for &d in pool {
+                                let run = |fpsr| {
+                                    let mut cpu = Cpu {
+                                        fpcr,
+                                        fpsr,
+                                        ..Cpu::default()
+                                    };
+                                    cpu.vectors[1] = u128::from(a);
+                                    cpu.vectors[2] = u128::from(b);
+                                    cpu.vectors[3] = u128::from(d);
+                                    fp_ternary(&mut cpu, op, size, 0, 1, 2, 3).unwrap();
+                                    (cpu.vectors[0], cpu.fpsr)
+                                };
+                                let (exact, flags) = run(0);
+                                assert_eq!(
+                                    run(FPSR_IXC),
+                                    (exact, flags | FPSR_IXC),
+                                    "{op:?} {size:?} fpcr {fpcr:#x}: {a:#x} {b:#x} {d:#x}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{native} native lanes");
+        // The native lanes take a good share, special operands included.
+        assert!(native > 20_000, "{native}");
+    }
+
     #[test]
     fn fused_element_lanes_keep_exact_flags_with_exceptional_inputs() {
         let samples = [
@@ -6224,6 +6537,25 @@ pub mod stats {
 
     /// One lane inlined vector code left to the exact helper
     /// (`vec_fp_lane`): its operation and its operands' classes.
+    /// A scalar helper's call: its form, the operands' classes, FPCR.FZ
+    /// and whether FPSR.IXC was set (the inline paths need it sticky).
+    pub(super) fn note_scalar(
+        helper: &str,
+        form: &str,
+        cpu: &super::Cpu,
+        size: FpSize,
+        operands: &[u64],
+    ) {
+        let bits = size_bits(size);
+        let classes: Vec<&str> = operands.iter().map(|&value| class(bits, value)).collect();
+        add(format!(
+            "{helper} {form} {size:?}: {} fz={} ixc={}",
+            classes.join(" "),
+            u8::from(cpu.fpcr & super::FPCR_FZ != 0),
+            u8::from(cpu.fpsr & FPSR_IXC != 0)
+        ));
+    }
+
     pub(super) fn note_lane(op: VecFpOp, size: FpSize, a: u64, b: u64) {
         let (bits, size) = match size {
             FpSize::S => (32, "S"),
