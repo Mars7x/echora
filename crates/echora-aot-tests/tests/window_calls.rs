@@ -140,6 +140,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_vectors),
         lift!(regalloc_crates),
         lift!(regalloc_capped),
+        lift!(regalloc_split),
         lift!(regalloc_span),
         lift!(regalloc_resume),
         lift!(regalloc_resume_crates),
@@ -173,6 +174,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_vectors"),
     ("window_call_base", "regalloc_crates"),
     ("window_call_base", "regalloc_capped"),
+    ("window_call_base", "regalloc_split"),
     ("window_call_base", "regalloc_span"),
     ("window_call_base", "regalloc_resume"),
     ("window_call_base", "regalloc_resume_crates"),
@@ -852,6 +854,10 @@ fn lifted_functions_cover_the_game_s_cases() {
     assert!(regalloc_capped::CAPPED_FUNCTIONS > 0);
     assert!(regalloc_capped::STRUCTURED_FUNCTIONS > 0);
     assert!(regalloc_capped::CAPPED_FUNCTIONS > regalloc_on::CAPPED_FUNCTIONS);
+    // In pieces instead: fewer left to the windows, several pieces each.
+    assert!(regalloc_split::SPLIT_FUNCTIONS > 0);
+    assert!(regalloc_split::PIECES > 2 * regalloc_split::SPLIT_FUNCTIONS);
+    assert!(regalloc_split::CAPPED_FUNCTIONS < regalloc_capped::CAPPED_FUNCTIONS);
 }
 
 /// The integer twin, without and with window calls (in one region and

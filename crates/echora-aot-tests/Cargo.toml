@@ -155,6 +155,9 @@ regalloc-vector-locals = []
 # With regalloc: PC stores in the slow paths of the code after them
 # (EmitOptions::regalloc_lazy_pc).
 regalloc-lazy-pc = []
+# With regalloc: functions over the size caps in structured pieces
+# (EmitOptions::regalloc_split_capped).
+regalloc-split-capped = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
