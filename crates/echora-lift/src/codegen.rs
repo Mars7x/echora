@@ -8747,6 +8747,11 @@ pub fn emit_rust_split_to_regions<E>(
                 writeln!(output, "\n{cold}#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
             output.push_str(&locals.load());
+            // The shared reloads' and stores' methods go next to `R`, outside
+            // the nested function: an `impl` of a type from an enclosing
+            // function is a non-local definition.
+            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
+            output.push_str(&methods);
             // The blocks run in a nested function so their early returns still
             // pass the final store; it is always inlined, as a closure is not,
             // so `r`'s fields stay host registers instead of stack slots
@@ -8764,8 +8769,6 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
         );
-            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
-            output.push_str(&methods);
             let header = if dense {
                 format!(
                     "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
