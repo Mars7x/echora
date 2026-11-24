@@ -938,6 +938,11 @@ fn lift(
     } else {
         apply(&mut options, DEFAULT_OPTIONS)?;
         apply(&mut listed_options, DEFAULT_OPTIONS)?;
+        // ECHORA_LIFT_OPTIONS_OTHERS: added to every region, listed or not.
+        if let Ok(others) = std::env::var("ECHORA_LIFT_OPTIONS_OTHERS") {
+            apply(&mut options, &others)?;
+            apply(&mut listed_options, &others)?;
+        }
         apply(&mut listed_options, extra.as_deref().unwrap_or(""))?;
         println!(
             "per-region options: {} regions (ECHORA_LIFT_OPTIONS_REGIONS) get the defaults plus {:?}; the others the defaults ({DEFAULT_OPTIONS})",
