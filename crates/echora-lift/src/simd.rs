@@ -2654,12 +2654,13 @@ fn arith_lane(fp_op: VecFpOp, float: &str) -> (String, &'static str) {
             format!("(-{float}::from_bits(x)).mul_add({float}::from_bits(y), 3.0) * 0.5"),
             "false",
         ),
-        _ => (
+        VecFpOp::MulSub => (
             format!(
                 "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
             ),
             "(zero(x) | zero(y)) & zero(z)",
         ),
+        _ => unreachable!("no arithmetic lane for {fp_op:?}"),
     }
 }
 
@@ -2737,13 +2738,86 @@ fn vec_fp_arith(
             "0".to_owned()
         };
         let lane_z_usable = if fused { " & usable(z)" } else { "" };
+        // `EmitOptions::special_lanes`, for a lane the test above refused:
+        // infinite operands (no NaN or denormal) whose result is an
+        // infinity, or a quotient's zero by an infinite divisor, are Arm's
+        // exact results and raise nothing; so are quiet NaN operands (no
+        // signalling NaN or denormal, and for the fused forms no infinity
+        // times zero with a NaN addend), whose result is FPProcessNaNs's:
+        // the first in Arm's order (the addend first, FMLS's operand
+        // negated), or the default NaN under FPCR.DN.
+        let special = if crate::codegen::special_lanes_on()
+            && matches!(
+                fp_op,
+                VecFpOp::Add
+                    | VecFpOp::Sub
+                    | VecFpOp::Mul
+                    | VecFpOp::Div
+                    | VecFpOp::MulAdd
+                    | VecFpOp::MulSub
+            ) {
+            let (ordinary_z, infinite_z, nan_z, plain_z) = if fused {
+                (
+                    " & ordinary(z)",
+                    " | infinite(z)",
+                    " | nan(z)",
+                    " & plain(z)",
+                )
+            } else {
+                ("", "", "", "")
+            };
+            let quotient = if fp_op == VecFpOp::Div {
+                " | (zero(raw) & infinite(y))"
+            } else {
+                ""
+            };
+            let invalid = if fused {
+                " & !(nan(z) & (infinite(x) & zero(y) | zero(x) & infinite(y)))"
+            } else {
+                ""
+            };
+            let picked = if fused {
+                let negate = if fp_op == VecFpOp::MulSub {
+                    format!(" ^ {sign}")
+                } else {
+                    String::new()
+                };
+                format!("if nan(z) {{ z }} else if nan(x) {{ x{negate} }} else {{ y }}")
+            } else {
+                "if nan(x) { x } else { y }".to_owned()
+            };
+            let default_nan = match size {
+                FpSize::S => "0x7fc0_0000u32",
+                FpSize::D => "0x7ff8_0000_0000_0000u64",
+            };
+            format!(
+                "else if ordinary(x) & ordinary(y){ordinary_z} & ((infinite(raw) & (infinite(x) | infinite(y){infinite_z})){quotient}) {{ raw }} \
+                 else if (nan(x) | nan(y){nan_z}) & plain(x) & plain(y){plain_z}{invalid} {{ \
+                 if m.cpu.fpcr & {p}::FPCR_DN != 0 {{ {default_nan} }} else {{ {picked} }} }} "
+            )
+        } else {
+            String::new()
+        };
+        let ordinary = if special.is_empty() {
+            String::new()
+        } else {
+            let quiet = match size {
+                FpSize::S => "0x0040_0000u32",
+                FpSize::D => "0x0008_0000_0000_0000u64",
+            };
+            format!(
+                "let ordinary = |value| usable(value) | infinite(value); \
+                 let nan = |value: {int}| value & !{sign} > {exponent}; \
+                 let plain = |value: {int}| (value & {exponent} != 0 || value & !{sign} == 0) & (!nan(value) || value & {quiet} != 0); "
+            )
+        };
         let lanewise = format!(
             "let mut out = 0u128; \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
-             let raw = ({value}).to_bits(); \
+             let raw = ({value}).to_bits(); {ordinary}\
              let native = usable(x) & {divisor}{lane_z_usable} & ({raw_normal} | (zero(raw) & ({exact}))); \
-             let raw = if native {{ raw }} else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
+             let raw = if native {{ raw }} {special}else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
              out |= u128::from(raw) << (lane * {width}); }} \
              m.cpu.vectors[{rd}] = out;"
         );
@@ -3500,7 +3574,7 @@ pub fn vector_run_op(op: &SimdOp) -> bool {
 /// `inline_vector_unary` inlines (FSQRT, FRINT*, FRECPE, FRSQRTE, FCVT*
 /// toward zero), SCVTF/UCVTF, the pairwise operations and FMAXV and its
 /// kin.
-fn run_other_op(op: &SimdOp) -> bool {
+pub fn run_other_op(op: &SimdOp) -> bool {
     match *op {
         SimdOp::VecFp {
             op: fp_op,
@@ -4334,6 +4408,9 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
     };
     for (index, op) in ops.iter().enumerate() {
         let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
+            // Only the forms the group computes itself; every other form
+            // (compares, 2S and 2D FMAX and FMIN, FABD, FMULX) is the runs'
+            // own, below.
             SimdOp::VecFp {
                 op: fp_op,
                 size,
@@ -4342,7 +4419,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                 rn,
                 rm,
                 ..
-            } => {
+            } if mxcsr_group_op(op) => {
                 let width = if size == FpSize::S { 32 } else { 64 };
                 (
                     fp_op,
@@ -4363,7 +4440,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                 rm,
                 index,
                 ..
-            } => {
+            } if mxcsr_group_op(op) => {
                 let width = if size == FpSize::S { 32 } else { 64 };
                 (
                     fp_op,
@@ -4454,10 +4531,11 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                     let d = singles(&mut code, &mut values, rd);
                     format!("mx_mul_add({n}, {y}, {d})")
                 }
-                _ => {
+                VecFpOp::MulSub => {
                     let d = singles(&mut code, &mut values, rd);
                     format!("mx_mul_sub({n}, {y}, {d})")
                 }
+                _ => unreachable!("mxcsr_group_op admits no 4S {fp_op:?}"),
             };
             if !tracked {
                 code.push_str("let (mut lo, mut hi) = mx_track_start(); ");
@@ -4534,6 +4612,388 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
         })
         .collect();
     (code, finals, fused_group)
+}
+
+/// The scalar forms an MXCSR group takes (`EmitOptions::mxcsr_groups`):
+/// FADD, FSUB, FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT,
+/// FABS, FNEG and FMOV in single or double precision, FCVT between them,
+/// SCVTF and UCVTF (from a general or a SIMD register), FCVT{N,P,M,Z,A}{S,U}
+/// to a general register, and FCMP and FCMPE.
+pub fn scalar_group_op(op: &SimdOp) -> bool {
+    match *op {
+        SimdOp::FpBinary { op, size, .. } => {
+            matches!(size, FpSize::S | FpSize::D)
+                && matches!(
+                    op,
+                    FpBinaryOp::Add
+                        | FpBinaryOp::Sub
+                        | FpBinaryOp::Mul
+                        | FpBinaryOp::Div
+                        | FpBinaryOp::NegMul
+                )
+        }
+        SimdOp::FpTernary { size, .. } => matches!(size, FpSize::S | FpSize::D),
+        SimdOp::FpUnary { op, size, .. } => {
+            matches!(size, FpSize::S | FpSize::D)
+                && matches!(
+                    op,
+                    FpUnaryOp::Sqrt | FpUnaryOp::Abs | FpUnaryOp::Neg | FpUnaryOp::Mov
+                )
+        }
+        SimdOp::FpConvert { from, to, .. } => {
+            matches!((from, to), (FpSize::S, FpSize::D) | (FpSize::D, FpSize::S))
+        }
+        SimdOp::IntToFp { size, .. }
+        | SimdOp::SimdIntToFp { size, .. }
+        | SimdOp::FpToInt { size, .. }
+        | SimdOp::FpCompare { size, .. } => matches!(size, FpSize::S | FpSize::D),
+        _ => false,
+    }
+}
+
+/// The fast copy of a scalar float group with `EmitOptions::mxcsr_groups`
+/// (`crate::codegen`'s `emit_scalar_group`): as `vector_group_mxcsr`, every
+/// operation as the host's scalar SSE instruction with no operand tests,
+/// MXCSR cleared before and read once after, and each arithmetic result's
+/// magnitude tracked (`mx_track_scalar32`, `mx_track_scalar64`) so one test
+/// at the end sees a denormal, exactly the smallest normal or a NaN. FABS,
+/// FNEG and FMOV are bit operations on both sides, raise nothing and are
+/// not tracked. A scalar result is written zero-extended, as Arm writes it.
+/// Returns the code computing `good`, the registers written with their
+/// final values, and whether the group fuses (it then needs the host's
+/// FMA).
+/// What a scalar group writes besides vector registers: general registers
+/// (with their final values) and NZCV (`scalar_group_mxcsr`).
+#[derive(Debug, Default)]
+pub struct ScalarGroupWrites {
+    pub general: RegisterValues,
+    pub nzcv: Option<String>,
+}
+
+pub fn scalar_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, ScalarGroupWrites, bool) {
+    let mut values: std::collections::BTreeMap<u8, String> = Default::default();
+    // General registers the group wrote (FCVT*S/U), read back from it.
+    let mut general: std::collections::BTreeMap<u8, String> = Default::default();
+    let mut general_written: Vec<u8> = Vec::new();
+    let mut nzcv: Option<String> = None;
+    // Registers holding a result the group tracked: the final test passes
+    // only if it is zero, normal or infinite, so a compare or a conversion
+    // to an integer need not test it again.
+    let mut checked: std::collections::BTreeSet<u8> = Default::default();
+    let mut code = String::from(
+        "mxcsr_clear(); let mut good = true; let (mut lo32, mut hi32) = (u32::MAX, 0u32); let (mut lo64, mut hi64) = (u64::MAX, 0u64); ",
+    );
+    let mut written: Vec<u8> = Vec::new();
+    let mut fused_group = false;
+    let read =
+        |code: &mut String, values: &mut std::collections::BTreeMap<u8, String>, register: u8| {
+            values
+                .entry(register)
+                .or_insert_with(|| {
+                    code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
+                    format!("v{register}")
+                })
+                .clone()
+        };
+    for (index, op) in ops.iter().enumerate() {
+        // (destination, the result's bits, its size, whether it is tracked)
+        let (rd, value, size, tracked) = match *op {
+            SimdOp::FpBinary {
+                op: fp_op,
+                size,
+                rd,
+                rn,
+                rm,
+            } => {
+                let (float, int) = if size == FpSize::S {
+                    ("f32", "u32")
+                } else {
+                    ("f64", "u64")
+                };
+                let x = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rn)
+                );
+                let y = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rm)
+                );
+                let value = match fp_op {
+                    FpBinaryOp::Add => format!("({x} + {y})"),
+                    FpBinaryOp::Sub => format!("({x} - {y})"),
+                    FpBinaryOp::Mul => format!("({x} * {y})"),
+                    FpBinaryOp::Div => format!("({x} / {y})"),
+                    FpBinaryOp::NegMul => format!("(-({x} * {y}))"),
+                    _ => unreachable!("scalar_group_op admits no {fp_op:?}"),
+                };
+                (rd, format!("{value}.to_bits()"), size, true)
+            }
+            SimdOp::FpTernary {
+                op: fp_op,
+                size,
+                rd,
+                rn,
+                rm,
+                ra,
+            } => {
+                fused_group = true;
+                let (float, int) = if size == FpSize::S {
+                    ("f32", "u32")
+                } else {
+                    ("f64", "u64")
+                };
+                let n = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rn)
+                );
+                let m = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, rm)
+                );
+                let a = format!(
+                    "{float}::from_bits({} as {int})",
+                    read(&mut code, &mut values, ra)
+                );
+                // Negations are exact: one rounding, as Arm's.
+                let value = match fp_op {
+                    FpTernaryOp::MulAdd => format!("{n}.mul_add({m}, {a})"),
+                    FpTernaryOp::MulSub => format!("(-{n}).mul_add({m}, {a})"),
+                    FpTernaryOp::NegMulAdd => format!("(-{n}).mul_add({m}, -{a})"),
+                    FpTernaryOp::NegMulSub => format!("{n}.mul_add({m}, -{a})"),
+                };
+                (rd, format!("{value}.to_bits()"), size, true)
+            }
+            SimdOp::FpUnary {
+                op: unary,
+                size,
+                rd,
+                rn,
+            } => {
+                let (float, int, sign) = if size == FpSize::S {
+                    ("f32", "u32", "0x8000_0000u32")
+                } else {
+                    ("f64", "u64", "0x8000_0000_0000_0000u64")
+                };
+                let x = format!("({} as {int})", read(&mut code, &mut values, rn));
+                match unary {
+                    FpUnaryOp::Sqrt => (
+                        rd,
+                        format!("{float}::from_bits({x}).sqrt().to_bits()"),
+                        size,
+                        true,
+                    ),
+                    FpUnaryOp::Abs => (rd, format!("({x} & !{sign})"), size, false),
+                    FpUnaryOp::Neg => (rd, format!("({x} ^ {sign})"), size, false),
+                    FpUnaryOp::Mov => (rd, x, size, false),
+                    _ => unreachable!("scalar_group_op admits no {unary:?}"),
+                }
+            }
+            SimdOp::FpConvert { rd, rn, from, to } => {
+                let x = read(&mut code, &mut values, rn);
+                assert!(
+                    matches!((from, to), (FpSize::S, FpSize::D) | (FpSize::D, FpSize::S)),
+                    "scalar_group_op admits no FCVT {from:?} to {to:?}"
+                );
+                if from == FpSize::S {
+                    (
+                        rd,
+                        format!("f64::from(f32::from_bits({x} as u32)).to_bits()"),
+                        FpSize::D,
+                        true,
+                    )
+                } else {
+                    (
+                        rd,
+                        format!("(f64::from_bits({x} as u64) as f32).to_bits()"),
+                        FpSize::S,
+                        true,
+                    )
+                }
+            }
+            // SCVTF/UCVTF: the host's conversion rounds to nearest as Arm's
+            // does, and no integer converts to a denormal, an infinity or a
+            // NaN: only IXC, which the group requires sticky, can rise.
+            SimdOp::IntToFp {
+                rd,
+                rn,
+                gp_bits,
+                size,
+                signed,
+            } => {
+                let source = match general.get(&rn) {
+                    Some(value) if gp_bits == 32 => format!("({value} & 0xffff_ffffu64)"),
+                    Some(value) => value.clone(),
+                    None => crate::simd_scalar::general(rn, gp_bits),
+                };
+                let value = crate::simd_scalar::int_to_fp(
+                    &format!("({source})"),
+                    u32::from(gp_bits),
+                    signed,
+                    size,
+                );
+                let value = if size == FpSize::S {
+                    format!("({value} as u32)")
+                } else {
+                    value
+                };
+                (rd, value, size, false)
+            }
+            SimdOp::SimdIntToFp {
+                rd,
+                rn,
+                size,
+                signed,
+            } => {
+                let x = read(&mut code, &mut values, rn);
+                let (source, bits) = if size == FpSize::S {
+                    (format!("({x} as u32 as u64)"), 32)
+                } else {
+                    (format!("({x} as u64)"), 64)
+                };
+                let value = crate::simd_scalar::int_to_fp(&source, bits, signed, size);
+                let value = if size == FpSize::S {
+                    format!("({value} as u32)")
+                } else {
+                    value
+                };
+                (rd, value, size, false)
+            }
+            // FCVT{N,P,M,Z,A}{S,U}: as the inline path, a normal or zero
+            // operand (no denormal to flush or round) whose rounded value
+            // fits (no IOC); else the exact copy.
+            SimdOp::FpToInt {
+                rd,
+                rn,
+                gp_bits,
+                size,
+                signed,
+                rounding,
+            } => {
+                let (float, int, exponent, sign) = if size == FpSize::S {
+                    ("f32", "u32", "0x7f80_0000u32", "0x8000_0000u32")
+                } else {
+                    (
+                        "f64",
+                        "u64",
+                        "0x7ff0_0000_0000_0000u64",
+                        "0x8000_0000_0000_0000u64",
+                    )
+                };
+                let (min, max) = match (signed, gp_bits) {
+                    (true, 32) => ("-2147483648.0", "2147483647.0"),
+                    (true, _) => ("-9223372036854775808.0", "9223372036854775808.0"),
+                    (false, 32) => ("0.0", "4294967295.0"),
+                    (false, _) => ("0.0", "18446744073709551616.0"),
+                };
+                let upper = if gp_bits == 64 { "<" } else { "<=" };
+                let convert = match (signed, gp_bits) {
+                    (true, 32) => "as i32 as u32 as u64",
+                    (true, _) => "as i64 as u64",
+                    (false, 32) => "as u32 as u64",
+                    (false, _) => "as u64",
+                };
+                let method = crate::simd_scalar::rounding_method(rounding);
+                let x = read(&mut code, &mut values, rn);
+                // A tracked operand is zero, normal or infinite (and the
+                // range test fails an infinity).
+                let usable = if checked.contains(&rn) {
+                    String::new()
+                } else {
+                    format!(
+                        "((e{index} != 0 && e{index} != {exponent}) || x{index} & !{sign} == 0) && "
+                    )
+                };
+                code.push_str(&format!(
+                    "let x{index} = {x} as {int}; let e{index} = x{index} & {exponent}; \
+                     let rounded{index} = f64::from({float}::from_bits(x{index})).{method}(); \
+                     good &= {usable}rounded{index} >= {min} && rounded{index} {upper} {max}; \
+                     let g{index} = rounded{index} {convert}; "
+                ));
+                if rd != 31 {
+                    general.insert(rd, format!("g{index}"));
+                    if !general_written.contains(&rd) {
+                        general_written.push(rd);
+                    }
+                }
+                continue;
+            }
+            // FCMP/FCMPE: as the inline path, neither operand a NaN (nothing
+            // to signal) nor a denormal (nothing to flush); the flags those
+            // of the comparison, written with the group's other results.
+            SimdOp::FpCompare { size, rn, rm, .. } => {
+                let (float, int, exponent, sign) = if size == FpSize::S {
+                    ("f32", "u32", "0x7f80_0000u32", "0x8000_0000u32")
+                } else {
+                    (
+                        "f64",
+                        "u64",
+                        "0x7ff0_0000_0000_0000u64",
+                        "0x8000_0000_0000_0000u64",
+                    )
+                };
+                let x = read(&mut code, &mut values, rn);
+                let y = match rm {
+                    Some(rm) => format!("{} as {int}", read(&mut code, &mut values, rm)),
+                    None => format!("0{int}"),
+                };
+                // Zero, normal or infinite: a zero exponent only with a
+                // zero fraction, an all-ones one only with a zero fraction.
+                let plain = |v: String, register: Option<u8>| {
+                    if register.is_some_and(|register| checked.contains(&register)) {
+                        "true".to_owned()
+                    } else {
+                        format!(
+                            "({{ let e = {v} & {exponent}; let f = {v} & !({exponent} | {sign}); (e != 0 || f == 0) && (e != {exponent} || f == 0) }})"
+                        )
+                    }
+                };
+                code.push_str(&format!(
+                    "let (cx{index}, cy{index}) = ({x} as {int}, {y}); good &= {} && {}; \
+                     let (ca{index}, cb{index}) = ({float}::from_bits(cx{index}), {float}::from_bits(cy{index})); \
+                     let n{index}: u8 = if ca{index} == cb{index} {{ 0b0110 }} else if ca{index} < cb{index} {{ 0b1000 }} else {{ 0b0010 }}; ",
+                    plain(format!("cx{index}"), Some(rn)),
+                    // #0.0 is plain.
+                    plain(format!("cy{index}"), rm)
+                ));
+                nzcv = Some(format!("n{index}"));
+                continue;
+            }
+            _ => unreachable!("scalar_group_op checked {op:?}"),
+        };
+        let width = if size == FpSize::S { 32 } else { 64 };
+        code.push_str(&format!("let r{index} = {value}; "));
+        if tracked {
+            code.push_str(&format!(
+                "mx_track_scalar{width}(r{index}, &mut lo{width}, &mut hi{width}); "
+            ));
+        }
+        code.push_str(&format!("let o{index} = u128::from(r{index}); "));
+        values.insert(rd, format!("o{index}"));
+        if tracked {
+            checked.insert(rd);
+        } else {
+            checked.remove(&rd);
+        }
+        if !written.contains(&rd) {
+            written.push(rd);
+        }
+    }
+    code.push_str(
+        "let bad = u64::from(lo32 < 0x0080_0000 || hi32 > 0x7f80_0000 || lo64 < 0x0010_0000_0000_0000 || hi64 > 0x7ff0_0000_0000_0000); \
+         let good = good && mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ",
+    );
+    let finals = written
+        .iter()
+        .map(|&register| (register, values[&register].clone()))
+        .collect();
+    let writes = ScalarGroupWrites {
+        general: general_written
+            .iter()
+            .map(|&register| (register, general[&register].clone()))
+            .collect(),
+        nzcv,
+    };
+    (code, finals, writes, fused_group)
 }
 
 /// The fast copy of a float run (`crate::codegen::emit_float_run`): every

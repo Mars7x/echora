@@ -867,6 +867,7 @@ fn lift(
                 "cold-fp-exact" => options.cold_fp_exact = true,
                 "hoist-fp-mode" => options.hoist_fp_mode = true,
                 "mxcsr-groups" => options.mxcsr_groups = true,
+                "special-lanes" => options.special_lanes = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
@@ -905,7 +906,8 @@ fn lift(
     // ECHORA_LIFT_REPORT_WEIGHTS names a file of `WEIGHT REGIONHEX
     // run_window_NAME` lines. `sizes`: every emitted crate's Rust bytes,
     // functions and largest function (`echora_lift::size_report`), the
-    // largest printed and all of them in `lift-sizes.txt`.
+    // largest printed and all of them in `lift-sizes.txt`. `helpers`: the
+    // operations still emitted as helper calls, by helper and form.
     let reports = std::env::var("ECHORA_LIFT_REPORT").unwrap_or_default();
     let size_report = reports
         .split(',')
@@ -1038,6 +1040,38 @@ fn lift(
             calls.summarized_sites,
             calls.sites,
             calls.same_region_sites
+        );
+    }
+
+    // `helpers`: the operations each region's options still emit as helper
+    // calls, by helper and form (`echora_lift::codegen::helper_report`),
+    // weighted as `vector-float` is.
+    if reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "helpers")
+    {
+        let weights = match std::env::var("ECHORA_LIFT_REPORT_WEIGHTS") {
+            Ok(path) => {
+                let text = std::fs::read_to_string(path.trim())
+                    .with_context(|| format!("read {}", path.trim()))?;
+                Some(
+                    echora_lift::vector_float_report::parse_weights(&text)
+                        .map_err(|error| anyhow::anyhow!("ECHORA_LIFT_REPORT_WEIGHTS: {error}"))?,
+                )
+            }
+            Err(_) => None,
+        };
+        print!(
+            "{}",
+            echora_lift::codegen::helper_report(
+                &d.translation,
+                region_bits,
+                options,
+                listed_options,
+                &listed_regions,
+                weights.as_ref(),
+            )
         );
     }
 

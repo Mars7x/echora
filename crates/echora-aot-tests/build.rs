@@ -71,6 +71,7 @@ fn options() -> EmitOptions {
         cold_fp_exact: std::env::var_os("CARGO_FEATURE_COLD_FP_EXACT").is_some(),
         hoist_fp_mode: std::env::var_os("CARGO_FEATURE_HOIST_FP_MODE").is_some(),
         mxcsr_groups: std::env::var_os("CARGO_FEATURE_MXCSR_GROUPS").is_some(),
+        special_lanes: std::env::var_os("CARGO_FEATURE_SPECIAL_LANES").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -248,6 +249,8 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("memory_fault", memory_fault_code),
     ("fp_mode_group", fp_mode_group_code),
     ("mxcsr_group", mxcsr_group_code),
+    ("special_lane", special_lane_code),
+    ("mxcsr_form", mxcsr_form_code),
     ("counter", counter_code),
     ("split_loop", split_loop_code),
 ];
@@ -2376,6 +2379,93 @@ fn mxcsr_group_code(out: &mut String) {
         ("fmaxp 4s", true, vec![0x6e22_f420]),
         ("fminnmp 4s", true, vec![0x6ea2_c420]),
         ("fmaxnmp 4s", true, vec![0x6e22_c420]),
+        // Scalar groups: every form alone, a chain shaped like the floats
+        // kernel, and doubles with conversions to and from single.
+        ("fadd s", true, vec![0x1e22_2820]),
+        ("fsub s", true, vec![0x1e22_3820]),
+        ("fmul s", true, vec![0x1e22_0820]),
+        ("fdiv s", true, vec![0x1e22_1820]),
+        ("fnmul s", true, vec![0x1e22_8820]),
+        ("fmadd s", true, vec![0x1f02_0c20]),
+        ("fmsub s", true, vec![0x1f02_8c20]),
+        ("fnmadd s", true, vec![0x1f22_0c20]),
+        ("fnmsub s", true, vec![0x1f22_8c20]),
+        ("fsqrt s", true, vec![0x1e21_c020]),
+        ("fadd d", false, vec![0x1e62_2820]),
+        ("fmul d", false, vec![0x1e62_0820]),
+        ("fdiv d", false, vec![0x1e62_1820]),
+        ("fmadd d", false, vec![0x1f42_0c20]),
+        ("fsqrt d", false, vec![0x1e61_c020]),
+        ("fcvt d, s", true, vec![0x1e22_c020]),
+        ("fcvt s, d", false, vec![0x1e62_4020]),
+        (
+            "floats-like",
+            true,
+            vec![
+                0x1e22_0823,
+                0x1f02_0c43,
+                0x1e22_2824,
+                0x1e21_0880,
+                0x1e23_3804,
+                0x1f01_0080,
+                0x1e20_0803,
+                0x1e21_2863,
+                0x1e21_c063,
+                0x1e21_1864,
+                0x1e21_4080,
+                0x1e20_c004,
+            ],
+        ),
+        // Conversions to and from general registers and FCMP; X0-X4 hold
+        // integers, a written general register is read back by a later
+        // SCVTF, and an FCMP feeds the block's branch. Each follows an FMUL
+        // of V3 into V4 (those forms join a group but form none alone), so
+        // its own operands' NaNs and denormals reach it, not the FMUL.
+        ("scvtf s, x", true, vec![0x1e23_0864, 0x9e22_0020]),
+        ("scvtf s, w", true, vec![0x1e23_0864, 0x1e22_0020]),
+        ("ucvtf s, x", true, vec![0x1e23_0864, 0x9e23_0020]),
+        ("scvtf d, x", false, vec![0x1e63_0864, 0x9e62_0020]),
+        ("ucvtf d, w", false, vec![0x1e63_0864, 0x1e63_0020]),
+        ("scvtf s, s", true, vec![0x1e23_0864, 0x5e21_d820]),
+        ("ucvtf d, d", false, vec![0x1e63_0864, 0x7e61_d820]),
+        ("fcvtzs x, s", true, vec![0x1e23_0864, 0x9e38_0020]),
+        ("fcvtzu w, s", true, vec![0x1e23_0864, 0x1e39_0020]),
+        ("fcvtms x, s", true, vec![0x1e23_0864, 0x9e30_0020]),
+        ("fcvtps x, s", true, vec![0x1e23_0864, 0x9e28_0020]),
+        ("fcvtzs x, d", false, vec![0x1e63_0864, 0x9e78_0020]),
+        ("fcvtas w, d", false, vec![0x1e63_0864, 0x1e64_0020]),
+        ("fcvtau x, d", false, vec![0x1e63_0864, 0x9e65_0020]),
+        ("fcvtns x, d", false, vec![0x1e63_0864, 0x9e60_0020]),
+        ("fcmp s", true, vec![0x1e23_0864, 0x1e22_2020]),
+        ("fcmpe s", true, vec![0x1e23_0864, 0x1e22_2030]),
+        ("fcmp d, #0", false, vec![0x1e63_0864, 0x1e60_2028]),
+        (
+            "conversions",
+            true,
+            vec![
+                0x9e38_0020,
+                0x9e22_0003,
+                0x1e22_0864,
+                0x1e39_0081,
+                0x1e23_0020,
+            ],
+        ),
+        (
+            "fcmp and branch",
+            true,
+            vec![0x1e22_0823, 0x1e22_2060, 0x5400_004c, 0x1e22_2820],
+        ),
+        (
+            "doubles and conversions",
+            false,
+            vec![
+                0x1e62_0823,
+                0x1e62_4060,
+                0x1e21_0800,
+                0x1e22_c004,
+                0x1e62_2880,
+            ],
+        ),
         // Groups shaped like the vnorm, fpairs and misc kernels: forms the
         // group computes and forms the runs' fast copy computes (FRSQRTE,
         // scalar FADDP, FMAXV) together.
@@ -2435,6 +2525,232 @@ fn mxcsr_group_code(out: &mut String) {
     for (name, options) in [
         ("mxcsr_group_code", grouped),
         ("mxcsr_group_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "pub const SINGLES: &[bool] = &{singles:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/special_lanes.rs`: vector FADD, FSUB, FMUL, FDIV,
+/// FMLA and FMLS (4S, 2S, 2D, by element) alone and in a chain, lifted with
+/// the build's options, the inline paths, whole-vector checks and
+/// `EmitOptions::special_lanes` (`special_lane_code`), and with the helpers
+/// alone (`special_lane_reference`).
+fn special_lane_code(out: &mut String) {
+    const BASE: u64 = 0x310_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    let programs: Vec<(&str, bool, Vec<u32>)> = vec![
+        ("fadd 4s", true, vec![0x4e22_d420]),
+        ("fsub 4s", true, vec![0x4ea2_d420]),
+        ("fmul 4s", true, vec![0x6e22_dc20]),
+        ("fdiv 4s", true, vec![0x6e22_fc20]),
+        ("fmla 4s", true, vec![0x4e22_cc20]),
+        ("fmls 4s", true, vec![0x4ea2_cc20]),
+        ("fmul 2s", true, vec![0x2e22_dc20]),
+        ("fmul 4s by element", true, vec![0x4fa2_9020]),
+        ("fmla 4s by element", true, vec![0x4fa2_1820]),
+        ("fadd 2d", false, vec![0x4e62_d420]),
+        ("fmul 2d", false, vec![0x6e62_dc20]),
+        ("fdiv 2d", false, vec![0x6e62_fc20]),
+        ("fmla 2d", false, vec![0x4e62_cc20]),
+        ("fmls 2d", false, vec![0x4ee2_cc20]),
+        ("fmul 2d by element", false, vec![0x4fc2_9820]),
+        (
+            "chain 4s",
+            true,
+            vec![
+                0x6e22_dc23,
+                0x4e21_d464,
+                0x4ea2_d483,
+                0x6e23_dc64,
+                0x4e21_cc80,
+            ],
+        ),
+    ];
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    let mut singles = Vec::new();
+    for (name, single, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(*name);
+        singles.push(*single);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "special_lane".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("special_lane");
+    let special = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        special_lanes: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("special_lane_code", special),
+        ("special_lane_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "pub const SINGLES: &[bool] = &{singles:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/mxcsr_forms.rs`: every form an MXCSR group admits
+/// (`mxcsr_group_op` or `run_other_op`: vector, by-element and pairwise
+/// float arithmetic, compares, FMAX and FMIN, FABD, FMULX, unary forms),
+/// found by decoding the SIMD space with registers narrowed to V0-V3, each
+/// alone, after an FMUL (so in a group) and before an FADD; and a block
+/// shaped like a game's angle wrap (FRINTM, FMUL by element, FSUB, FCMGT,
+/// BSL, FMAX, FCMEQ, FMOV, TBZ) in 2S and 4S. Lifted with the build's
+/// options, the inline paths, vector float runs and MXCSR groups
+/// (`mxcsr_form_code`), and with the helpers alone (`mxcsr_form_reference`).
+fn mxcsr_form_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+
+    const BASE: u64 = 0x320_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    /// FMUL V3.4S, V1.4S, V2.4S and FADD V3.4S, V0.4S, V1.4S.
+    const FMUL: u32 = 0x6e22_dc23;
+    const FADD: u32 = 0x4e21_d403;
+    let mut forms: std::collections::BTreeMap<String, (u32, bool)> = Default::default();
+    let mut state = 0x6d78_666f_726d_7321u64;
+    for _ in 0..4_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let word = (state as u32 & !0x0e00_0000) | 0x0e00_0000;
+        // Rd, Rn and Rm (bits 16-20, M clear) narrowed; or Rd and Rn alone
+        // for a form whose bits 16-20 are its opcode.
+        let random = (state >> 32) as u32;
+        for narrowed in [
+            word & !0x001f_03ff | random & 0x0003_0063,
+            word & !0x0000_03ff | random & 0x0000_0063,
+        ] {
+            let Instruction::Simd(op) = decode(narrowed, 0) else {
+                continue;
+            };
+            if !(echora_lift::simd::mxcsr_group_op(&op) || echora_lift::simd::run_other_op(&op)) {
+                continue;
+            }
+            // One program per form: the operation without its registers.
+            let text = format!("{op:?}");
+            let key: String = text
+                .split(", ")
+                .filter(|field| {
+                    !["rd:", "rn:", "rm:"]
+                        .iter()
+                        .any(|name| field.trim_start().starts_with(name))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let single = !text.contains("size: D");
+            forms.entry(key).or_insert((narrowed, single));
+        }
+    }
+    assert!(forms.len() > 40, "{} forms", forms.len());
+    let mut programs: Vec<(String, bool, Vec<u32>)> = vec![
+        (
+            "angle wrap 2s".into(),
+            true,
+            vec![
+                0x0e21_9801,
+                0x0f83_9022,
+                0x0ea2_d404,
+                0x2ea3_e485,
+                0x2e60_1c85,
+                0x0e21_f4a6,
+                0x0e23_e4c7,
+                0x1e26_00e8,
+                0x3600_0048,
+                NOP,
+            ],
+        ),
+        (
+            "angle wrap 4s".into(),
+            true,
+            vec![
+                0x4e21_9801,
+                0x4f83_9022,
+                0x4ea2_d404,
+                0x6ea3_e485,
+                0x6e60_1c85,
+                0x4e21_f4a6,
+                0x4e23_e4c7,
+                0x1e26_00e8,
+                0x3600_0048,
+                NOP,
+            ],
+        ),
+    ];
+    for (key, &(word, single)) in &forms {
+        programs.push((format!("{key} alone"), single, vec![word]));
+        programs.push((format!("{key} after fmul"), single, vec![FMUL, word]));
+        programs.push((format!("{key} before fadd"), single, vec![word, FADD]));
+    }
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    let mut singles = Vec::new();
+    for (name, single, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(name.clone());
+        singles.push(*single);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "mxcsr_form".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("mxcsr_form");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        vector_float_runs: true,
+        mxcsr_groups: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("mxcsr_form_code", grouped),
+        ("mxcsr_form_reference", EmitOptions::default()),
     ] {
         let (root, regions) = split(&translation, options);
         writeln!(out, "pub mod {name} {{").expect("write");
