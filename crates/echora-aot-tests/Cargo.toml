@@ -164,6 +164,13 @@ regalloc-lazy-pc = []
 # With regalloc: functions over the size caps in structured pieces
 # (EmitOptions::regalloc_split_capped).
 regalloc-split-capped = []
+# Register locals' full reloads as one method per window or function
+# (EmitOptions::shared_reloads).
+shared-reloads = []
+# Tests only: structured functions capped at 6 KB of Rust
+# (EmitOptions::regalloc_function_bytes), so that every program's
+# functions are capped, or with regalloc-split-capped run in pieces.
+regalloc-tiny-caps = []
 # With regalloc: call return points outside loops are function entries
 # (EmitOptions::regalloc_return_entries).
 regalloc-return-entries = []

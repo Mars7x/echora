@@ -219,6 +219,105 @@ functions run as 334 pieces, none left to the windows, and every run
 (whole, sliced, budgets) ends with the default emission's state; a
 lifter test splits a 1,600-block loop.
 
+**Compile cost: `shared-reloads`** (opt-in; coordinator: the listed set's
+codesize crate is 100.8 MB of Rust against 36.1 MB for the plain set,
+rustc out of memory at 13.6 GB in the front end, about 15 MB of it
+post-call reloads; on the biggest real crate, 20 MB, 280 s and 4.8 GB:
+LLVM 134 s, type checking 111 s). The register locals' full reload after
+a call or helper (every local) becomes one `#[inline(always)]` method per
+window or structured function, `r.reload(m)`; and every store or reload
+list of three or more general registers (the stores before calls and at
+exits, the reloads of what a summarized callee may write) is a set: a set
+used twice or more in the function becomes a method of its own,
+`r.store_<set>(m)` / `r.reload_<set>(m)`, a set used once stays written
+out (`RegisterLocals::finalize`). The methods store and reload exactly
+their set, so the machine code does what it did. Inside structured
+functions the exit stores no longer count a reload as a write of every
+local, so exits store fewer. A macro would not help: rustc type-checks
+and borrow-checks the expanded text.
+
+| (game_regalloc set) | Rust | rustc | peak RSS | `.text` |
+|---|---|---|---|---|
+| 120-block function | 441,770 B | 4.0 s | 264 MB | 232,943 |
+| + `shared-reloads` | 238,426 B (-46%) | 2.8 s | 188 MB | 215,331 |
+| every split program as one region | 77.6 MB | | | |
+| + `shared-reloads` | 63.7 MB (-18%) | | | |
+
+The 240-block function's structured form now fits under the 500 KB cap
+(it was a capped stub, windows only): 432 KB of Rust, 6.7 s / 276 MB, for
+more code structured. Kernels unchanged (gamefn 2.32, gamecalls 2.14,
+calls2 1.46, crossing 2.12, calls 1.33, vchain 7.96, arith 3.14, ldst
+4.09; measured with the first form, which differed only in long store
+lists). `ECHORA_REGALLOC_FUNCTION_BYTES` sets the size cap (and with
+`regalloc-split-capped` the pieces' size). Not done: skipping reloads of
+what a callee writes but nothing reads before it is written again (the
+translation's liveness allows it; the exit stores must then not store
+those locals, a gen/kill change to their dataflow).
+
+**Fixed: `direct-q-pairs` under regalloc did not compile** (coordinator,
+cloud/lift e31de94, region crate 710025): where a function keeps FP status
+in locals, `wrap_cpu_helpers` wraps each call handing the CPU to a helper
+with the status stores, and it took `bytes[..16].copy_from_slice(&m.cpu.vectors[7]..)`
+in a Q pair's code for one. It now wraps only a free function handed the
+whole CPU (`&m.cpu` or `&mut m.cpu` followed by `,` or `)`), never a
+method nor a CPU field passed by reference. Tests: a lifter test of the
+rewrite on that line, and `tests/q_pairs.rs`'s new `q_pair_regalloc` lift
+(every LDP/STP Q form in structured functions with inline-vector and FP
+status locals, three programs with an FADD beside the pairs) against the
+helper calls.
+
+**Hang with `regalloc-split-capped` (coordinator, candidate 6, cloud/lift
+da4ab9f): not from this branch.** Candidate 7, without the option, hung
+the same way; the coordinator traced it to `mxcsr-groups` (vector groups
+admitting compares, FMAX/FMIN/FABD/FMULX but computing them with the FMLS
+formula). Checked here: with the candidate's option set, every program's
+emitted Rust at 9a4f30e (main's tree) and with this branch's options off
+is byte-identical (the window-call file only gains the new lifts and two
+count constants per lift). The record of the search, still useful: The game hangs after the opening movie
+with guest-worker-1 in `run_function_7101692860` (crate
+gen-r-10000710169) and FP fallbacks; candidate 3 without the option runs.
+What was checked:
+
+- `tests/split_loops.rs` (new): a loop crossing piece boundaries, its
+  exit decided by an FCMP, a mid-loop exit decided by another, branches
+  inside the body; and a 1,200-block function (past the old block
+  limit) with a frame, leaf calls storing and loading memory inside the
+  loop, called three times by a caller holding a register across the
+  calls. Each as windows, as functions without pieces, and in pieces
+  under the default cap and three smaller ones: registers, vector
+  registers, flags, FPSR, memory, steps and every host boundary agree,
+  whole and in slices of many lengths (every piece boundary crossed both
+  ways, every entry resumed at).
+- The whole `echora-aot-tests` suite with the game set, every regalloc
+  option and `regalloc-split-capped` with a new test-only feature,
+  `regalloc-tiny-caps` (every structured function capped at 6 KB of
+  Rust, so every program's functions run in pieces), and again with
+  `mxcsr-groups` and `small-address-space` on the semantic, SIMD, FP,
+  loop, call, switch, exclusive, atomic, stress and kernel-call suites:
+  all equivalence tests pass (only count checks of how much is emitted
+  structured move).
+
+Changed meanwhile: the driver goes on only where the piece it ran left
+by one of its own edges to another piece; anywhere else (a return, a
+callee or the piece handing back, a failed stop-word test) it returns,
+as a function does. Before it also re-entered pieces at any entry, also
+after a callee handed back there; I found no case where that ran wrong,
+but it was not the design. A component holding the function's entry is
+now cut below that entry. And `ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT`
+(EmitOptions::regalloc_split_block_limit) sets the block limit under the
+option: `1024` keeps exactly the functions of candidate 3 and splits
+only those over the size caps, which tells the two halves of the option
+apart.
+
+To find it: rerun candidate 6 with `ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT=1024`
+(hang gone: the newly lifted functions past 1,024 blocks or their
+callers; still there: the pieces of capped functions), and with the
+option on only for region 0x710169; the lift log lists the functions run
+in pieces ("run in structured pieces"), so whether 0x7101692860 is one
+of them, or calls one, says which code to look at. Its guest code (the
+function's blocks and the pieces' entries from the emitted crate) is
+what a reproduction needs.
+
 For the third (structured code run as windows), two opt-in options:
 
 - `regalloc-return-entries`: the blocks a structured function's own
