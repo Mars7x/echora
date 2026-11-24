@@ -1655,6 +1655,10 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
 /// function (`REGALLOC_ENTRIES`), as a call that is no guest call.
 const RUN_ENTRY_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn run_entry(m: &mut Machine, function: fn(&mut Machine) -> Result<(), Trap>) -> Result<(), Trap> { function(m) }\n";
 
+/// The registers a store list holds from which `EmitOptions::shared_reloads`
+/// stores every written local through the shared method instead.
+const SHARED_STORE_LENGTH: usize = 6;
+
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[(&str, &str)] = &[
     ("m.cpu.nzcv", "r.fl.nzcv"),
@@ -1787,7 +1791,28 @@ impl RegisterLocals {
                 write!(values, "{field}: m.cpu.{field}, ").unwrap();
             }
         }
-        format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
+        let mut text = format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n");
+        if self.shared_reload() {
+            // One copy of the full reload (`EmitOptions::shared_reloads`),
+            // under the same names as the copies it replaces.
+            // And of the store of every written local, for the long store
+            // lists (`store_dirty`).
+            let store = self.store().replace('\n', " ");
+            writeln!(
+                text,
+                "    impl R {{\n        #[inline(always)]\n        fn reload(&mut self, m: &Machine) {{ let r = self; {} }}\n        #[allow(dead_code)]\n        #[inline(always)]\n        fn store(&self, m: &mut Machine) {{ let r = self; {store} }}\n    }}",
+                self.reload()
+            )
+            .unwrap();
+        }
+        text
+    }
+
+    /// Whether the full reload is one shared method (`r.reload(m)`,
+    /// `EmitOptions::shared_reloads`): with the option, where it reloads
+    /// more than a few locals.
+    fn shared_reload(&self) -> bool {
+        SHARED_RELOADS.get() && self.used.len() + usize::from(self.flags) >= 4
     }
 
     fn store(&self) -> String {
@@ -1862,6 +1887,18 @@ impl RegisterLocals {
 
     /// `store`, of only the locals in `dirty` (FPCR and FPSR as `store`).
     fn store_dirty(&self, dirty: Dirty) -> String {
+        // A long list as the shared store of every written local
+        // (`shared_reload`): storing a local that is not dirty writes the
+        // value the `Core` already holds.
+        let long = self
+            .written
+            .iter()
+            .filter(|&&index| dirty & 1 << index != 0)
+            .count()
+            >= SHARED_STORE_LENGTH;
+        if self.shared_reload() && long {
+            return "r.store(m); ".to_owned();
+        }
         let mut text = String::new();
         for index in &self.written {
             if dirty & 1 << index != 0 {
@@ -2046,7 +2083,11 @@ impl RegisterLocals {
         arms: Option<&BTreeMap<u64, usize>>,
         mut out: Option<&mut String>,
     ) -> Heads {
-        let reload = self.reload();
+        let reload = if self.shared_reload() {
+            "r.reload(m); ".to_owned()
+        } else {
+            self.reload()
+        };
         let tracked = heads.any != Dirty::MAX;
         let mut next = Heads {
             arms: vec![0; heads.arms.len()],
@@ -6783,6 +6824,12 @@ pub struct EmitOptions {
     /// keeps the functions of `regalloc` alone, splitting only those over
     /// the size caps).
     pub regalloc_split_block_limit: usize,
+    /// Windows' and structured functions' full reload of their register
+    /// locals after a call or helper as one `#[inline(always)]` method per
+    /// window or function (`r.reload(m)`) instead of a copy of every
+    /// assignment at each site: the same machine code, much less Rust for
+    /// rustc's front end.
+    pub shared_reloads: bool,
     /// With `regalloc`: the blocks a structured function's own calls
     /// return to outside its loops are entries of the function (window
     /// arms there run it), not only resume points.
@@ -6833,6 +6880,8 @@ thread_local! {
     static REGALLOC_LAZY_PC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_split_capped` of the region being emitted.
     static REGALLOC_SPLIT_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::shared_reloads` of the region being emitted.
+    static SHARED_RELOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_return_entries` of the region being emitted.
     static REGALLOC_RETURN_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_summarized_entries` of the region being emitted.
@@ -7465,6 +7514,7 @@ struct RegionSettings {
     regalloc_vector_locals: Flag,
     regalloc_lazy_pc: Flag,
     regalloc_split_capped: Flag,
+    shared_reloads: Flag,
     regalloc_return_entries: Flag,
     regalloc_summarized_entries: Flag,
 }
@@ -7573,6 +7623,7 @@ impl RegionSettings {
             ),
             regalloc_lazy_pc: Flag::set(&REGALLOC_LAZY_PC, options.regalloc_lazy_pc),
             regalloc_split_capped: Flag::set(&REGALLOC_SPLIT_CAPPED, options.regalloc_split_capped),
+            shared_reloads: Flag::set(&SHARED_RELOADS, options.shared_reloads),
             regalloc_return_entries: Flag::set(
                 &REGALLOC_RETURN_ENTRIES,
                 options.regalloc_return_entries,
@@ -11041,7 +11092,9 @@ mod tests {
         let both = format!("{pair} echora_guest::simd::vec_fp(&mut m.cpu, 1, 2)?;");
         assert_eq!(
             wrap_cpu_helpers(&both, "S; ", "L; "),
-            format!("{pair} {{ S; let called = echora_guest::simd::vec_fp(&mut m.cpu, 1, 2); L; called? }};")
+            format!(
+                "{pair} {{ S; let called = echora_guest::simd::vec_fp(&mut m.cpu, 1, 2); L; called? }};"
+            )
         );
         assert_eq!(
             wrap_cpu_helpers("let v = read(&m.cpu);", "S; ", "L; "),

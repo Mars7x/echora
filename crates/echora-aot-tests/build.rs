@@ -96,6 +96,7 @@ fn options() -> EmitOptions {
         regalloc_lazy_pc: std::env::var_os("CARGO_FEATURE_REGALLOC_LAZY_PC").is_some(),
         regalloc_split_capped: std::env::var_os("CARGO_FEATURE_REGALLOC_SPLIT_CAPPED").is_some(),
         regalloc_split_block_limit: 0,
+        shared_reloads: std::env::var_os("CARGO_FEATURE_SHARED_RELOADS").is_some(),
         regalloc_return_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_RETURN_ENTRIES")
             .is_some(),
         regalloc_summarized_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_SUMMARIZED_ENTRIES")
@@ -578,6 +579,18 @@ fn codesize(out_dir: &std::path::Path) {
                     transitive_summaries: true,
                     regalloc: true,
                     regalloc_loop_inlining: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc_shared",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    shared_reloads: true,
                     ..game
                 },
             ),
@@ -6031,6 +6044,18 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             mxcsr_groups: true,
             float_runs: true,
             float_run_loads: true,
+            ..structured_functions
+        },
+    );
+    // Shared reloads and stores of the register locals, in windows and
+    // structured functions.
+    lift(
+        "regalloc_shared",
+        16,
+        EmitOptions {
+            shared_reloads: true,
+            regalloc_return_entries: true,
+            regalloc_resume_loops: true,
             ..structured_functions
         },
     );
