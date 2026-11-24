@@ -2579,6 +2579,12 @@ fn special_lane_code(out: &mut String) {
         ("fmla 2d", false, vec![0x4e62_cc20]),
         ("fmls 2d", false, vec![0x4ee2_cc20]),
         ("fmul 2d by element", false, vec![0x4fc2_9820]),
+        // Scalar compares: every operand but a NaN natively, a denormal
+        // flushed (IDC) under FZ.
+        ("fcmp s", true, vec![0x1e22_2020]),
+        ("fcmpe s", true, vec![0x1e22_2030]),
+        ("fcmp d", false, vec![0x1e62_2020]),
+        ("fcmp d, #0", false, vec![0x1e60_2028]),
         (
             "chain 4s",
             true,

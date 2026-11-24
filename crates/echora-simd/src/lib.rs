@@ -1063,11 +1063,28 @@ pub fn fp_compare(
     rm: Option<u8>,
     signaling: bool,
 ) -> Result<(), Trap> {
-    if default_mode(cpu) {
+    // A compare of numbers raises nothing and rounds nothing: in any FPCR
+    // the helpers accept, with or without IXC, the host's compare is Arm's.
+    // Under FPCR.FZ a denormal operand is a zero of its sign (FPUnpack,
+    // raising IDC). Only a NaN takes the exact path (IOC, unordered).
+    if cpu.fpcr & (FPCR_RMODE | FPCR_AH | FPCR_FZ16) == 0 {
         let a = read_fp(cpu, rn, size);
         let b = rm.map_or(0, |rm| read_fp(cpu, rm, size));
         let format = Format::of(size);
         if !format.is_nan(a) && !format.is_nan(b) {
+            let fz = cpu.fpcr & FPCR_FZ != 0;
+            let flush = |value: u64| {
+                if fz && format.is_denormal(value) {
+                    (value & format.sign_bit(), true)
+                } else {
+                    (value, false)
+                }
+            };
+            let (a, flushed_a) = flush(a);
+            let (b, flushed_b) = flush(b);
+            if flushed_a || flushed_b {
+                cpu.fpsr |= FPSR_IDC;
+            }
             let (x, y) = match size {
                 FpSize::S => (
                     f64::from(f32::from_bits(a as u32)),
@@ -5500,6 +5517,85 @@ mod sticky_inexact_tests {
     /// normal, denormal, zero, infinite, NaN, overflowing and underflowing
     /// values, in every FZ/DN mode: with FPSR.IXC set (the native lanes on)
     /// the result and flags are those of the exact path (IXC clear).
+    /// `fp_compare`'s native path: every pair of special values, FCMP and
+    /// FCMPE, with a register and with #0.0, in every FZ/DN mode, with and
+    /// without IXC: NZCV and FPSR are the exact path's.
+    #[test]
+    fn compares_run_natively_as_the_exact_path() {
+        let singles: &[u64] = &[
+            0,
+            0x8000_0000,
+            1,
+            0x807f_ffff,
+            0x0080_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_0001,
+            0x7fc0_0000,
+            0xffc0_1234,
+            0x0000_0002,
+        ];
+        let doubles: &[u64] = &[
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            0x800f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+            0xbff8_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0x7ff8_0000_0000_0000,
+            0x0000_0000_0000_0002,
+        ];
+        let mut native = 0u64;
+        for (size, pool) in [(FpSize::S, singles), (FpSize::D, doubles)] {
+            for signaling in [false, true] {
+                for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN] {
+                    for fpsr in [0, FPSR_IXC] {
+                        for &a in pool {
+                            for b in pool.iter().map(|&b| Some(b)).chain([None]) {
+                                let run = |exact: bool| {
+                                    let mut cpu = Cpu {
+                                        fpcr,
+                                        fpsr,
+                                        ..Cpu::default()
+                                    };
+                                    cpu.vectors[1] = u128::from(a);
+                                    let rm = b.map(|b| {
+                                        cpu.vectors[2] = u128::from(b);
+                                        2
+                                    });
+                                    if exact {
+                                        fp_compare_exact(&mut cpu, size, 1, rm, signaling).unwrap();
+                                    } else {
+                                        fp_compare(&mut cpu, size, 1, rm, signaling).unwrap();
+                                    }
+                                    (cpu.nzcv, cpu.fpsr)
+                                };
+                                assert_eq!(
+                                    run(false),
+                                    run(true),
+                                    "{size:?} fcmpe {signaling} fpcr {fpcr:#x} fpsr {fpsr:#x}: {a:#x} {b:x?}"
+                                );
+                                let format = Format::of(size);
+                                if !format.is_nan(a) && !b.is_some_and(|b| format.is_nan(b)) {
+                                    native += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(native > 2_000, "{native}");
+    }
+
     #[test]
     fn special_lanes_run_natively_as_the_exact_path() {
         let singles: &[u64] = &[

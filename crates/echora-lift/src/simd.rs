@@ -3307,6 +3307,27 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
                 Some(rm) => format!("m.cpu.vectors[{rm}] as {int}"),
                 None => "0".to_owned(),
             };
+            if crate::codegen::special_lanes_on() {
+                // `EmitOptions::special_lanes`: every operand but a NaN.
+                // Under FPCR.FZ a denormal is a zero of its sign (FPUnpack,
+                // raising IDC); without, the host compares it exactly.
+                let (exponent, sign) = match size {
+                    FpSize::S => ("0x7f80_0000u32", "0x8000_0000u32"),
+                    FpSize::D => ("0x7ff0_0000_0000_0000u64", "0x8000_0000_0000_0000u64"),
+                };
+                let p = "echora_guest::simd";
+                return Some(format!(
+                    "{{ let x = m.cpu.vectors[{rn}] as {int}; let y: {int} = {y}; \
+                     if {FP_MODE} && x & !{sign} <= {exponent} && y & !{sign} <= {exponent} {{ \
+                     let fz = m.cpu.fpcr & {p}::FPCR_FZ != 0; \
+                     let flush = |value: {int}| if fz && value & {exponent} == 0 && value & !{sign} != 0 {{ (value & {sign}, true) }} else {{ (value, false) }}; \
+                     let ((x, fx), (y, fy)) = (flush(x), flush(y)); \
+                     if fx | fy {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_IDC; }} \
+                     let (a, b) = ({float}::from_bits(x), {float}::from_bits(y)); \
+                     m.cpu.nzcv = if a == b {{ 0b0110 }} else if a < b {{ 0b1000 }} else {{ 0b0010 }}; \
+                     }} else {{\n{call}\n}} }}"
+                ));
+            }
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; let y: {int} = {y}; {kit} \
                  let plain = |value: {int}| usable(value) || {float}::from_bits(value).is_infinite(); \

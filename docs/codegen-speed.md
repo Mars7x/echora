@@ -1383,6 +1383,23 @@ operands with IXC set so the groups commit: 389,800 runs, without regalloc
 and with it, none differing; before the fix 73 programs differed, both
 angle-wrap blocks among them.
 
+**Compares under FZ.** The helpers' scalar fast paths took only FPCR 0
+(`default_mode`); the game runs with FZ, so every FCMP through a helper
+took the exact path, and a candidate's run counted 17.5 million FCMPs of
+a normal and a denormal under FZ, 4 million of two normals and 2.7
+million of a zero and a normal. `fp_compare` now compares natively in any
+FPCR the helpers accept, with or without IXC (a compare rounds nothing),
+a denormal operand flushed to a zero of its sign (IDC) under FZ; only a
+NaN takes the exact path. With `special-lanes`, the inlined FCMP and
+FCMPE do the same (they took only normal, zero and infinite operands).
+`compares_run_natively_as_the_exact_path` (echora-simd) compares every
+pair of 14 single and 13 double values, a register and #0.0, FCMP and
+FCMPE, FPCR 0, FZ, DN and FZ+DN, FPSR with and without IXC, against the
+exact path: NZCV and FPSR agree; it fails without the flush, with the
+flush outside FZ, without IDC or with NaNs taken. `tests/special_lanes.rs`
+holds FCMP and FCMPE S, FCMP D and FCMP D with #0.0: 80,000 runs, none
+differing; it fails without the flush, without IDC or with NaNs taken.
+
 **Compile cost of the candidates' set, and `shared-float-tests`.** The
 codesize crate (every test program as one crate, 94,098 guest
 instructions) lifted with the game's hot-region set of its candidates
