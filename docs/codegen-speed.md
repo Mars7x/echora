@@ -1326,6 +1326,47 @@ vnorm is unchanged; `.text` within 200 bytes. `tests/mxcsr_groups.rs`
 fails with the minimum's half or the maximum's half of the tracking
 removed, or with the NaN half of the final test.
 
+**More forms, and groups mixing them with the runs' own.** In four
+singles a group also takes (`mxcsr_singles_only_op`):
+
+- FABD: the difference with the sign cleared (`mx_abs`); a NaN result is
+  the lane test's.
+- FMULX: a multiply; its 0 x infinity (Arm's 2) raises IE on the host.
+- FMAX, FMIN, FMAXNM, FMINNM (`mx_max`, `mx_min`): the host's `maxps` and
+  `minps` raise IE for any NaN operand (quiet ones too) and DE for a
+  denormal, so only lanes without either commit; where the lanes compare
+  equal the result is their AND (max) or OR (min), which is the lane
+  itself unless they are zeros of both signs: Arm's +0 and -0, where the
+  host would return the second operand.
+- FRECPS and FRSQRTS (`mx_recip_step`, `mx_rsqrt_step`): 2 - n * m and
+  (3 - n * m) / 2 with one rounding, so with the host's FMA only; Arm's
+  0 x infinity (2 and 1.5) raises IE; the halving is exact unless the
+  result underflows, which the lane test sees.
+- The pairwise FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP: the adjacent pairs
+  of Vm:Vn as two shuffles (`mx_evens`, `mx_odds`), then the operation.
+
+A group may also hold the operations a vector run's fast copy computes
+with its own tests (`run_other_op`: FRSQRTE, FRECPE, FMAXV, scalar FADDP
+and the rest): they take that code, from the group's values so far
+converted to `u128`, and clear the group's `good` where their own fast
+path would not take a lane; the group commits only with `good`, clean
+flags and no bad lane. So FRSQRTE no longer sends vnorm's whole run to the
+runs' fast copy.
+
+| kernel | game | + these | regalloc | + these |
+|---|---|---|---|---|
+| fpairs | 36.70 | 16.10 (-56%) | 37.52 | 15.53 (-59%) |
+| misc | 63.77 | 48.77 (-24%) | 62.21 | 47.30 (-24%) |
+| vnorm | 22.60 | 20.30 (-10%) | 22.44 | 20.80 (-7%) |
+| vchain, vector | | unchanged | | unchanged |
+
+`.text` shrank 3.8 KB (game) and 8 KB (regalloc). The test now holds every
+one of these forms alone and three groups shaped like vnorm, fpairs and
+misc (FRSQRTE, scalar FADDP and FMAXV among the group's own operations):
+120,000 runs, with FMA, without it and with regalloc, none differing.
+Without the signed-zero correction of FMAX, with the pairs' evens taken as
+odds, or with FABD's sign kept, it fails.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's
