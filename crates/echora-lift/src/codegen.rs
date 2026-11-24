@@ -1794,18 +1794,7 @@ impl RegisterLocals {
                 write!(values, "{field}: m.cpu.{field}, ").unwrap();
             }
         }
-        let mut text = format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n");
-        if self.shared_reload() {
-            // One copy of the full reload (`EmitOptions::shared_reloads`),
-            // under the same names as the copies it replaces.
-            writeln!(
-                text,
-                "    impl R {{\n        #[inline(always)]\n        fn reload(&mut self, m: &Machine) {{ let r = self; {} }}\n    }}",
-                self.reload()
-            )
-            .unwrap();
-        }
-        text
+        format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
     }
 
     /// Whether the full reload is one shared method (`r.reload(m)`,
@@ -1893,12 +1882,21 @@ impl RegisterLocals {
         for part in parts.iter().skip(1).step_by(2) {
             *uses.entry(part).or_default() += 1;
         }
-        let parse = |part: &str| -> (bool, Dirty) {
+        // (store, set; None for `F`, the full reload).
+        let parse = |part: &str| -> (bool, Option<Dirty>) {
             let (kind, mask) = part.split_at(1);
-            (
-                kind == "S",
-                Dirty::from_str_radix(mask, 16).expect("a shared set"),
-            )
+            let mask = Dirty::from_str_radix(mask, 16).expect("a shared set");
+            (kind == "S", (kind != "F").then_some(mask))
+        };
+        let name = |store: bool, mask: Option<Dirty>| match (store, mask) {
+            (_, None) => "reload".to_owned(),
+            (true, Some(mask)) => format!("store_{mask:x}"),
+            (false, Some(mask)) => format!("reload_{mask:x}"),
+        };
+        let text_of = |store: bool, mask: Option<Dirty>| match (store, mask) {
+            (_, None) => self.reload(),
+            (true, Some(mask)) => self.store_dirty_text(mask),
+            (false, Some(mask)) => self.reload_subset_text(mask),
         };
         let mut output = String::with_capacity(text.len());
         for (index, part) in parts.iter().enumerate() {
@@ -1908,35 +1906,30 @@ impl RegisterLocals {
             }
             let (store, mask) = parse(part);
             if uses[part] >= 2 {
-                let name = if store { "store" } else { "reload" };
-                write!(output, "r.{name}_{mask:x}(m); ").unwrap();
-            } else if store {
-                output.push_str(&self.store_dirty_text(mask));
+                write!(output, "r.{}(m); ", name(store, mask)).unwrap();
             } else {
-                output.push_str(&self.reload_subset_text(mask));
+                output.push_str(&text_of(store, mask));
             }
         }
+        // Only the sets the text calls: no method goes unused.
         let mut methods = String::new();
         for (part, &count) in &uses {
             if count < 2 {
                 continue;
             }
             let (store, mask) = parse(part);
-            if store {
-                write!(
-                    methods,
-                    "        #[inline(always)]\n        fn store_{mask:x}(&self, m: &mut Machine) {{ let r = self; {} }}\n",
-                    self.store_dirty_text(mask)
-                )
-                .unwrap();
+            let receiver = if store {
+                "&self, m: &mut Machine"
             } else {
-                write!(
-                    methods,
-                    "        #[inline(always)]\n        fn reload_{mask:x}(&mut self, m: &Machine) {{ let r = self; {} }}\n",
-                    self.reload_subset_text(mask)
-                )
-                .unwrap();
-            }
+                "&mut self, m: &Machine"
+            };
+            write!(
+                methods,
+                "        #[inline(always)]\n        fn {}({receiver}) {{ let r = self; {} }}\n",
+                name(store, mask),
+                text_of(store, mask)
+            )
+            .unwrap();
         }
         if !methods.is_empty() {
             methods = format!("    impl R {{\n{methods}    }}\n");
@@ -2192,7 +2185,7 @@ impl RegisterLocals {
         mut out: Option<&mut String>,
     ) -> Heads {
         let reload = if self.shared_reload() {
-            "r.reload(m); ".to_owned()
+            format!("{SHARED_MARK}F0{SHARED_MARK}")
         } else {
             self.reload()
         };
@@ -6049,7 +6042,11 @@ fn emit_function(
         "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{"
     )
     .unwrap();
+    // The rewrite first: its shared methods go next to `R` (an `impl R`
+    // inside `body` would be a non-local definition).
+    let (body, methods) = locals.finalize(&locals.rewrite(&cases));
     output.push_str(&locals.load());
+    output.push_str(&methods);
     let pending = if deferred {
         ", pending: &mut u64"
     } else if STEPS_LOCAL.get() {
@@ -6062,8 +6059,6 @@ fn emit_function(
         "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R{pending}) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {entry:#x};"
     )
     .unwrap();
-    let (body, methods) = locals.finalize(&locals.rewrite(&cases));
-    output.push_str(&methods);
     if WINDOW_MEMORY.get() {
         output.push_str("    let wmem = m.memory.window_memory();\n");
         output.push_str("    loop {\n        match next_pc {\n");
@@ -8715,7 +8710,10 @@ pub fn emit_rust_split_to_regions<E>(
                 let cold = if cold { "#[cold]\n" } else { "" };
                 writeln!(output, "\n{cold}#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
+            // The rewrite first: its shared methods go next to `R`.
+            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
             output.push_str(&locals.load());
+            output.push_str(&methods);
             // The blocks run in a nested function so their early returns still
             // pass the final store; it is always inlined, as a closure is not,
             // so `r`'s fields stay host registers instead of stack slots
@@ -8733,8 +8731,6 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
         );
-            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
-            output.push_str(&methods);
             let header = if dense {
                 format!(
                     "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"

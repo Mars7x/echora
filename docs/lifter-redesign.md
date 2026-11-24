@@ -248,7 +248,11 @@ The 240-block function's structured form now fits under the 500 KB cap
 more code structured. Kernels unchanged (gamefn 2.32, gamecalls 2.14,
 calls2 1.46, crossing 2.12, calls 1.33, vchain 7.96, arith 3.14, ldst
 4.09; measured with the first form, which differed only in long store
-lists). `ECHORA_REGALLOC_FUNCTION_BYTES` sets the size cap (and with
+lists). The methods are declared next to `struct R` (in a window, before its
+nested `body`, which an `impl R` inside would make a non-local
+definition), and only those the text calls: the full reload is a set too,
+shared where it recurs and written out where it does not (clippy
+`-D warnings` is clean on the window-call lifts). `ECHORA_REGALLOC_FUNCTION_BYTES` sets the size cap (and with
 `regalloc-split-capped` the pieces' size). Not done: skipping reloads of
 what a callee writes but nothing reads before it is written again (the
 translation's liveness allows it; the exit stores must then not store
