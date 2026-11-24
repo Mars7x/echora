@@ -242,6 +242,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("fp_mode_group", fp_mode_group_code),
     ("mxcsr_group", mxcsr_group_code),
     ("special_lane", special_lane_code),
+    ("mxcsr_form", mxcsr_form_code),
     ("counter", counter_code),
 ];
 
@@ -2555,6 +2556,148 @@ fn special_lane_code(out: &mut String) {
     for (name, options) in [
         ("special_lane_code", special),
         ("special_lane_reference", EmitOptions::default()),
+    ] {
+        let (root, regions) = split(&translation, options);
+        writeln!(out, "pub mod {name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {BASE:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
+        writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
+        writeln!(out, "pub const SINGLES: &[bool] = &{singles:?};").expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
+/// Programs for `tests/mxcsr_forms.rs`: every form an MXCSR group admits
+/// (`mxcsr_group_op` or `run_other_op`: vector, by-element and pairwise
+/// float arithmetic, compares, FMAX and FMIN, FABD, FMULX, unary forms),
+/// found by decoding the SIMD space with registers narrowed to V0-V3, each
+/// alone, after an FMUL (so in a group) and before an FADD; and a block
+/// shaped like a game's angle wrap (FRINTM, FMUL by element, FSUB, FCMGT,
+/// BSL, FMAX, FCMEQ, FMOV, TBZ) in 2S and 4S. Lifted with the build's
+/// options, the inline paths, vector float runs and MXCSR groups
+/// (`mxcsr_form_code`), and with the helpers alone (`mxcsr_form_reference`).
+fn mxcsr_form_code(out: &mut String) {
+    use echora_lift::aarch64::{Instruction, decode};
+
+    const BASE: u64 = 0x320_0000;
+    const NOP: u32 = 0xd503_201f;
+    const SVC_EXIT: u32 = 0xd400_00e1;
+    /// FMUL V3.4S, V1.4S, V2.4S and FADD V3.4S, V0.4S, V1.4S.
+    const FMUL: u32 = 0x6e22_dc23;
+    const FADD: u32 = 0x4e21_d403;
+    let mut forms: std::collections::BTreeMap<String, (u32, bool)> = Default::default();
+    let mut state = 0x6d78_666f_726d_7321u64;
+    for _ in 0..4_000_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let word = (state as u32 & !0x0e00_0000) | 0x0e00_0000;
+        // Rd, Rn and Rm (bits 16-20, M clear) narrowed; or Rd and Rn alone
+        // for a form whose bits 16-20 are its opcode.
+        let random = (state >> 32) as u32;
+        for narrowed in [
+            word & !0x001f_03ff | random & 0x0003_0063,
+            word & !0x0000_03ff | random & 0x0000_0063,
+        ] {
+            let Instruction::Simd(op) = decode(narrowed, 0) else {
+                continue;
+            };
+            if !(echora_lift::simd::mxcsr_group_op(&op) || echora_lift::simd::run_other_op(&op)) {
+                continue;
+            }
+            // One program per form: the operation without its registers.
+            let text = format!("{op:?}");
+            let key: String = text
+                .split(", ")
+                .filter(|field| {
+                    !["rd:", "rn:", "rm:"]
+                        .iter()
+                        .any(|name| field.trim_start().starts_with(name))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let single = !text.contains("size: D");
+            forms.entry(key).or_insert((narrowed, single));
+        }
+    }
+    assert!(forms.len() > 40, "{} forms", forms.len());
+    let mut programs: Vec<(String, bool, Vec<u32>)> = vec![
+        (
+            "angle wrap 2s".into(),
+            true,
+            vec![
+                0x0e21_9801,
+                0x0f83_9022,
+                0x0ea2_d404,
+                0x2ea3_e485,
+                0x2e60_1c85,
+                0x0e21_f4a6,
+                0x0e23_e4c7,
+                0x1e26_00e8,
+                0x3600_0048,
+                NOP,
+            ],
+        ),
+        (
+            "angle wrap 4s".into(),
+            true,
+            vec![
+                0x4e21_9801,
+                0x4f83_9022,
+                0x4ea2_d404,
+                0x6ea3_e485,
+                0x6e60_1c85,
+                0x4e21_f4a6,
+                0x4e23_e4c7,
+                0x1e26_00e8,
+                0x3600_0048,
+                NOP,
+            ],
+        ),
+    ];
+    for (key, &(word, single)) in &forms {
+        programs.push((format!("{key} alone"), single, vec![word]));
+        programs.push((format!("{key} after fmul"), single, vec![FMUL, word]));
+        programs.push((format!("{key} before fadd"), single, vec![word, FADD]));
+    }
+    let mut words: Vec<u32> = Vec::new();
+    let mut entries = Vec::new();
+    let mut names = Vec::new();
+    let mut singles = Vec::new();
+    for (name, single, program) in &programs {
+        entries.push(BASE + 4 * words.len() as u64);
+        names.push(name.clone());
+        singles.push(*single);
+        words.push(NOP);
+        words.extend_from_slice(program);
+        words.push(SVC_EXIT);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let translation = discover(
+        &[CodeRegion {
+            name: "mxcsr_form".into(),
+            base: BASE,
+            bytes,
+        }],
+        &entries,
+        words.len() + 16,
+    )
+    .expect("mxcsr_form");
+    let grouped = EmitOptions {
+        inline_vector: true,
+        whole_vector_checks: true,
+        fp_status_locals: true,
+        vector_float_runs: true,
+        mxcsr_groups: true,
+        ..options()
+    };
+    for (name, options) in [
+        ("mxcsr_form_code", grouped),
+        ("mxcsr_form_reference", EmitOptions::default()),
     ] {
         let (root, regions) = split(&translation, options);
         writeln!(out, "pub mod {name} {{").expect("write");
