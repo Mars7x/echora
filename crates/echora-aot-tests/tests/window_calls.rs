@@ -141,6 +141,9 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_crates),
         lift!(regalloc_capped),
         lift!(regalloc_split),
+        lift!(regalloc_returns),
+        lift!(regalloc_summarized),
+        lift!(regalloc_returns_resume),
         lift!(regalloc_span),
         lift!(regalloc_resume),
         lift!(regalloc_resume_crates),
@@ -175,6 +178,9 @@ const PAIRS: &[(&str, &str)] = &[
     ("window_call_base", "regalloc_crates"),
     ("window_call_base", "regalloc_capped"),
     ("window_call_base", "regalloc_split"),
+    ("window_call_base", "regalloc_returns"),
+    ("window_call_base", "regalloc_summarized"),
+    ("window_call_base", "regalloc_returns_resume"),
     ("window_call_base", "regalloc_span"),
     ("window_call_base", "regalloc_resume"),
     ("window_call_base", "regalloc_resume_crates"),
@@ -858,6 +864,12 @@ fn lifted_functions_cover_the_game_s_cases() {
     assert!(regalloc_split::SPLIT_FUNCTIONS > 0);
     assert!(regalloc_split::PIECES > 2 * regalloc_split::SPLIT_FUNCTIONS);
     assert!(regalloc_split::CAPPED_FUNCTIONS < regalloc_capped::CAPPED_FUNCTIONS);
+    // Return points as entries: more window arms run structured code.
+    if cfg!(feature = "regalloc-return-entries") || cfg!(feature = "regalloc-resume-returns") {
+        assert!(regalloc_returns::STRUCTURED_ENTRIES >= regalloc_on::STRUCTURED_ENTRIES);
+    } else {
+        assert!(regalloc_returns::STRUCTURED_ENTRIES > regalloc_on::STRUCTURED_ENTRIES);
+    }
 }
 
 /// The integer twin, without and with window calls (in one region and

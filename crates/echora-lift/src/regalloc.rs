@@ -1230,6 +1230,39 @@ fn emit_entered(
                 .filter(|&head| !base.contains(&head) && head >> KEY_SHIFT == 0),
         )
         .collect();
+    // With regalloc_return_entries, also the blocks its own calls return
+    // to outside any loop (one inside a loop would be a second way into
+    // it): a caller handed back during a call (a host boundary, a callee
+    // leaving early) comes back structured when the callee returns.
+    let with_returns: Vec<u64> = if REGALLOC_RETURN_ENTRIES.get() {
+        let next: BTreeMap<u64, Vec<u64>> = graph
+            .iter()
+            .map(|(&key, targets)| (key, targets.iter().flatten().copied().collect()))
+            .collect();
+        let keys: BTreeSet<u64> = graph.keys().copied().collect();
+        let cyclic: BTreeSet<u64> = components(&keys, &next)
+            .into_iter()
+            .filter(|component| {
+                component.len() > 1
+                    || component
+                        .iter()
+                        .all(|key| next.get(key).is_some_and(|targets| targets.contains(key)))
+            })
+            .flatten()
+            .collect();
+        entries
+            .iter()
+            .copied()
+            .chain(returns.iter().copied().filter(|&pc| {
+                pc >> KEY_SHIFT == 0
+                    && graph.contains_key(&pc)
+                    && !cyclic.contains(&pc)
+                    && !entries.contains(&pc)
+            }))
+            .collect()
+    } else {
+        entries.clone()
+    };
     // The heads of its own inner loops.
     let mut inner = BTreeSet::new();
     loop_heads(&single, &mut inner, false);
@@ -1238,6 +1271,14 @@ fn emit_entered(
     if REGALLOC_RESUME_RETURNS.get() {
         inner.extend(returns.iter().copied());
     }
+    let structured_returns = (with_returns.len() > entries.len())
+        .then(|| crate::structure::function_structure(&with_returns, &edges))
+        .flatten();
+    let entries = if structured_returns.is_some() {
+        with_returns
+    } else {
+        entries
+    };
     let inner: Vec<u64> = inner
         .into_iter()
         .filter(|&head| {
@@ -1245,7 +1286,9 @@ fn emit_entered(
             head >> KEY_SHIFT == 0 && graph.contains_key(&head) && !entries.contains(&head)
         })
         .collect();
-    let tree = if entries.len() > base.len()
+    let tree = if let Some(tree) = structured_returns {
+        tree
+    } else if entries.len() > base.len()
         && let Some(tree) = crate::structure::function_structure(&entries, &edges)
     {
         tree
