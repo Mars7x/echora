@@ -413,6 +413,7 @@ fn loop_heads(tree: &crate::structure::Structured, heads: &mut BTreeSet<u64>, ou
 /// nothing, when it does not qualify (an irreducible graph; a spin-wait head, a
 /// traced block, an exclusive access or anything reading the step count),
 /// and the caller emits the window form.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_function(
     output: &mut String,
     entry: u64,
@@ -421,6 +422,7 @@ pub(super) fn emit_function(
     jump_tables: &BTreeMap<u64, Vec<u64>>,
     functions: &BTreeMap<u64, Vec<u64>>,
     by_start: &BTreeMap<u64, &BasicBlock>,
+    armless: &BTreeSet<u64>,
 ) -> Option<Vec<(u64, u64)>> {
     let own: Vec<&BasicBlock> = blocks.iter().collect();
     if !plain(&own, spin_heads) {
@@ -476,7 +478,32 @@ pub(super) fn emit_function(
         }
     }
     let own_size: usize = blocks.iter().map(|block| block.instructions.len()).sum();
+    // Past the block limit of a function in one piece: split at once (the
+    // structuring of the whole would only be thrown away, and recurses
+    // deeply).
+    if REGALLOC_SPLIT_CAPPED.get() && blocks.len() > REGALLOC_BLOCK_LIMIT {
+        return split_capped(
+            output,
+            entry,
+            &own,
+            jump_tables,
+            functions,
+            by_start,
+            armless,
+        );
+    }
     if own_size > FUNCTION_INSTRUCTIONS {
+        if REGALLOC_SPLIT_CAPPED.get() {
+            return split_capped(
+                output,
+                entry,
+                &own,
+                jump_tables,
+                functions,
+                by_start,
+                armless,
+            );
+        }
         capped(entry, "instructions");
         return None;
     }
@@ -534,9 +561,20 @@ pub(super) fn emit_function(
         ),
         None => return None,
     };
-    // Too large even without inlining: left to the windows.
+    // Too large even without inlining: in pieces, or left to the windows.
     if output.len() - start > function_bytes() {
         output.truncate(start);
+        if REGALLOC_SPLIT_CAPPED.get() {
+            return split_capped(
+                output,
+                entry,
+                &own,
+                jump_tables,
+                functions,
+                by_start,
+                armless,
+            );
+        }
         capped(entry, "bytes");
         return None;
     }
@@ -609,6 +647,366 @@ pub(super) fn emit_function(
         }
     }
     Some(entered)
+}
+
+/// A function over the size caps as several structured pieces
+/// (`EmitOptions::regalloc_split_capped`), each under the caps, and a
+/// driver under the function's own name that runs the piece holding the
+/// PC until the PC leaves them all (a return, a hand-back) or a piece
+/// comes back where it was entered (its stop-word test failed there): the
+/// caller sets the PC to the entry before a call, and a window arm runs
+/// the driver at its own block, so the driver always starts at the PC.
+///
+/// The pieces: the function's blocks cut into units in topological order
+/// of their strongly connected components, a component too large for a
+/// piece cut again below its header (a reducible loop has one), and the
+/// units packed in that order up to a size budget. A piece is entered at
+/// each of its blocks with a predecessor in another piece, and only a
+/// loop header takes edges from later pieces, so each piece is reducible
+/// as it stands; registers pass between pieces through the `Core`, as at
+/// any exit. A piece that still does not fit, or does not structure,
+/// leaves its blocks to the windows. None when no piece was emitted.
+fn split_capped(
+    output: &mut String,
+    entry: u64,
+    own: &[&BasicBlock],
+    jump_tables: &BTreeMap<u64, Vec<u64>>,
+    functions: &BTreeMap<u64, Vec<u64>>,
+    by_start: &BTreeMap<u64, &BasicBlock>,
+    armless: &BTreeSet<u64>,
+) -> Option<Vec<(u64, u64)>> {
+    let next: BTreeMap<u64, Vec<u64>> = own
+        .iter()
+        .map(|block| {
+            (
+                block.start,
+                successors(block, jump_tables)
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut predecessors: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (&from, targets) in &next {
+        for &to in targets {
+            if next.contains_key(&to) {
+                predecessors.entry(to).or_default().push(from);
+            }
+        }
+    }
+    for from in predecessors.values_mut() {
+        from.sort_unstable();
+        from.dedup();
+    }
+    // A unit's size: its blocks' instructions (the caps' measure, and
+    // roughly the Rust they take) and one per block, so that a piece also
+    // holds at most half its budget in blocks.
+    let sizes: BTreeMap<u64, usize> = own
+        .iter()
+        .map(|block| (block.start, block.instructions.len() + 1))
+        .collect();
+    let all: BTreeSet<u64> = next.keys().copied().collect();
+    // Pieces of about a third of the instructions cap (scaled with
+    // `regalloc_function_bytes`), a piece that does not fit cut again at
+    // half the budget. A piece's entries depend only on its own blocks, so
+    // cutting one again changes no other.
+    let ratio = (function_bytes() as f64 / FUNCTION_BYTES as f64).min(1.0);
+    let budget = ((FUNCTION_INSTRUCTIONS / 3) as f64 * ratio).max(8.0) as usize;
+    let mut units = Vec::new();
+    split_units(&all, &next, &predecessors, &sizes, budget, &mut units);
+    let mut pending: Vec<(BTreeSet<u64>, usize)> =
+        with_predecessors(pack(&units, &sizes, budget), armless, &predecessors)
+            .into_iter()
+            .rev()
+            .map(|blocks| (blocks, budget))
+            .collect();
+    let mut entered: Vec<(u64, u64)> = Vec::new();
+    let mut arms = String::new();
+    let mut bodies = String::new();
+    let mut index = 0usize;
+    while let Some((blocks, budget)) = pending.pop() {
+        let mut entries: Vec<u64> = blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                *block == entry
+                    || predecessors
+                        .get(block)
+                        .is_some_and(|from| from.iter().any(|pc| !blocks.contains(pc)))
+            })
+            .collect();
+        if let Some(at) = entries.iter().position(|&pc| pc == entry) {
+            entries.swap(0, at);
+        }
+        let part: Vec<&BasicBlock> = own
+            .iter()
+            .copied()
+            .filter(|block| blocks.contains(&block.start))
+            .collect();
+        let mut text = String::new();
+        let emitted = entries.first().and_then(|&first| {
+            emit_entered(
+                &mut text,
+                first,
+                &entries[1..],
+                &part,
+                jump_tables,
+                functions,
+                by_start,
+                &BTreeSet::new(),
+            )
+        });
+        if emitted.is_some() && text.len() > function_bytes() && budget > 8 && blocks.len() > 1 {
+            // Cut again: its pieces in order, the first emitted first.
+            let mut units = Vec::new();
+            split_units(
+                &blocks,
+                &next,
+                &predecessors,
+                &sizes,
+                budget / 2,
+                &mut units,
+            );
+            for piece in with_predecessors(pack(&units, &sizes, budget / 2), armless, &predecessors)
+                .into_iter()
+                .rev()
+            {
+                pending.push((piece, budget / 2));
+            }
+            continue;
+        }
+        let Some((piece_entries, _)) = emitted.filter(|_| text.len() <= function_bytes()) else {
+            continue;
+        };
+        let first = entries[0];
+        let header = format!("pub fn run_function_{first:x}(m: &mut Machine)");
+        let name = format!("run_piece_{entry:x}_{index}");
+        index += 1;
+        let Some(at) = text.find(&header) else {
+            continue;
+        };
+        text.replace_range(
+            at..at + header.len(),
+            &format!("fn {name}(m: &mut Machine)"),
+        );
+        bodies.push_str(&text);
+        let pattern: Vec<String> = piece_entries.iter().map(|pc| format!("{pc:#x}")).collect();
+        writeln!(arms, "            {} => {name}(m)?,", pattern.join(" | ")).unwrap();
+        entered.extend(piece_entries.into_iter().map(|block| (block, entry)));
+    }
+    if entered.is_empty() {
+        capped(entry, "bytes");
+        return None;
+    }
+    SPLIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(entry);
+    writeln!(
+        output,
+        "\n/// In pieces, over the size caps (`regalloc_split_capped`).\n#[inline(never)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{\n    loop {{\n        let pc = m.cpu.pc;\n        match pc {{\n{arms}            _ => return Ok(()),\n        }}\n        if m.cpu.pc == pc {{\n            return Ok(());\n        }}\n    }}\n}}"
+    )
+    .unwrap();
+    output.push_str(&bodies);
+    Some(entered)
+}
+
+/// The functions `split_capped` emitted in pieces since the last
+/// `take_split_functions`.
+static SPLIT: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// The functions emitted in pieces (`regalloc_split_capped`) since the
+/// last call, sorted.
+pub fn take_split_functions() -> Vec<u64> {
+    let mut split = std::mem::take(
+        &mut *SPLIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    split.sort_unstable();
+    split
+}
+
+/// The blocks of `set` as units for `pack`, in topological order of their
+/// strongly connected components; a component over `budget` instructions
+/// with one header (its only block entered from outside it) as the
+/// header alone and then the units of the rest.
+fn split_units(
+    set: &BTreeSet<u64>,
+    next: &BTreeMap<u64, Vec<u64>>,
+    predecessors: &BTreeMap<u64, Vec<u64>>,
+    sizes: &BTreeMap<u64, usize>,
+    budget: usize,
+    units: &mut Vec<BTreeSet<u64>>,
+) {
+    for component in components(set, next) {
+        let size: usize = component.iter().map(|block| sizes[block]).sum();
+        if size <= budget || component.len() == 1 {
+            units.push(component);
+            continue;
+        }
+        let headers: Vec<u64> = component
+            .iter()
+            .copied()
+            .filter(|block| {
+                predecessors
+                    .get(block)
+                    .is_some_and(|from| from.iter().any(|pc| !component.contains(pc)))
+            })
+            .collect();
+        let header = match headers.as_slice() {
+            [header] => *header,
+            // Entered only from outside the function's blocks (its entry).
+            [] => *component.first().expect("components are not empty"),
+            _ => {
+                units.push(component);
+                continue;
+            }
+        };
+        units.push(BTreeSet::from([header]));
+        let mut rest = component;
+        rest.remove(&header);
+        split_units(&rest, next, predecessors, sizes, budget, units);
+    }
+}
+
+/// The strongly connected components of the graph `next` restricted to
+/// `set`, in topological order (Tarjan's, iteratively).
+fn components(set: &BTreeSet<u64>, next: &BTreeMap<u64, Vec<u64>>) -> Vec<BTreeSet<u64>> {
+    let mut index: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut low: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut stack: Vec<u64> = Vec::new();
+    let mut on_stack: BTreeSet<u64> = BTreeSet::new();
+    let mut found: Vec<BTreeSet<u64>> = Vec::new();
+    let successors = |pc: u64| -> Vec<u64> {
+        next.get(&pc)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|target| set.contains(target))
+            .collect()
+    };
+    for &root in set {
+        if index.contains_key(&root) {
+            continue;
+        }
+        // (block, its successors, the next one to visit).
+        let mut work: Vec<(u64, Vec<u64>, usize)> = Vec::new();
+        let visit = |pc: u64,
+                     index: &mut BTreeMap<u64, usize>,
+                     low: &mut BTreeMap<u64, usize>,
+                     stack: &mut Vec<u64>,
+                     on_stack: &mut BTreeSet<u64>| {
+            let number = index.len();
+            index.insert(pc, number);
+            low.insert(pc, number);
+            stack.push(pc);
+            on_stack.insert(pc);
+        };
+        visit(root, &mut index, &mut low, &mut stack, &mut on_stack);
+        work.push((root, successors(root), 0));
+        while let Some((pc, targets, at)) = work.last_mut() {
+            let pc = *pc;
+            if *at < targets.len() {
+                let target = targets[*at];
+                *at += 1;
+                if !index.contains_key(&target) {
+                    visit(target, &mut index, &mut low, &mut stack, &mut on_stack);
+                    work.push((target, successors(target), 0));
+                } else if on_stack.contains(&target) {
+                    let value = low[&pc].min(index[&target]);
+                    low.insert(pc, value);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some((parent, _, _)) = work.last() {
+                let value = low[parent].min(low[&pc]);
+                low.insert(*parent, value);
+            }
+            if low[&pc] == index[&pc] {
+                let mut component = BTreeSet::new();
+                while let Some(member) = stack.pop() {
+                    on_stack.remove(&member);
+                    component.insert(member);
+                    if member == pc {
+                        break;
+                    }
+                }
+                found.push(component);
+            }
+        }
+    }
+    // Tarjan's finds them in reverse topological order.
+    found.reverse();
+    found
+}
+
+/// `pieces` with each block that has no window arm of its own (`armless`:
+/// its window runs it inside its one predecessor's arm) moved to its
+/// predecessor's piece, so that no piece is entered there: a piece
+/// leaves to the windows at its exits, which need an arm. Pieces left
+/// empty go.
+fn with_predecessors(
+    mut pieces: Vec<BTreeSet<u64>>,
+    armless: &BTreeSet<u64>,
+    predecessors: &BTreeMap<u64, Vec<u64>>,
+) -> Vec<BTreeSet<u64>> {
+    let mut piece_of: BTreeMap<u64, usize> = BTreeMap::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        for &block in piece {
+            piece_of.insert(block, index);
+        }
+    }
+    loop {
+        let mut moved = false;
+        for (&block, from) in predecessors {
+            let ([predecessor], true) = (from.as_slice(), armless.contains(&block)) else {
+                continue;
+            };
+            let (Some(&own), Some(&target)) = (piece_of.get(&block), piece_of.get(predecessor))
+            else {
+                continue;
+            };
+            if own != target {
+                pieces[own].remove(&block);
+                pieces[target].insert(block);
+                piece_of.insert(block, target);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    pieces.retain(|piece| !piece.is_empty());
+    pieces
+}
+
+/// `units` packed in order into pieces of at most `budget` instructions
+/// (a larger unit alone).
+fn pack(
+    units: &[BTreeSet<u64>],
+    sizes: &BTreeMap<u64, usize>,
+    budget: usize,
+) -> Vec<BTreeSet<u64>> {
+    let mut pieces: Vec<BTreeSet<u64>> = Vec::new();
+    let mut current = BTreeSet::new();
+    let mut size = 0;
+    for unit in units {
+        let unit_size: usize = unit.iter().map(|block| sizes[block]).sum();
+        if !current.is_empty() && size + unit_size > budget {
+            pieces.push(std::mem::take(&mut current));
+            size = 0;
+        }
+        current.extend(unit.iter().copied());
+        size += unit_size;
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
 }
 
 /// The bytes of Rust a structured function may take: a larger one is
@@ -734,6 +1132,34 @@ fn emit_with(
     by_start: &BTreeMap<u64, &BasicBlock>,
     inlined: &BTreeSet<u64>,
 ) -> Option<(Vec<u64>, Vec<u64>)> {
+    emit_entered(
+        output,
+        entry,
+        &[],
+        own,
+        jump_tables,
+        functions,
+        by_start,
+        inlined,
+    )
+}
+
+/// `emit_with`, the function also entered at `extra` (a piece of a split
+/// function, `split_capped`).
+#[allow(clippy::too_many_arguments)]
+fn emit_entered(
+    output: &mut String,
+    entry: u64,
+    extra: &[u64],
+    own: &[&BasicBlock],
+    jump_tables: &BTreeMap<u64, Vec<u64>>,
+    functions: &BTreeMap<u64, Vec<u64>>,
+    by_start: &BTreeMap<u64, &BasicBlock>,
+    inlined: &BTreeSet<u64>,
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    let base: Vec<u64> = std::iter::once(entry)
+        .chain(extra.iter().copied().filter(|&pc| pc != entry))
+        .collect();
     // The graph: the function's own blocks, then a copy of each inlined
     // callee for each call of it (the calls inside a copy too).
     let mut graph: BTreeMap<u64, Vec<Option<u64>>> = BTreeMap::new();
@@ -789,17 +1215,19 @@ fn emit_with(
         .iter()
         .map(|(key, targets)| (*key, targets.clone()))
         .collect();
-    let single = crate::structure::function_structure(&[entry], &edges)?;
+    let single = crate::structure::function_structure(&base, &edges)?;
     // Also entered at the heads of its outermost loops of its own blocks,
     // where execution resumes after a host boundary (an inner loop's head
     // would be a second way into the loop around it).
     let mut outer = BTreeSet::new();
     loop_heads(&single, &mut outer, true);
-    let entries: Vec<u64> = std::iter::once(entry)
+    let entries: Vec<u64> = base
+        .iter()
+        .copied()
         .chain(
             outer
                 .into_iter()
-                .filter(|&head| head != entry && head >> KEY_SHIFT == 0),
+                .filter(|&head| !base.contains(&head) && head >> KEY_SHIFT == 0),
         )
         .collect();
     // The heads of its own inner loops.
@@ -817,7 +1245,7 @@ fn emit_with(
             head >> KEY_SHIFT == 0 && graph.contains_key(&head) && !entries.contains(&head)
         })
         .collect();
-    let tree = if entries.len() > 1
+    let tree = if entries.len() > base.len()
         && let Some(tree) = crate::structure::function_structure(&entries, &edges)
     {
         tree
@@ -825,7 +1253,7 @@ fn emit_with(
         return emit_tree(
             output,
             entry,
-            &[entry],
+            &base,
             single,
             &graph,
             &counts,

@@ -188,6 +188,37 @@ under `functions` with that set (also on main's tree alone), and adding
 `mxcsr-groups` to the set breaks `vector_runs`' compile-time
 `vector_run_reference::RUNS == 0`.
 
+**Coverage of the winning candidate** (coordinator, exact diagnostic
+relift, perf cycles): hot-region windows still 24.2% of guest cycles,
+structured functions 9.3%. Of all cycles, 11.2% in 314 functions over
+the 500 KB Rust cap (median 1,277 instructions, 204 blocks, mostly FP),
+5.35% past the 1,024-block limit or behind such functions, 5.3% in
+structured code run as windows (tiny BLR callees, return points without
+resume functions).
+
+`regalloc-split-capped` (opt-in) answers the first two: a function over
+a size cap is emitted as several structured pieces under a driver with
+the function's own name, and with it lifted functions may hold 16,384
+blocks (`REGALLOC_SPLIT_BLOCK_LIMIT`; past 1,024 blocks a function is
+split without trying it whole). The pieces: the function's strongly
+connected components in topological order, a component too large cut
+again below its header, packed in order up to a third of the
+instructions cap (scaled with `regalloc_function_bytes`, one more per
+block); a block the windows run inside its predecessor's arm stays in
+that predecessor's piece, so every place a piece is entered has a window
+arm. Each piece is entered at its blocks with a predecessor in another
+piece; only a loop header takes edges from a later piece, so every piece
+is reducible as it stands. A piece still over the cap is cut again at
+half the budget. The driver runs the piece holding the PC (callers set
+the PC to the entry, window arms run the driver at their own block)
+until the PC leaves the pieces or a piece comes back where it was
+entered (its stop-word test failed); registers pass between pieces
+through the `Core`, as at any exit. In the window-call program with the
+cap at 4 KB (`regalloc_split` against `regalloc_capped`): all 67 capped
+functions run as 334 pieces, none left to the windows, and every run
+(whole, sliced, budgets) ends with the default emission's state; a
+lifter test splits a 1,600-block loop.
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and

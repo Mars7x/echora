@@ -851,6 +851,7 @@ fn lift(
                 "regalloc-indirect-entries" => options.regalloc_indirect_entries = true,
                 "regalloc-vector-locals" => options.regalloc_vector_locals = true,
                 "regalloc-lazy-pc" => options.regalloc_lazy_pc = true,
+                "regalloc-split-capped" => options.regalloc_split_capped = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
@@ -1068,6 +1069,15 @@ fn lift(
             capped.len(),
             echora_lift::codegen::FUNCTION_INSTRUCTIONS,
             echora_lift::codegen::FUNCTION_BYTES,
+            list.join(", ")
+        );
+    }
+    let split = echora_lift::codegen::take_split_functions();
+    if !split.is_empty() {
+        let list: Vec<String> = split.iter().map(|entry| format!("{entry:#x}")).collect();
+        println!(
+            "regalloc: {} functions over the size caps run in structured pieces: {}",
+            split.len(),
             list.join(", ")
         );
     }
