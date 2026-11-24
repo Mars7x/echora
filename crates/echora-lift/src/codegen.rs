@@ -1938,6 +1938,22 @@ impl RegisterLocals {
                 None
             };
             let kind = kind.unwrap_or_else(|| {
+                if let Some(rest) = line.trim_start().strip_prefix(SUMMARIZED_ENTRY) {
+                    let fields: Vec<&str> = rest
+                        .split_once(") {")
+                        .expect("a summarized entry")
+                        .0
+                        .split(", ")
+                        .collect();
+                    let number = |text: &str| {
+                        Dirty::from_str_radix(text.trim_start_matches("0x"), 16).expect("a number")
+                    };
+                    return Kind::SummarizedEntry {
+                        callee: fields[0].to_owned(),
+                        touched: number(fields[1]),
+                        writes: number(fields[2]),
+                    };
+                }
                 if let Some(rest) = line.trim_start().strip_prefix(SUMMARIZED_CALL) {
                     let fields: Vec<&str> = rest
                         .split_once(") {")
@@ -2146,6 +2162,24 @@ impl RegisterLocals {
                         state = if WINDOW_CALLS_AUDIT.get() { 0 } else { held };
                     }
                 }
+                Kind::SummarizedEntry {
+                    callee,
+                    touched,
+                    writes,
+                } => {
+                    if let Some(out) = out.as_deref_mut() {
+                        let store = self.store_dirty(state & touched) + steps_out();
+                        let reload_writes = self.reload_subset(*writes) + steps_in();
+                        writeln!(
+                            out,
+                            "{indent}{store}let called = {callee}(m); {reload_writes}if let Err(trap) = called {{ return Err(trap); }}"
+                        )
+                        .unwrap();
+                    }
+                    if top {
+                        state &= !touched;
+                    }
+                }
                 Kind::Call(call, arguments) => {
                     // The callee runs on the Core: store before, reload
                     // after (also on its error path, so the final store
@@ -2244,6 +2278,12 @@ fn successors(rest: &str) -> Option<Vec<u64>> {
 /// which `RegisterLocals::rewrite` replaces.
 const SUMMARIZED_CALL: &str = "if let Err(trap) = m.call_summarized(";
 
+/// A window arm running a structured function that has an effect summary
+/// (`EmitOptions::regalloc_summarized_entries`): the function, and the
+/// locals it may read or write, and those it may write. Rewritten by
+/// `RegisterLocals` as a call storing and reloading only those.
+const SUMMARIZED_ENTRY: &str = "if let Err(trap) = m.run_entry_summarized(";
+
 /// Guest state a window's locals may hold that the `Core` does not:
 /// general register n at bit n, SP and NZCV above.
 type Dirty = u64;
@@ -2260,6 +2300,16 @@ enum Kind {
     /// A call of a lifted leaf function with an effect summary
     /// (`EmitOptions::call_summaries`): its return address, the callee,
     /// and the locals it may read or write, and those it may write.
+    /// A window arm's structured function with a summary
+    /// (`SUMMARIZED_ENTRY`): the callee and the locals it may read or
+    /// write, and those it may write. Unlike a guest call nothing is
+    /// expected of the PC after it: the window goes on wherever it is,
+    /// and the locals it did not touch still hold the guest's values.
+    SummarizedEntry {
+        callee: String,
+        touched: Dirty,
+        writes: Dirty,
+    },
     Summarized {
         next: u64,
         callee: String,
@@ -5975,9 +6025,36 @@ fn emit_split_cases(
                 _ if REGALLOC_SPLIT.get() => "run_entry_pc(m".to_owned(),
                 _ => format!("run_entry(m, run_function_{function:x}"),
             };
+            // With a summary of the function (its own effects and its
+            // callees', over all its instructions, so wherever it is
+            // entered), only what it may touch is stored and only what it
+            // may write reloaded.
+            let summary = REGALLOC_SUMMARIZED_ENTRIES
+                .get()
+                .then(|| {
+                    SUMMARIES.with_borrow(|summaries| summaries.as_ref()?.get(&function).copied())
+                })
+                .flatten();
+            let summarized = match (summary, function_call(function, function)) {
+                (Some((touched, writes)), Some(Some(index))) => {
+                    Some((format!("function_at({index})"), touched, writes))
+                }
+                (Some((touched, writes)), Some(None)) => {
+                    Some((format!("run_function_{function:x}"), touched, writes))
+                }
+                _ => None,
+            };
+            let call = match summarized {
+                Some((callee, touched, writes)) => {
+                    format!(
+                        "{SUMMARIZED_ENTRY}{callee}, {touched:#x}, {writes:#x}) {{ return Err(trap); }}"
+                    )
+                }
+                None => format!("if let Err(trap) = {callee}) {{ return Err(trap); }}"),
+            };
             writeln!(
                 output,
-                "                if let Err(trap) = {callee}) {{ return Err(trap); }}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
+                "                {call}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
                 block.start
             )
             .unwrap();
@@ -6856,6 +6933,14 @@ pub struct EmitOptions {
     /// structured pieces under a driver (`regalloc::split_capped`) instead
     /// of left to the windows.
     pub regalloc_split_capped: bool,
+    /// With `regalloc`: the blocks a structured function's own calls
+    /// return to outside its loops are entries of the function (window
+    /// arms there run it), not only resume points.
+    pub regalloc_return_entries: bool,
+    /// With `regalloc` and summaries: a window arm running a structured
+    /// function stores and reloads only the locals the function's summary
+    /// names (`SUMMARIZED_ENTRY`), not all of them.
+    pub regalloc_summarized_entries: bool,
 }
 
 /// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
@@ -6898,6 +6983,10 @@ thread_local! {
     static REGALLOC_LAZY_PC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_split_capped` of the region being emitted.
     static REGALLOC_SPLIT_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_return_entries` of the region being emitted.
+    static REGALLOC_RETURN_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_summarized_entries` of the region being emitted.
+    static REGALLOC_SUMMARIZED_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_returns` of the region being emitted.
     static REGALLOC_RESUME_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
@@ -7527,6 +7616,8 @@ struct RegionSettings {
     regalloc_vector_locals: Flag,
     regalloc_lazy_pc: Flag,
     regalloc_split_capped: Flag,
+    regalloc_return_entries: Flag,
+    regalloc_summarized_entries: Flag,
 }
 
 impl RegionSettings {
@@ -7634,6 +7725,14 @@ impl RegionSettings {
             ),
             regalloc_lazy_pc: Flag::set(&REGALLOC_LAZY_PC, options.regalloc_lazy_pc),
             regalloc_split_capped: Flag::set(&REGALLOC_SPLIT_CAPPED, options.regalloc_split_capped),
+            regalloc_return_entries: Flag::set(
+                &REGALLOC_RETURN_ENTRIES,
+                options.regalloc_return_entries,
+            ),
+            regalloc_summarized_entries: Flag::set(
+                &REGALLOC_SUMMARIZED_ENTRIES,
+                options.regalloc_summarized_entries,
+            ),
             regalloc: Flag::set(
                 &REGALLOC,
                 options.regalloc

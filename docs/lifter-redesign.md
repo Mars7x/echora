@@ -219,6 +219,39 @@ functions run as 334 pieces, none left to the windows, and every run
 (whole, sliced, budgets) ends with the default emission's state; a
 lifter test splits a 1,600-block loop.
 
+For the third (structured code run as windows), two opt-in options:
+
+- `regalloc-return-entries`: the blocks a structured function's own
+  calls (BL and BLR) return to are entries of the function where they
+  lie outside its loops (inside one an entry would be a second way into
+  the loop; `regalloc-resume-returns` gives those resume functions). A
+  caller handed back during a call (a host boundary in the callee, a
+  callee leaving early) comes back structured when the callee returns,
+  at no size limit and without a resume function's copy. In the
+  window-call program: 211 window arms run structured code against 120,
+  the same 91 return points `regalloc-resume-returns` reaches with 91
+  more functions.
+- `regalloc-summarized-entries`: a window arm that runs a structured
+  function with an effect summary (its own instructions and its
+  callees', so it holds wherever the function is entered) stores only
+  the locals the summary says it may touch and reloads only those it may
+  write, instead of every local; after it the window goes on at the PC
+  with its other locals. 34 of the 211 arms qualify in the window-call
+  program (functions with a BLR have no summary).
+
+With both on (and `regalloc-split-capped`) the kernels are unchanged
+(gamefn 2.32, gamecalls 2.14, calls2 1.46, crossing 2.11, calls 1.33,
+vcalls 11.10, vchain 7.96, switch 2.46): none of them hands back. Not
+done: inlining tiny BLR targets at monomorphic call sites needs the
+call site's observed target, which the lifter does not have (a profile,
+or `CallCache` contents fed back, would give it).
+
+Gate: the whole `echora-aot-tests` suite with the game set, every
+regalloc option, `float-run-loads` and these three (`-j 1`) passes but
+for `plt`'s count from main (above) and, fixed since, the
+`regalloc_capped` lift's own count (it now keeps `regalloc_split_capped`
+off: it is the windows-only baseline).
+
 **Next**: fewer locals live across non-inlined calls (stores and reloads
 only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and

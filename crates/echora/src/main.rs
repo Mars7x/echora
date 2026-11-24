@@ -852,6 +852,8 @@ fn lift(
                 "regalloc-vector-locals" => options.regalloc_vector_locals = true,
                 "regalloc-lazy-pc" => options.regalloc_lazy_pc = true,
                 "regalloc-split-capped" => options.regalloc_split_capped = true,
+                "regalloc-return-entries" => options.regalloc_return_entries = true,
+                "regalloc-summarized-entries" => options.regalloc_summarized_entries = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
