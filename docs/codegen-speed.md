@@ -1367,6 +1367,22 @@ misc (FRSQRTE, scalar FADDP and FMAXV among the group's own operations):
 Without the signed-zero correction of FMAX, with the pairs' evens taken as
 odds, or with FABD's sign kept, it fails.
 
+**A fix: forms the group does not compute.** From 10d9d8f, when groups
+took the runs' own forms (`run_other_op`), `vector_group_mxcsr` sent every
+vector and by-element float form down its arithmetic path, whose
+catch-all arms were FMLS's (`mx_mul_sub`, and `arith_lane`'s `(-x) * y +
+z`): a committed group computed FCMGT, FCMGE, FCMEQ, 2S and 2D FMAX and
+FMIN, FABD and FMULX as a negated product (a game's angle-wrap loop of
+FRINTM, FMUL, FSUB, FCMGT, BSL, FMAX and FCMEQ hung on it). Those arms now
+take only `mxcsr_group_op`'s forms, the rest go to `run_other`, and the
+arithmetic matches name each form (`unreachable!` otherwise), as the
+scalar groups' do. `tests/mxcsr_forms.rs` covers every form a group
+admits (649, found by decoding the SIMD space), each alone, after an FMUL
+and before an FADD, and the angle-wrap block in 2S and 4S, from normal
+operands with IXC set so the groups commit: 389,800 runs, without regalloc
+and with it, none differing; before the fix 73 programs differed, both
+angle-wrap blocks among them.
+
 **Scalar groups.** With `mxcsr-groups`, consecutive scalar FADD, FSUB,
 FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT, FABS, FNEG and FMOV
 (single and double) and FCVT between single and double form a scalar

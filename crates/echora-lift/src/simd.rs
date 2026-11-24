@@ -2654,12 +2654,13 @@ fn arith_lane(fp_op: VecFpOp, float: &str) -> (String, &'static str) {
             format!("(-{float}::from_bits(x)).mul_add({float}::from_bits(y), 3.0) * 0.5"),
             "false",
         ),
-        _ => (
+        VecFpOp::MulSub => (
             format!(
                 "(-{float}::from_bits(x)).mul_add({float}::from_bits(y), {float}::from_bits(z))"
             ),
             "(zero(x) | zero(y)) & zero(z)",
         ),
+        _ => unreachable!("no arithmetic lane for {fp_op:?}"),
     }
 }
 
@@ -3573,7 +3574,7 @@ pub fn vector_run_op(op: &SimdOp) -> bool {
 /// `inline_vector_unary` inlines (FSQRT, FRINT*, FRECPE, FRSQRTE, FCVT*
 /// toward zero), SCVTF/UCVTF, the pairwise operations and FMAXV and its
 /// kin.
-fn run_other_op(op: &SimdOp) -> bool {
+pub fn run_other_op(op: &SimdOp) -> bool {
     match *op {
         SimdOp::VecFp {
             op: fp_op,
@@ -4407,6 +4408,9 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
     };
     for (index, op) in ops.iter().enumerate() {
         let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
+            // Only the forms the group computes itself; every other form
+            // (compares, 2S and 2D FMAX and FMIN, FABD, FMULX) is the runs'
+            // own, below.
             SimdOp::VecFp {
                 op: fp_op,
                 size,
@@ -4415,7 +4419,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                 rn,
                 rm,
                 ..
-            } => {
+            } if mxcsr_group_op(op) => {
                 let width = if size == FpSize::S { 32 } else { 64 };
                 (
                     fp_op,
@@ -4436,7 +4440,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                 rm,
                 index,
                 ..
-            } => {
+            } if mxcsr_group_op(op) => {
                 let width = if size == FpSize::S { 32 } else { 64 };
                 (
                     fp_op,
@@ -4527,10 +4531,11 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                     let d = singles(&mut code, &mut values, rd);
                     format!("mx_mul_add({n}, {y}, {d})")
                 }
-                _ => {
+                VecFpOp::MulSub => {
                     let d = singles(&mut code, &mut values, rd);
                     format!("mx_mul_sub({n}, {y}, {d})")
                 }
+                _ => unreachable!("mxcsr_group_op admits no 4S {fp_op:?}"),
             };
             if !tracked {
                 code.push_str("let (mut lo, mut hi) = mx_track_start(); ");
@@ -4718,7 +4723,8 @@ pub fn scalar_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, ScalarGrou
                     FpBinaryOp::Sub => format!("({x} - {y})"),
                     FpBinaryOp::Mul => format!("({x} * {y})"),
                     FpBinaryOp::Div => format!("({x} / {y})"),
-                    _ => format!("(-({x} * {y}))"),
+                    FpBinaryOp::NegMul => format!("(-({x} * {y}))"),
+                    _ => unreachable!("scalar_group_op admits no {fp_op:?}"),
                 };
                 (rd, format!("{value}.to_bits()"), size, true)
             }
@@ -4778,11 +4784,16 @@ pub fn scalar_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, ScalarGrou
                     ),
                     FpUnaryOp::Abs => (rd, format!("({x} & !{sign})"), size, false),
                     FpUnaryOp::Neg => (rd, format!("({x} ^ {sign})"), size, false),
-                    _ => (rd, x, size, false),
+                    FpUnaryOp::Mov => (rd, x, size, false),
+                    _ => unreachable!("scalar_group_op admits no {unary:?}"),
                 }
             }
-            SimdOp::FpConvert { rd, rn, from, .. } => {
+            SimdOp::FpConvert { rd, rn, from, to } => {
                 let x = read(&mut code, &mut values, rn);
+                assert!(
+                    matches!((from, to), (FpSize::S, FpSize::D) | (FpSize::D, FpSize::S)),
+                    "scalar_group_op admits no FCVT {from:?} to {to:?}"
+                );
                 if from == FpSize::S {
                     (
                         rd,
