@@ -2737,13 +2737,86 @@ fn vec_fp_arith(
             "0".to_owned()
         };
         let lane_z_usable = if fused { " & usable(z)" } else { "" };
+        // `EmitOptions::special_lanes`, for a lane the test above refused:
+        // infinite operands (no NaN or denormal) whose result is an
+        // infinity, or a quotient's zero by an infinite divisor, are Arm's
+        // exact results and raise nothing; so are quiet NaN operands (no
+        // signalling NaN or denormal, and for the fused forms no infinity
+        // times zero with a NaN addend), whose result is FPProcessNaNs's:
+        // the first in Arm's order (the addend first, FMLS's operand
+        // negated), or the default NaN under FPCR.DN.
+        let special = if crate::codegen::special_lanes_on()
+            && matches!(
+                fp_op,
+                VecFpOp::Add
+                    | VecFpOp::Sub
+                    | VecFpOp::Mul
+                    | VecFpOp::Div
+                    | VecFpOp::MulAdd
+                    | VecFpOp::MulSub
+            ) {
+            let (ordinary_z, infinite_z, nan_z, plain_z) = if fused {
+                (
+                    " & ordinary(z)",
+                    " | infinite(z)",
+                    " | nan(z)",
+                    " & plain(z)",
+                )
+            } else {
+                ("", "", "", "")
+            };
+            let quotient = if fp_op == VecFpOp::Div {
+                " | (zero(raw) & infinite(y))"
+            } else {
+                ""
+            };
+            let invalid = if fused {
+                " & !(nan(z) & (infinite(x) & zero(y) | zero(x) & infinite(y)))"
+            } else {
+                ""
+            };
+            let picked = if fused {
+                let negate = if fp_op == VecFpOp::MulSub {
+                    format!(" ^ {sign}")
+                } else {
+                    String::new()
+                };
+                format!("if nan(z) {{ z }} else if nan(x) {{ x{negate} }} else {{ y }}")
+            } else {
+                "if nan(x) { x } else { y }".to_owned()
+            };
+            let default_nan = match size {
+                FpSize::S => "0x7fc0_0000u32",
+                FpSize::D => "0x7ff8_0000_0000_0000u64",
+            };
+            format!(
+                "else if ordinary(x) & ordinary(y){ordinary_z} & ((infinite(raw) & (infinite(x) | infinite(y){infinite_z})){quotient}) {{ raw }} \
+                 else if (nan(x) | nan(y){nan_z}) & plain(x) & plain(y){plain_z}{invalid} {{ \
+                 if m.cpu.fpcr & {p}::FPCR_DN != 0 {{ {default_nan} }} else {{ {picked} }} }} "
+            )
+        } else {
+            String::new()
+        };
+        let ordinary = if special.is_empty() {
+            String::new()
+        } else {
+            let quiet = match size {
+                FpSize::S => "0x0040_0000u32",
+                FpSize::D => "0x0008_0000_0000_0000u64",
+            };
+            format!(
+                "let ordinary = |value| usable(value) | infinite(value); \
+                 let nan = |value: {int}| value & !{sign} > {exponent}; \
+                 let plain = |value: {int}| (value & {exponent} != 0 || value & !{sign} == 0) & (!nan(value) || value & {quiet} != 0); "
+            )
+        };
         let lanewise = format!(
             "let mut out = 0u128; \
              for lane in 0..{lanes} {{ \
              let x = (n >> (lane * {width})) as {int}; let y = {lane_y}; {lane_z} \
-             let raw = ({value}).to_bits(); \
+             let raw = ({value}).to_bits(); {ordinary}\
              let native = usable(x) & {divisor}{lane_z_usable} & ({raw_normal} | (zero(raw) & ({exact}))); \
-             let raw = if native {{ raw }} else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
+             let raw = if native {{ raw }} {special}else {{ let exact = {p}::vec_fp_lane(&mut m.cpu, {p}::VecFpOp::{fp_op:?}, {p}::FpSize::{size:?}, x as u64, y as u64, {lane_d})?; exact as {int} }}; \
              out |= u128::from(raw) << (lane * {width}); }} \
              m.cpu.vectors[{rd}] = out;"
         );

@@ -864,6 +864,7 @@ fn lift(
                 "cold-fp-exact" => options.cold_fp_exact = true,
                 "hoist-fp-mode" => options.hoist_fp_mode = true,
                 "mxcsr-groups" => options.mxcsr_groups = true,
+                "special-lanes" => options.special_lanes = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }

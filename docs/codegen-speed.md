@@ -1439,6 +1439,84 @@ together fail. The test first ran each form after an FMUL of its own
 operands, whose NaNs and denormals sent every such group to the exact
 copy: the operand tests' mutations passed until the FMUL read V3.
 
+**Special lanes.** A lane holding an infinity, a zero result of one, a
+NaN or a denormal (as a vector's padding lane often does) fails the
+inline paths' test and takes the exact single-lane helper. Two changes
+make those lanes cheaper; their results and flags are the exact path's.
+
+The helpers (`echora_simd::native_arith_lane`, always on: the helpers'
+results are unchanged) compute a lane of FADD, FSUB, FMUL, FDIV and the
+fused forms natively, with FPSR.IXC set, when IEEE's result is Arm's and
+raises nothing new: denormal operands flushed to zeros of their sign
+under FZ (raising IDC) and else computed as they are; a result that is
+normal (not the smallest normal of a product, quotient or fused result),
+infinite only from an infinite operand (an infinity divided by zero
+included), or an exact zero (of a sum, of a zero operand, of a quotient
+by an infinity, of a fused sum that cancels in single precision); and
+quiet NaN operands, whose result is FPProcessNaNs's (the first in Arm's
+order, the addend first and FMLS's operand negated, or the default NaN
+under DN). A signalling NaN, a NaN the operation makes (IOC), a quiet NaN
+addend of an infinity times zero, a denormal result, an overflow and a
+division by zero take the exact path. `binary_lane` used this in place of
+its narrower test, `ternary_lane` (which had none) uses it, the
+whole-vector helpers' per-lane fallback (`mixed_lane`) no longer tests an
+arithmetic lane twice, and the mode test's trap is out of line.
+
+`special-lanes` (`EmitOptions::special_lanes`, with `inline-vector` and
+`whole-vector-checks`) takes the same lanes in the lifted per-lane loop of
+FADD, FSUB, FMUL, FDIV, FMLA and FMLS: after the ordinary test refuses a
+lane, infinite operands (no NaN or denormal) whose result is an infinity
+or a quotient's zero by an infinite divisor keep the host's result, and
+quiet NaN operands (no signalling NaN or denormal; no infinity times zero
+with a NaN addend) take FPProcessNaNs's; only the rest call the helper.
+The extra tests run only for refused lanes.
+
+Counted on the vector kernels and on the same kernels with every fourth
+single lane, in turn, an infinity, a zero, a quiet NaN and a denormal
+(`-special`, `SPECIAL_KERNELS` in the bench), against da4ab9f:
+
+| kernel | da4ab9f | helpers | + special-lanes | regalloc | helpers | + special-lanes |
+|---|---|---|---|---|---|---|
+| vector-special | 239.21 | 231.82 (-3%) | 196.51 (-18%) | 236.21 | 228.82 (-3%) | 194.35 (-18%) |
+| vchain-special | 394.21 | 357.81 (-9%) | 299.31 (-24%) | 390.41 | 354.00 (-9%) | 298.79 (-23%) |
+| vnorm-special | 323.21 | 300.09 (-7%) | 269.45 (-17%) | 320.31 | 297.19 (-7%) | 267.89 (-16%) |
+| misc-special | 265.19 | 263.67 (-1%) | 258.13 (-3%) | 262.60 | 261.08 (-1%) | 255.32 (-3%) |
+| fpairs-special | 169.66 | 165.76 (-2%) | 165.76 (-2%) | 168.44 | 164.54 (-2%) | 164.54 (-2%) |
+| vchain | 8.18 | 8.18 | 8.30 (+1%) | 7.95 | 7.95 | 8.04 (+1%) |
+| vnorm | 20.30 | 20.30 | 20.10 (-1%) | 20.80 | 20.80 | 20.14 (-3%) |
+| vector, misc, fpairs | | unchanged | within 1% | | unchanged | within 1% |
+
+The special kernels cost 20 to 50 times the plain ones: most of it is
+the lifted per-lane loop around each helper call (62% of vector-special's
+instructions) and the call's entry (about 57 instructions). The first
+version of the helper rule computed every lane before refusing its NaN
+result and tested again inside the lifted loop for every lane: it made
+vector-special 7% and vchain-special 7% slower and, with special-lanes,
+16% and 21%; testing quiet NaN operands first and the special tests only
+for refused lanes reversed it. `.text` grew under 1 KB (helpers) and
+about 5 KB (special-lanes, game set).
+
+The helper rule is tested in `echora-simd`
+(`special_lanes_run_natively_as_the_exact_path`): every pair and triple
+of 21 single and 17 double values (normal, smallest normal, denormal,
+zero, infinite, signalling and quiet NaN, overflowing and underflowing)
+in every FZ/DN mode, vector FADD, FSUB, FMUL, FDIV, FABD, FMULX, FMLA,
+FMLS and scalar FMADD, FMSUB, FNMADD, FNMSUB, against the exact path
+(FPSR.IXC clear): 96,174 lanes native, none differing. It fails without
+the FZ flush, IDC, the infinite-operand condition, the smallest-normal
+exclusion, any of the zero rules, the fused negations' order, the NaN
+order, the negated NaN operands, the signalling NaN or invalid product
+exclusions, IDC on the NaN path or the default NaN. Three checks first
+written proved redundant under mutation and went: a zero divisor
+(normal / 0 makes an infinity of no infinite operand; infinity / 0 is
+exact), NaN operands (they make NaNs) and the refusal of denormals
+without FZ (the host rounds them as Arm does). `tests/special_lanes.rs`
+lifts each form (4S, 2S, 2D, by element, a chain) with special-lanes
+against the helpers: 64,000 runs, none differing; it fails without the
+infinite-operand condition, the quotient's divisor test, the operand
+tests, the signalling NaN or denormal exclusions, the invalid product,
+the NaN order, FMLS's negation or the default NaN.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's

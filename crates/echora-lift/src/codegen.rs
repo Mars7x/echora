@@ -4254,6 +4254,11 @@ pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     runs
 }
 
+/// `EmitOptions::special_lanes` of the region being emitted.
+pub(crate) fn special_lanes_on() -> bool {
+    SPECIAL_LANES.get()
+}
+
 /// Whether `EmitOptions::mxcsr_groups` is in effect: with `inline_vector`,
 /// on an x86-64 host (the translation builds on the machine that runs it).
 pub fn mxcsr_groups_on(options: &EmitOptions) -> bool {
@@ -5589,6 +5594,8 @@ thread_local! {
     /// `EmitOptions::mxcsr_groups` of the region being emitted, on an
     /// x86-64 host.
     static MXCSR_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::special_lanes` of the region being emitted.
+    static SPECIAL_LANES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6746,6 +6753,13 @@ pub struct EmitOptions {
     /// each result's lanes (`crate::simd::vector_group_mxcsr`); any hit
     /// reruns the group exactly from its unchanged registers.
     pub mxcsr_groups: bool,
+    /// With `inline_vector` and `whole_vector_checks`: a lane of an inlined
+    /// vector FADD, FSUB, FMUL, FDIV, FMLA or FMLS whose operands include an
+    /// infinity (none a NaN or a denormal) runs natively when its result is
+    /// an infinity, or a quotient's zero by an infinite divisor: IEEE's
+    /// arithmetic on infinities is Arm's and raises nothing. Other lanes
+    /// still take the exact single-lane helper (`special_lanes_on`).
+    pub special_lanes: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -7502,6 +7516,7 @@ struct RegionSettings {
     cold_fp_exact: Flag,
     hoist_fp_mode: Flag,
     mxcsr_groups: Flag,
+    special_lanes: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -7594,6 +7609,7 @@ impl RegionSettings {
             cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
             hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
             mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
+            special_lanes: Flag::set(&SPECIAL_LANES, options.special_lanes),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
