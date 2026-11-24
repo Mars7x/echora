@@ -220,7 +220,13 @@ functions run as 334 pieces, none left to the windows, and every run
 lifter test splits a 1,600-block loop.
 
 **Hang with `regalloc-split-capped` (coordinator, candidate 6, cloud/lift
-da4ab9f): not reproduced yet.** The game hangs after the opening movie
+da4ab9f): not from this branch.** Candidate 7, without the option, hung
+the same way; the coordinator traced it to `mxcsr-groups` (vector groups
+admitting compares, FMAX/FMIN/FABD/FMULX but computing them with the FMLS
+formula). Checked here: with the candidate's option set, every program's
+emitted Rust at 9a4f30e (main's tree) and with this branch's options off
+is byte-identical (the window-call file only gains the new lifts and two
+count constants per lift). The record of the search, still useful: The game hangs after the opening movie
 with guest-worker-1 in `run_function_7101692860` (crate
 gen-r-10000710169) and FP fallbacks; candidate 3 without the option runs.
 What was checked:

@@ -5015,6 +5015,9 @@ fn split_loop_program(out: &mut String, prefix: &str, base: u64, reps: u32, big:
             words.push(0x1e61_28c6); // fadd d6, d6, d1
         }
     }
+    // The exit's compare right after an FP operation: with mxcsr-groups
+    // one scalar group computes both and sets NZCV.
+    words.push(0x1e60_0802); // fmul d2, d0, d0
     words.push(0x1e63_2000); // fcmp d0, d3
     let back = (inner as i64 - words.len() as i64) as u32 & 0x7_ffff;
     words.push(0x5400_000b | (back << 5)); // b.lt H
@@ -5058,9 +5061,11 @@ fn split_loop_program(out: &mut String, prefix: &str, base: u64, reps: u32, big:
         ..options()
     };
     let lifts = [
+        // The reference: windows, each float operation alone.
         (
             "windows",
             EmitOptions {
+                mxcsr_groups: false,
                 regalloc: false,
                 functions: false,
                 function_table: false,
