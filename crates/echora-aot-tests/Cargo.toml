@@ -158,6 +158,12 @@ regalloc-lazy-pc = []
 # With regalloc: functions over the size caps in structured pieces
 # (EmitOptions::regalloc_split_capped).
 regalloc-split-capped = []
+# With regalloc: call return points outside loops are function entries
+# (EmitOptions::regalloc_return_entries).
+regalloc-return-entries = []
+# With regalloc: window arms store and reload only what a structured
+# function's summary names (EmitOptions::regalloc_summarized_entries).
+regalloc-summarized-entries = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 
