@@ -26,7 +26,9 @@ pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
 
 #[path = "regalloc.rs"]
 mod regalloc;
-pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
+pub use regalloc::{
+    FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions, take_split_functions,
+};
 
 #[derive(Clone, Debug)]
 pub struct CodeRegion {
@@ -4768,6 +4770,11 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
 /// bound what it emits.
 pub const REGALLOC_BLOCK_LIMIT: usize = 1024;
 
+/// The blocks a lifted function may hold with
+/// `EmitOptions::regalloc_split_capped`, whose pieces bound what each
+/// structured function emits.
+pub const REGALLOC_SPLIT_BLOCK_LIMIT: usize = 16_384;
+
 /// [`functions`], with `extra` entries besides the BL targets (with
 /// `EmitOptions::regalloc`: the translation's entries, which windows then
 /// run as structured functions).
@@ -6825,6 +6832,16 @@ pub struct EmitOptions {
     /// prologues), not only those discovery had not reached otherwise, so
     /// code reached only through BLR runs structured.
     pub regalloc_indirect_entries: bool,
+    /// With `regalloc`: vector registers in structured functions' locals,
+    /// written through to the `Core` (`regalloc::vector_locals`).
+    pub regalloc_vector_locals: bool,
+    /// With `regalloc`: PC stores moved into the slow paths (helper calls
+    /// and returns) of the code after them (`regalloc::lazy_pc`).
+    pub regalloc_lazy_pc: bool,
+    /// With `regalloc`: a function over the size caps emitted as several
+    /// structured pieces under a driver (`regalloc::split_capped`) instead
+    /// of left to the windows.
+    pub regalloc_split_capped: bool,
 }
 
 /// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
@@ -6861,6 +6878,12 @@ thread_local! {
     /// (`regalloc::capped`).
     static REGALLOC_CAPPED: std::cell::RefCell<BTreeSet<u64>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
+    /// `EmitOptions::regalloc_vector_locals` of the region being emitted.
+    static REGALLOC_VECTOR_LOCALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_lazy_pc` of the region being emitted.
+    static REGALLOC_LAZY_PC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_split_capped` of the region being emitted.
+    static REGALLOC_SPLIT_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_returns` of the region being emitted.
     static REGALLOC_RESUME_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
@@ -7486,6 +7509,9 @@ struct RegionSettings {
     regalloc_loop_inlining: Flag,
     regalloc_resume_loops: Flag,
     regalloc_resume_returns: Flag,
+    regalloc_vector_locals: Flag,
+    regalloc_lazy_pc: Flag,
+    regalloc_split_capped: Flag,
 }
 
 impl RegionSettings {
@@ -7586,6 +7612,12 @@ impl RegionSettings {
                 &REGALLOC_RESUME_RETURNS,
                 options.regalloc_resume_returns,
             ),
+            regalloc_vector_locals: Flag::set(
+                &REGALLOC_VECTOR_LOCALS,
+                options.regalloc_vector_locals,
+            ),
+            regalloc_lazy_pc: Flag::set(&REGALLOC_LAZY_PC, options.regalloc_lazy_pc),
+            regalloc_split_capped: Flag::set(&REGALLOC_SPLIT_CAPPED, options.regalloc_split_capped),
             regalloc: Flag::set(
                 &REGALLOC,
                 options.regalloc
@@ -7968,7 +8000,9 @@ pub fn emit_rust_split_to_regions<E>(
         if used(|o| o.functions && o.regalloc && o.regalloc_indirect_entries) {
             extra.extend(translation.deferred_roots.iter().copied());
         }
-        let limit = if used(|o| o.functions && o.regalloc) {
+        let limit = if used(|o| o.functions && o.regalloc && o.regalloc_split_capped) {
+            REGALLOC_SPLIT_BLOCK_LIMIT
+        } else if used(|o| o.functions && o.regalloc) {
             REGALLOC_BLOCK_LIMIT
         } else {
             FUNCTION_BLOCK_LIMIT
@@ -8093,6 +8127,7 @@ pub fn emit_rust_split_to_regions<E>(
                     &translation.jump_table_cases,
                     &lifted,
                     &by_start,
+                    &inlined,
                 )
             {
                 for &(_, function) in &entered {
@@ -11022,6 +11057,60 @@ mod tests {
             assert!(f[..f.find("\npub fn ").unwrap_or(f.len())].contains("n: &mut u64"));
             assert!(!text.contains("pub fn run_function_1400("));
         }
+    }
+
+    #[test]
+    fn a_function_over_the_caps_runs_in_structured_pieces() {
+        // 0x1000: bl F; svc. F (0x1008): a loop of 800 `cbz x0, +8; add
+        // x1, x1, #1` pairs (1,600 blocks, past REGALLOC_BLOCK_LIMIT), then
+        // `subs x2, x2, #1; b.ne F; ret`.
+        const PAIRS: usize = 800;
+        let mut words = vec![0x9400_0002, 0xd400_00e1];
+        for _ in 0..PAIRS {
+            words.push(0xb400_0040); // cbz x0, +8
+            words.push(0x9100_0421); // add x1, x1, #1
+        }
+        words.push(0xf100_0442); // subs x2, x2, #1
+        let back = (-(2 * PAIRS as i32 + 1)) as u32 & 0x7_ffff;
+        words.push(0x5400_0001 | (back << 5)); // b.ne F
+        words.push(0xd65f_03c0); // ret
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            regalloc: true,
+            regalloc_function_bytes: 100_000,
+            ..EmitOptions::default()
+        };
+        let text = |options: EmitOptions| -> String {
+            let (_, regions) = emit_rust_split_with(&translation, 16, options);
+            regions.iter().map(|(_, source)| source.as_str()).collect()
+        };
+        // Past the block limit: not lifted at all.
+        assert!(!text(options).contains("pub fn run_function_1008("));
+        let split = text(EmitOptions {
+            regalloc_split_capped: true,
+            ..options
+        });
+        let driver = &split[split.find("pub fn run_function_1008(").unwrap()..];
+        assert!(
+            split[..split.find("pub fn run_function_1008(").unwrap()]
+                .ends_with("#[inline(never)]\n")
+        );
+        assert!(driver.starts_with(
+            "pub fn run_function_1008(m: &mut Machine) -> Result<(), Trap> {\nloop {"
+        ));
+        let pieces = split.matches("fn run_piece_1008_").count();
+        assert!(pieces > 2, "{pieces} pieces");
+        // Every piece is structured, and the driver runs each.
+        assert_eq!(
+            split.matches("n: &mut u64) -> Result<(), Trap>").count() - 1,
+            pieces
+        );
+        assert_eq!(driver.matches("=> run_piece_1008_").count(), pieces);
+        assert_eq!(take_split_functions(), vec![0x1008]);
     }
 
     #[test]

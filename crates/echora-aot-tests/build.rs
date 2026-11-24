@@ -86,6 +86,9 @@ fn options() -> EmitOptions {
             .is_some(),
         regalloc_indirect_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_INDIRECT_ENTRIES")
             .is_some(),
+        regalloc_vector_locals: std::env::var_os("CARGO_FEATURE_REGALLOC_VECTOR_LOCALS").is_some(),
+        regalloc_lazy_pc: std::env::var_os("CARGO_FEATURE_REGALLOC_LAZY_PC").is_some(),
+        regalloc_split_capped: std::env::var_os("CARGO_FEATURE_REGALLOC_SPLIT_CAPPED").is_some(),
         stub_windows: false,
     }
 }
@@ -5864,6 +5867,29 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             ..structured_functions
         },
     );
+    // Vector registers in locals, with the FP lowering the game uses.
+    lift(
+        "regalloc_vectors",
+        16,
+        EmitOptions {
+            regalloc_vector_locals: true,
+            regalloc_loop_inlining: true,
+            mxcsr_groups: true,
+            float_runs: true,
+            float_run_loads: true,
+            ..structured_functions
+        },
+    );
+    // The same caps, the functions over them in structured pieces.
+    lift(
+        "regalloc_split",
+        16,
+        EmitOptions {
+            regalloc_function_bytes: 4_000,
+            regalloc_split_capped: true,
+            ..structured_functions
+        },
+    );
     lift(
         "regalloc_loops",
         16,
@@ -6058,6 +6084,13 @@ pub const FUNCTION_CALLS: usize = {};",
             out,
             "/// Functions the size caps left to the windows.\npub const CAPPED_FUNCTIONS: usize = {};",
             count("/// Over the size caps")
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Functions over the size caps run in structured pieces, and the pieces.\npub const SPLIT_FUNCTIONS: usize = {};\npub const PIECES: usize = {};",
+            count("/// In pieces, over the size caps"),
+            count("fn run_piece_")
         )
         .expect("write");
         writeln!(
