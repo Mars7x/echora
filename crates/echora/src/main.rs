@@ -966,6 +966,18 @@ fn lift(
         options.regalloc_crate_bytes = bytes;
         listed_options.regalloc_crate_bytes = bytes;
     }
+    // ECHORA_REGALLOC_FUNCTION_BYTES: the bytes of Rust a structured
+    // function may take (default echora_lift::codegen::FUNCTION_BYTES);
+    // with regalloc-split-capped, larger ones are cut into pieces of about
+    // a third of the instructions cap scaled by it.
+    if let Ok(bytes) = std::env::var("ECHORA_REGALLOC_FUNCTION_BYTES") {
+        let bytes: usize = bytes
+            .trim()
+            .parse()
+            .with_context(|| format!("ECHORA_REGALLOC_FUNCTION_BYTES {bytes:?}"))?;
+        options.regalloc_function_bytes = bytes;
+        listed_options.regalloc_function_bytes = bytes;
+    }
     // ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT: with regalloc-split-capped, the
     // blocks a lifted function may hold (default
     // echora_lift::codegen::REGALLOC_SPLIT_BLOCK_LIMIT; 1024 splits only

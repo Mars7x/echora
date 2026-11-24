@@ -222,13 +222,16 @@ lifter test splits a 1,600-block loop.
 **Compile cost: `shared-reloads`** (opt-in; coordinator: the listed set's
 codesize crate is 100.8 MB of Rust against 36.1 MB for the plain set,
 rustc out of memory at 13.6 GB in the front end, about 15 MB of it
-post-call reloads). The register locals' full reload after a call or
-helper (every local, `r.xN = m.cpu.regs[N]; ...`) becomes one
-`#[inline(always)]` method per window or structured function,
-`r.reload(m)`, and a store list of six or more registers becomes
-`r.store(m)`, which stores every written local: a local that is not dirty
-holds what the `Core` holds (a callee that may write a register has it
-reloaded), so the extra stores write the same values. Inside structured
+post-call reloads; on the biggest real crate, 20 MB, 280 s and 4.8 GB:
+LLVM 134 s, type checking 111 s). The register locals' full reload after
+a call or helper (every local) becomes one `#[inline(always)]` method per
+window or structured function, `r.reload(m)`; and every store or reload
+list of three or more general registers (the stores before calls and at
+exits, the reloads of what a summarized callee may write) is a set: a set
+used twice or more in the function becomes a method of its own,
+`r.store_<set>(m)` / `r.reload_<set>(m)`, a set used once stays written
+out (`RegisterLocals::finalize`). The methods store and reload exactly
+their set, so the machine code does what it did. Inside structured
 functions the exit stores no longer count a reload as a write of every
 local, so exits store fewer. A macro would not help: rustc type-checks
 and borrow-checks the expanded text.
@@ -236,20 +239,20 @@ and borrow-checks the expanded text.
 | (game_regalloc set) | Rust | rustc | peak RSS | `.text` |
 |---|---|---|---|---|
 | 120-block function | 441,770 B | 4.0 s | 264 MB | 232,943 |
-| + `shared-reloads` | 231,227 B (-48%) | 2.9 s | 189 MB | 232,571 |
+| + `shared-reloads` | 238,426 B (-46%) | 2.8 s | 188 MB | 215,331 |
 | every split program as one region | 77.6 MB | | | |
-| + `shared-reloads` | 63.0 MB (-19%) | | | |
+| + `shared-reloads` | 63.7 MB (-18%) | | | |
 
 The 240-block function's structured form now fits under the 500 KB cap
-(it was a capped stub, windows only): 423 KB of Rust and 7.2 s / 305 MB,
-for more code structured. Kernels unchanged (gamefn 2.32, gamecalls
-2.14, calls2 1.46, crossing 2.12, calls 1.33, vchain 7.96, arith 3.14,
-ldst 4.09). The whole `echora-aot-tests` suite with the game set, every
-regalloc option and `shared-reloads` passes but for `plt`'s count from
-main; `window_calls` has a `regalloc_shared` lift. Still to cut: the stores before calls shorter than six
-registers (one helper per register set would name each set), and
-reloads of locals dead after a call (they must then not be stored at a
-later exit).
+(it was a capped stub, windows only): 432 KB of Rust, 6.7 s / 276 MB, for
+more code structured. Kernels unchanged (gamefn 2.32, gamecalls 2.14,
+calls2 1.46, crossing 2.12, calls 1.33, vchain 7.96, arith 3.14, ldst
+4.09; measured with the first form, which differed only in long store
+lists). `ECHORA_REGALLOC_FUNCTION_BYTES` sets the size cap (and with
+`regalloc-split-capped` the pieces' size). Not done: skipping reloads of
+what a callee writes but nothing reads before it is written again (the
+translation's liveness allows it; the exit stores must then not store
+those locals, a gen/kill change to their dataflow).
 
 **Fixed: `direct-q-pairs` under regalloc did not compile** (coordinator,
 cloud/lift e31de94, region crate 710025): where a function keeps FP status
