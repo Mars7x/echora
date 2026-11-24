@@ -1298,10 +1298,33 @@ The golden hashes moved by the new lifts alone (the `vchain` kernel and
 
 A first version tested the result lanes in a `for` loop over the `u128`:
 at `opt-level` 1 the host compiler neither unrolls nor vectorizes it, and
-vchain went from 13.2 to 30.8. What remains in vchain is mostly moving
-each value between the `u128` the generated code holds and the SSE
-registers the arithmetic uses; keeping a group's values as `__m128`
-would be the next step.
+vchain went from 13.2 to 30.8.
+
+**`__m128` values and one test per group.** A group's 4S values are now
+`__m128` locals (`mx_singles` at the first use, `mx_bits` at the commit;
+2S and 2D lanes stay `u128`), and its arithmetic the SSE intrinsics
+themselves (`mx_add`, `mx_mul_add`, `mx_lane` for by element). That alone
+changed no machine code: LLVM had already kept the values in SSE
+registers through the `u128` transmutes. What the disassembly showed
+instead was the lane test: seven instructions after each one-instruction
+operation. A group now tracks its 4S results' extremes (`mx_track`: the
+unsigned minimum of each lane's magnitude minus one, a zero wrapping to
+the top, and the unsigned maximum of its magnitude; four instructions per
+result) and tests them once at its end (`mx_track_bad`: the same
+conditions as two SSE4.1 unsigned compares and one movemask). Its first
+form reduced the extremes lane by lane in scalar code, and the vector
+kernel's three-operation groups lost 18% to it.
+
+| kernel | before mxcsr-groups | per-result tests | one test per group |
+|---|---|---|---|
+| vchain (game) | 13.24 | 10.24 | 8.18 (-38% in all) |
+| vchain (regalloc) | 12.87 | 10.01 | 7.95 (-38%) |
+| vector (game) | 21.72 | 12.86 | 11.72 (-46%) |
+| vector (regalloc) | 20.94 | 12.27 | 11.13 (-47%) |
+
+vnorm is unchanged; `.text` within 200 bytes. `tests/mxcsr_groups.rs`
+fails with the minimum's half or the maximum's half of the tracking
+removed, or with the NaN half of the final test.
 
 ## Step accounting: what needs exact counts (2026-11)
 
