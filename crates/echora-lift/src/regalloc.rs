@@ -2052,6 +2052,8 @@ fn emit_tree(
             .map(|line| format!("{line}\n"))
             .collect()
     };
+    let (finalized, methods) = locals.finalize(&body);
+    body = finalized;
     if WINDOW_MEMORY.get() {
         body = body
             .replace("m.memory.load_u", "wmem.load_u")
@@ -2063,7 +2065,7 @@ fn emit_tree(
     } else {
         body
     };
-    let mut load = lazy_flags(&locals.load());
+    let mut load = lazy_flags(&(locals.load() + &methods));
     let body = match REGALLOC_VECTOR_LOCALS
         .get()
         .then(|| vector_locals(&body))

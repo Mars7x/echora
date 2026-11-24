@@ -1655,9 +1655,12 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
 /// function (`REGALLOC_ENTRIES`), as a call that is no guest call.
 const RUN_ENTRY_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn run_entry(m: &mut Machine, function: fn(&mut Machine) -> Result<(), Trap>) -> Result<(), Trap> { function(m) }\n";
 
-/// The registers a store list holds from which `EmitOptions::shared_reloads`
-/// stores every written local through the shared method instead.
-const SHARED_STORE_LENGTH: usize = 6;
+/// The general registers from which a store or reload list's set is shared
+/// (`EmitOptions::shared_reloads`, `RegisterLocals::finalize`).
+const SHARED_SET_LENGTH: usize = 3;
+
+/// Delimits a shared set's placeholder until `RegisterLocals::finalize`.
+const SHARED_MARK: char = '\u{3}';
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[(&str, &str)] = &[
@@ -1795,12 +1798,9 @@ impl RegisterLocals {
         if self.shared_reload() {
             // One copy of the full reload (`EmitOptions::shared_reloads`),
             // under the same names as the copies it replaces.
-            // And of the store of every written local, for the long store
-            // lists (`store_dirty`).
-            let store = self.store().replace('\n', " ");
             writeln!(
                 text,
-                "    impl R {{\n        #[inline(always)]\n        fn reload(&mut self, m: &Machine) {{ let r = self; {} }}\n        #[allow(dead_code)]\n        #[inline(always)]\n        fn store(&self, m: &mut Machine) {{ let r = self; {store} }}\n    }}",
+                "    impl R {{\n        #[inline(always)]\n        fn reload(&mut self, m: &Machine) {{ let r = self; {} }}\n    }}",
                 self.reload()
             )
             .unwrap();
@@ -1869,6 +1869,83 @@ impl RegisterLocals {
 
     /// `reload`, of only the locals in `which` (FPCR and FPSR as `reload`).
     fn reload_subset(&self, which: Dirty) -> String {
+        let mask = self.reloaded_set(which);
+        if self.shared_reload()
+            && (mask & !(DIRTY_SP | DIRTY_NZCV)).count_ones() as usize >= SHARED_SET_LENGTH
+        {
+            return format!("{SHARED_MARK}R{mask:x}{SHARED_MARK}");
+        }
+        self.reload_subset_text(mask)
+    }
+
+    /// The text of the shared stores and reloads `text` holds as
+    /// placeholders (`shared_reloads`): a set used at least twice becomes
+    /// a method of `R` (`r.store_<set>(m)`, `r.reload_<set>(m)`, returned
+    /// as an `impl R` block to emit in the function), one used once its
+    /// assignments in place.
+    fn finalize(&self, text: &str) -> (String, String) {
+        if !text.contains(SHARED_MARK) {
+            return (text.to_owned(), String::new());
+        }
+        let parts: Vec<&str> = text.split(SHARED_MARK).collect();
+        // Odd parts are the placeholders.
+        let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+        for part in parts.iter().skip(1).step_by(2) {
+            *uses.entry(part).or_default() += 1;
+        }
+        let parse = |part: &str| -> (bool, Dirty) {
+            let (kind, mask) = part.split_at(1);
+            (
+                kind == "S",
+                Dirty::from_str_radix(mask, 16).expect("a shared set"),
+            )
+        };
+        let mut output = String::with_capacity(text.len());
+        for (index, part) in parts.iter().enumerate() {
+            if index % 2 == 0 {
+                output.push_str(part);
+                continue;
+            }
+            let (store, mask) = parse(part);
+            if uses[part] >= 2 {
+                let name = if store { "store" } else { "reload" };
+                write!(output, "r.{name}_{mask:x}(m); ").unwrap();
+            } else if store {
+                output.push_str(&self.store_dirty_text(mask));
+            } else {
+                output.push_str(&self.reload_subset_text(mask));
+            }
+        }
+        let mut methods = String::new();
+        for (part, &count) in &uses {
+            if count < 2 {
+                continue;
+            }
+            let (store, mask) = parse(part);
+            if store {
+                write!(
+                    methods,
+                    "        #[inline(always)]\n        fn store_{mask:x}(&self, m: &mut Machine) {{ let r = self; {} }}\n",
+                    self.store_dirty_text(mask)
+                )
+                .unwrap();
+            } else {
+                write!(
+                    methods,
+                    "        #[inline(always)]\n        fn reload_{mask:x}(&mut self, m: &Machine) {{ let r = self; {} }}\n",
+                    self.reload_subset_text(mask)
+                )
+                .unwrap();
+            }
+        }
+        if !methods.is_empty() {
+            methods = format!("    impl R {{\n{methods}    }}\n");
+        }
+        (output, methods)
+    }
+
+    /// `reload_subset`'s text, always written out.
+    fn reload_subset_text(&self, which: Dirty) -> String {
         let mut text = String::new();
         for &index in &self.used {
             if which & 1 << index != 0 {
@@ -1887,18 +1964,49 @@ impl RegisterLocals {
 
     /// `store`, of only the locals in `dirty` (FPCR and FPSR as `store`).
     fn store_dirty(&self, dirty: Dirty) -> String {
-        // A long list as the shared store of every written local
-        // (`shared_reload`): storing a local that is not dirty writes the
-        // value the `Core` already holds.
-        let long = self
-            .written
-            .iter()
-            .filter(|&&index| dirty & 1 << index != 0)
-            .count()
-            >= SHARED_STORE_LENGTH;
-        if self.shared_reload() && long {
-            return "r.store(m); ".to_owned();
+        // A long list: a placeholder `finalize` makes a shared method of
+        // where the same set recurs.
+        let mask = self.stored_set(dirty);
+        if self.shared_reload()
+            && (mask & !(DIRTY_SP | DIRTY_NZCV)).count_ones() as usize >= SHARED_SET_LENGTH
+        {
+            return format!("{SHARED_MARK}S{mask:x}{SHARED_MARK}");
         }
+        self.store_dirty_text(mask)
+    }
+
+    /// The locals in `dirty` that `store_dirty` stores, as a set.
+    fn stored_set(&self, dirty: Dirty) -> Dirty {
+        let mut mask = 0;
+        for &index in &self.written {
+            mask |= dirty & 1 << index;
+        }
+        if self.sp_written {
+            mask |= dirty & DIRTY_SP;
+        }
+        if self.flags {
+            mask |= dirty & DIRTY_NZCV;
+        }
+        mask
+    }
+
+    /// The locals in `which` that `reload_subset` reloads, as a set.
+    fn reloaded_set(&self, which: Dirty) -> Dirty {
+        let mut mask = 0;
+        for &index in &self.used {
+            mask |= which & 1 << index;
+        }
+        if self.sp_used {
+            mask |= which & DIRTY_SP;
+        }
+        if self.flags {
+            mask |= which & DIRTY_NZCV;
+        }
+        mask
+    }
+
+    /// `store_dirty`'s text, always written out.
+    fn store_dirty_text(&self, dirty: Dirty) -> String {
         let mut text = String::new();
         for index in &self.written {
             if dirty & 1 << index != 0 {
@@ -5682,7 +5790,8 @@ fn emit_function(
         "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R{pending}) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {entry:#x};"
     )
     .unwrap();
-    let body = locals.rewrite(&cases);
+    let (body, methods) = locals.finalize(&locals.rewrite(&cases));
+    output.push_str(&methods);
     if WINDOW_MEMORY.get() {
         output.push_str("    let wmem = m.memory.window_memory();\n");
         output.push_str("    loop {\n        match next_pc {\n");
@@ -8343,7 +8452,8 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
         );
-            let body = locals.rewrite(&cases);
+            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
+            output.push_str(&methods);
             let header = if dense {
                 format!(
                     "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
