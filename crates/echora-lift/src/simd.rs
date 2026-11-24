@@ -4235,20 +4235,63 @@ pub fn mxcsr_group_op(op: &SimdOp) -> bool {
 /// final values' locals, and whether the group fuses (it then needs the
 /// host's FMA: `fmaf` in software rounds through double).
 pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
-    let mut values: std::collections::BTreeMap<u8, String> = Default::default();
+    /// A register's value in the group: as a `u128`, as an `__m128` of
+    /// four singles, or both.
+    #[derive(Clone, Default)]
+    struct Value {
+        bits: Option<String>,
+        singles: Option<String>,
+    }
+    let mut values: std::collections::BTreeMap<u8, Value> = Default::default();
     let mut code = String::from("mxcsr_clear(); let mut bad = 0u64; ");
     let mut written: Vec<u8> = Vec::new();
     let mut fused_group = false;
-    let read =
-        |code: &mut String, values: &mut std::collections::BTreeMap<u8, String>, register: u8| {
-            values
-                .entry(register)
-                .or_insert_with(|| {
-                    code.push_str(&format!("let v{register} = m.cpu.vectors[{register}]; "));
-                    format!("v{register}")
-                })
-                .clone()
+    let mut conversions = 0usize;
+    // Whether a 4S result was tracked (`mx_track`).
+    let mut tracked = false;
+    // The register as a `u128` (loaded, or converted from its `__m128`).
+    let mut bits = |code: &mut String,
+                    values: &mut std::collections::BTreeMap<u8, Value>,
+                    register: u8|
+     -> String {
+        let value = values.entry(register).or_default();
+        if let Some(bits) = &value.bits {
+            return bits.clone();
+        }
+        let name = match &value.singles {
+            Some(singles) => {
+                conversions += 1;
+                let name = format!("u{register}_{conversions}");
+                code.push_str(&format!("let {name} = mx_bits({singles}); "));
+                name
+            }
+            None => {
+                let name = format!("v{register}");
+                code.push_str(&format!("let {name} = m.cpu.vectors[{register}]; "));
+                name
+            }
         };
+        value.bits = Some(name.clone());
+        name
+    };
+    // The register as an `__m128` (loaded as one, or converted).
+    let singles = |code: &mut String,
+                   values: &mut std::collections::BTreeMap<u8, Value>,
+                   register: u8|
+     -> String {
+        let value = values.entry(register).or_default();
+        if let Some(singles) = &value.singles {
+            return singles.clone();
+        }
+        let source = value
+            .bits
+            .clone()
+            .unwrap_or_else(|| format!("m.cpu.vectors[{register}]"));
+        let name = format!("s{register}");
+        code.push_str(&format!("let {name} = mx_singles({source}); "));
+        value.singles = Some(name.clone());
+        name
+    };
     for (index, op) in ops.iter().enumerate() {
         let (fp_op, size, lanes, rd, rn, rm, element) = match *op {
             SimdOp::VecFp {
@@ -4294,79 +4337,103 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
             }
             _ => unreachable!("mxcsr_group_op checked {op:?}"),
         };
-        let (float, int, width) = if size == FpSize::S {
-            ("f32", "u32", 32u32)
-        } else {
-            ("f64", "u64", 64u32)
-        };
         let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
         fused_group |= fused;
-        let n = read(&mut code, &mut values, rn);
-        let v = read(&mut code, &mut values, rm);
-        let d = if fused {
-            read(&mut code, &mut values, rd)
-        } else {
-            "0u128".to_owned()
-        };
-        let y = match element {
-            Some(lane) => format!("({v} >> {}) as {int}", u32::from(lane) * width),
-            None => format!("({v} >> (lane * {width})) as {int}"),
-        };
-        let (value, _) = arith_lane(fp_op, float);
-        let lanes_code = format!(
-            "let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
-             let x = ({n} >> (lane * {width})) as {int}; let y = {y}; let z = ({d} >> (lane * {width})) as {int}; let _ = z; \
-             out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out"
-        );
-        let computed = if width == 32 && lanes == 4 {
-            let p = "echora_guest::simd";
-            let second = if element.is_some() {
-                format!(
-                    "u128::from(({v} >> {}) as u32)",
-                    u32::from(element.unwrap_or(0)) * width
-                )
-            } else {
-                v.clone()
+        if size == FpSize::S && lanes == 4 {
+            // Four singles: `__m128` arithmetic, kept as `__m128`.
+            let n = singles(&mut code, &mut values, rn);
+            let v = singles(&mut code, &mut values, rm);
+            let y = match element {
+                Some(lane) => format!("mx_lane({v}, {lane})"),
+                None => v,
             };
-            format!(
-                "{p}::vector_fp_arithmetic_4s::<{}>({p}::VecFpOp::{fp_op:?}, {n}, {second}, {d}).unwrap_or_else(|| {{ {lanes_code} }})",
-                element.is_some()
-            )
+            let value = match fp_op {
+                VecFpOp::Add => format!("mx_add({n}, {y})"),
+                VecFpOp::Sub => format!("mx_sub({n}, {y})"),
+                VecFpOp::Mul => format!("mx_mul({n}, {y})"),
+                VecFpOp::Div => format!("mx_div({n}, {y})"),
+                VecFpOp::MulAdd => {
+                    let d = singles(&mut code, &mut values, rd);
+                    format!("mx_mul_add({n}, {y}, {d})")
+                }
+                _ => {
+                    let d = singles(&mut code, &mut values, rd);
+                    format!("mx_mul_sub({n}, {y}, {d})")
+                }
+            };
+            if !tracked {
+                code.push_str("let (mut lo, mut hi) = mx_track_start(); ");
+                tracked = true;
+            }
+            code.push_str(&format!(
+                "let q{index} = {value}; mx_track(q{index}, &mut lo, &mut hi); "
+            ));
+            values.insert(
+                rd,
+                Value {
+                    bits: None,
+                    singles: Some(format!("q{index}")),
+                },
+            );
         } else {
-            format!("{{ {lanes_code} }}")
-        };
-        // A lane is suspect when |lane| - 1 is below the smallest normal
-        // (a denormal or exactly the smallest normal) or |lane| is above
-        // infinity (a NaN).
-        let (sign_clear, smallest, infinity) = if width == 32 {
-            ("0x7fff_ffffu32", "0x0080_0000u32", "0x7f80_0000u32")
-        } else {
-            (
-                "0x7fff_ffff_ffff_ffffu64",
-                "0x0010_0000_0000_0000u64",
-                "0x7ff0_0000_0000_0000u64",
-            )
-        };
-        // Single precision with SSE2 (`mxcsr_suspect_4s`; a 2S vector's
-        // upper lanes are zero); doubles lane by lane.
-        let suspect = if width == 32 {
-            format!("bad |= mxcsr_suspect_4s(o{index}); ")
-        } else {
-            format!(
-                "for lane in 0..{lanes}u32 {{ let a = (o{index} >> (lane * {width})) as {int} & {sign_clear}; \
-                 bad |= u64::from((a.wrapping_sub(1) < {smallest}) | (a > {infinity})); }} "
-            )
-        };
-        code.push_str(&format!("let o{index} = {computed}; {suspect}"));
-        values.insert(rd, format!("o{index}"));
+            // Two singles or doubles: lane by lane on `u128`s.
+            let (float, int, width) = if size == FpSize::S {
+                ("f32", "u32", 32u32)
+            } else {
+                ("f64", "u64", 64u32)
+            };
+            let n = bits(&mut code, &mut values, rn);
+            let v = bits(&mut code, &mut values, rm);
+            let d = if fused {
+                bits(&mut code, &mut values, rd)
+            } else {
+                "0u128".to_owned()
+            };
+            let y = match element {
+                Some(lane) => format!("({v} >> {}) as {int}", u32::from(lane) * width),
+                None => format!("({v} >> (lane * {width})) as {int}"),
+            };
+            let (value, _) = arith_lane(fp_op, float);
+            let suspect = if width == 32 {
+                format!("bad |= mxcsr_suspect_4s(o{index}); ")
+            } else {
+                format!(
+                    "for lane in 0..{lanes}u32 {{ let a = (o{index} >> (lane * 64)) as u64 & 0x7fff_ffff_ffff_ffffu64; \
+                     bad |= u64::from((a.wrapping_sub(1) < 0x0010_0000_0000_0000u64) | (a > 0x7ff0_0000_0000_0000u64)); }} "
+                )
+            };
+            code.push_str(&format!(
+                "let o{index} = {{ let mut out = 0u128; for lane in 0..{lanes}u32 {{ \
+                 let x = ({n} >> (lane * {width})) as {int}; let y = {y}; let z = ({d} >> (lane * {width})) as {int}; let _ = z; \
+                 out |= u128::from(({value}).to_bits()) << (lane * {width}); }} out }}; {suspect}"
+            ));
+            values.insert(
+                rd,
+                Value {
+                    bits: Some(format!("o{index}")),
+                    singles: None,
+                },
+            );
+        }
         if !written.contains(&rd) {
             written.push(rd);
         }
     }
+    if tracked {
+        code.push_str("bad |= mx_track_bad(lo, hi); ");
+    }
     code.push_str("let good = mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ");
     let finals = written
         .iter()
-        .map(|&register| (register, values[&register].clone()))
+        .map(|&register| {
+            let value = &values[&register];
+            let committed = match (&value.bits, &value.singles) {
+                (Some(bits), _) => bits.clone(),
+                (None, Some(singles)) => format!("mx_bits({singles})"),
+                (None, None) => unreachable!("a written register has a value"),
+            };
+            (register, committed)
+        })
         .collect();
     (code, finals, fused_group)
 }

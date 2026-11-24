@@ -4289,6 +4289,170 @@ fn mxcsr_suspect_4s(value: u128) -> u64 {
         _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
     }
 }
+/// Four singles in an SSE register, and back (`crate::simd::vector_group_mxcsr`
+/// keeps a group's 4S values as `__m128`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_singles(value: u128) -> core::arch::x86_64::__m128 {
+    // SAFETY: both are 128 bits; the lanes keep their order.
+    unsafe { core::mem::transmute::<u128, core::arch::x86_64::__m128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_bits(value: core::arch::x86_64::__m128) -> u128 {
+    // SAFETY: as `mx_singles`.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128, u128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: SSE is part of every x86-64 target.
+    unsafe { core::arch::x86_64::_mm_add_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_sub_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_mul_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_div(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_div_ps(a, b) }
+}
+/// a * b + c, one rounding (FMLA). Without the host's FMA the group never
+/// commits (its condition tests the feature); the lanes are then only
+/// placeholders.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_add(mx_mul(a, b), c);
+}
+/// c - a * b, one rounding (FMLS).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fnmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_sub(c, mx_mul(a, b));
+}
+/// Lane `lane` of `a` in every lane (by element).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lane(a: core::arch::x86_64::__m128, lane: u8) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::_mm_shuffle_ps;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        match lane & 3 {
+            0 => _mm_shuffle_ps::<0x00>(a, a),
+            1 => _mm_shuffle_ps::<0x55>(a, a),
+            2 => _mm_shuffle_ps::<0xaa>(a, a),
+            _ => _mm_shuffle_ps::<0xff>(a, a),
+        }
+    }
+}
+/// `mxcsr_suspect_4s` of an `__m128`.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_singles(value: core::arch::x86_64::__m128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// The running extremes of a group's 4S results (`mx_track`): the
+/// unsigned minimum of each lane's magnitude minus one (a zero wraps to the
+/// top) and the unsigned maximum of its magnitude.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_start() -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe { (_mm_set1_epi32(-1), _mm_setzero_si128()) }
+}
+/// Adds a result to the extremes: four instructions, where testing it
+/// alone (`mxcsr_suspect_singles`) takes seven.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track(value: core::arch::x86_64::__m128, lo: &mut core::arch::x86_64::__m128i, hi: &mut core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE4.1's `pminud`/`pmaxud` where the target has it (else
+    // the compiler emulates them with SSE2).
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        *lo = mx_min_u32(*lo, _mm_add_epi32(a, _mm_set1_epi32(-1)));
+        *hi = mx_max_u32(*hi, a);
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_min_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].min(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_max_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].max(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lanes(a: core::arch::x86_64::__m128i) -> [u32; 4] {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128i, [u32; 4]>(a) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_from_lanes(a: [u32; 4]) -> core::arch::x86_64::__m128i {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<[u32; 4], core::arch::x86_64::__m128i>(a) }
+}
+/// Whether the extremes saw a denormal, the smallest normal (some lane's
+/// magnitude minus one below it) or a NaN (a magnitude above infinity's).
+/// Unsigned compares as SSE4.1's min and max and an equality: `lo` below
+/// 0x0080_0000 where min(lo, 0x007f_ffff) is `lo`, `hi` above 0x7f80_0000
+/// where max(hi, 0x7f80_0001) is `hi`; one movemask for both.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_bad(lo: core::arch::x86_64::__m128i, hi: core::arch::x86_64::__m128i) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe {
+        let tiny = _mm_cmpeq_epi32(mx_min_u32(lo, _mm_set1_epi32(0x007f_ffff)), lo);
+        let nan = _mm_cmpeq_epi32(mx_max_u32(hi, _mm_set1_epi32(0x7f80_0001)), hi);
+        _mm_movemask_epi8(_mm_or_si128(tiny, nan)) as u64
+    }
+}
 /// MXCSR, read after `after` is computed.
 #[allow(dead_code, unsafe_code)]
 #[inline(always)]
