@@ -404,6 +404,9 @@ fn rounded(format: Format, size: FpSize, op: FpBinaryOp, a: u64, b: u64, raw: u6
 
 pub fn fp_unary(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> Result<(), Trap> {
     let value = read_fp(cpu, rn, size);
+    if stats::enabled() {
+        stats::note_scalar("fp_unary", &format!("{op:?}"), cpu, size, &[value]);
+    }
     let format = Format::of(size);
     let result = match op {
         // FMOV, FABS and FNEG are bitwise and never trap or flush.
@@ -475,6 +478,10 @@ fn round<T: Rint>(value: T, rounding: Rounding) -> T {
 }
 
 pub fn fp_convert(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Result<(), Trap> {
+    if stats::enabled() {
+        let value = read_fp(cpu, rn, from);
+        stats::note_scalar("fp_convert", &format!("to {to:?}"), cpu, from, &[value]);
+    }
     let mode = mode(cpu)?;
     let source = Format::of(from);
     let target = Format::of(to);
@@ -960,6 +967,10 @@ fn fp_compare_exact(
 ) -> Result<(), Trap> {
     let a = read_fp(cpu, rn, size);
     let b = rm.map_or(0, |rm| read_fp(cpu, rm, size));
+    if stats::enabled() {
+        let form = if signaling { "fcmpe" } else { "fcmp" };
+        stats::note_scalar("fp_compare_exact", form, cpu, size, &[a, b]);
+    }
     let mut fp = Fp::new(cpu, size)?;
     let a = fp.input(a);
     let b = fp.input(b);
@@ -1074,6 +1085,13 @@ pub fn fp_to_int(
     rounding: Rounding,
 ) -> Result<(), Trap> {
     let raw = read_fp(cpu, rn, size);
+    if stats::enabled() {
+        let form = format!(
+            "{rounding:?} {} {gp_bits}",
+            if signed { "signed" } else { "unsigned" }
+        );
+        stats::note_scalar("fp_to_int", &form, cpu, size, &[raw]);
+    }
     let mut fp = Fp::new(cpu, size)?;
     let raw = fp.input(raw);
     let format = fp.format;
@@ -6224,6 +6242,25 @@ pub mod stats {
 
     /// One lane inlined vector code left to the exact helper
     /// (`vec_fp_lane`): its operation and its operands' classes.
+    /// A scalar helper's call: its form, the operands' classes, FPCR.FZ
+    /// and whether FPSR.IXC was set (the inline paths need it sticky).
+    pub(super) fn note_scalar(
+        helper: &str,
+        form: &str,
+        cpu: &super::Cpu,
+        size: FpSize,
+        operands: &[u64],
+    ) {
+        let bits = size_bits(size);
+        let classes: Vec<&str> = operands.iter().map(|&value| class(bits, value)).collect();
+        add(format!(
+            "{helper} {form} {size:?}: {} fz={} ixc={}",
+            classes.join(" "),
+            u8::from(cpu.fpcr & super::FPCR_FZ != 0),
+            u8::from(cpu.fpsr & FPSR_IXC != 0)
+        ));
+    }
+
     pub(super) fn note_lane(op: VecFpOp, size: FpSize, a: u64, b: u64) {
         let (bits, size) = match size {
             FpSize::S => (32, "S"),
