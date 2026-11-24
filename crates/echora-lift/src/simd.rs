@@ -4213,7 +4213,43 @@ pub fn mxcsr_group_op(op: &SimdOp) -> bool {
             scalar: false,
             ..
         }
+    ) || mxcsr_singles_only_op(op)
+}
+
+/// The forms an MXCSR group takes in four singles only (`mx_*` on
+/// `__m128`): FABD, FMULX, FMAX, FMIN, FMAXNM, FMINNM, FRECPS, FRSQRTS,
+/// and the pairwise FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP.
+fn mxcsr_singles_only_op(op: &SimdOp) -> bool {
+    matches!(
+        *op,
+        SimdOp::VecFp {
+            op: VecFpOp::AbsDiff
+                | VecFpOp::MulExtended
+                | VecFpOp::Max
+                | VecFpOp::Min
+                | VecFpOp::MaxNum
+                | VecFpOp::MinNum
+                | VecFpOp::RecipStep
+                | VecFpOp::RSqrtStep,
+            size: FpSize::S,
+            q: true,
+            scalar: false,
+            ..
+        } | SimdOp::VecFpPairwise {
+            op: VecFpOp::Add | VecFpOp::Max | VecFpOp::Min | VecFpOp::MaxNum | VecFpOp::MinNum,
+            size: FpSize::S,
+            q: true,
+            scalar: false,
+            ..
+        }
     )
+}
+
+/// Whether `ops` can be an MXCSR group: every operation one it computes
+/// (`mxcsr_group_op`) or one a vector run's fast copy computes with its
+/// own tests (`run_other_op`), and at least one of the first kind.
+pub fn mxcsr_group(ops: &[SimdOp]) -> bool {
+    ops.iter().any(mxcsr_group_op) && ops.iter().all(|op| mxcsr_group_op(op) || run_other_op(op))
 }
 
 /// The fast copy of a vector float group with `EmitOptions::mxcsr_groups`
@@ -4234,6 +4270,10 @@ pub fn mxcsr_group_op(op: &SimdOp) -> bool {
 /// Returns the code computing `good`, the registers written with their
 /// final values' locals, and whether the group fuses (it then needs the
 /// host's FMA: `fmaf` in software rounds through double).
+/// The `element` of a pairwise operation in `vector_group_mxcsr` (no lane
+/// is 255).
+const PAIRWISE: u8 = 255;
+
 pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
     /// A register's value in the group: as a `u128`, as an `__m128` of
     /// four singles, or both.
@@ -4243,7 +4283,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
         singles: Option<String>,
     }
     let mut values: std::collections::BTreeMap<u8, Value> = Default::default();
-    let mut code = String::from("mxcsr_clear(); let mut bad = 0u64; ");
+    let mut code = String::from("mxcsr_clear(); let mut bad = 0u64; let mut good = true; ");
     let mut written: Vec<u8> = Vec::new();
     let mut fused_group = false;
     let mut conversions = 0usize;
@@ -4335,23 +4375,81 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
                     Some(index),
                 )
             }
-            _ => unreachable!("mxcsr_group_op checked {op:?}"),
+            SimdOp::VecFpPairwise {
+                op: fp_op,
+                rd,
+                rn,
+                rm,
+                ..
+            } if mxcsr_group_op(op) => (fp_op, FpSize::S, 4, rd, rn, rm, Some(PAIRWISE)),
+            _ => {
+                // An operation a vector run's fast copy computes with its
+                // own tests (`run_other`), from the group's values so far.
+                let mut run_values: RunValues = Default::default();
+                for (&register, value) in values.iter_mut() {
+                    let name = match (&value.bits, &value.singles) {
+                        (Some(bits), _) => bits.clone(),
+                        (None, Some(singles)) => {
+                            let name = format!("u{register}_x{index}");
+                            code.push_str(&format!("let {name} = mx_bits({singles}); "));
+                            value.bits = Some(name.clone());
+                            name
+                        }
+                        (None, None) => continue,
+                    };
+                    run_values.insert(register, (name, None));
+                }
+                let (rd, _) = run_other(op, index, &mut run_values, &mut code);
+                for (register, (name, _)) in run_values {
+                    values.entry(register).or_insert_with(|| Value {
+                        bits: Some(name),
+                        singles: None,
+                    });
+                }
+                values.insert(
+                    rd,
+                    Value {
+                        bits: Some(format!("o{index}")),
+                        singles: None,
+                    },
+                );
+                if !written.contains(&rd) {
+                    written.push(rd);
+                }
+                continue;
+            }
         };
-        let fused = matches!(fp_op, VecFpOp::MulAdd | VecFpOp::MulSub);
+        let fused = matches!(
+            fp_op,
+            VecFpOp::MulAdd | VecFpOp::MulSub | VecFpOp::RecipStep | VecFpOp::RSqrtStep
+        );
         fused_group |= fused;
         if size == FpSize::S && lanes == 4 {
             // Four singles: `__m128` arithmetic, kept as `__m128`.
             let n = singles(&mut code, &mut values, rn);
             let v = singles(&mut code, &mut values, rm);
-            let y = match element {
-                Some(lane) => format!("mx_lane({v}, {lane})"),
-                None => v,
+            // Pairwise: the pairs of Vm:Vn as evens and odds.
+            let (n, y) = if element == Some(PAIRWISE) {
+                (format!("mx_evens({n}, {v})"), format!("mx_odds({n}, {v})"))
+            } else {
+                (
+                    n,
+                    match element {
+                        Some(lane) => format!("mx_lane({v}, {lane})"),
+                        None => v,
+                    },
+                )
             };
             let value = match fp_op {
                 VecFpOp::Add => format!("mx_add({n}, {y})"),
                 VecFpOp::Sub => format!("mx_sub({n}, {y})"),
-                VecFpOp::Mul => format!("mx_mul({n}, {y})"),
+                VecFpOp::Mul | VecFpOp::MulExtended => format!("mx_mul({n}, {y})"),
                 VecFpOp::Div => format!("mx_div({n}, {y})"),
+                VecFpOp::AbsDiff => format!("mx_abs(mx_sub({n}, {y}))"),
+                VecFpOp::Max | VecFpOp::MaxNum => format!("mx_max({n}, {y})"),
+                VecFpOp::Min | VecFpOp::MinNum => format!("mx_min({n}, {y})"),
+                VecFpOp::RecipStep => format!("mx_recip_step({n}, {y})"),
+                VecFpOp::RSqrtStep => format!("mx_rsqrt_step({n}, {y})"),
                 VecFpOp::MulAdd => {
                     let d = singles(&mut code, &mut values, rd);
                     format!("mx_mul_add({n}, {y}, {d})")
@@ -4422,7 +4520,7 @@ pub fn vector_group_mxcsr(ops: &[SimdOp]) -> (String, RegisterValues, bool) {
     if tracked {
         code.push_str("bad |= mx_track_bad(lo, hi); ");
     }
-    code.push_str("let good = mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ");
+    code.push_str("let good = good && mxcsr_read(bad) & MXCSR_EXCEPTIONS == 0 && bad == 0; ");
     let finals = written
         .iter()
         .map(|&register| {

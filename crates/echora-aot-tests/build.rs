@@ -2304,6 +2304,42 @@ fn mxcsr_group_code(out: &mut String) {
                 0x4e21_cc80,
             ],
         ),
+        ("fabd 4s", true, vec![0x6ea2_d420]),
+        ("fmulx 4s", true, vec![0x4e22_dc20]),
+        ("fmax 4s", true, vec![0x4e22_f420]),
+        ("fmin 4s", true, vec![0x4ea2_f420]),
+        ("fmaxnm 4s", true, vec![0x4e22_c420]),
+        ("fminnm 4s", true, vec![0x4ea2_c420]),
+        ("frecps 4s", true, vec![0x4e22_fc20]),
+        ("frsqrts 4s", true, vec![0x4ea2_fc20]),
+        ("faddp 4s", true, vec![0x6e22_d420]),
+        ("fmaxp 4s", true, vec![0x6e22_f420]),
+        ("fminnmp 4s", true, vec![0x6ea2_c420]),
+        ("fmaxnmp 4s", true, vec![0x6e22_c420]),
+        // Groups shaped like the vnorm, fpairs and misc kernels: forms the
+        // group computes and forms the runs' fast copy computes (FRSQRTE,
+        // scalar FADDP, FMAXV) together.
+        (
+            "vnorm-like",
+            true,
+            vec![
+                0x6e20_dc01,
+                0x6ea1_d822,
+                0x6e22_dc43,
+                0x4ea3_fc23,
+                0x6e23_dc42,
+            ],
+        ),
+        (
+            "fpairs-like",
+            true,
+            vec![0x6e21_d402, 0x6e22_f403, 0x6ea1_c464, 0x7e30_d884],
+        ),
+        (
+            "misc-like",
+            true,
+            vec![0x6ea1_d403, 0x4e21_dc64, 0x6e30_f884, 0x4e24_d400],
+        ),
     ];
     let mut words: Vec<u32> = Vec::new();
     let mut entries = Vec::new();
