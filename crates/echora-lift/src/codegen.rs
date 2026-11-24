@@ -4349,6 +4349,70 @@ fn mx_mul_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: c
     #[cfg(not(target_feature = "fma"))]
     return mx_sub(c, mx_mul(a, b));
 }
+/// |a| (FABD's last step: clears every lane's sign).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_abs(a: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe { _mm_and_ps(a, _mm_castsi128_ps(_mm_set1_epi32(0x7fff_ffff))) }
+}
+/// FMAX and FMAXNM where no lane is a NaN (any NaN raises IE): the larger
+/// lane, and +0 of +0 and -0 (where the lanes compare equal their AND,
+/// which is the lane itself unless they are zeros of both signs).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_max_ps(a, b)), _mm_and_ps(equal, _mm_and_ps(a, b)))
+    }
+}
+/// FMIN and FMINNM as `mx_max`: -0 of +0 and -0 (their OR).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_min_ps(a, b)), _mm_and_ps(equal, _mm_or_ps(a, b)))
+    }
+}
+/// FRECPS: 2 - a * b, one rounding (needs the host's FMA, as `mx_mul_add`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_recip_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let two = unsafe { core::arch::x86_64::_mm_set1_ps(2.0) };
+    mx_mul_sub(a, b, two)
+}
+/// FRSQRTS: (3 - a * b) / 2, one rounding and an exact halving where the
+/// result is normal (the lane test sees the rest).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_rsqrt_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let (three, half) = unsafe { (core::arch::x86_64::_mm_set1_ps(3.0), core::arch::x86_64::_mm_set1_ps(0.5)) };
+    mx_mul(mx_mul_sub(a, b, three), half)
+}
+/// The first of each adjacent pair of Vm:Vn (pairwise forms): n0, n2,
+/// m0, m2.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_evens(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b10_00_10_00>(n, m) }
+}
+/// The second of each pair: n1, n3, m1, m3.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_odds(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b11_01_11_01>(n, m) }
+}
 /// Lane `lane` of `a` in every lane (by element).
 #[allow(dead_code, unsafe_code)]
 #[inline(always)]
@@ -4484,7 +4548,7 @@ fn emit_vector_run(
             _ => unreachable!("vector runs hold SIMD operations"),
         })
         .collect();
-    if MXCSR_GROUPS.get() && ops.iter().all(crate::simd::mxcsr_group_op) {
+    if MXCSR_GROUPS.get() && crate::simd::mxcsr_group(&ops) {
         let (fast, finals, fused) = crate::simd::vector_group_mxcsr(&ops);
         let commits: String = finals
             .iter()
