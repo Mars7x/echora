@@ -26,6 +26,8 @@ pub mod hid;
 pub mod hle;
 mod host_cores;
 pub mod host_profile;
+#[cfg(target_os = "linux")]
+mod huge_text;
 pub mod input;
 pub mod ipc;
 pub mod loader;
