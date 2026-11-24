@@ -219,6 +219,18 @@ functions run as 334 pieces, none left to the windows, and every run
 (whole, sliced, budgets) ends with the default emission's state; a
 lifter test splits a 1,600-block loop.
 
+**Fixed: `direct-q-pairs` under regalloc did not compile** (coordinator,
+cloud/lift e31de94, region crate 710025): where a function keeps FP status
+in locals, `wrap_cpu_helpers` wraps each call handing the CPU to a helper
+with the status stores, and it took `bytes[..16].copy_from_slice(&m.cpu.vectors[7]..)`
+in a Q pair's code for one. It now wraps only a free function handed the
+whole CPU (`&m.cpu` or `&mut m.cpu` followed by `,` or `)`), never a
+method nor a CPU field passed by reference. Tests: a lifter test of the
+rewrite on that line, and `tests/q_pairs.rs`'s new `q_pair_regalloc` lift
+(every LDP/STP Q form in structured functions with inline-vector and FP
+status locals, three programs with an FADD beside the pairs) against the
+helper calls.
+
 **Hang with `regalloc-split-capped` (coordinator, candidate 6, cloud/lift
 da4ab9f): not from this branch.** Candidate 7, without the option, hung
 the same way; the coordinator traced it to `mxcsr-groups` (vector groups
