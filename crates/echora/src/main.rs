@@ -849,6 +849,8 @@ fn lift(
                 "regalloc-span-regions" => options.regalloc_span_regions = true,
                 "regalloc-resume-returns" => options.regalloc_resume_returns = true,
                 "regalloc-indirect-entries" => options.regalloc_indirect_entries = true,
+                "regalloc-vector-locals" => options.regalloc_vector_locals = true,
+                "regalloc-lazy-pc" => options.regalloc_lazy_pc = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,

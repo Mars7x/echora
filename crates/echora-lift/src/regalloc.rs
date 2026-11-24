@@ -1109,6 +1109,291 @@ fn explicit_errors(text: &str) -> Option<String> {
     Some(output)
 }
 
+/// Whether a line hands the `Core` to code that may read or write vector
+/// registers there: a helper taking the CPU, or any call.
+fn hands_over_core(line: &str) -> bool {
+    ["(m)", "(m,", "m.call"]
+        .iter()
+        .any(|text| line.contains(text))
+        || helpers_outside_wrappers(line)
+}
+
+/// Whether a line hands the CPU to a helper other than in a wrapped call
+/// (`let called = helper(&mut m.cpu, ..);`, `wrap_cpu_helpers`).
+fn helpers_outside_wrappers(line: &str) -> bool {
+    let mut rest = line;
+    let mut wrapped = 0;
+    while let Some(at) = rest.find("let called = ") {
+        let call = &rest[at..];
+        let end = statement_end(call).unwrap_or(call.len());
+        wrapped += call[..end].matches("m.cpu").count() - call[..end].matches("m.cpu.").count();
+        rest = &call[end..];
+    }
+    let all = line.matches("m.cpu").count() - line.matches("m.cpu.").count();
+    all != wrapped
+}
+
+/// The index of the `;` ending the statement `text` starts with.
+fn statement_end(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    text.char_indices()
+        .find(|&(_, c)| {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ';' if depth == 0 => return true,
+                _ => {}
+            }
+            false
+        })
+        .map(|(end, _)| end)
+}
+
+/// `line` with `reload` after each wrapped helper call that may write the
+/// CPU.
+fn reload_after_helpers(line: &str, reload: &str) -> String {
+    let mut output = String::with_capacity(line.len() + 64);
+    let mut rest = line;
+    while let Some(at) = rest.find("let called = ") {
+        let call = &rest[at..];
+        let end = statement_end(call).map_or(call.len(), |end| end + 1);
+        output.push_str(&rest[..at]);
+        output.push_str(&call[..end]);
+        if call[..end].contains("&mut m.cpu") {
+            output.push(' ');
+            output.push_str(reload);
+        }
+        rest = &call[end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// The structured body with vector registers in locals
+/// (`EmitOptions::regalloc_vector_locals`): `r.vN` for `m.cpu.vectors[N]`,
+/// written through (a write sets the local and stores the register at
+/// once, so the `Core` always holds every vector register and no exit,
+/// trap or call needs a store), read from the local. A line that hands
+/// the `Core` to a helper or a call keeps its own accesses, and every
+/// vector local is loaded again after it. None (unchanged) where a vector
+/// register is named other than by a constant index. Also the registers
+/// used.
+fn vector_locals(text: &str) -> Option<(String, BTreeSet<u8>)> {
+    const VECTORS: &str = "m.cpu.vectors";
+    let mut used: BTreeSet<u8> = BTreeSet::new();
+    for (at, _) in text.match_indices(VECTORS) {
+        let rest = text[at + VECTORS.len()..].strip_prefix('[')?;
+        let end = rest.find(']')?;
+        used.insert(rest[..end].parse::<u8>().ok().filter(|&n| n < 32)?);
+    }
+    if used.is_empty() {
+        return Some((text.to_owned(), used));
+    }
+    let reload: String = used
+        .iter()
+        .map(|n| format!("r.v{n} = m.cpu.vectors[{n}]; "))
+        .collect();
+    let mut output = String::with_capacity(text.len() * 2);
+    for line in text.lines() {
+        if hands_over_core(line) {
+            // The reload must follow everything the line runs.
+            let code = without_strings(line);
+            if code.matches('{').count() != code.matches('}').count() {
+                return None;
+            }
+            output.push_str(line);
+            output.push('\n');
+            output.push_str(&reload);
+            output.push('\n');
+            continue;
+        }
+        // Writes first (to a placeholder the reads leave alone), then reads.
+        let mut rewritten = String::with_capacity(line.len() + 32);
+        let mut rest = line;
+        while let Some(at) = rest.find(VECTORS) {
+            let after = &rest[at + VECTORS.len() + 1..];
+            let close = after.find(']').expect("checked above");
+            let number = &after[..close];
+            let tail = &after[close + 1..];
+            rewritten.push_str(&rest[..at]);
+            if let Some(expression) = tail.strip_prefix(" = ") {
+                // The statement's end: `;` outside brackets.
+                let mut depth = 0i32;
+                let end = expression
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            ';' if depth == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    })
+                    .map(|(end, _)| end)?;
+                write!(
+                    rewritten,
+                    "r.v{number} = {}; \u{1}{number}\u{2} = r.v{number}",
+                    &expression[..end]
+                )
+                .unwrap();
+                rest = &expression[end..];
+            } else {
+                write!(rewritten, "r.v{number}").unwrap();
+                rest = tail;
+            }
+        }
+        rewritten.push_str(rest);
+        // Reads inside the written expressions too; the placeholders are
+        // the stores.
+        for n in &used {
+            rewritten = rewritten.replace(&format!("{VECTORS}[{n}]"), &format!("r.v{n}"));
+        }
+        let rewritten = rewritten
+            .replace('\u{1}', "m.cpu.vectors[")
+            .replace('\u{2}', "]");
+        let rewritten = if rewritten.contains("&mut m.cpu") {
+            reload_after_helpers(&rewritten, &reload)
+        } else {
+            rewritten
+        };
+        output.push_str(&rewritten);
+        output.push('\n');
+    }
+    Some((output, used))
+}
+
+/// The PC stores in `text` (`m.cpu.pc = K;` lines) moved to where the
+/// code after them can observe the PC (`EmitOptions::regalloc_lazy_pc`):
+/// before each wrapped helper call and each `return` up to the next PC
+/// store. Every instruction that may observe the PC stores its own
+/// (`needs_pc`), and so do exits and stop-word bails, so the PC is the
+/// store's value at each place it can be seen, as before. A store stays
+/// where any line before the next one could see the PC otherwise: a call
+/// taking the `Machine`, an unwrapped helper, a read or write of the PC,
+/// any other use of `m`. Needs `text` without `?` (`explicit_errors`).
+fn lazy_pc(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let store_of = |line: &str| {
+        let line = line.trim();
+        line.strip_prefix("m.cpu.pc = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .filter(|value| {
+                value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+            })
+            .map(str::to_owned)
+    };
+    let mut output = String::with_capacity(text.len() + text.len() / 8);
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        let Some(value) = store_of(line) else {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        };
+        // The lines up to the next PC store, all of them able to take the
+        // store where they observe the PC.
+        let end = lines[index..]
+            .iter()
+            .position(|line| store_of(line).is_some())
+            .map(|offset| index + offset);
+        let sinkable = end.is_some_and(|end| {
+            lines[index..end]
+                .iter()
+                .all(|line| pc_observed_only_at_exits(line))
+        });
+        if !sinkable {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        let store = format!("m.cpu.pc = {value}; ");
+        for line in &lines[index..end.expect("sinkable")] {
+            output.push_str(
+                &line
+                    .replace("let called = ", &format!("{store}let called = "))
+                    .replace("return ", &format!("{store}return ")),
+            );
+            output.push('\n');
+        }
+        index = end.expect("sinkable");
+    }
+    output
+}
+
+/// Whether `line` can observe the PC only at its wrapped helper calls
+/// (`let called = helper(&mut m.cpu, ..)`) and its `return`s: it names
+/// no other part of the `Machine` than CPU fields other than the PC, its
+/// pure flag helpers (as `needs_pc`), memory and the step counters.
+fn pc_observed_only_at_exits(line: &str) -> bool {
+    const PURE: &[&str] = &[
+        "add_sub(",
+        "add_with_carry(",
+        "condition(",
+        "logical_flags(",
+        "conditional_compare(",
+        "conditional_compare_negative(",
+    ];
+    let code = without_strings(line);
+    if code.contains('?') || code.contains("m.cpu.pc") || helpers_outside_wrappers(&code) {
+        return false;
+    }
+    let bytes = code.as_bytes();
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    // The `Machine` itself, handed to a call or bound.
+    let whole_machine = bytes.iter().enumerate().any(|(at, &byte)| {
+        byte == b'm'
+            && (at == 0 || !(ident(bytes[at - 1]) || bytes[at - 1] == b'.'))
+            && bytes
+                .get(at + 1)
+                .is_none_or(|&next| !ident(next) && next != b'.')
+    });
+    if whole_machine {
+        return false;
+    }
+    code.match_indices("m.").all(|(at, _)| {
+        if at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'_'
+                || bytes[at - 1] == b'.')
+        {
+            return true;
+        }
+        let rest = &code[at + 2..];
+        if rest.starts_with("cpu")
+            && !rest[3..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            // The CPU handed to a wrapped helper (checked above).
+            return true;
+        }
+        if let Some(field) = rest.strip_prefix("cpu.") {
+            let end = field
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(field.len());
+            // A field, or a pure method.
+            !field[end..].starts_with('(') || PURE.iter().any(|pure| field.starts_with(pure))
+        } else {
+            ["memory.load_u", "memory.store_u", "steps", "stop."]
+                .iter()
+                .any(|allowed| rest.starts_with(allowed))
+        }
+    })
+}
+
+/// The locals' declaration and load (`RegisterLocals::load`) with a
+/// `u128` field per vector register in `vectors`.
+fn with_vector_fields(load: &str, vectors: &BTreeSet<u8>) -> String {
+    let fields: String = vectors.iter().map(|n| format!("v{n}: u128, ")).collect();
+    let values: String = vectors
+        .iter()
+        .map(|n| format!("v{n}: m.cpu.vectors[{n}], "))
+        .collect();
+    load.replacen("struct R { ", &format!("struct R {{ {fields}"), 1)
+        .replacen("let mut r = R { ", &format!("let mut r = R {{ {values}"), 1)
+}
+
 /// The NZCV local as a `cpu::LazyFlags` instead of a `cpu::Flags`: its writes `set(..)`, its
 /// reads `nzcv()`, the flag operations by the same names.
 fn lazy_flags(text: &str) -> String {
@@ -1269,12 +1554,29 @@ fn emit_tree(
             .replace("m.memory.store_u", "wmem.store_u");
     }
     let body = lazy_flags(&returned_results(&body));
+    let body = if precise && REGALLOC_LAZY_PC.get() {
+        lazy_pc(&body)
+    } else {
+        body
+    };
+    let mut load = lazy_flags(&locals.load());
+    let body = match REGALLOC_VECTOR_LOCALS
+        .get()
+        .then(|| vector_locals(&body))
+        .flatten()
+    {
+        Some((body, vectors)) if !vectors.is_empty() => {
+            load = with_vector_fields(&load, &vectors);
+            body
+        }
+        _ => body,
+    };
     writeln!(
         output,
         "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unreachable_code, unused_labels)]\npub fn run_function_{entry:x}(m: &mut Machine) -> Result<(), Trap> {{"
     )
     .unwrap();
-    output.push_str(&lazy_flags(&locals.load()));
+    output.push_str(&load);
     writeln!(
         output,
         "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, n: &mut u64) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {};",
@@ -1310,4 +1612,32 @@ fn emit_tree(
     }
     output.push_str("    result\n}\n");
     Some(entries.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pc_stores_move_into_slow_paths_only_where_nothing_else_sees_the_pc() {
+        let text = "m.cpu.pc = 0x100;\n\
+            let x = r.x1; if x != 0 { { m.cpu.fpsr = r.fpsr; let called = helper(&mut m.cpu, x); r.fpsr = m.cpu.fpsr; (match called { Ok(value) => value, Err(error) => { return Err(error); } }) }; }\n\
+            m.cpu.pc = 0x104;\n\
+            let called = run_function_200(m);\n\
+            m.cpu.pc = 0x108;\n\
+            m.cpu.regs[1] = m.cpu.load_q_pair(&m.memory, 0, 0, 1);\n\
+            m.cpu.pc = 0x10c;\n";
+        let moved = lazy_pc(text);
+        let lines: Vec<&str> = moved.lines().collect();
+        // Into the helper call and the error return.
+        assert_eq!(
+            lines[0],
+            "let x = r.x1; if x != 0 { { m.cpu.fpsr = r.fpsr; m.cpu.pc = 0x100; let called = helper(&mut m.cpu, x); r.fpsr = m.cpu.fpsr; (match called { Ok(value) => value, Err(error) => { m.cpu.pc = 0x100; return Err(error); } }) }; }"
+        );
+        // Not past a call taking the Machine or a CPU method.
+        assert_eq!(lines[1], "m.cpu.pc = 0x104;");
+        assert_eq!(lines[3], "m.cpu.pc = 0x108;");
+        // Not past the last store, with nothing after it to bound the span.
+        assert_eq!(lines[5], "m.cpu.pc = 0x10c;");
+    }
 }
