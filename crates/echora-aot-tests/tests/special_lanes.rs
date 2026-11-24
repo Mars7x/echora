@@ -1,6 +1,8 @@
 //! `EmitOptions::special_lanes`: inlined vector FADD, FSUB, FMUL, FDIV,
-//! FMLA and FMLS take lanes with infinite operands natively when their
-//! results are exact, against the helpers.
+//! FMLA and FMLS take lanes with infinite and quiet NaN operands natively
+//! when their results are exact (and a division by zero, with DZC), and
+//! the vector compares, FMAX and FMIN and the scalar FCMP every lane but a
+//! NaN's (a denormal flushed, with IDC, under FZ), against the helpers.
 //!
 //! `build.rs` (`special_lane_code`) lifts each form (4S, 2S, 2D, by
 //! element) alone and in a chain, with the build's options, the inline
@@ -182,11 +184,16 @@ fn special_lanes_are_lifted() {
     let source = include_str!(concat!(env!("OUT_DIR"), "/lifted_special_lane.rs"));
     let (special, helpers) =
         source.split_at(source.find("pub mod special_lane_reference").unwrap());
-    assert!(
-        special.matches("let ordinary =").count() >= code::ENTRIES.len(),
-        "a lane test per form"
-    );
-    assert!(!helpers.contains("let ordinary ="));
+    // A lane test per arithmetic form (16), per vector compare and
+    // FMAX/FMIN (10) and per scalar compare (4); with regalloc, more.
+    for (marker, programs) in [
+        ("let ordinary =", 16),
+        ("let mut idc = false", 10),
+        ("if fx | fy", 4),
+    ] {
+        assert!(special.matches(marker).count() >= programs, "{marker}");
+        assert!(!helpers.contains(marker), "{marker}");
+    }
 }
 
 #[test]

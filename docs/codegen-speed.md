@@ -1400,6 +1400,26 @@ flush outside FZ, without IDC or with NaNs taken. `tests/special_lanes.rs`
 holds FCMP and FCMPE S, FCMP D and FCMP D with #0.0: 80,000 runs, none
 differing; it fails without the flush, without IDC or with NaNs taken.
 
+**Vector compares, FMAX and FMIN, and division by zero.** The same run
+counted 3.8 million FCMGE lanes of a normal and an infinity, 2.2 million
+divisions of a normal by zero, 1.5 million FMIN and 1.4 million FMAX of
+an infinity and a normal, 1.2 million FCMGE of two infinities and more of
+NaNs, zeros and denormals. With `special-lanes` the inlined FCMEQ, FCMGE,
+FCMGT, FACGE, FACGT, FMAX, FMIN, FMAXNM and FMINNM take every lane but a
+NaN's natively (`compare_lane_test`): IEEE's compares and the maximum and
+minimum of infinities are Arm's, and under FZ a denormal operand is a
+zero of its sign, IDC raised for a native lane that flushed one (the
+helper raises it for the NaN lanes it takes). A normal number divided by
+zero is the host's infinity with DZC, inlined with `special-lanes` and in
+the helpers' `native_arith_lane` always (an infinity divided by zero is
+exact and raises nothing; zero by zero and a denormal by zero under FZ are
+NaNs, the exact path's). `tests/special_lanes.rs` holds FCMGT, FCMGE,
+FCMEQ, FACGE, FMAX, FMIN, FMAXNM 4S, FCMGT, FMINNM 2D and FMAX 2S:
+120,000 runs, none differing; it fails without the flush, without IDC,
+with NaN lanes taken, without DZC or with any dividend over zero; the
+echora-simd lane test fails without DZC or with an infinity's division
+by zero raising it.
+
 **Compile cost of the candidates' set, and `shared-float-tests`.** The
 codesize crate (every test program as one crate, 94,098 guest
 instructions) lifted with the game's hot-region set of its candidates

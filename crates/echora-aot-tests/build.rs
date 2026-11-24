@@ -2585,6 +2585,17 @@ fn special_lane_code(out: &mut String) {
         ("fcmpe s", true, vec![0x1e22_2030]),
         ("fcmp d", false, vec![0x1e62_2020]),
         ("fcmp d, #0", false, vec![0x1e60_2028]),
+        // Vector compares and FMAX/FMIN: every lane but a NaN's natively.
+        ("fcmgt 4s", true, vec![0x6ea2_e420]),
+        ("fcmge 4s", true, vec![0x6e22_e420]),
+        ("fcmeq 4s", true, vec![0x4e22_e420]),
+        ("facge 4s", true, vec![0x6e22_ec20]),
+        ("fcmgt 2d", false, vec![0x6ee2_e420]),
+        ("fmax 4s", true, vec![0x4e22_f420]),
+        ("fmin 4s", true, vec![0x4ea2_f420]),
+        ("fmaxnm 4s", true, vec![0x4e22_c420]),
+        ("fminnm 2d", false, vec![0x4ee2_c420]),
+        ("fmax 2s", true, vec![0x0e22_f420]),
         (
             "chain 4s",
             true,
