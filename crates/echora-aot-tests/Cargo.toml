@@ -149,6 +149,12 @@ regalloc-resume-returns = []
 # With regalloc: every deferred root of discovery a function entry
 # (EmitOptions::regalloc_indirect_entries).
 regalloc-indirect-entries = []
+# With regalloc: vector registers in structured functions' locals
+# (EmitOptions::regalloc_vector_locals).
+regalloc-vector-locals = []
+# With regalloc: PC stores in the slow paths of the code after them
+# (EmitOptions::regalloc_lazy_pc).
+regalloc-lazy-pc = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

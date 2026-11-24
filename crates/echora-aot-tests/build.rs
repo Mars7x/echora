@@ -86,6 +86,8 @@ fn options() -> EmitOptions {
             .is_some(),
         regalloc_indirect_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_INDIRECT_ENTRIES")
             .is_some(),
+        regalloc_vector_locals: std::env::var_os("CARGO_FEATURE_REGALLOC_VECTOR_LOCALS").is_some(),
+        regalloc_lazy_pc: std::env::var_os("CARGO_FEATURE_REGALLOC_LAZY_PC").is_some(),
         stub_windows: false,
     }
 }
@@ -5774,6 +5776,19 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         EmitOptions {
             // Most functions over the cap: left to the windows.
             regalloc_function_bytes: 4_000,
+            ..structured_functions
+        },
+    );
+    // Vector registers in locals, with the FP lowering the game uses.
+    lift(
+        "regalloc_vectors",
+        16,
+        EmitOptions {
+            regalloc_vector_locals: true,
+            regalloc_loop_inlining: true,
+            mxcsr_groups: true,
+            float_runs: true,
+            float_run_loads: true,
             ..structured_functions
         },
     );
