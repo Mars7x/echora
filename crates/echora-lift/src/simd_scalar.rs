@@ -25,7 +25,7 @@ pub(crate) fn set_inline_fp_scalar(on: bool) -> bool {
 
 /// General register `rn` read as `bits` (`Cpu::read_reg`, the zero
 /// register as 0).
-fn general(rn: u8, bits: u8) -> String {
+pub(crate) fn general(rn: u8, bits: u8) -> String {
     if rn == 31 {
         "0u64".to_owned()
     } else if bits == 32 {
@@ -53,7 +53,7 @@ fn write_fp(rd: u8, size: FpSize, value: &str) -> String {
 }
 
 /// `int_to_fp_bits` of the u64 `value`.
-fn int_to_fp(value: &str, int_bits: u32, signed: bool, size: FpSize) -> String {
+pub(crate) fn int_to_fp(value: &str, int_bits: u32, signed: bool, size: FpSize) -> String {
     let source = match (signed, int_bits) {
         (true, 32) => format!("({value} as u32 as i32)"),
         (true, _) => format!("({value} as i64)"),
@@ -66,7 +66,7 @@ fn int_to_fp(value: &str, int_bits: u32, signed: bool, size: FpSize) -> String {
     }
 }
 
-fn rounding_method(rounding: Rounding) -> &'static str {
+pub(crate) fn rounding_method(rounding: Rounding) -> &'static str {
     match rounding {
         Rounding::Nearest => "round_ties_even",
         Rounding::Plus => "ceil",

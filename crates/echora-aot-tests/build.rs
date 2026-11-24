@@ -2353,6 +2353,45 @@ fn mxcsr_group_code(out: &mut String) {
                 0x1e20_c004,
             ],
         ),
+        // Conversions to and from general registers and FCMP; X0-X4 hold
+        // integers, a written general register is read back by a later
+        // SCVTF, and an FCMP feeds the block's branch. Each follows an FMUL
+        // of V3 into V4 (those forms join a group but form none alone), so
+        // its own operands' NaNs and denormals reach it, not the FMUL.
+        ("scvtf s, x", true, vec![0x1e23_0864, 0x9e22_0020]),
+        ("scvtf s, w", true, vec![0x1e23_0864, 0x1e22_0020]),
+        ("ucvtf s, x", true, vec![0x1e23_0864, 0x9e23_0020]),
+        ("scvtf d, x", false, vec![0x1e63_0864, 0x9e62_0020]),
+        ("ucvtf d, w", false, vec![0x1e63_0864, 0x1e63_0020]),
+        ("scvtf s, s", true, vec![0x1e23_0864, 0x5e21_d820]),
+        ("ucvtf d, d", false, vec![0x1e63_0864, 0x7e61_d820]),
+        ("fcvtzs x, s", true, vec![0x1e23_0864, 0x9e38_0020]),
+        ("fcvtzu w, s", true, vec![0x1e23_0864, 0x1e39_0020]),
+        ("fcvtms x, s", true, vec![0x1e23_0864, 0x9e30_0020]),
+        ("fcvtps x, s", true, vec![0x1e23_0864, 0x9e28_0020]),
+        ("fcvtzs x, d", false, vec![0x1e63_0864, 0x9e78_0020]),
+        ("fcvtas w, d", false, vec![0x1e63_0864, 0x1e64_0020]),
+        ("fcvtau x, d", false, vec![0x1e63_0864, 0x9e65_0020]),
+        ("fcvtns x, d", false, vec![0x1e63_0864, 0x9e60_0020]),
+        ("fcmp s", true, vec![0x1e23_0864, 0x1e22_2020]),
+        ("fcmpe s", true, vec![0x1e23_0864, 0x1e22_2030]),
+        ("fcmp d, #0", false, vec![0x1e63_0864, 0x1e60_2028]),
+        (
+            "conversions",
+            true,
+            vec![
+                0x9e38_0020,
+                0x9e22_0003,
+                0x1e22_0864,
+                0x1e39_0081,
+                0x1e23_0020,
+            ],
+        ),
+        (
+            "fcmp and branch",
+            true,
+            vec![0x1e22_0823, 0x1e22_2060, 0x5400_004c, 0x1e22_2820],
+        ),
         (
             "doubles and conversions",
             false,
