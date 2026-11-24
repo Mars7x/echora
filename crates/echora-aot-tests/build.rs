@@ -1949,11 +1949,25 @@ fn q_pair_code(out: &mut String) {
             ],
         ));
     }
+    // A float operation beside the pairs: its function keeps FPSR in a
+    // local, so the helper calls on its lines are wrapped with the status
+    // stores (which must leave the pairs' own code alone).
+    const FADD_S0: u32 = 0x1e21_2800; // fadd s0, s0, s1
+    for (form, store, load) in FORMS {
+        programs.push((
+            format!("fadd s0; stp q0, q1, x2 {form} 1; ldp q3, q4, x2 {form} -1"),
+            vec![
+                FADD_S0,
+                encode(store, 1, 1, 2, 0),
+                encode(load, -1, 4, 2, 3),
+            ],
+        ));
+    }
     let mut words: Vec<u32> = Vec::new();
     let mut entries = Vec::new();
     let mut names = Vec::new();
     for (name, program) in &programs {
-        for &word in program {
+        for &word in program.iter().filter(|&&word| word != FADD_S0) {
             assert!(
                 matches!(decode(word, 0), Instruction::LoadStoreVectorPair { .. }),
                 "{name}: {word:#010x}"
@@ -1975,13 +1989,26 @@ fn q_pair_code(out: &mut String) {
         words.len() + 16,
     )
     .expect("q_pairs");
-    for (name, direct) in [("q_pair_code", true), ("q_pair_reference", false)] {
+    for (name, direct, regalloc) in [
+        ("q_pair_code", true, false),
+        ("q_pair_reference", false, false),
+        // The pairs in structured functions (every program's entry is a
+        // function entry), whose helper calls are wrapped with the FP
+        // status stores: the pairs' own code must be left alone.
+        ("q_pair_regalloc", true, true),
+    ] {
         let options = EmitOptions {
             direct_q_pairs: direct,
             window_memory: true,
             fp_status_locals: true,
-            // The census counts the windows' calls: no function copies.
-            regalloc: false,
+            // The census counts the windows' calls: no function copies,
+            // but in the regalloc lift.
+            regalloc,
+            functions: regalloc,
+            call_summaries: regalloc || options().call_summaries,
+            inline_vector: regalloc || options().inline_vector,
+            function_table: false,
+            regalloc_crates: false,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -2000,6 +2027,11 @@ fn q_pair_code(out: &mut String) {
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
         writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
         writeln!(out, "/// Out-of-line `load_q_pair`/`store_q_pair` calls left (`echora_lift::census`).\npub const OUT_OF_LINE: usize = {out_of_line};").expect("write");
+        let structured: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches("n: &mut u64) -> Result<(), Trap>").count())
+            .sum();
+        writeln!(out, "/// Functions emitted structured.\npub const STRUCTURED_FUNCTIONS: usize = {structured};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }

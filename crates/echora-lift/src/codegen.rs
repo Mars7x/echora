@@ -2480,20 +2480,21 @@ fn wrap_cpu_helpers(line: &str, store: &str, reload: &str) -> String {
     loop {
         // The earliest helper call left in the line: (start of the call,
         // index of its opening parenthesis, whether it may write).
+        // Only a free function handed the whole `Cpu` (`&m.cpu` then `,`
+        // or `)`), never a method (`.copy_from_slice(&m.cpu.vectors[7]..)`)
+        // nor a field of the `Cpu` passed by reference.
         let found = [("(&mut m.cpu", true), ("(&m.cpu", false)]
             .iter()
             .filter_map(|&(pattern, writes)| {
-                let at = rest.find(pattern)?;
-                let (start, open) = if pattern.starts_with('(') {
+                rest.match_indices(pattern).find_map(|(at, _)| {
+                    let whole = rest[at + pattern.len()..].starts_with([',', ')']);
                     // Back over the helper's path to the start of its name.
                     let start = rest[..at]
                         .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
                         .map_or(0, |i| i + 1);
-                    (start, at)
-                } else {
-                    (at, at + pattern.len() - 1)
-                };
-                Some((start, open, writes))
+                    let free = start < at && !rest[..start].ends_with('.');
+                    (whole && free).then_some((start, at, writes))
+                })
             })
             .min_by_key(|&(start, _, _)| start);
         let Some((start, open, writes)) = found else {
@@ -11025,6 +11026,27 @@ mod tests {
             assert!(f[..f.find("\npub fn ").unwrap_or(f.len())].contains("n: &mut u64"));
             assert!(!text.contains("pub fn run_function_1400("));
         }
+    }
+
+    #[test]
+    fn only_helpers_handed_the_whole_cpu_are_wrapped() {
+        // A Q pair's code (`direct_q_pairs`): methods on CPU fields, not
+        // helpers taking the CPU.
+        let pair = "{ let mut bytes = [0u8; 32]; bytes[..16].copy_from_slice(&m.cpu.vectors[7].to_le_bytes()); bytes[16..].copy_from_slice(&m.cpu.vectors[8].to_le_bytes()); }";
+        assert_eq!(wrap_cpu_helpers(pair, "S;", "L;"), pair);
+        // A field of the CPU by reference to a free function: not the CPU.
+        let field = "let x = helper(&m.cpu.vectors[3]);";
+        assert_eq!(wrap_cpu_helpers(field, "S;", "L;"), field);
+        // A helper taking the CPU, beside a pair on the same line.
+        let both = format!("{pair} echora_guest::simd::vec_fp(&mut m.cpu, 1, 2)?;");
+        assert_eq!(
+            wrap_cpu_helpers(&both, "S; ", "L; "),
+            format!("{pair} {{ S; let called = echora_guest::simd::vec_fp(&mut m.cpu, 1, 2); L; called? }};")
+        );
+        assert_eq!(
+            wrap_cpu_helpers("let v = read(&m.cpu);", "S; ", "L; "),
+            "let v = { S; let called = read(&m.cpu); called };"
+        );
     }
 
     #[test]
