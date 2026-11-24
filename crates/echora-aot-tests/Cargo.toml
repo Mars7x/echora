@@ -106,6 +106,49 @@ long-windows = []
 # After a call, the return point as a constant successor; any other PC
 # leaves the window (EmitOptions::known_returns).
 known-returns = []
+# Inlined float operations' exact paths cold and out of line
+# (EmitOptions::cold_fp_exact).
+cold-fp-exact = []
+# Consecutive inlined float operations test the FPCR mode and IXC once
+# (EmitOptions::hoist_fp_mode).
+hoist-fp-mode = []
+# With inline-vector on x86-64: vector float groups checked by the host's
+# exception flags (EmitOptions::mxcsr_groups).
+mxcsr-groups = []
+# With call-summaries: every summarized call of a lifted function audited
+# (EmitOptions::call_summaries_audit).
+call-summaries-audit = []
+# Constant successors with their own arms copied into the arm instead of
+# dispatched (EmitOptions::threaded_successors).
+threaded-successors = []
+# A 34-bit guest address space instead of 39 bits, for running the
+# benchmark kernels under valgrind (measuring only).
+# With split ticks: the stop word in a window local (EmitOptions::cached_stop).
+cached-stop = []
+# With split ticks: one stop test per window arm (EmitOptions::arm_charges).
+arm-charges = []
+small-address-space = []
+# With functions: lifted functions as structured host code, charged at
+# entries, loop heads and call returns (EmitOptions::regalloc).
+regalloc = []
+# With regalloc: larger callees inlined where called inside a loop
+# (EmitOptions::regalloc_loop_inlining).
+regalloc-loop-inlining = []
+# With regalloc: structured resume functions for small inner loops
+# (EmitOptions::regalloc_resume_loops).
+regalloc-resume-loops = []
+# With regalloc: each region's lifted functions in crates of their own
+# (EmitOptions::regalloc_crates).
+regalloc-crates = []
+# With regalloc-crates: function bodies across region edges
+# (EmitOptions::regalloc_span_regions).
+regalloc-span-regions = []
+# With regalloc: resume functions at call return points
+# (EmitOptions::regalloc_resume_returns).
+regalloc-resume-returns = []
+# With regalloc: every deferred root of discovery a function entry
+# (EmitOptions::regalloc_indirect_entries).
+regalloc-indirect-entries = []
 # Write the split programs per emission mode for `benches/codesize.rs`.
 codesize = []
 

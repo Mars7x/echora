@@ -399,6 +399,187 @@ impl Flags {
     }
 }
 
+/// NZCV as generated structured functions keep it: the operands of the
+/// last flag-setting operation, the flags computed whole only where they
+/// are read whole (`nzcv`), and a condition read from the operands
+/// directly (a subtraction's GE is a signed compare). Every operation
+/// leaves exactly the NZCV that [`Flags`] would; the host compiler sees the
+/// constant `mode` of each write and folds the rest away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LazyFlags {
+    /// 0: the flags themselves, in `x`; 1, 2: a 32- or 64-bit subtraction
+    /// `x - y`; 3, 4: an addition `x + y`; 5, 6: a logical result `x`.
+    mode: u8,
+    x: u64,
+    y: u64,
+}
+
+impl LazyFlags {
+    #[inline(always)]
+    pub fn from(nzcv: u8) -> Self {
+        Self {
+            mode: 0,
+            x: u64::from(nzcv),
+            y: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, nzcv: u8) {
+        *self = Self::from(nzcv);
+    }
+
+    /// N, Z, C, V in bits 3, 2, 1, 0.
+    #[inline(always)]
+    pub fn nzcv(&self) -> u8 {
+        let (x, y) = (self.x, self.y);
+        let (bits, mask) = match self.mode {
+            0 => return x as u8,
+            1 | 3 | 5 => (32, u64::from(u32::MAX)),
+            _ => (64, u64::MAX),
+        };
+        let top = bits - 1;
+        let pack = |n: u64, z: bool, c: bool, v: u64| {
+            ((n as u8 & 1) << 3) | (u8::from(z) << 2) | (u8::from(c) << 1) | (v as u8 & 1)
+        };
+        match self.mode {
+            1 | 2 => {
+                let r = x.wrapping_sub(y) & mask;
+                pack(r >> top, r == 0, x >= y, ((x ^ y) & (x ^ r)) >> top)
+            }
+            3 | 4 => {
+                let r = x.wrapping_add(y) & mask;
+                let carry = if bits == 32 {
+                    (x + y) >> 32 != 0
+                } else {
+                    r < x
+                };
+                pack(r >> top, r == 0, carry, (!(x ^ y) & (x ^ r)) >> top)
+            }
+            _ => pack(x >> top, x == 0, false, 0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn add_with_carry(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        carry: bool,
+        bits: u8,
+        flags: bool,
+    ) -> u64 {
+        let mut eager = Flags { nzcv: 0 };
+        let value = eager.add_with_carry(lhs, rhs, carry, bits, flags);
+        if flags {
+            self.set(eager.nzcv);
+        }
+        value
+    }
+
+    #[inline(always)]
+    pub fn add_sub(&mut self, lhs: u64, rhs: u64, subtract: bool, bits: u8, flags: bool) -> u64 {
+        let mask = width_mask(bits);
+        let value = if subtract {
+            lhs.wrapping_sub(rhs)
+        } else {
+            lhs.wrapping_add(rhs)
+        } & mask;
+        if flags {
+            *self = Self {
+                mode: match (subtract, bits) {
+                    (true, 32) => 1,
+                    (true, _) => 2,
+                    (false, 32) => 3,
+                    (false, _) => 4,
+                },
+                x: lhs & mask,
+                y: rhs & mask,
+            };
+        }
+        value
+    }
+
+    #[inline(always)]
+    pub fn logical_flags(&mut self, value: u64, bits: u8) {
+        *self = Self {
+            mode: if bits == 32 { 5 } else { 6 },
+            x: value & width_mask(bits),
+            y: 0,
+        };
+    }
+
+    #[inline(always)]
+    pub fn conditional_compare(&mut self, lhs: u64, rhs: u64, bits: u8, condition: u8, nzcv: u8) {
+        if self.condition(condition) {
+            self.add_sub(lhs, rhs, true, bits, true);
+        } else {
+            self.set(nzcv & 15);
+        }
+    }
+
+    #[inline(always)]
+    pub fn conditional_compare_negative(
+        &mut self,
+        lhs: u64,
+        rhs: u64,
+        bits: u8,
+        condition: u8,
+        nzcv: u8,
+    ) {
+        if self.condition(condition) {
+            self.add_sub(lhs, rhs, false, bits, true);
+        } else {
+            self.set(nzcv & 15);
+        }
+    }
+
+    #[inline(always)]
+    pub fn condition(&self, condition: u8) -> bool {
+        let (x, y) = (self.x, self.y);
+        let wide = matches!(self.mode, 2 | 4 | 6);
+        let signed = |value: u64| {
+            if wide {
+                value as i64
+            } else {
+                i64::from(value as u32 as i32)
+            }
+        };
+        let result = match self.mode {
+            1 | 2 => match (condition >> 1) & 7 {
+                0 => x == y,
+                1 => x >= y,
+                2 => signed(x.wrapping_sub(y)) < 0,
+                3 => {
+                    if wide {
+                        (x as i64).overflowing_sub(y as i64).1
+                    } else {
+                        (x as u32 as i32).overflowing_sub(y as u32 as i32).1
+                    }
+                }
+                4 => x > y,
+                5 => signed(x) >= signed(y),
+                6 => signed(x) > signed(y),
+                _ => true,
+            },
+            5 | 6 => match (condition >> 1) & 7 {
+                0 => x == 0,
+                1 | 3 | 4 => false,
+                2 => signed(x) < 0,
+                5 => signed(x) >= 0,
+                6 => x != 0 && signed(x) >= 0,
+                _ => true,
+            },
+            _ => return Flags { nzcv: self.nzcv() }.condition(condition),
+        };
+        if condition & 1 != 0 && condition != 15 {
+            !result
+        } else {
+            result
+        }
+    }
+}
+
 /// One CRC32 (`castagnoli` false, polynomial 0x04C11DB7) or CRC32C
 /// (polynomial 0x1EDC6F41) step over the low `bytes` bytes of `data`, in the
 /// reflected bit order the instructions use, without inversion.
@@ -416,6 +597,115 @@ pub fn crc32(acc: u32, data: u64, bytes: u8, castagnoli: bool) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Operands near the edges of both widths and random ones.
+    fn operands() -> Vec<u64> {
+        let mut values = vec![
+            0,
+            1,
+            2,
+            0x7fff_ffff,
+            0x8000_0000,
+            0x8000_0001,
+            0xffff_fffe,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0001,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(state);
+            values.push(state & 0xffff_ffff);
+        }
+        values
+    }
+
+    #[test]
+    fn lazy_flags_match_flags_for_every_operation_and_condition() {
+        use super::{Flags, LazyFlags};
+        let values = operands();
+        for &lhs in &values {
+            for &rhs in &values {
+                for bits in [32u8, 64] {
+                    for subtract in [false, true] {
+                        let mut eager = Flags { nzcv: 0b1010 };
+                        let mut lazy = LazyFlags::from(0b1010);
+                        assert_eq!(
+                            lazy.add_sub(lhs, rhs, subtract, bits, true),
+                            eager.add_sub(lhs, rhs, subtract, bits, true)
+                        );
+                        assert_eq!(
+                            lazy.nzcv(),
+                            eager.nzcv,
+                            "{lhs:#x} {rhs:#x} {bits} {subtract}"
+                        );
+                        for condition in 0..16 {
+                            assert_eq!(
+                                lazy.condition(condition),
+                                eager.condition(condition),
+                                "{lhs:#x} {rhs:#x} {bits} {subtract} {condition}"
+                            );
+                        }
+                        // Without flags: NZCV stays.
+                        let before = lazy;
+                        lazy.add_sub(rhs, lhs, subtract, bits, false);
+                        assert_eq!(lazy, before);
+                    }
+                    for carry in [false, true] {
+                        let mut eager = Flags { nzcv: 0 };
+                        let mut lazy = LazyFlags::from(0);
+                        assert_eq!(
+                            lazy.add_with_carry(lhs, rhs, carry, bits, true),
+                            eager.add_with_carry(lhs, rhs, carry, bits, true)
+                        );
+                        assert_eq!(lazy.nzcv(), eager.nzcv);
+                    }
+                    for nzcv in [0u8, 0b0110, 0b1001, 0b1111] {
+                        for condition in 0..16 {
+                            let mut eager = Flags { nzcv: 0b0010 };
+                            let mut lazy = LazyFlags::from(0b0010);
+                            eager.add_sub(lhs, rhs, true, bits, true);
+                            lazy.add_sub(lhs, rhs, true, bits, true);
+                            eager.conditional_compare(rhs, lhs, bits, condition, nzcv);
+                            lazy.conditional_compare(rhs, lhs, bits, condition, nzcv);
+                            assert_eq!(lazy.nzcv(), eager.nzcv);
+                            eager.conditional_compare_negative(lhs, rhs, bits, condition, nzcv);
+                            lazy.conditional_compare_negative(lhs, rhs, bits, condition, nzcv);
+                            assert_eq!(lazy.nzcv(), eager.nzcv);
+                        }
+                    }
+                }
+                let mut eager = Flags { nzcv: 0b0011 };
+                let mut lazy = LazyFlags::from(0b0011);
+                for bits in [32u8, 64] {
+                    eager.logical_flags(lhs ^ rhs, bits);
+                    lazy.logical_flags(lhs ^ rhs, bits);
+                    assert_eq!(lazy.nzcv(), eager.nzcv);
+                    for condition in 0..16 {
+                        assert_eq!(lazy.condition(condition), eager.condition(condition));
+                    }
+                }
+            }
+        }
+        for nzcv in 0..16u8 {
+            let mut lazy = LazyFlags::from(0);
+            lazy.set(nzcv);
+            assert_eq!(lazy.nzcv(), nzcv);
+            for condition in 0..16 {
+                assert_eq!(
+                    lazy.condition(condition),
+                    Flags { nzcv }.condition(condition)
+                );
+            }
+        }
+    }
 
     #[test]
     fn crc32_matches_standard_check_values() {

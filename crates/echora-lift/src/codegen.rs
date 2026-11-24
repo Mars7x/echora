@@ -22,7 +22,11 @@ pub const MAX_BLOCKS_PER_FUNCTION: usize = 128;
 const WINDOW_BITS: u32 = 12;
 /// Split crates use 1 KiB windows: densely seeded windows of FP-heavy code
 /// otherwise produce single functions too large to compile in bounded memory.
-const SPLIT_WINDOW_BITS: u32 = 10;
+pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
+
+#[path = "regalloc.rs"]
+mod regalloc;
+pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
 
 #[derive(Clone, Debug)]
 pub struct CodeRegion {
@@ -73,12 +77,19 @@ pub struct Translation {
     pub jump_tables: BTreeMap<u64, usize>,
     /// Every recovered jump-table case target (reached by an indirect branch).
     pub indirect_targets: BTreeSet<u64>,
+    /// The case targets of each recovered jump table, by its BR's address.
+    pub jump_table_cases: BTreeMap<u64, Vec<u64>>,
     /// Predicted 64-bit words of data the guest's dynamic linker writes
     /// (GOT slots), by address: what the loader's relocations say it will
     /// store there. Empty unless the caller fills it after discovery. A
     /// prediction only chooses a guarded fast path (see `plt_stubs`); the
     /// word in guest memory decides where execution goes.
     pub got_words: BTreeMap<u64, u64>,
+    /// The deferred roots discovery was given (relocation targets, address
+    /// constants, prologue candidates) that start translated code, whether
+    /// or not discovery had reached them first (`entries` holds only those
+    /// it had not).
+    pub deferred_roots: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -224,6 +235,7 @@ pub fn discover_with_tables(
     let mut all_entries = entries.to_vec();
     let mut deferred_queued = deferred.is_empty();
     let mut jump_tables = BTreeMap::new();
+    let mut jump_table_cases = BTreeMap::new();
     let mut indirect_targets = BTreeSet::new();
     loop {
         let pc = match pending.pop_front() {
@@ -260,6 +272,7 @@ pub fn discover_with_tables(
                 let targets = jump_table_targets(pc, &read_word, regions, data);
                 if !targets.is_empty() {
                     jump_tables.insert(pc, targets.len());
+                    jump_table_cases.insert(pc, targets.clone());
                     indirect_targets.extend(targets.iter().copied());
                     successors.extend(targets);
                 }
@@ -305,6 +318,11 @@ pub fn discover_with_tables(
             });
         }
     }
+    let deferred_roots: BTreeSet<u64> = deferred
+        .iter()
+        .copied()
+        .filter(|root| instructions.contains_key(root))
+        .collect();
     Ok(Translation {
         instructions,
         blocks,
@@ -313,7 +331,9 @@ pub fn discover_with_tables(
         truncated,
         jump_tables,
         indirect_targets,
+        jump_table_cases,
         got_words: BTreeMap::new(),
+        deferred_roots,
     })
 }
 
@@ -1270,6 +1290,9 @@ fn flush_pending(output: &mut String) {
 /// this region, the callee's window function runs directly
 /// (`Core::call_window`); otherwise, as any call, through the window table.
 fn emit_call_predicted(output: &mut String, next: u64, direct: Option<(u64, u64)>) {
+    // In crates packed by size (`regalloc_crates`) another window of the
+    // region may be in another crate.
+    let direct = direct.filter(|_| !REGALLOC_SPLIT.get());
     let Some((predicted, window)) = direct else {
         emit_call(output, next);
         return;
@@ -1620,7 +1643,15 @@ const WRITES_REGISTERS: &[&str] = &[
 const CALL_PREFIXES: &[(&str, &str)] = &[
     ("if let Err(trap) = m.call(", "m.call("),
     ("if let Err(trap) = m.call_window(", "m.call_window("),
+    ("if let Err(trap) = run_entry(", "run_entry("),
+    ("if let Err(trap) = run_entry_at(", "run_entry_at("),
+    ("if let Err(trap) = run_entry_pc(", "run_entry_pc("),
+    ("if let Err(trap) = m.call_indirect(", "m.call_indirect("),
 ];
+
+/// With `EmitOptions::regalloc`: a window arm runs its block's structured
+/// function (`REGALLOC_ENTRIES`), as a call that is no guest call.
+const RUN_ENTRY_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn run_entry(m: &mut Machine, function: fn(&mut Machine) -> Result<(), Trap>) -> Result<(), Trap> { function(m) }\n";
 
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[(&str, &str)] = &[
@@ -2470,7 +2501,10 @@ fn replace_sp(line: &str) -> String {
 }
 
 /// The stack alignment check `emit_sp_alignment_check` writes.
-const SP_ALIGNMENT_CHECK: &str = "if base & 15 != 0 { return Err(Trap::InvalidState { message: format!(\"unaligned SP memory access at {:#x}\", m.cpu.pc) }); }";
+/// Its trap is built out of line (`unaligned_sp`, `AT_HELPER`): the check
+/// stands before every SP-based access, and an inline `format!` there put
+/// the formatting code in every hot path that touches the stack.
+const SP_ALIGNMENT_CHECK: &str = "if base & 15 != 0 { return Err(unaligned_sp(m.cpu.pc)); }";
 
 /// `body` with the PC stored only where it leaves with a trap, when its
 /// fallible calls (`)?`) and stack alignment checks are the only reasons it
@@ -2493,7 +2527,56 @@ fn pc_on_error_paths(body: &str, pc: u64) -> Option<String> {
 /// generic helper rather than a `map_err` closure per call site, which the
 /// compiler would type-check, borrow-check and compile as a function each.
 const AT_HELPER: &str = "#[allow(dead_code)]\ntrait At<T> { fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap>; }\n\
-impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap> { if self.is_err() { m.cpu.pc = pc; } self } }\n";
+impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora_guest::Core, pc: u64) -> Result<T, Trap> { if self.is_err() { m.cpu.pc = pc; } self } }\n\
+/// The trap of a stack access with SP not 16-byte aligned (`SP_ALIGNMENT_CHECK`).\n\
+#[allow(dead_code)]\n#[cold]\n#[inline(never)]\nfn unaligned_sp(pc: u64) -> Trap { Trap::InvalidState { message: format!(\"unaligned SP memory access at {pc:#x}\") } }\n";
+
+/// With `EmitOptions::cold_fp_exact`, written into a region's source: the
+/// exact scalar float helpers the inline paths fall back to, each behind
+/// one cold, never-inlined wrapper the region's call sites share (the
+/// helpers are inlinable, so each site would otherwise hold a copy).
+const COLD_FP_HELPERS: &[(&str, &str, &str)] = &[
+    (
+        "fp_binary",
+        "op: echora_guest::simd::FpBinaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8",
+        "op, size, rd, rn, rm",
+    ),
+    (
+        "fp_ternary",
+        "op: echora_guest::simd::FpTernaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8, ra: u8",
+        "op, size, rd, rn, rm, ra",
+    ),
+    (
+        "fp_compare",
+        "size: echora_guest::simd::FpSize, rn: u8, rm: Option<u8>, signaling: bool",
+        "size, rn, rm, signaling",
+    ),
+];
+
+/// A region's source with `EmitOptions::cold_fp_exact`: its calls of the
+/// helpers in `COLD_FP_HELPERS` through the region's cold wrappers
+/// (written after the header, `header_end` bytes in, for the helpers it
+/// calls).
+fn cold_fp_helpers(source: &str, header_end: usize) -> String {
+    let (header, body) = source.split_at(header_end);
+    let mut body = body.to_owned();
+    let mut wrappers = String::new();
+    for (name, parameters, arguments) in COLD_FP_HELPERS {
+        let call = format!("echora_guest::simd::{name}(");
+        if !body.contains(&call) {
+            continue;
+        }
+        body = body.replace(&call, &format!("cold_{name}("));
+        writeln!(
+            wrappers,
+            "/// `echora_guest::simd::{name}` out of the hot code (`EmitOptions::cold_fp_exact`).\n\
+             #[cold]\n#[inline(never)]\n\
+             fn cold_{name}(cpu: &mut echora_guest::cpu::Cpu, {parameters}) -> Result<(), Trap> {{ echora_guest::simd::{name}(cpu, {arguments}) }}"
+        )
+        .unwrap();
+    }
+    format!("{header}{wrappers}{body}")
+}
 
 /// Whether an instruction's emitted code might observe `m.cpu.pc`: it can
 /// trap or return early, reads the PC, or calls a CPU or SIMD helper other
@@ -2544,7 +2627,12 @@ fn emit_instruction_body(
     // With `EmitOptions::known_returns` the window goes on at the return
     // point as a constant (no dispatch), and any other PC leaves it.
     let returned;
-    let after_call = if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
+    let after_call = if local_pc && REGALLOC_BODY.get() {
+        returned = format!(
+            "                next_pc = {next:#x};\n                if m.cpu.pc != next_pc {{ return Ok(()); }}\n"
+        );
+        returned.as_str()
+    } else if local_pc && KNOWN_RETURNS.get() && !IN_FUNCTION.get() {
         returned = format!(
             "                next_pc = {next:#x};\n                if m.cpu.pc != next_pc {{ return m.finish_block(); }}\n"
         );
@@ -2581,7 +2669,12 @@ fn emit_instruction_body(
             if *link {
                 put(output, 30, 64, false, &format!("{next:#x}"));
             }
-            if *link {
+            if *link
+                && REGALLOC_BODY.get()
+                && REGALLOC_INLINED.with_borrow(|inlined| inlined.contains(&pc))
+            {
+                writeln!(output, "                {successor} = {target:#x};").unwrap();
+            } else if *link {
                 writeln!(output, "                m.cpu.pc = {target:#x};").unwrap();
                 match emit_plt_stub(output, pc, *target, true) {
                     Some(direct) => emit_call_predicted(output, next, direct),
@@ -2596,7 +2689,7 @@ fn emit_instruction_body(
                         writeln!(
                             output,
                             "                {SUMMARIZED_CALL}{next:#x}, {callee}, {touched:#x}, {writes:#x}, {}) {{ return Err(trap); }}",
-                            u8::from(IN_FUNCTION.get() && TRANSITIVE.get())
+                            u8::from(IN_FUNCTION.get() && (TRANSITIVE.get() || REGALLOC_BODY.get()))
                         )
                         .unwrap();
                     }
@@ -2697,7 +2790,20 @@ fn emit_instruction_body(
             }
             if *link {
                 output.push_str("                m.cpu.pc = target;\n");
-                emit_call(output, next);
+                if REGALLOC_BODY.get()
+                    && FUNCTIONS
+                        .with_borrow(|functions| functions.as_ref().is_some_and(|set| set.table))
+                {
+                    // A target that is a lifted function's entry runs it
+                    // directly, found through the site's cache.
+                    writeln!(
+                        output,
+                        "                static CALL_SITE_{pc:X}: echora_guest::CallCache = echora_guest::CallCache::new();\n                if let Err(trap) = m.call_indirect({next:#x}, &CALL_SITE_{pc:X}) {{ return Err(trap); }}"
+                    )
+                    .unwrap();
+                } else {
+                    emit_call(output, next);
+                }
                 output.push_str(after_call);
             } else {
                 writeln!(output, "                {successor} = target;").unwrap();
@@ -3723,23 +3829,28 @@ fn emit_block_body(
     }
     let count = block.instructions.len();
     let fuse = FUSE.replace(fusion(block));
-    let mut body = String::new();
     let runs = if FLOAT_RUNS.get() {
         float_runs_in(block, FLOAT_RUN_LOADS.get() && INLINE_VECTOR.get())
     } else {
         Vec::new()
     };
     // Vector float runs hold no scalar float run's operation: disjoint.
-    let vector_runs = if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
+    let vector_runs = if MXCSR_GROUPS.get() {
+        vector_groups_in(block)
+    } else if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
         vector_runs_in(block)
     } else {
         Vec::new()
     };
     let mut skip_to = 0;
+    // Each instruction's code, and whether it is an inlined float operation
+    // `hoist_fp_mode` may group (with its PC).
+    let mut pieces: Vec<(String, Option<u64>)> = Vec::new();
     for (index, instruction) in block.instructions.iter().enumerate() {
         if index < skip_to {
             continue;
         }
+        let mut body = String::new();
         if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
             emit_float_run(
                 &mut body,
@@ -3748,6 +3859,7 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
         if let Some(&(_, end)) = vector_runs.iter().find(|&&(start, _)| start == index) {
@@ -3758,9 +3870,31 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
-        let block_size = (index == 0).then_some(count);
+        let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
+        if REGALLOC_BODY.get()
+            && matches!(
+                instruction.instruction,
+                Instruction::ReadPhysicalCounter { .. }
+            )
+        {
+            // The counter reads the steps, which a charged block holds
+            // whole: as in window code.
+            body.push_str("                m.steps += *n; *n = 0;\n");
+        }
+        if REGALLOC_BODY.get()
+            && index + 1 == count
+            && matches!(
+                instruction.instruction,
+                Instruction::Branch { link: true, .. } | Instruction::BranchReg { link: true, .. }
+            )
+            && !REGALLOC_INLINED.with_borrow(|inlined| inlined.contains(&instruction.pc))
+        {
+            // The callee charges its own blocks against exact steps.
+            body.push_str("                m.steps += *n; *n = 0;\n");
+        }
         emit_instruction(
             &mut body,
             instruction,
@@ -3769,8 +3903,22 @@ fn emit_block_body(
             check_entry,
             resumable,
         );
+        let grouped = (HOIST_FP_MODE.get() && index > 0 && fp_mode_test(&body).is_some())
+            .then_some(instruction.pc);
+        pieces.push((body, grouped));
     }
+    let body = hoist_fp_mode(pieces);
     FUSE.set(fuse);
+    if REGALLOC_BODY.get() {
+        writeln!(output, "                *n += {count};").unwrap();
+        // A spin hint reads the steps (and may lower the stop word, which
+        // the function's next test sees, as a preemption).
+        output.push_str(&body.replace(
+            "m.spin_hint();",
+            "{ m.steps += *n; *n = 0; m.spin_hint(); }",
+        ));
+        return;
+    }
     if SPLIT_TICKS.get()
         && let Some((tick, rest)) = body.split_once(")?;\n")
         && !tick.contains("enter_window")
@@ -3827,6 +3975,17 @@ fn emit_block_body(
             output.push_str(rest);
             return;
         }
+        if CACHED_STOP.get() && !IN_FUNCTION.get() && !tagged {
+            // The window's copy of the stop word (`EmitOptions::cached_stop`):
+            // the steps in the `Core` as before; only a charge it does not
+            // clear reloads the word and takes the exact checks.
+            let count = count as u64;
+            output.push_str(&format!(
+                "{indent}if m.steps + {count} <= stop {{ m.steps += {count}; }} else {{ stop = m.stop.load(std::sync::atomic::Ordering::Relaxed); if !m.charge_block_at({arguments}, false) {{ m.charge_block_slow({arguments}, {resumable})?; }} }}\n"
+            ));
+            output.push_str(rest);
+            return;
+        }
         output.push_str(&format!(
             "{indent}if !m.charge_block_at({arguments}, {tagged}) {{ m.charge_block_slow({arguments}, {resumable})?; }}\n"
         ));
@@ -3857,6 +4016,61 @@ fn emit_block_body(
     }
 }
 
+/// The inline paths' FPCR mode and sticky IXC test as an instruction's
+/// code spells it (on `m.cpu` or, with FPCR and FPSR in locals, `r`), if
+/// it holds one.
+fn fp_mode_test(code: &str) -> Option<String> {
+    let test = format!(
+        "{} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0",
+        crate::simd::FP_MODE
+    );
+    let local = test.replace("m.cpu.", "r.");
+    [test, local]
+        .into_iter()
+        .find(|test| code.contains(test.as_str()))
+}
+
+/// A block's instructions' code (`emit_block_body`), with
+/// `EmitOptions::hoist_fp_mode`: two or more consecutive inlined float
+/// operations test the FPCR mode and IXC once, before the first. The test
+/// is all a group's operations share: each keeps its operand and result
+/// tests and its exact fallback. No helper writes FPCR or clears an FPSR
+/// flag (they only add flags), so a test true before the group stays
+/// true; one false stays false, and the group's operations take their
+/// exact helpers, as each would have alone until IXC was raised.
+fn hoist_fp_mode(pieces: Vec<(String, Option<u64>)>) -> String {
+    let mut body = String::new();
+    let mut index = 0;
+    while index < pieces.len() {
+        let end = (index..pieces.len())
+            .find(|&at| pieces[at].1.is_none())
+            .unwrap_or(pieces.len());
+        let Some(first) = pieces[index].1.filter(|_| end - index >= 2) else {
+            body.push_str(&pieces[index].0);
+            index += 1;
+            continue;
+        };
+        let name = format!("fp_mode_{first:x}");
+        let test = fp_mode_test(&pieces[index].0).expect("a grouped operation tests the mode");
+        let fpcr = test.split(" & (").next().expect("the mode test reads FPCR");
+        let nonzero = format!("{fpcr} != 0 && {test}");
+        writeln!(
+            body,
+            "                let {name} = ({test}, {fpcr} != 0 && {test});"
+        )
+        .unwrap();
+        for (code, _) in &pieces[index..end] {
+            body.push_str(
+                &code
+                    .replace(&nonzero, &format!("{name}.1"))
+                    .replace(&test, &format!("{name}.0")),
+            );
+        }
+        index = end;
+    }
+    body
+}
+
 /// Scalar single-precision operations a float run needs at least.
 pub const FLOAT_RUN_MINIMUM: usize = 8;
 
@@ -3881,7 +4095,7 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             index += 1;
             continue;
         }
-        let start = index;
+        let mut start = index;
         let mut arithmetic = 0;
         while index + 1 < count
             && let Some(counts) = kind(&block.instructions[index])
@@ -3889,8 +4103,18 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             arithmetic += usize::from(counts);
             index += 1;
         }
+        // With `loads`, only loads between the run's operations: one that
+        // leads or ends the run runs before or after it as it would alone.
+        let load = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::float_run_load(op));
+        let mut end = index;
+        while start < end && load(&block.instructions[start]) {
+            start += 1;
+        }
+        while start < end && load(&block.instructions[end - 1]) {
+            end -= 1;
+        }
         if arithmetic >= FLOAT_RUN_MINIMUM {
-            runs.push((start, index));
+            runs.push((start, end));
         }
     }
     runs
@@ -3960,7 +4184,12 @@ fn emit_float_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -3973,7 +4202,7 @@ fn emit_float_run(
 /// block's first instruction (which charges the block) or its last.
 /// Nothing between two of a run's operations writes FPCR, calls a helper
 /// or leaves the block: they are consecutive instructions.
-fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
     let count = block.instructions.len();
     let mut runs = Vec::new();
@@ -3993,6 +4222,311 @@ fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     }
     runs
 }
+
+/// Whether `EmitOptions::mxcsr_groups` is in effect: with `inline_vector`,
+/// on an x86-64 host (the translation builds on the machine that runs it).
+pub fn mxcsr_groups_on(options: &EmitOptions) -> bool {
+    options.mxcsr_groups && options.inline_vector && cfg!(target_arch = "x86_64")
+}
+
+/// Vector float groups in `block` (`EmitOptions::mxcsr_groups`): the runs
+/// `vector_runs_in` finds, and a single operation an MXCSR group takes
+/// (`crate::simd::mxcsr_group_op`) where no run holds it.
+pub(crate) fn vector_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
+    let single = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::mxcsr_group_op(op));
+    let count = block.instructions.len();
+    let mut groups = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if !held(&block.instructions[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < count && held(&block.instructions[index]) {
+            index += 1;
+        }
+        if index - start >= 2 || single(&block.instructions[start]) {
+            groups.push((start, index));
+        }
+    }
+    groups
+}
+
+/// With `EmitOptions::mxcsr_groups`, written into a region's header: the
+/// host's floating-point exception flags, cleared before a group and read
+/// after it. `mxcsr_read` takes a value computed from every result of the
+/// group as an operand, so the host compiler computes them first; the
+/// group loads its operands after `mxcsr_clear`, which may write memory.
+const MXCSR_HELPER: &str = r#"/// MXCSR's IE, DE, ZE, OE and UE flags (`EmitOptions::mxcsr_groups`).
+#[allow(dead_code)]
+const MXCSR_EXCEPTIONS: u32 = 0x1f;
+/// Clears MXCSR's exception flags.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_clear() {
+    let mut csr = 0u32;
+    // SAFETY: stores, changes and loads MXCSR through a local; only the
+    // sticky flags (bits 0-5) change.
+    unsafe { core::arch::asm!("stmxcsr [{p}]", "and dword ptr [{p}], -64", "ldmxcsr [{p}]", p = in(reg) &mut csr, options(nostack)) }
+}
+/// The lanes of a 4S (or 2S, upper lanes zero) result an MXCSR group
+/// cannot trust: a denormal, exactly the smallest normal, or a NaN (a bit
+/// per lane; `crate::simd::vector_group_mxcsr`). With the sign cleared the
+/// signed compares order the magnitudes.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_4s(value: u128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target; the transmutes keep
+    // all 128 bits in lane order.
+    unsafe {
+        let v: __m128i = core::mem::transmute::<u128, __m128i>(value);
+        let a = _mm_and_si128(v, _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// Four singles in an SSE register, and back (`crate::simd::vector_group_mxcsr`
+/// keeps a group's 4S values as `__m128`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_singles(value: u128) -> core::arch::x86_64::__m128 {
+    // SAFETY: both are 128 bits; the lanes keep their order.
+    unsafe { core::mem::transmute::<u128, core::arch::x86_64::__m128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_bits(value: core::arch::x86_64::__m128) -> u128 {
+    // SAFETY: as `mx_singles`.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128, u128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: SSE is part of every x86-64 target.
+    unsafe { core::arch::x86_64::_mm_add_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_sub_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_mul_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_div(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_div_ps(a, b) }
+}
+/// a * b + c, one rounding (FMLA). Without the host's FMA the group never
+/// commits (its condition tests the feature); the lanes are then only
+/// placeholders.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_add(mx_mul(a, b), c);
+}
+/// c - a * b, one rounding (FMLS).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fnmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_sub(c, mx_mul(a, b));
+}
+/// |a| (FABD's last step: clears every lane's sign).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_abs(a: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe { _mm_and_ps(a, _mm_castsi128_ps(_mm_set1_epi32(0x7fff_ffff))) }
+}
+/// FMAX and FMAXNM where no lane is a NaN (any NaN raises IE): the larger
+/// lane, and +0 of +0 and -0 (where the lanes compare equal their AND,
+/// which is the lane itself unless they are zeros of both signs).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_max_ps(a, b)), _mm_and_ps(equal, _mm_and_ps(a, b)))
+    }
+}
+/// FMIN and FMINNM as `mx_max`: -0 of +0 and -0 (their OR).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_min_ps(a, b)), _mm_and_ps(equal, _mm_or_ps(a, b)))
+    }
+}
+/// FRECPS: 2 - a * b, one rounding (needs the host's FMA, as `mx_mul_add`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_recip_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let two = unsafe { core::arch::x86_64::_mm_set1_ps(2.0) };
+    mx_mul_sub(a, b, two)
+}
+/// FRSQRTS: (3 - a * b) / 2, one rounding and an exact halving where the
+/// result is normal (the lane test sees the rest).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_rsqrt_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let (three, half) = unsafe { (core::arch::x86_64::_mm_set1_ps(3.0), core::arch::x86_64::_mm_set1_ps(0.5)) };
+    mx_mul(mx_mul_sub(a, b, three), half)
+}
+/// The first of each adjacent pair of Vm:Vn (pairwise forms): n0, n2,
+/// m0, m2.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_evens(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b10_00_10_00>(n, m) }
+}
+/// The second of each pair: n1, n3, m1, m3.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_odds(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b11_01_11_01>(n, m) }
+}
+/// Lane `lane` of `a` in every lane (by element).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lane(a: core::arch::x86_64::__m128, lane: u8) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::_mm_shuffle_ps;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        match lane & 3 {
+            0 => _mm_shuffle_ps::<0x00>(a, a),
+            1 => _mm_shuffle_ps::<0x55>(a, a),
+            2 => _mm_shuffle_ps::<0xaa>(a, a),
+            _ => _mm_shuffle_ps::<0xff>(a, a),
+        }
+    }
+}
+/// `mxcsr_suspect_4s` of an `__m128`.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_singles(value: core::arch::x86_64::__m128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// The running extremes of a group's 4S results (`mx_track`): the
+/// unsigned minimum of each lane's magnitude minus one (a zero wraps to the
+/// top) and the unsigned maximum of its magnitude.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_start() -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe { (_mm_set1_epi32(-1), _mm_setzero_si128()) }
+}
+/// Adds a result to the extremes: four instructions, where testing it
+/// alone (`mxcsr_suspect_singles`) takes seven.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track(value: core::arch::x86_64::__m128, lo: &mut core::arch::x86_64::__m128i, hi: &mut core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE4.1's `pminud`/`pmaxud` where the target has it (else
+    // the compiler emulates them with SSE2).
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        *lo = mx_min_u32(*lo, _mm_add_epi32(a, _mm_set1_epi32(-1)));
+        *hi = mx_max_u32(*hi, a);
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_min_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].min(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_max_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].max(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lanes(a: core::arch::x86_64::__m128i) -> [u32; 4] {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128i, [u32; 4]>(a) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_from_lanes(a: [u32; 4]) -> core::arch::x86_64::__m128i {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<[u32; 4], core::arch::x86_64::__m128i>(a) }
+}
+/// Whether the extremes saw a denormal, the smallest normal (some lane's
+/// magnitude minus one below it) or a NaN (a magnitude above infinity's).
+/// Unsigned compares as SSE4.1's min and max and an equality: `lo` below
+/// 0x0080_0000 where min(lo, 0x007f_ffff) is `lo`, `hi` above 0x7f80_0000
+/// where max(hi, 0x7f80_0001) is `hi`; one movemask for both.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_bad(lo: core::arch::x86_64::__m128i, hi: core::arch::x86_64::__m128i) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe {
+        let tiny = _mm_cmpeq_epi32(mx_min_u32(lo, _mm_set1_epi32(0x007f_ffff)), lo);
+        let nan = _mm_cmpeq_epi32(mx_max_u32(hi, _mm_set1_epi32(0x7f80_0001)), hi);
+        _mm_movemask_epi8(_mm_or_si128(tiny, nan)) as u64
+    }
+}
+/// MXCSR, read after `after` is computed.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_read(after: u64) -> u32 {
+    let mut csr = 0u32;
+    // SAFETY: stores MXCSR into a local; `after` only orders the read.
+    unsafe { core::arch::asm!("/* {a} */", "stmxcsr [{p}]", a = in(reg) after, p = in(reg) &mut csr, options(nostack)) }
+    csr
+}
+"#;
 
 /// A vector float run (`vector_runs_in`), emitted twice: the fast copy
 /// (`crate::simd::vector_run_fast`), committed only when FPCR is in the
@@ -4014,17 +4548,38 @@ fn emit_vector_run(
             _ => unreachable!("vector runs hold SIMD operations"),
         })
         .collect();
-    let (fast, finals) = crate::simd::vector_run_fast(&ops);
-    let commits: String = finals
-        .iter()
-        .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
-        .collect();
-    writeln!(
-        output,
-        "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
-        crate::simd::FP_MODE
-    )
-    .unwrap();
+    if MXCSR_GROUPS.get() && crate::simd::mxcsr_group(&ops) {
+        let (fast, finals, fused) = crate::simd::vector_group_mxcsr(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        // Fused operations need the host's FMA (`fmaf` in software rounds
+        // through double): without it the exact copy runs.
+        let fma = if fused {
+            " && cfg!(target_feature = \"fma\")"
+        } else {
+            ""
+        };
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0{fma} && {{ {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    } else {
+        let (fast, finals) = crate::simd::vector_run_fast(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    }
     // The exact copy, marked for `crate::census` (which counts the tests of
     // the path taken when the fast copy commits).
     let (open, close) = if crate::simd::census_on() {
@@ -4032,7 +4587,12 @@ fn emit_vector_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -4052,6 +4612,30 @@ pub const FUNCTION_BLOCK_LIMIT: usize = 256;
 /// returns with the PC there, and the caller's `Core::call_window`
 /// continues through the window table). By entry: its blocks, in order.
 pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, Vec<u64>> {
+    functions_with(
+        translation,
+        region_bits,
+        &BTreeSet::new(),
+        FUNCTION_BLOCK_LIMIT,
+        false,
+    )
+}
+
+/// The blocks a lifted function may hold with `EmitOptions::regalloc`,
+/// whose size caps (`regalloc::FUNCTION_INSTRUCTIONS`, `FUNCTION_BYTES`)
+/// bound what it emits.
+pub const REGALLOC_BLOCK_LIMIT: usize = 1024;
+
+/// [`functions`], with `extra` entries besides the BL targets (with
+/// `EmitOptions::regalloc`: the translation's entries, which windows then
+/// run as structured functions).
+pub fn functions_with(
+    translation: &Translation,
+    region_bits: u32,
+    extra: &BTreeSet<u64>,
+    block_limit: usize,
+    span_regions: bool,
+) -> BTreeMap<u64, Vec<u64>> {
     use Instruction::*;
     let by_start: BTreeMap<u64, &BasicBlock> = translation
         .blocks
@@ -4065,6 +4649,12 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
             Branch { target, link: true } if by_start.contains_key(&target) => Some(target),
             _ => None,
         })
+        .chain(
+            extra
+                .iter()
+                .copied()
+                .filter(|entry| by_start.contains_key(entry)),
+        )
         .collect();
     let mut functions = BTreeMap::new();
     'entries: for &entry in &entries {
@@ -4086,16 +4676,23 @@ pub fn functions(translation: &Translation, region_bits: u32) -> BTreeMap<u64, V
                 BranchCond { target, .. }
                 | CompareBranch { target, .. }
                 | TestBranch { target, .. } => vec![*target, next],
+                // A recovered jump table: its cases (a target the table
+                // does not hold at run time leaves the function).
+                BranchReg { link: false, .. }
+                    if let Some(cases) = translation.jump_table_cases.get(&last.pc) =>
+                {
+                    cases.clone()
+                }
                 instruction if instruction.ends_block() => Vec::new(),
                 _ => vec![next],
             };
             for successor in successors {
                 if by_start.contains_key(&successor)
-                    && successor >> region_bits == entry >> region_bits
+                    && (span_regions || successor >> region_bits == entry >> region_bits)
                     && (successor == entry || !entries.contains(&successor))
                     && seen.insert(successor)
                 {
-                    if seen.len() > FUNCTION_BLOCK_LIMIT {
+                    if seen.len() > block_limit {
                         continue 'entries;
                     }
                     pending.push(successor);
@@ -4130,7 +4727,13 @@ fn function_call(from: u64, target: u64) -> Option<Option<usize>> {
     FUNCTIONS.with_borrow(|functions| {
         let set = functions.as_ref()?;
         let &index = set.entries.get(&target)?;
-        if set.table {
+        let same_region = target >> set.region_bits == from >> set.region_bits;
+        // With regalloc's own crates: always through the table (the crates
+        // are packed after emission).
+        if set.table && REGALLOC_SPLIT.get() {
+            return Some(Some(index));
+        }
+        if set.table && !(REGALLOC.get() && same_region) {
             Some(Some(index))
         } else {
             (target >> set.region_bits == from >> set.region_bits).then_some(None)
@@ -4178,6 +4781,14 @@ pub struct CallReport {
     pub summarized_callers: usize,
     /// BL sites whose target is such a function.
     pub summarized_caller_sites: usize,
+    /// BL targets starting a block that are no lifted function (their
+    /// body over `FUNCTION_BLOCK_LIMIT` blocks).
+    pub over_limit: usize,
+    /// Lifted functions holding a recovered jump table with its cases.
+    pub with_jump_tables: usize,
+    /// Instructions in lifted functions' bodies (each a copy of window
+    /// code: what `functions` adds to compile).
+    pub function_instructions: usize,
 }
 
 /// [`CallReport`] of a translation with `region_bits`-bit regions.
@@ -4190,10 +4801,41 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
         .filter(|entry| !leaves.contains_key(entry))
         .copied()
         .collect();
+    let sizes: BTreeMap<u64, usize> = translation
+        .blocks
+        .iter()
+        .map(|block| (block.start, block.instructions.len()))
+        .collect();
+    let targets: BTreeSet<u64> = translation
+        .instructions
+        .values()
+        .filter_map(|record| match record.instruction {
+            Instruction::Branch { target, link: true } if sizes.contains_key(&target) => {
+                Some(target)
+            }
+            _ => None,
+        })
+        .collect();
     let mut report = CallReport {
         functions: lifted.len(),
         leaves: leaves.len(),
         summarized_callers: callers.len(),
+        over_limit: targets.iter().filter(|t| !lifted.contains_key(t)).count(),
+        with_jump_tables: lifted
+            .values()
+            .filter(|starts| {
+                starts.iter().any(|start| {
+                    translation
+                        .jump_table_cases
+                        .keys()
+                        .any(|br| (*start..*start + 4 * sizes[start] as u64).contains(br))
+                })
+            })
+            .count(),
+        function_instructions: lifted
+            .values()
+            .flat_map(|starts| starts.iter().map(|start| sizes[start]))
+            .sum(),
         ..CallReport::default()
     };
     for record in translation.instructions.values() {
@@ -4219,7 +4861,11 @@ pub fn call_report(translation: &Translation, region_bits: u32) -> CallReport {
 /// running on outside its body (after an SVC, through a resume point, by a
 /// branch out) gets no summary, so the code it reaches never relies on a
 /// caller's held local.
-fn exits_only_by_return(starts: &[u64], by_start: &BTreeMap<u64, &BasicBlock>) -> bool {
+fn exits_only_by_return(
+    starts: &[u64],
+    by_start: &BTreeMap<u64, &BasicBlock>,
+    jump_tables: &BTreeMap<u64, Vec<u64>>,
+) -> bool {
     use Instruction::*;
     let body: BTreeSet<u64> = starts.iter().copied().collect();
     starts.iter().all(|start| {
@@ -4235,6 +4881,10 @@ fn exits_only_by_return(starts: &[u64], by_start: &BTreeMap<u64, &BasicBlock>) -
                 link: false,
             }
             | PAuthDisabledReturn { .. } => true,
+            // A recovered jump table with every case in the body.
+            BranchReg { link: false, .. } if let Some(cases) = jump_tables.get(&last.pc) => {
+                cases.iter().all(|case| body.contains(case))
+            }
             Branch {
                 target,
                 link: false,
@@ -4269,7 +4919,7 @@ pub fn leaf_summaries(
             | if regs.nzcv { DIRTY_NZCV } else { 0 }
     };
     'functions: for (&entry, starts) in lifted {
-        if !exits_only_by_return(starts, &by_start) {
+        if !exits_only_by_return(starts, &by_start, &translation.jump_table_cases) {
             continue;
         }
         let (mut touched, mut writes): (Dirty, Dirty) = (0, 0);
@@ -4329,7 +4979,7 @@ pub fn transitive_summaries(
     let mut own: BTreeMap<u64, OwnEffects> = BTreeMap::new();
     for (&entry, starts) in lifted {
         let (mut touched, mut writes, mut calls) = (0, 0, Vec::new());
-        let mut valid = exits_only_by_return(starts, &by_start);
+        let mut valid = exits_only_by_return(starts, &by_start, &translation.jump_table_cases);
         for start in starts {
             for record in &by_start[start].instructions {
                 match record.instruction {
@@ -4427,9 +5077,31 @@ pub fn transitive_summaries(
             break;
         }
     }
+    // Summarized calls take no `Core::call` depth: chains nest at most
+    // `WINDOW_CALL_DEPTH_LIMIT` deep (the call graph of summarized
+    // functions is acyclic; a caller is deeper than its callees, so it
+    // goes with them).
+    let mut depths: BTreeMap<u64, u32> = BTreeMap::new();
+    fn depth(entry: u64, own: &BTreeMap<u64, OwnEffects>, depths: &mut BTreeMap<u64, u32>) -> u32 {
+        if let Some(&known) = depths.get(&entry) {
+            return known;
+        }
+        let calls = match own.get(&entry) {
+            Some(Some((_, _, calls))) => calls.clone(),
+            _ => Vec::new(),
+        };
+        let deepest = calls
+            .into_iter()
+            .map(|callee| depth(callee, own, depths))
+            .max()
+            .unwrap_or(0);
+        depths.insert(entry, deepest + 1);
+        deepest + 1
+    }
     summaries
         .into_iter()
         .filter_map(|(entry, summary)| Some((entry, summary?)))
+        .filter(|(entry, _)| depth(*entry, &own, &mut depths) <= WINDOW_CALL_DEPTH_LIMIT)
         .collect()
 }
 
@@ -4666,6 +5338,28 @@ pub fn window_call_summaries_in(
         .collect()
 }
 
+/// [`window_call_summaries_in`] with `windows`, for the targets that also
+/// have a summary with plain 1 KiB windows: long windows give each target
+/// the summary of what its longer window runs (which is what a call of it
+/// runs), but add no targets, so the windows window calls enter (each a
+/// function of its own) stay those of plain window calls.
+pub fn window_call_targets(
+    translation: &Translation,
+    active: &dyn Fn(u64) -> Option<bool>,
+    windows: &BTreeMap<u64, Vec<u64>>,
+) -> BTreeMap<u64, (Dirty, Dirty)> {
+    let mut summaries = window_call_summaries_in(translation, active, windows);
+    if windows.iter().any(|(window, starts)| {
+        starts
+            .iter()
+            .any(|start| start >> SPLIT_WINDOW_BITS != *window)
+    }) {
+        let plain = window_call_summaries(translation, active);
+        summaries.retain(|target, _| plain.contains_key(target));
+    }
+    summaries
+}
+
 /// BL sites by what window calls (`EmitOptions::window_calls`) do with
 /// them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -4695,9 +5389,9 @@ pub fn window_call_report(
     active: &dyn Fn(u64) -> Option<bool>,
     windows: &BTreeMap<u64, Vec<u64>>,
 ) -> WindowCallReport {
-    let summaries = window_call_summaries_in(translation, active, windows);
-    let strict = window_call_summaries_in(translation, &|pc| active(pc).map(|_| false), windows);
-    let early = window_call_summaries_in(translation, &|pc| active(pc).map(|_| true), windows);
+    let summaries = window_call_targets(translation, active, windows);
+    let strict = window_call_targets(translation, &|pc| active(pc).map(|_| false), windows);
+    let early = window_call_targets(translation, &|pc| active(pc).map(|_| true), windows);
     let mut report = WindowCallReport {
         targets: summaries.len(),
         early_exit_targets: summaries.keys().filter(|t| !strict.contains_key(t)).count(),
@@ -4739,6 +5433,23 @@ thread_local! {
     static RET_LEAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::known_returns` of the region being emitted.
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::cold_fp_exact` of the region being emitted.
+    static COLD_FP_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::hoist_fp_mode` of the region being emitted.
+    static HOIST_FP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::mxcsr_groups` of the region being emitted, on an
+    /// x86-64 host.
+    static MXCSR_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::threaded_successors` of the region being emitted.
+    static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::arm_charges` of the region being emitted (split
+    /// ticks, without deferred charges, a local step count or the cached
+    /// stop word).
+    static ARM_CHARGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::cached_stop` of the region being emitted (split
+    /// windows with split ticks, not structured, without deferred charges
+    /// or a local step count).
+    static CACHED_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Restores [`WINDOW_CALLS`] when it goes.
@@ -4786,7 +5497,7 @@ fn audited_call(next: u64, callee: &str, touched: Dirty, writes: Dirty) -> Strin
          for n in 0..31 {{ if {writes:#x}u64 >> n & 1 == 0 && m.cpu.regs[n] != expected.0[n] {{ changed = Some(format!(\"x{{n}}\")); }} }} \
          if {writes:#x}u64 & {DIRTY_SP:#x} == 0 && m.cpu.sp != expected.1 {{ changed = Some(\"sp\".to_owned()); }} \
          if {writes:#x}u64 & {DIRTY_NZCV:#x} == 0 && m.cpu.nzcv != expected.2 {{ changed = Some(\"nzcv\".to_owned()); }} \
-         if let Some(register) = changed {{ return Err(Trap::InvalidState {{ message: format!(\"window-call audit: the call at {site:#x} ({callee}) changed {{register}}, outside its summary {touched:#x}/{writes:#x}\") }}); }} \
+         if let Some(register) = changed {{ return Err(Trap::InvalidState {{ message: format!(\"summary audit: the call at {site:#x} ({callee}) changed {{register}}, outside its summary {touched:#x}/{writes:#x}\") }}); }} \
          for n in 0..31 {{ if {touched:#x}u64 >> n & 1 == 0 {{ m.cpu.regs[n] = saved.0[n]; }} }} \
          if {touched:#x}u64 & {DIRTY_SP:#x} == 0 {{ m.cpu.sp = saved.1; }} \
          if {touched:#x}u64 & {DIRTY_NZCV:#x} == 0 {{ m.cpu.nzcv = saved.2; }} "
@@ -5079,14 +5790,120 @@ fn emit_split_cases(
             (block.start, body)
         })
         .collect();
+    let loop_heads: Arc<BTreeSet<u64>> = Arc::new(
+        blocks
+            .iter()
+            .flat_map(|block| {
+                crate::structure::block_successors(block)
+                    .0
+                    .into_iter()
+                    .filter(move |target| *target <= block.start)
+            })
+            .collect(),
+    );
     for block in blocks {
         if inlined.contains(&block.start) {
             continue;
         }
         writeln!(output, "            {:#x} => {{", block.start).unwrap();
-        expand_block(output, &bodies, inlined, block.start);
+        // A structured function's entry runs the function; where it comes
+        // back at its entry (its first test of the stop word failed), the
+        // block runs here with its per-block charge.
+        let entered = REGALLOC_ENTRIES.with_borrow(|entries| entries.get(&block.start).copied());
+        if let Some(function) = entered {
+            // In its own crate (`regalloc_crates`) through the table.
+            let callee = match function_call(function, function) {
+                Some(Some(index)) => format!("run_entry_at(m, {index}"),
+                // A resume function in a crate of its own: by PC, through
+                // the installed entries.
+                _ if REGALLOC_SPLIT.get() => "run_entry_pc(m".to_owned(),
+                _ => format!("run_entry(m, run_function_{function:x}"),
+            };
+            writeln!(
+                output,
+                "                if let Err(trap) = {callee}) {{ return Err(trap); }}\n                if m.cpu.pc != {:#x} {{\n                next_pc = m.cpu.pc;\n                }} else {{",
+                block.start
+            )
+            .unwrap();
+        }
+        // Spin-wait heads keep their dispatch (`crate::spin`).
+        let mut copying =
+            (THREADED_SUCCESSORS.get() && !spin_heads.contains(&block.start)).then(|| Copying {
+                chain: Vec::new(),
+                budget: THREADED_LINE_BUDGET,
+                loop_heads: loop_heads.clone(),
+            });
+        if ARM_CHARGES.get() {
+            let mut arm = String::new();
+            expand_block_copying(&mut arm, &bodies, inlined, block.start, &mut copying);
+            output.push_str(&arm_charges(&arm));
+        } else {
+            expand_block_copying(output, &bodies, inlined, block.start, &mut copying);
+        }
+        if entered.is_some() {
+            output.push_str("                }\n");
+        }
         output.push_str("            }\n");
     }
+}
+
+/// With `EmitOptions::arm_charges`: an arm whose untagged blocks after
+/// its first charge (inlined and copied blocks: no dispatch, so its blocks
+/// form a tree) tests once, at its first charge, that every charge in it
+/// fits under the stop word (`arm_fast`: the steps plus the sum of all its
+/// counts, at least its longest path); each untagged charge then only adds
+/// its count, and takes the exact checks when the test failed. The steps
+/// are as before at every block; where the test passed no block's own
+/// check could have failed, so budgets and boundaries fall on the same
+/// blocks. A preemption another thread requests is seen at the next arm.
+fn arm_charges(arm: &str) -> String {
+    // (pc, count, tagged, resumable) of a split-ticks charge line.
+    let parse = |line: &str| -> Option<(u64, u64, bool, bool)> {
+        let rest = line.trim_start().strip_prefix("if !m.charge_block_at(")?;
+        let (head, slow) = rest.split_once(") { m.charge_block_slow(")?;
+        let fields: Vec<&str> = head.split(", ").collect();
+        let slow: Vec<&str> = slow.strip_suffix(")?; }")?.split(", ").collect();
+        Some((
+            u64::from_str_radix(fields.first()?.trim_start_matches("0x"), 16).ok()?,
+            fields.get(1)?.parse().ok()?,
+            *fields.get(2)? == "true",
+            *slow.get(2)? == "true",
+        ))
+    };
+    let charges: Vec<(u64, u64, bool, bool)> = arm.lines().filter_map(parse).collect();
+    if charges
+        .iter()
+        .skip(1)
+        .filter(|(_, _, tagged, _)| !tagged)
+        .count()
+        == 0
+    {
+        return arm.to_owned();
+    }
+    let total: u64 = charges.iter().map(|(_, count, _, _)| count).sum();
+    let mut out = String::with_capacity(arm.len() + 256);
+    let mut first = true;
+    for line in arm.split_inclusive('\n') {
+        let Some((pc, count, tagged, resumable)) = parse(line.trim_end()) else {
+            out.push_str(line);
+            continue;
+        };
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if first {
+            first = false;
+            out.push_str(&format!(
+                "{indent}let arm_fast = m.steps + {total} <= m.stop.load(std::sync::atomic::Ordering::Relaxed);\n"
+            ));
+        }
+        if tagged {
+            out.push_str(line);
+        } else {
+            out.push_str(&format!(
+                "{indent}if arm_fast {{ m.steps += {count}; }} else if !m.charge_block_at({pc:#x}, {count}, false) {{ m.charge_block_slow({pc:#x}, {count}, {resumable})?; }}\n"
+            ));
+        }
+    }
+    out
 }
 
 /// The match arms that run a structured window's entries through its tree.
@@ -5456,25 +6273,75 @@ fn split_conditional(body: &str) -> Option<(&str, &str, u64, u64)> {
     (!condition.contains('{')).then_some((&body[..split], condition, taken, other))
 }
 
+/// With `EmitOptions::threaded_successors`: the blocks an arm's expansion
+/// is in (a successor among them is a loop's back edge and dispatches),
+/// and the lines of copied bodies it may still add.
+struct Copying {
+    chain: Vec<u64>,
+    budget: usize,
+    /// Targets of the window's backward branches: loop heads, which their
+    /// back edge reaches through the `match` every iteration anyway, and
+    /// whose copy measured slower (the arm grows, and the host compiler's
+    /// registers for the loop with it).
+    loop_heads: Arc<BTreeSet<u64>>,
+}
+
+/// Lines of copied successors one arm may hold
+/// (`EmitOptions::threaded_successors`).
+pub const THREADED_LINE_BUDGET: usize = 24;
+
 /// `start`'s body with each successor that is inlined here written out in
 /// place of its `next_pc` assignment. An inlined block stores its PC first:
-/// its first instruction relies on `m.cpu.pc` as an arm's does.
-fn expand_block(
+/// its first instruction relies on `m.cpu.pc` as an arm's does. With
+/// `copying`, also successors that keep their own arms: a constant successor of the window not on the
+/// arm's chain runs in place, as an inlined block does (the same body: its
+/// PC stored, its charge, which may take a host boundary there, since
+/// execution can resume at its arm), instead of going back through the
+/// window's `match`.
+fn expand_block_copying(
     output: &mut String,
     bodies: &BTreeMap<u64, String>,
     inlined: &BTreeSet<u64>,
     start: u64,
+    copying: &mut Option<Copying>,
 ) {
     let body = &bodies[&start];
     let trimmed = body.trim_end_matches('\n');
     let split = trimmed.rfind('\n').map_or(0, |at| at + 1);
     let (head, last) = (&body[..split], &trimmed[split..]);
-    let here = |target: u64| inlined.contains(&target) && bodies.contains_key(&target);
+    if let Some(copy) = copying.as_mut() {
+        copy.chain.push(start);
+    }
+    // Only forward successors: a backward one is a loop's head, which
+    // every iteration reaches through the `match` anyway (copying it into
+    // the latch only grows the arm; measured slower on tight loops).
+    let copies = |copying: &Option<Copying>, target: u64| {
+        copying.as_ref().is_some_and(|copy| {
+            target > start
+                && !copy.loop_heads.contains(&target)
+                && !inlined.contains(&target)
+                && !copy.chain.contains(&target)
+                && bodies.get(&target).is_some_and(|body| {
+                    // Not a cold end (an SVC or a trap).
+                    body.lines().count() <= copy.budget
+                        && !body.contains("m.svc(")
+                        && !body.contains("return Err(Trap::")
+                })
+        })
+    };
+    let here = |copying: &Option<Copying>, target: u64| {
+        (inlined.contains(&target) && bodies.contains_key(&target)) || copies(copying, target)
+    };
     let target = |text: &str| u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
-    let branch = |output: &mut String, next: u64| {
-        if here(next) {
+    let branch = |output: &mut String, next: u64, copying: &mut Option<Copying>| {
+        if here(copying, next) {
+            if copies(copying, next)
+                && let Some(copy) = copying.as_mut()
+            {
+                copy.budget -= bodies[&next].lines().count();
+            }
             writeln!(output, "                m.cpu.pc = {next:#x};").unwrap();
-            expand_block(output, bodies, inlined, next);
+            expand_block_copying(output, bodies, inlined, next, copying);
         } else {
             writeln!(output, "                next_pc = {next:#x};").unwrap();
         }
@@ -5485,26 +6352,29 @@ fn expand_block(
         .strip_prefix("next_pc = ")
         .and_then(|rest| rest.strip_suffix(';'))
         .and_then(target)
-        .filter(|&next| here(next))
+        .filter(|&next| here(copying, next))
     {
-        branch(output, next);
-        return;
+        branch(output, next, copying);
+    } else {
+        let conditional = split_conditional(body)
+            .map(|(_, condition, taken, other)| (condition, taken, other))
+            .filter(|&(_, taken, other)| here(copying, taken) || here(copying, other));
+        match conditional {
+            Some((condition, taken, other)) => {
+                writeln!(output, "                if {condition} {{").unwrap();
+                branch(output, taken, copying);
+                output.push_str("                } else {\n");
+                branch(output, other, copying);
+                output.push_str("                }\n");
+            }
+            None => {
+                output.push_str(last);
+                output.push('\n');
+            }
+        }
     }
-    let conditional = split_conditional(body)
-        .map(|(_, condition, taken, other)| (condition, taken, other))
-        .filter(|&(_, taken, other)| here(taken) || here(other));
-    match conditional {
-        Some((condition, taken, other)) => {
-            writeln!(output, "                if {condition} {{").unwrap();
-            branch(output, taken);
-            output.push_str("                } else {\n");
-            branch(output, other);
-            output.push_str("                }\n");
-        }
-        None => {
-            output.push_str(last);
-            output.push('\n');
-        }
+    if let Some(copy) = copying.as_mut() {
+        copy.chain.pop();
     }
 }
 
@@ -5706,9 +6576,164 @@ pub struct EmitOptions {
     /// limit) leaves the window, and its caller or the dispatcher goes on
     /// from the PC as with any exit.
     pub known_returns: bool,
+    /// The exact paths of inlined float operations out of the hot code: a
+    /// float run's exact copy is marked cold (`core::hint::cold_path`), and
+    /// each exact scalar helper the inline paths fall back to (`fp_binary`,
+    /// `fp_ternary`, `fp_compare`, inlinable in echora-simd) is called
+    /// through one cold, never-inlined wrapper per region
+    /// (`COLD_FP_HELPERS`), so the inline fast paths stay small.
+    pub cold_fp_exact: bool,
+    /// Consecutive inlined float operations in a block (outside float
+    /// runs) test the inline paths' FPCR mode and sticky IXC once, before
+    /// the first (`hoist_fp_mode`): no helper writes FPCR or clears an
+    /// FPSR flag, so the test cannot turn false inside the group, and each
+    /// operation keeps its own exact fallback.
+    pub hoist_fp_mode: bool,
+    /// With `inline_vector`, on an x86-64 host: vector float groups
+    /// (consecutive operations `vector_runs_in` takes, and single FADD,
+    /// FSUB, FMUL, FDIV, FMLA or FMLS) whose operations are all
+    /// `crate::simd::mxcsr_group_op` compute natively with no operand
+    /// tests, checked once by the host's exception flags and a test of
+    /// each result's lanes (`crate::simd::vector_group_mxcsr`); any hit
+    /// reruns the group exactly from its unchanged registers.
+    pub mxcsr_groups: bool,
+    /// With `functions` and `call_summaries`: every summarized call of a
+    /// lifted function is audited as `window_calls_audit` audits window
+    /// calls (all locals stored, markers in the registers outside the
+    /// callee's summary, a `Trap::InvalidState` naming the call site when
+    /// one outside what it may write changed, the caller's values put
+    /// back). For one checked run, not for speed.
+    pub call_summaries_audit: bool,
+    /// Split windows (not structured): a block's constant forward successor
+    /// in its window that keeps its own arm runs as a copy in the arm, as an
+    /// inlined block does, instead of going back through the window's
+    /// `match next_pc` (whose compare tree and indirect jump the host
+    /// compiler does not thread through the loop). Only successors on the
+    /// arm's chain (a loop's back edge) and those past
+    /// `THREADED_LINE_BUDGET` lines of copies per arm still dispatch. The
+    /// copies are the blocks' own code (PC store, charge, boundary), and
+    /// every block keeps its arm, so resuming is unchanged.
+    pub threaded_successors: bool,
+    /// With split ticks (not structured, without deferred charges or a
+    /// local step count): a split window keeps the stop word in a local,
+    /// loaded on entry, at every backward dispatch and whenever an
+    /// untagged block's charge does not clear it; that charge is then
+    /// `m.steps + n <= stop` and an add, without the two dependent loads
+    /// of `Core::charge_block_at`. Steps stay in the `Core`, exact for
+    /// calls, traps and counters; budgets and host boundaries fall on the
+    /// same blocks. A preemption another thread requests (lowering the
+    /// word) is seen at the next backward dispatch or failed check.
+    pub cached_stop: bool,
+    /// With split ticks (without deferred charges, a local step count or
+    /// the cached stop word): each split window arm tests once that all
+    /// its charges fit under the stop word, and its untagged blocks then
+    /// only add their counts (`arm_charges`).
+    pub arm_charges: bool,
+    /// With `functions` (not with deferred charges or a local step
+    /// count): each lifted function whose blocks form a reducible graph
+    /// is emitted as structured host code (`crate::structure::
+    /// function_structure`: loops, ifs and labelled blocks, constant
+    /// successors as direct jumps) instead of a `match next_pc` loop over
+    /// its blocks. Its blocks add their counts to a local; the steps are
+    /// exact wherever they can be observed (calls, traps, SVCs, exits),
+    /// and the function tests the stop word only at its entry, its loop
+    /// heads and its call return points, against the longest path to the
+    /// next such test: where that could pass the stop word it leaves to
+    /// the windows at that block, whose per-block charges then take every
+    /// budget and host boundary exactly where window code would.
+    pub regalloc: bool,
+    /// With `regalloc`: callees of up to `regalloc::LOOP_INLINE_LIMIT`
+    /// instructions (with what they call) run inlined where they are
+    /// called inside a loop, not only those of up to `INLINE_LIMIT`.
+    pub regalloc_loop_inlining: bool,
+    /// With `regalloc`: each small inner loop (up to
+    /// `regalloc::RESUME_LIMIT` instructions to the function's next entry)
+    /// gets a structured resume function its window arm runs, so that
+    /// execution resuming there after a host boundary leaves the windows
+    /// at once instead of at the loop's end.
+    pub regalloc_resume_loops: bool,
+    /// With `regalloc` and `function_table`: each region is emitted as
+    /// crates of at most `REGALLOC_CRATE_BYTES` of Rust (the first keeps
+    /// the region's id, the others are `region | k << 40`): its windows,
+    /// then its lifted functions, in order. The root's tables name each
+    /// window's and function's crate; windows and functions reach
+    /// functions through the function table, and PLT stubs' predicted
+    /// targets through the window table. Resume functions
+    /// (`regalloc_resume_loops`) are not emitted then.
+    pub regalloc_crates: bool,
+    /// With `regalloc_crates`: the bytes of Rust per crate, 0 for
+    /// `REGALLOC_CRATE_BYTES`.
+    pub regalloc_crate_bytes: usize,
+    /// With `regalloc`: the bytes of Rust a structured function may take,
+    /// 0 for `regalloc::FUNCTION_BYTES`.
+    pub regalloc_function_bytes: usize,
+    /// With `regalloc_crates`: a lifted function's body is not cut at its
+    /// region's edge (code that falls through or branches into the next
+    /// region stays in the function); it is emitted with its entry's
+    /// region, and reaches everything else through the tables.
+    pub regalloc_span_regions: bool,
+    /// With `regalloc`: the blocks structured functions' calls return to
+    /// get resume functions too (as `regalloc_resume_loops` gives inner
+    /// loops), so execution that comes back there through the windows (a
+    /// failed test after a call, a resumed boundary) is structured again.
+    pub regalloc_resume_returns: bool,
+    /// With `regalloc`: every deferred root of discovery that starts a
+    /// block is a function entry too (`Translation::deferred_roots`:
+    /// relocation targets such as vtable slots, address constants,
+    /// prologues), not only those discovery had not reached otherwise, so
+    /// code reached only through BLR runs structured.
+    pub regalloc_indirect_entries: bool,
+}
+
+/// With `EmitOptions::regalloc_crates`: the bytes of Rust a region crate
+/// holds at most, but for a single larger window or function.
+pub const REGALLOC_CRATE_BYTES: usize = 10_000_000;
+
+/// One region's emission: its crates' sources, and with
+/// `EmitOptions::regalloc_crates` the crate of each window and function.
+#[derive(Default)]
+struct Placed {
+    sources: Vec<(u64, String)>,
+    windows: Vec<(u64, u64)>,
+    functions: Vec<(u64, u64)>,
+    /// Resume functions (`regalloc_resume_*`) and their crates.
+    resumes: Vec<(u64, u64)>,
 }
 
 thread_local! {
+    /// `EmitOptions::regalloc` of the region being emitted (with
+    /// functions).
+    static REGALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while the blocks of a structured lifted function are emitted
+    /// (`EmitOptions::regalloc`): no per-block charges, the count added
+    /// to the function's local `n`, flushed into the steps before calls.
+    static REGALLOC_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_loop_inlining` of the region being emitted.
+    static REGALLOC_LOOP_INLINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_crates` of the region being emitted (with
+    /// regalloc and the function table).
+    static REGALLOC_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_function_bytes` of the region being emitted.
+    static REGALLOC_FUNCTION_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Functions of the region the size caps left to the windows
+    /// (`regalloc::capped`).
+    static REGALLOC_CAPPED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+    /// `EmitOptions::regalloc_resume_returns` of the region being emitted.
+    static REGALLOC_RESUME_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::regalloc_resume_loops` of the region being emitted.
+    static REGALLOC_RESUME_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The BLs of the structured lifted function being emitted whose
+    /// callee runs inlined: they only set X30 and branch.
+    static REGALLOC_INLINED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+    /// The entries of the region's functions emitted structured: their
+    /// window arms run the function first (`run_entry`).
+    static REGALLOC_ENTRIES: std::cell::RefCell<BTreeMap<u64, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+    /// The blocks the region's structured functions hold.
+    static REGALLOC_COVERED: std::cell::RefCell<BTreeSet<u64>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
     /// `EmitOptions::float_runs` of the emission running on this thread.
     static FLOAT_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::float_run_loads` of the emission running on this thread.
@@ -6009,7 +7034,9 @@ thread_local! {
 /// (`EmitOptions::direct_calls`): `target`'s, when it is a block with a
 /// dispatch arm in `from`'s region.
 fn direct_call_window(from: u64, target: u64) -> Option<u64> {
-    if !DIRECT_ON.get() {
+    // In crates packed by size (`regalloc_crates`) the target's window may
+    // be in another crate.
+    if !DIRECT_ON.get() || REGALLOC_SPLIT.get() {
         return None;
     }
     EMISSION_ANALYSES.with_borrow(|analysis| {
@@ -6169,10 +7196,12 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
                     format!("(v >> {sign}) & 1 != 0"),
                     format!("(v >> {sign}) & 1 == 0"),
                 ),
-                3 => (
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 != 0"),
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 == 0"),
-                ),
+                // V: the signed subtraction overflows (one host subtract
+                // and its overflow flag).
+                3 => {
+                    let overflows = format!("{}.overflowing_sub({}).1", signed("a"), signed("b"));
+                    (overflows.clone(), format!("!{overflows}"))
+                }
                 4 => (compare(">", false), compare("<=", false)),
                 5 => (compare(">=", true), compare("<", true)),
                 _ => (compare(">", true), compare("<=", true)),
@@ -6186,7 +7215,9 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
         Some(false) => format!(
             "let a = lhs & {mask}; let b = rhs & {mask}; let v = value & {mask}; \
              let n = (v >> {sign}) & 1 != 0; let z = v == 0; let c = v < a; \
-             let o = (!(a ^ b) & (a ^ v)) >> {sign} & 1 != 0;"
+             let o = {}.overflowing_add({}).1;",
+            signed("a"),
+            signed("b")
         ),
         // ANDS (TST): N and Z from the result, C and V clear.
         None => format!(
@@ -6303,6 +7334,16 @@ struct RegionSettings {
     ret_leaves: Flag,
     audit: Flag,
     known_returns: Flag,
+    cold_fp_exact: Flag,
+    hoist_fp_mode: Flag,
+    mxcsr_groups: Flag,
+    threaded: Flag,
+    cached_stop: Flag,
+    arm_charges: Flag,
+    regalloc: Flag,
+    regalloc_loop_inlining: Flag,
+    regalloc_resume_loops: Flag,
+    regalloc_resume_returns: Flag,
 }
 
 impl RegionSettings {
@@ -6376,9 +7417,48 @@ impl RegionSettings {
             ret_leaves: Flag::set(&RET_LEAVES, calls_windows),
             audit: Flag::set(
                 &WINDOW_CALLS_AUDIT,
-                calls_windows && options.window_calls_audit,
+                (calls_windows && options.window_calls_audit)
+                    || (options.functions
+                        && options.call_summaries
+                        && options.call_summaries_audit),
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
+            cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
+            hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
+            mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
+            threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
+            arm_charges: Flag::set(
+                &ARM_CHARGES,
+                options.arm_charges
+                    && options.split_ticks
+                    && !options.deferred_charges
+                    && !options.steps_local
+                    && !options.cached_stop,
+            ),
+            regalloc_loop_inlining: Flag::set(
+                &REGALLOC_LOOP_INLINING,
+                options.regalloc_loop_inlining,
+            ),
+            regalloc_resume_loops: Flag::set(&REGALLOC_RESUME_LOOPS, options.regalloc_resume_loops),
+            regalloc_resume_returns: Flag::set(
+                &REGALLOC_RESUME_RETURNS,
+                options.regalloc_resume_returns,
+            ),
+            regalloc: Flag::set(
+                &REGALLOC,
+                options.regalloc
+                    && options.functions
+                    && !options.deferred_charges
+                    && !options.steps_local,
+            ),
+            cached_stop: Flag::set(
+                &CACHED_STOP,
+                options.cached_stop
+                    && options.split_ticks
+                    && !options.structured
+                    && !options.deferred_charges
+                    && !options.steps_local,
+            ),
         }
     }
 }
@@ -6399,8 +7479,9 @@ pub fn long_windows_on(options: &EmitOptions) -> bool {
 
 /// Guest instructions a long window (`EmitOptions::long_windows`) may hold
 /// beyond its own 1 KiB, as copies of other windows' blocks: one window's
-/// worth, which bounds the extra code each window function compiles.
-pub const WINDOW_EXTENSION_LIMIT: usize = 256;
+/// worth (256) measured 8% slower on the game, bound by instruction fetch:
+/// a quarter of that, and only loops (`window_extension`).
+pub const WINDOW_EXTENSION_LIMIT: usize = 64;
 
 /// Block starts by split window (`window_blocks`).
 pub type WindowBlocks = BTreeMap<u64, Vec<u64>>;
@@ -6472,8 +7553,9 @@ pub fn window_extension_report(
 /// branches, both sides of conditional ones, fallthroughs and call return
 /// points, breadth first: in the same region, no PLT stub, each with the
 /// blocks inlined into it (they have no arm of their own), while the total
-/// stays within `WINDOW_EXTENSION_LIMIT` instructions. A block that does
-/// not fit is left out (reaching it leaves the window, as before).
+/// stays within `WINDOW_EXTENSION_LIMIT` instructions, of which only those
+/// from which the window's own blocks are reached again (loops across its
+/// edge). A block left out leaves the window when reached, as before.
 fn window_extension(
     by_start: &BTreeMap<u64, &BasicBlock>,
     inlined: &BTreeSet<u64>,
@@ -6490,6 +7572,7 @@ fn window_extension(
         queue.extend(successors(start));
     }
     let (mut extra, mut size) = (Vec::new(), 0);
+    let mut groups: Vec<Vec<u64>> = Vec::new();
     while let Some(start) = queue.pop_front() {
         if members.contains(&start)
             || start >> SPLIT_WINDOW_BITS == window
@@ -6519,8 +7602,36 @@ fn window_extension(
         size += instructions;
         for &block in &group {
             members.insert(block);
-            extra.push(block);
             queue.extend(successors(block));
+        }
+        groups.push(group);
+    }
+    // Only the copies that pay: groups from which the window's own blocks
+    // are reached again (a loop across the window's edge, which would
+    // otherwise leave and enter windows every iteration). A straight run
+    // out of the window leaves it once either way.
+    let mut back: BTreeSet<u64> = own.iter().copied().collect();
+    let mut kept = vec![false; groups.len()];
+    loop {
+        let mut grew = false;
+        for (index, group) in groups.iter().enumerate() {
+            if !kept[index]
+                && group
+                    .iter()
+                    .any(|&block| successors(block).iter().any(|next| back.contains(next)))
+            {
+                kept[index] = true;
+                back.extend(group.iter().copied());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (group, kept) in groups.into_iter().zip(kept) {
+        if kept {
+            extra.extend(group);
         }
     }
     extra
@@ -6583,7 +7694,15 @@ pub fn emit_rust_split_to_regions<E>(
     };
     let used =
         |pick: fn(&EmitOptions) -> bool| pick(&base) || (!regions.is_empty() && pick(&listed));
-    let inlined = inlined_blocks(translation);
+    let mut inlined = inlined_blocks(translation);
+    // With regalloc-indirect-entries every deferred root is an entry a
+    // structured function can hand back at: its window keeps an arm.
+    // (Also without functions: a window lift to compare with.)
+    if used(|o| o.regalloc_indirect_entries) {
+        for root in &translation.deferred_roots {
+            inlined.remove(root);
+        }
+    }
     let resume = used(|o| o.deferred_charges && o.split_ticks).then(|| resume_blocks(translation));
     let analyses = Arc::new(EmissionAnalyses {
         pending: resume
@@ -6676,6 +7795,15 @@ pub fn emit_rust_split_to_regions<E>(
         if window_calls_on(&options) {
             header.push_str(WINDOW_CALL_HELPER);
         }
+        if options.functions && options.regalloc {
+            header.push_str(RUN_ENTRY_HELPER);
+            if options.function_table {
+                header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_pc(m: &mut Machine) -> Result<(), Trap> { m.run_function_at_pc() }\n");
+            }
+        }
+        if mxcsr_groups_on(&options) {
+            header.push_str(MXCSR_HELPER);
+        }
         if options.count_fallbacks {
             header.push_str(&format!(
                 "/// Calls of each helper inlined code fell back to (`FALLBACK_HELPERS` of the root).\n\
@@ -6688,7 +7816,32 @@ pub fn emit_rust_split_to_regions<E>(
     // Lifted functions, emitted after their region's windows: only those of
     // regions whose options have them.
     let lifted: BTreeMap<u64, Vec<u64>> = if used(|o| o.functions) {
-        functions(translation, region_bits)
+        let mut extra: BTreeSet<u64> = if used(|o| o.functions && o.regalloc) {
+            translation.entries.iter().copied().collect()
+        } else {
+            BTreeSet::new()
+        };
+        // With regalloc-indirect-entries, every deferred root (function
+        // pointers, vtable slots, prologues), reached first or not.
+        if used(|o| o.functions && o.regalloc && o.regalloc_indirect_entries) {
+            extra.extend(translation.deferred_roots.iter().copied());
+        }
+        let limit = if used(|o| o.functions && o.regalloc) {
+            REGALLOC_BLOCK_LIMIT
+        } else {
+            FUNCTION_BLOCK_LIMIT
+        };
+        // With regalloc-span-regions (and its own crates, where every call
+        // goes through the function table) a body may run on into the
+        // regions after its entry's.
+        let span = used(|o| {
+            o.functions
+                && o.function_table
+                && o.regalloc
+                && o.regalloc_crates
+                && o.regalloc_span_regions
+        });
+        functions_with(translation, region_bits, &extra, limit, span)
             .into_iter()
             .filter(|(entry, _)| options_of(entry >> region_bits).functions)
             .collect()
@@ -6751,14 +7904,11 @@ pub fn emit_rust_split_to_regions<E>(
                     &plain
                 }
             };
-            let summaries = window_call_summaries_in(
-                translation,
-                &|pc| {
-                    let options = options_of(pc >> region_bits);
-                    window_calls_on(&options).then_some(options.window_call_early_exits)
-                },
-                windows,
-            );
+            let active = |pc: u64| {
+                let options = options_of(pc >> region_bits);
+                window_calls_on(&options).then_some(options.window_call_early_exits)
+            };
+            let summaries = window_call_targets(translation, &active, windows);
             let windows: BTreeSet<u64> = summaries
                 .keys()
                 .map(|target| target >> SPLIT_WINDOW_BITS)
@@ -6780,13 +7930,45 @@ pub fn emit_rust_split_to_regions<E>(
             .map(|block| (block.start, block))
             .collect()
     };
-    let region_functions = |region: u64, output: &mut String| {
+    // Each resume function (`regalloc_resume_*`) with the function whose
+    // text holds it.
+    let region_functions = |region: u64,
+                            texts: &mut Vec<(u64, String)>,
+                            resumes: &mut Vec<(u64, u64)>| {
         let first = region << region_bits;
         let last = first + ((1u64 << region_bits) - 1);
         for (&entry, starts) in lifted.range(first..=last) {
+            texts.push((entry, String::new()));
+            let output = &mut texts.last_mut().expect("just pushed").1;
             let blocks: Vec<BasicBlock> =
                 starts.iter().map(|start| by_start[start].clone()).collect();
-            emit_function(output, entry, &blocks, &inlined, &spin_heads);
+            if REGALLOC.get()
+                && let Some(entered) = regalloc::emit_function(
+                    output,
+                    entry,
+                    &blocks,
+                    &spin_heads,
+                    &translation.jump_table_cases,
+                    &lifted,
+                    &by_start,
+                )
+            {
+                for &(_, function) in &entered {
+                    if function != entry && !resumes.iter().any(|(head, _)| *head == function) {
+                        resumes.push((function, entry));
+                    }
+                }
+                REGALLOC_ENTRIES.with_borrow_mut(|entries| {
+                    for (block, function) in entered {
+                        entries.entry(block).or_insert(function);
+                    }
+                });
+                REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
+            } else if REGALLOC_CAPPED.with_borrow(|capped| capped.contains(&entry)) {
+                regalloc::capped_stub(output, entry);
+            } else {
+                emit_function(output, entry, &blocks, &inlined, &spin_heads);
+            }
         }
     };
     for (window, _) in &windows {
@@ -6807,7 +7989,27 @@ pub fn emit_rust_split_to_regions<E>(
             &window_calls,
         );
         let mut source = header_of(options);
+        let header_end = source.len();
+        let split = options.functions
+            && options.function_table
+            && options.regalloc
+            && options.regalloc_crates;
+        let _split = Flag::set(&REGALLOC_SPLIT, split);
+        let outer_bytes = REGALLOC_FUNCTION_BYTES.replace(options.regalloc_function_bytes);
+        // With regalloc the region's functions are emitted first, so its
+        // windows know which entries run structured.
+        let mut functions_first: Vec<(u64, String)> = Vec::new();
+        let mut resumes: Vec<(u64, u64)> = Vec::new();
+        if REGALLOC.get() {
+            REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
+            REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
+            region_functions(region, &mut functions_first, &mut resumes);
+        }
+        // Where each window's text starts in `source` (`regalloc_crates`).
+        let mut window_starts: Vec<(u64, usize)> = Vec::new();
         for (window, blocks) in region_windows {
+            window_starts.push((*window, source.len()));
             let output = &mut source;
             let extended: Vec<BasicBlock>;
             let blocks: &[BasicBlock] = match long_windows
@@ -6907,13 +8109,24 @@ pub fn emit_rust_split_to_regions<E>(
                     .is_some_and(|(_, windows)| windows.contains_key(window));
             if entered {
                 // Summarized calls enter the window past the entry's
-                // diagnostics (`window_call_summaries`).
-                // Both entries hold the body inlined: neither pays a second
-                // call (a `Result<(), Trap>` returns through memory, so a
-                // wrapper could not jump to the other).
-                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    window_body_{window:x}(m)\n}}\n\n#[inline(never)]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    window_body_{window:x}(m)\n}}\n\n#[inline(always)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\nfn window_body_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
+                // diagnostics (`window_call_summaries`). The body is compiled
+                // once, in `enter_window_<w>`; the dispatcher's entry runs
+                // the diagnostics and calls it (one more call there: a
+                // `Result<(), Trap>` returns through memory, so it is no tail
+                // jump; inlining the body into both doubled every entered
+                // window's machine code, which the game, bound by
+                // instruction fetch, paid for).
+                writeln!(output, "\n#[inline(never)]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;\n    enter_window_{window:x}(m)\n}}\n\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn enter_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{").unwrap();
             } else {
-                writeln!(output, "\n#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
+                // With regalloc, a window whose every block a structured
+                // function holds runs only next to budgets and host
+                // boundaries: cold, out of the hot code's way.
+                let cold = REGALLOC.get()
+                    && REGALLOC_COVERED.with_borrow(|covered| {
+                        blocks.iter().all(|block| covered.contains(&block.start))
+                    });
+                let cold = if cold { "#[cold]\n" } else { "" };
+                writeln!(output, "\n{cold}#[inline(never)]\n#[allow(unused_parens, unused_mut, unused_assignments, unused_variables, unreachable_patterns, unused_labels{dead})]\npub fn run_window_{window:x}(m: &mut Machine) -> Result<(), Trap> {{\n    m.enter_window()?;").unwrap();
             }
             output.push_str(&locals.load());
             // The blocks run in a nested function so their early returns still
@@ -6927,6 +8140,8 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, pending: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             } else if STEPS_LOCAL.get() {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R, st: &mut u64) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
+            } else if CACHED_STOP.get() {
+                "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n    let mut stop = m.stop.load(std::sync::atomic::Ordering::Relaxed);\n"
             } else {
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
@@ -6969,6 +8184,12 @@ pub fn emit_rust_split_to_regions<E>(
                 output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet mut pending = 0u64;\nlet result = body(m, &mut r, &mut pending);\nm.steps += pending;\n",
             );
+            } else if CACHED_STOP.get() {
+                // A backward dispatch reloads the stop word, so every loop
+                // sees a preemption within an iteration.
+                output.push_str(
+                "}\nif next_pc <= m.cpu.pc { stop = m.stop.load(std::sync::atomic::Ordering::Relaxed); }\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
+            );
             } else {
                 output.push_str(
                 "}\nm.cpu.pc = next_pc;\nm.finish_block()?;\n}\n}\nlet result = body(m, &mut r);\n",
@@ -6977,12 +8198,102 @@ pub fn emit_rust_split_to_regions<E>(
             output.push_str(&locals.store());
             output.push_str("    result\n}\n");
         }
-        region_functions(region, &mut source);
-        (region, unindent(&source))
+        if REGALLOC.get() {
+            REGALLOC_ENTRIES.with_borrow_mut(BTreeMap::clear);
+            REGALLOC_COVERED.with_borrow_mut(BTreeSet::clear);
+            REGALLOC_CAPPED.with_borrow_mut(BTreeSet::clear);
+        } else {
+            region_functions(region, &mut functions_first, &mut resumes);
+        }
+        let mut placed = Placed::default();
+        for &(head, _) in &resumes {
+            placed.resumes.push((head, region));
+        }
+        if !split {
+            for (_, text) in functions_first {
+                source.push_str(&text);
+            }
+            if options.cold_fp_exact {
+                source = cold_fp_helpers(&source, header_end);
+            }
+            placed.sources.push((region, unindent(&source)));
+            REGALLOC_FUNCTION_BYTES.set(outer_bytes);
+            return placed;
+        }
+        // Crates of at most REGALLOC_CRATE_BYTES of Rust each: the windows
+        // (the first crate keeps the region's own id), then the functions.
+        let header = header_of(options);
+        let budget = match options.regalloc_crate_bytes {
+            0 => REGALLOC_CRATE_BYTES,
+            bytes => bytes,
+        };
+        let mut crates: Vec<String> = vec![header.clone()];
+        let place = |crates: &mut Vec<String>, text: &str| -> u64 {
+            let last = crates.last().expect("a crate");
+            if last.len() > header.len() && last.len() + text.len() > budget {
+                crates.push(header.clone());
+            }
+            crates.last_mut().expect("a crate").push_str(text);
+            crates.len() as u64 - 1
+        };
+        let ends: Vec<usize> = window_starts
+            .iter()
+            .skip(1)
+            .map(|&(_, start)| start)
+            .chain(std::iter::once(source.len()))
+            .collect();
+        let headers = window_starts
+            .first()
+            .map_or(source.len(), |&(_, start)| start);
+        crates[0].push_str(&source[header.len().min(headers)..headers]);
+        let id = |index: u64| {
+            if index == 0 {
+                region
+            } else {
+                region | index << 40
+            }
+        };
+        for (&(window, start), &end) in window_starts.iter().zip(&ends) {
+            let index = place(&mut crates, &source[start..end]);
+            placed.windows.push((window, id(index)));
+        }
+        crates.push(header.clone());
+        for (entry, text) in functions_first {
+            let index = place(&mut crates, &text);
+            placed.functions.push((entry, id(index)));
+            for resume in placed.resumes.iter_mut() {
+                if resumes
+                    .iter()
+                    .any(|&(head, of)| head == resume.0 && of == entry)
+                {
+                    resume.1 = id(index);
+                }
+            }
+        }
+        for (index, text) in crates.into_iter().enumerate() {
+            if index == 0 || text.len() > header.len() {
+                // Each crate starts with the header; with `cold_fp_exact`
+                // it gets its own wrappers after it.
+                let text = if options.cold_fp_exact {
+                    cold_fp_helpers(&text, header.len())
+                } else {
+                    text
+                };
+                placed.sources.push((id(index as u64), unindent(&text)));
+            }
+        }
+        REGALLOC_FUNCTION_BYTES.set(outer_bytes);
+        placed
     };
     let groups: Vec<_> = windows
         .chunk_by(|a, b| a.0 >> shift == b.0 >> shift)
         .collect();
+    // With regalloc_crates: the crate of each window and function that is
+    // not in its region's own, and every crate emitted.
+    let mut window_crates: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut function_crates: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut crate_ids: Vec<u64> = Vec::new();
+    let mut resume_crates: BTreeMap<u64, u64> = BTreeMap::new();
     let workers = if windows.len() < 256 {
         1
     } else {
@@ -6992,8 +8303,14 @@ pub fn emit_rust_split_to_regions<E>(
     };
     for batch in groups.chunks(workers) {
         if let [one] = batch {
-            let (region, source) = emit(one);
-            sink(region, source, groups.len())?;
+            let placed = emit(one);
+            window_crates.extend(placed.windows);
+            function_crates.extend(placed.functions);
+            resume_crates.extend(placed.resumes);
+            for (region, source) in placed.sources {
+                crate_ids.push(region);
+                sink(region, source, groups.len())?;
+            }
         } else {
             std::thread::scope(|scope| {
                 let pending: Vec<_> = batch
@@ -7003,10 +8320,16 @@ pub fn emit_rust_split_to_regions<E>(
                 // Keep deterministic sink order and hold at most one batch
                 // of completed region sources at a time.
                 for worker in pending {
-                    let (region, source) = worker
+                    let placed = worker
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    sink(region, source, groups.len())?;
+                    window_crates.extend(placed.windows);
+                    function_crates.extend(placed.functions);
+                    resume_crates.extend(placed.resumes);
+                    for (region, source) in placed.sources {
+                        crate_ids.push(region);
+                        sink(region, source, groups.len())?;
+                    }
                 }
                 Ok(())
             })?;
@@ -7015,7 +8338,10 @@ pub fn emit_rust_split_to_regions<E>(
     // The window table for direct calls between windows (`Core::call`).
     root.push_str("\nstatic WINDOWS: &[(u64, WindowFn)] = &[\n");
     for (window, _) in &windows {
-        let region = window >> shift;
+        let region = window_crates
+            .get(window)
+            .copied()
+            .unwrap_or(window >> shift);
         writeln!(
             root,
             "    ({window:#x}, gen_r_{region:x}::run_window_{window:x}),"
@@ -7083,19 +8409,60 @@ pub fn emit_rust_split_to_regions<E>(
         // gets a copy of.
         root.push_str("\nstatic FUNCTION_TABLE: &[WindowFn] = &[\n");
         for &entry in lifted.keys() {
-            writeln!(
-                root,
-                "    gen_r_{:x}::run_function_{entry:x},",
-                entry >> region_bits
-            )
-            .unwrap();
+            let crate_id = function_crates
+                .get(&entry)
+                .copied()
+                .unwrap_or(entry >> region_bits);
+            writeln!(root, "    gen_r_{crate_id:x}::run_function_{entry:x},").unwrap();
         }
         root.push_str("];\n");
         let mut installs = String::new();
-        for region in regions_seen.iter().filter(|region| {
-            let options = options_of(**region);
-            options.functions && options.function_table
-        }) {
+        if used(|o| o.functions && o.function_table && o.regalloc) {
+            // Indirect calls from structured functions enter functions by
+            // entry (`Core::call_indirect`).
+            // ... and resume functions (`regalloc_resume_*`) by their head.
+            let mut entries: BTreeMap<u64, u64> = lifted
+                .keys()
+                .map(|&entry| {
+                    (
+                        entry,
+                        function_crates
+                            .get(&entry)
+                            .copied()
+                            .unwrap_or(entry >> region_bits),
+                    )
+                })
+                .collect();
+            for (&head, &crate_id) in &resume_crates {
+                entries.entry(head).or_insert(crate_id);
+            }
+            root.push_str("\nstatic FUNCTION_ENTRIES: &[u64] = &[\n");
+            for &entry in entries.keys() {
+                writeln!(root, "    {entry:#x},").unwrap();
+            }
+            root.push_str("];\nstatic ENTRY_FUNCTIONS: &[WindowFn] = &[\n");
+            for (&entry, &crate_id) in &entries {
+                writeln!(root, "    gen_r_{crate_id:x}::run_function_{entry:x},").unwrap();
+            }
+            root.push_str("];\n");
+            installs.push_str(
+                "    echora_guest::install_function_entries(FUNCTION_ENTRIES, ENTRY_FUNCTIONS);\n",
+            );
+        }
+        // Crates of their own (`regalloc_crates`) hold a table copy too.
+        let extra: Vec<u64> = crate_ids
+            .iter()
+            .copied()
+            .filter(|id| id >> 40 != 0)
+            .collect();
+        for region in regions_seen
+            .iter()
+            .filter(|region| {
+                let options = options_of(**region);
+                options.functions && options.function_table
+            })
+            .chain(&extra)
+        {
             writeln!(
                 installs,
                 "    gen_r_{region:x}::install_functions(FUNCTION_TABLE);"
@@ -7624,7 +8991,9 @@ mod tests {
         let translation = discover(&[region(&words)], &entries, count).unwrap();
         let output = emit_rust(&translation);
         assert_eq!(translation.blocks.len(), count);
-        assert_eq!(output.matches("#[inline(never)]").count(), 2);
+        // The two windows and the cold trap helper (`AT_HELPER`).
+        assert_eq!(output.matches("#[inline(never)]").count(), 3);
+        assert_eq!(output.matches("fn run_window_").count(), 2);
         assert!(output.contains("0x1 => return run_window_1(m),"));
         assert!(output.contains("0x2 => return run_window_2(m),"));
         assert!(output.contains("pc if pc >> 12 != 0x1 => return Ok(())"));
@@ -7791,6 +9160,225 @@ mod tests {
         )
         .unwrap();
         assert!(!inlined_blocks(&translation).contains(&0x100c));
+    }
+
+    /// Where two options take the same thing, the emission with both is
+    /// the winner's alone, and the loser alone changes it (so the
+    /// comparison sees something): deferred charges turn the step-count
+    /// local off, and a BL to a lifted function calls it whatever
+    /// `direct_calls` says.
+    #[test]
+    fn overlapping_options_emit_the_winners_code() {
+        let emit = |translation: &Translation, options: EmitOptions| {
+            let (root, regions) = emit_rust_split_with(translation, 16, options);
+            let mut text = root;
+            for (_, source) in regions {
+                text.push_str(&source);
+            }
+            text
+        };
+        let base = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            ..EmitOptions::default()
+        };
+        // ADD X0, X0, #1; SUBS X1, X1, #1; B.NE -8; BL +12; SVC; (pad);
+        // ADD X2, X2, #1; RET.
+        let translation = discover(
+            &[region(&[
+                0x9100_0400,
+                0xf100_0421,
+                0x54ff_ffc1,
+                0x9400_0003,
+                0xd400_00e1,
+                0xd503_201f,
+                0x9100_0442,
+                0xd65f_03c0,
+            ])],
+            &[0x1000],
+            16,
+        )
+        .unwrap();
+        let deferred = EmitOptions {
+            deferred_charges: true,
+            ..base
+        };
+        let steps_local = EmitOptions {
+            steps_local: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, steps_local), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    steps_local: true,
+                    ..deferred
+                }
+            ),
+            emit(&translation, deferred)
+        );
+        let functions = EmitOptions {
+            functions: true,
+            ..base
+        };
+        let direct = EmitOptions {
+            direct_calls: true,
+            ..base
+        };
+        assert!(emit(&translation, direct).contains("m.call_window(0x1010, run_window_"));
+        let both = emit(
+            &translation,
+            EmitOptions {
+                direct_calls: true,
+                ..functions
+            },
+        );
+        assert!(
+            both.contains("m.call_window(0x1010, run_function_1018)"),
+            "{both}"
+        );
+        assert_eq!(both, emit(&translation, functions));
+        // Window calls give way to lifted functions; with direct calls, a
+        // BL to a summarized target is a window call.
+        let window_calls = EmitOptions {
+            window_calls: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, window_calls), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    window_calls: true,
+                    ..functions
+                }
+            ),
+            emit(&translation, functions)
+        );
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    direct_calls: true,
+                    ..window_calls
+                }
+            ),
+            emit(&translation, window_calls)
+        );
+        // Long windows give way to lifted functions and deferred charges
+        // (on a loop across a window edge, which they change).
+        let (crossing, _) = crossing_function();
+        let long = EmitOptions {
+            long_windows: true,
+            ..base
+        };
+        assert_ne!(emit(&crossing, long), emit(&crossing, base));
+        for winner in [functions, deferred] {
+            assert_eq!(
+                emit(
+                    &crossing,
+                    EmitOptions {
+                        long_windows: true,
+                        ..winner
+                    }
+                ),
+                emit(&crossing, winner)
+            );
+        }
+    }
+
+    #[test]
+    fn cold_fp_exact_moves_the_exact_paths_out_of_line() {
+        // A float run of eight FMUL S2, S0, S1 between NOPs, an FADD S2,
+        // S2, S3, an FCMP S0, S1 and an FMADD S0, S1, S2, S3; SVC.
+        let mut words = vec![0xd503_201f];
+        words.extend([0x1e21_0802; 8]);
+        words.extend([
+            0xd503_201f,
+            0x1e23_2842,
+            0x1e21_2000,
+            0x1f02_0c20,
+            0xd400_00e1,
+        ]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let emit = |cold_fp_exact| {
+            let options = EmitOptions {
+                inline_vector: true,
+                float_runs: true,
+                split_ticks: true,
+                cold_fp_exact,
+                ..EmitOptions::default()
+            };
+            let (_, regions) = emit_rust_split_with(&translation, 16, options);
+            regions
+                .into_iter()
+                .map(|(_, source)| source)
+                .collect::<String>()
+        };
+        let (plain, cold) = (emit(false), emit(true));
+        for name in ["fp_binary", "fp_ternary", "fp_compare"] {
+            let direct = format!("echora_guest::simd::{name}(&mut m.cpu");
+            assert!(plain.contains(&direct), "{name}");
+            assert!(!cold.contains(&direct), "{name}");
+            assert_eq!(
+                cold.matches(&format!("fn cold_{name}(")).count(),
+                1,
+                "{name}: one wrapper per region"
+            );
+            assert_eq!(
+                cold.matches(&format!("cold_{name}(&mut m.cpu")).count(),
+                plain.matches(&direct).count(),
+                "{name}: every call through it"
+            );
+        }
+        assert!(cold.contains("if !committed { core::hint::cold_path();"));
+        assert!(!plain.contains("cold_path") && !plain.contains("fn cold_"));
+        // Nothing else changes.
+        let undone = COLD_FP_HELPERS.iter().fold(
+            cold.replace(" core::hint::cold_path();", ""),
+            |text, (name, _, _)| {
+                text.replace(
+                    &format!("cold_{name}("),
+                    &format!("echora_guest::simd::{name}("),
+                )
+            },
+        );
+        let without_wrappers: String = undone
+            .lines()
+            .filter(|line| {
+                !line.contains("out of the hot code (`EmitOptions::cold_fp_exact`)")
+                    && *line != "#[cold]"
+                    && *line != "#[inline(never)]"
+                    && !line.starts_with("fn echora_guest::simd::")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let plain_lines: String = plain
+            .lines()
+            .filter(|line| *line != "#[cold]" && *line != "#[inline(never)]")
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(without_wrappers, plain_lines);
+    }
+
+    #[test]
+    fn float_runs_hold_only_loads_between_their_operations() {
+        // NOP; LDR S0, [X1]; LDR S1, [X1, #4]; four FMUL S2, S0, S1;
+        // LDR S3, [X1, #8]; four FADD S2, S2, S3; LDR S4, [X1, #12]; SVC.
+        let mut words = vec![0xd503_201f, 0xbd40_0020, 0xbd40_0421];
+        words.extend([0x1e21_0802; 4]);
+        words.push(0xbd40_0823);
+        words.extend([0x1e23_2842; 4]);
+        words.extend([0xbd40_0c24, 0xd400_00e1]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let block = &translation.blocks[0];
+        assert_eq!(block.instructions.len(), words.len());
+        // The leading and trailing loads stay outside; the one between
+        // operations is held.
+        assert_eq!(float_runs_in(block, true), [(3, 12)]);
+        // Without loads, no eight consecutive operations.
+        assert!(float_runs_in(block, false).is_empty());
     }
 
     #[test]
@@ -9051,9 +10639,130 @@ mod tests {
     }
 
     #[test]
+    fn threaded_successors_copy_a_join_into_both_branches() {
+        // CBZ X0 over one ADD to a join (two predecessors: an arm of its
+        // own), then a loop back to the start through a SUBS/B.NE.
+        let words = [
+            0xb400_0040, // 0x1000: cbz x0, 0x1008
+            0x9100_0421, // 0x1004: add x1, x1, #1
+            0x9100_0842, // 0x1008: join: add x2, x2, #2
+            0xf100_0400, // 0x100c: subs x0, x0, #1
+            0x54ff_ff81, // 0x1010: b.ne 0x1000
+            0xd65f_03c0, // 0x1014: ret
+        ];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        // An arm: from its label to the next one (or the catch-all).
+        let arm = |source: &str, pc: u64| {
+            let start = source.find(&format!("\n{pc:#x} => {{")).unwrap() + 1;
+            let end = source[start..]
+                .find("\n0x")
+                .or_else(|| source[start..].find("\npc "))
+                .map_or(source.len(), |at| start + at);
+            source[start..end].to_owned()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, EmitOptions::default());
+        let plain = arm(&regions[0].1, 0x1000);
+        assert!(plain.contains("next_pc = 0x1008;"), "{plain}");
+        assert!(!plain.contains("m.cpu.pc = 0x1008;"), "{plain}");
+        let options = EmitOptions {
+            threaded_successors: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        let threaded = arm(source, 0x1000);
+        // The join runs in place on both sides; it keeps its own arm; the
+        // loop's back edge to the arm's own start still dispatches.
+        assert_eq!(
+            threaded.matches("m.cpu.pc = 0x1008;").count(),
+            2,
+            "{threaded}"
+        );
+        assert!(!threaded.contains("next_pc = 0x1008;"), "{threaded}");
+        assert!(threaded.contains("0x1000"), "{threaded}");
+        assert!(source.contains("\n0x1008 => {"));
+    }
+
+    #[test]
+    fn cached_stop_charges_untagged_blocks_against_the_window_s_word() {
+        let words = [
+            0x9100_0421, // 0x1000: add x1, x1, #1
+            0xf100_0400, // 0x1004: subs x0, x0, #1
+            0x54ff_ffc1, // 0x1008: b.ne 0x1000
+            0xd65f_03c0, // 0x100c: ret
+        ];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            cached_stop: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        assert!(
+            source.contains("let mut stop = m.stop.load(std::sync::atomic::Ordering::Relaxed);")
+        );
+        assert!(
+            source.contains("if m.steps + 3 <= stop { m.steps += 3; } else { stop = m.stop.load(")
+        );
+        assert!(source.contains("if next_pc <= m.cpu.pc { stop = m.stop.load("));
+        for other in [
+            EmitOptions {
+                steps_local: true,
+                ..options
+            },
+            EmitOptions {
+                deferred_charges: true,
+                ..options
+            },
+            EmitOptions {
+                split_ticks: false,
+                ..options
+            },
+        ] {
+            let (_, regions) = emit_rust_split_with(&translation, 16, other);
+            assert!(!regions[0].1.contains("<= stop {"), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn arm_charges_test_the_stop_word_once_per_arm() {
+        // CBZ over an ADD (inlined both sides) to a join.
+        let words = [0xb400_0040, 0x9100_0421, 0x9100_0842, 0xd65f_03c0];
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            arm_charges: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        let source = &regions[0].1;
+        // The arm at 0x1000 holds its own and the inlined 0x1004's charges.
+        assert!(
+            source.contains("let arm_fast = m.steps + 2 <= m.stop.load("),
+            "{source}"
+        );
+        assert!(source.contains(
+            "if arm_fast { m.steps += 1; } else if !m.charge_block_at(0x1004, 1, false)"
+        ));
+        let (_, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                arm_charges: false,
+                ..options
+            },
+        );
+        assert!(!regions[0].1.contains("arm_fast"));
+    }
+
+    #[test]
     fn long_windows_stop_at_the_extension_limit() {
-        // A straight run over three windows from 0x1000's last words: each
-        // window may take at most WINDOW_EXTENSION_LIMIT instructions more.
+        // A straight run over three windows from 0x1000's last words: no
+        // window takes more than WINDOW_EXTENSION_LIMIT instructions, and
+        // none that do not loop back.
         let at = |index: u64| 0x1000 + 4 * index;
         let mut words = vec![0x9100_0421u32; 256 * 3 + 2];
         words[0] = bl(at(0), at(200));
@@ -9074,31 +10783,180 @@ mod tests {
                 .sum();
             assert!(outside <= WINDOW_EXTENSION_LIMIT, "{window:#x}: {outside}");
         }
-        // 0x4 takes all of 0x5 (256 instructions) and nothing of 0x6.
-        assert!(long[&4].contains(&0x1400));
-        assert!(!long[&4].iter().any(|start| start >> 10 == 6));
+        // A straight run leaves each window once either way: no copies.
+        assert_eq!(long, window_blocks(&translation, 16, &|_| false));
     }
 
     #[test]
-    fn long_windows_summarize_calls_whose_function_crosses_a_window() {
+    fn long_windows_summarize_but_add_no_window_call_targets() {
         let (translation, at) = crossing_function();
         let active = |_: u64| Some(false);
         // Without long windows the callee leaves its window early: no
         // summary without early exits.
         assert!(!window_call_summaries(&translation, &active).contains_key(&at(252)));
+        // Its long window's summary covers the loop across the edge...
         let long = window_blocks(&translation, 16, &|_| true);
         let summaries = window_call_summaries_in(&translation, &active, &long);
         let x = |n: u32| 1u64 << n;
         let (touched, writes) = summaries[&at(252)];
         assert_eq!(writes, x(1) | x(2) | x(3) | x(4) | DIRTY_NZCV);
         assert_eq!(touched, writes | x(30));
+        // ...but window calls keep plain windows' targets.
+        assert!(!window_call_targets(&translation, &active, &long).contains_key(&at(252)));
         let options = EmitOptions {
             long_windows: true,
             window_calls: true,
             ..EmitOptions::default()
         };
         let (_, regions) = emit_rust_split_with(&translation, 16, options);
-        assert!(regions[0].1.contains("let called = enter_window_4(m);"));
+        assert!(!regions[0].1.contains("let called = enter_window_4(m);"));
+    }
+
+    /// A BL at 0x1000 to a switch at 0x1008 through a halfword jump table
+    /// in the code (as `tests/window_calls.rs`'s program has it).
+    fn switch_program() -> Translation {
+        let b = |from: u32, to: u32| 0x1400_0000 | (to.wrapping_sub(from) & 0x03ff_ffff);
+        let adr = |from: u32, to: u32, rd: u32| {
+            let delta = to.wrapping_sub(from);
+            0x1000_0000 | ((delta & 3) << 29) | (((delta >> 2) & 0x7_ffff) << 5) | rd
+        };
+        let mut words = vec![bl(0x1000, 0x1008), 0xd400_00e1];
+        let mut switch = vec![
+            0x1200_0411,        // and w17, w0, #3
+            adr(4, 4 * 15, 16), // adr x16, table
+            0x7871_7a09,        // ldrh w9, [x16, x17, lsl #1]
+            adr(12, 4 * 6, 3),  // adr x3, cases
+            0x8b09_0863,        // add x3, x3, x9, lsl #2
+            0xd61f_0060,        // br x3
+        ];
+        for case in 0..4u32 {
+            switch.push(0x9100_0000 | ((case + 1) << 10)); // add x0, x0, #case+1
+            switch.push(b(switch.len() as u32, 14));
+        }
+        switch.push(0xd65f_03c0);
+        switch.extend([2 << 16, 4 | (6 << 16)]);
+        words.extend(switch);
+        discover(&[region(&words)], &[0x1000], words.len()).unwrap()
+    }
+
+    /// A function whose last block is a BL at the end of its 1 KiB region:
+    /// the call returns past its body (into the next region), to a block no
+    /// function starts at, so it gets no resume function (it once panicked
+    /// looking that block up).
+    #[test]
+    fn a_call_returning_past_the_function_gets_no_resume_function() {
+        let mut words = vec![0u32; 0x130];
+        words[0] = 0x9400_0000 | 0xff; // 0x1000: bl F (0x13fc)
+        words[1] = 0xd400_00e1; // 0x1004: svc #7
+        words[0xff] = 0x9400_0000 | 0x3; // 0x13fc: F: bl G (0x1408)
+        words[0x100] = 0x9100_0400; // 0x1400: add x0, x0, #1 (F's return point)
+        words[0x101] = 0xd65f_03c0; // 0x1404: ret
+        // 0x1408: G, too long to run inlined: 30 ADDs, RET.
+        words[0x102..0x102 + 30].fill(0x9100_0400);
+        words[0x102 + 30] = 0xd65f_03c0;
+        let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
+        let options = EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            regalloc: true,
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            ..EmitOptions::default()
+        };
+        for crates in [false, true] {
+            let (_, regions) = emit_rust_split_with(
+                &translation,
+                10,
+                EmitOptions {
+                    regalloc_crates: crates,
+                    ..options
+                },
+            );
+            let text: String = regions.iter().map(|(_, source)| source.as_str()).collect();
+            // F is structured, and nothing runs from its return point.
+            let f = &text[text.find("pub fn run_function_13fc(").unwrap()..];
+            assert!(f[..f.find("\npub fn ").unwrap_or(f.len())].contains("n: &mut u64"));
+            assert!(!text.contains("pub fn run_function_1400("));
+        }
+    }
+
+    #[test]
+    fn lifted_functions_hold_their_jump_tables_cases() {
+        let translation = switch_program();
+        let br = 0x1008 + 4 * 5;
+        let cases = &translation.jump_table_cases[&br];
+        assert_eq!(cases.len(), 4);
+        let lifted = functions(&translation, 16);
+        for case in cases {
+            assert!(lifted[&0x1008].contains(case), "{case:#x}");
+        }
+        // Every exit is the RET, so the switch gets a summary.
+        let x = |n: u32| 1u64 << n;
+        let (touched, writes) = leaf_summaries(&translation, &lifted)[&0x1008];
+        assert_eq!(writes, x(0) | x(3) | x(9) | x(16) | x(17));
+        assert_eq!(touched, writes | x(30));
+        assert!(transitive_summaries(&translation, &lifted, 16, true).contains_key(&0x1008));
+    }
+
+    #[test]
+    fn transitive_summaries_stop_at_the_depth_limit() {
+        // A caller, then 20 functions each calling the next with a frame.
+        const CHAIN: u64 = 20;
+        let at = |index: u64| 0x1000 + 4 * index;
+        let function = |i: u64| at(2 + 4 * i);
+        let mut words = vec![bl(at(0), function(0)), 0xd400_00e1];
+        for i in 0..CHAIN {
+            if i + 1 == CHAIN {
+                words.extend([0xd503_201f, 0xd503_201f, 0xd503_201f, 0xd65f_03c0]);
+            } else {
+                words.extend([
+                    0xa9bf_7bfd,
+                    bl(function(i) + 4, function(i + 1)),
+                    0xa8c1_7bfd,
+                    0xd65f_03c0,
+                ]);
+            }
+        }
+        let translation = discover(&[region(&words)], &[at(0)], words.len()).unwrap();
+        let lifted = functions(&translation, 16);
+        let summaries = transitive_summaries(&translation, &lifted, 16, true);
+        for i in 0..CHAIN {
+            // Function i nests CHAIN - i deep.
+            let depth = (CHAIN - i) as u32;
+            assert_eq!(
+                summaries.contains_key(&function(i)),
+                depth <= WINDOW_CALL_DEPTH_LIMIT,
+                "{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_summaries_audit_audits_every_summarized_function_call() {
+        let translation = switch_program();
+        let options = EmitOptions {
+            functions: true,
+            function_table: true,
+            call_summaries: true,
+            transitive_summaries: true,
+            ..EmitOptions::default()
+        };
+        let (_, regions) = emit_rust_split_with(&translation, 16, options);
+        assert!(regions[0].1.contains("let called = function_at(0)(m);"));
+        assert!(!regions[0].1.contains("summary audit"));
+        let (_, regions) = emit_rust_split_with(
+            &translation,
+            16,
+            EmitOptions {
+                call_summaries_audit: true,
+                ..options
+            },
+        );
+        let source = &regions[0].1;
+        assert!(source.contains("summary audit: the call at 0x1000 (function_at(0))"));
+        assert!(!source.contains("let called = function_at(0)(m); r."));
     }
 
     #[test]

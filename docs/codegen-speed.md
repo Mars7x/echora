@@ -522,6 +522,99 @@ resuming at the RET) stores the caller's X30 before the SVC trap reaches
 the host, so the cause there is not yet seen, and the rule removes such
 calls from summarized ones whatever it was.
 
+### Toward the game: audit, jump tables, depth, tests and measurements
+
+**Audit** (`EmitOptions::call_summaries_audit`, `call-summaries-audit`,
+with functions and call summaries). Every summarized call of a lifted
+function (from a window or a function, directly or through the table)
+runs as `window-calls-audit` runs window calls: all locals stored, the
+registers, SP and NZCV outside the callee's summary filled with markers,
+and when the callee comes back (or traps) a `Trap::InvalidState` ("summary
+audit: the call at <site> (<callee>) changed <register>, outside its
+summary") if one outside what it may write changed; then the caller's
+values go back. For one checked game run before trusting the summaries.
+
+**Jump tables.** A recovered jump table's BR (`Translation::jump_table_cases`,
+its case targets by BR address) no longer ends a function: its cases are
+part of the body, and a function whose every case is in its body still
+leaves only by its return, so it (and its callers) can get a summary. A
+target the table does not hold at run time is not in the body: the
+function leaves, and its caller stores what it holds before going on
+through the window table, as for any early return.
+
+**Depth.** Summarized calls take no `Core::call` depth, so transitive
+summaries now stop at `WINDOW_CALL_DEPTH_LIMIT` (16) nested levels, as
+window calls do: a function that would nest deeper has no summary and is
+called through `Core::call_window` (with its depth limit).
+
+**Lift report.** `echora lift` also prints the BL targets over
+`FUNCTION_BLOCK_LIMIT`, the functions holding a jump table, and the
+instructions in function bodies with their share of the translation
+(each body is a copy of window code that compiles again as a function).
+
+**Tests.** `tests/window_calls.rs`'s game-shaped program now has a
+switch through a halfword jump table in the code (a leaf, and a frame
+calling it), a function of 600 blocks across three windows (over the
+block limit), and a game-shaped function (a frame saving X19/X20, six
+rounds of random bodies with CBZ skips and calls of the switch and its
+frame, in an eight-round loop). Besides its window-call lifts it lifts
+functions with the table, call and transitive summaries in one 64 KiB
+region, in 1 KiB regions (bodies cut at region edges), audited, with
+direct calls, with deferred charges and with the step count in a local,
+each against the function-free lift (whole, sliced and budgeted runs, in
+child processes: every general and vector register, SP, NZCV, FPCR,
+FPSR, PC, step and boundary count, trap, data and stack), and the
+integer twin's 64 KiB and 1 KiB function lifts against the reference
+interpreter (which reads the table from the code): 792 runs each, none
+skipped. `lifted_functions_cover_the_game_s_cases` checks the switch, its
+frame and the game function are lifted with summaries and the long one is
+not. The lifter's unit tests cover a function's jump-table cases and its
+summary, the depth limit and the audit's text. The whole
+`echora-aot-tests` suite passes with the game set plus `functions`,
+`function-table`, `call-summaries` and `transitive-summaries`.
+
+**Measurements.** Kernels lifted in 64 KiB regions on a shared 4-core
+container, median Minstr/s of six interleaved rounds of seven runs
+(ranges): game set + window-calls (wc), + window-calls, long-windows and
+known-returns (wcl), and game set + functions, function-table,
+call-summaries and transitive-summaries (fn). `gamefn` is a new kernel: an
+update loop calling, per object, a function of about 70 instructions
+(a frame saving X19-X22, loads, compares and branches, a four-way switch
+through a jump table, calls of the clamp and flag leaves, stores back).
+
+| kernel | wc | wcl | fn | fn against wc |
+|---|---|---|---|---|
+| calls | 1098 [903-1189] | 1021 [980-1029] | 1066 [635-1102] | -3% |
+| calls2 | 965 [731-1000] | 947 [619-979] | 760 [512-787] | -21% |
+| gamecalls | 1498 [1289-1580] | 1480 [1219-1574] | 1646 [888-1715] | +10% |
+| crossing | 2113 [2063-2155] | 4778 [3216-4836] | 5251 [5151-5292] | +149% |
+| gamefn | 2041 [1535-2094] | 2008 [1180-2031] | 2095 [1071-2152] | +3% |
+
+Census (stores and reloads of register locals; calls are emitted call
+sites):
+
+| window or function | wc calls/spills/reloads | fn calls/spills/reloads |
+|---|---|---|
+| calls window | 2 / 2 / 0 | 4 / 6 / 6 |
+| calls2 window | 3 / 5 / 3 | 6 / 15 / 18 |
+| gamecalls window | 2 / 8 / 9 | 4 / 14 / 31 |
+| gamecalls update (window; fn: `run_function_105000`) | 2 / 6 / 3 | 2 / 6 / 3 |
+| crossing window | 1 / 9 / 11 | 2 / 9 / 14 |
+| gamefn window | 1 / 9 / 11 | 2 / 9 / 22 |
+| gamefn function (window; fn: `run_function_106800`) | 2 / 6 / 3 | 2 / 6 / 3 |
+
+A function's body has the stores and reloads of the window it copies
+(a summarized call keeps the rest in host registers either way); with
+functions the windows hold a summarized and an unsummarized path per call
+site, which is where their larger counts come from. On these kernels the
+call boundary is no longer the cost: functions with summaries are about
+level with window calls, ahead where a function runs across a window
+edge (crossing, which long windows also cover), and behind on calls2
+(within this container's noise of about ±30% on the other kernels).
+Making the lifted code itself several times faster will take changes
+inside blocks (the per-block charge and PC bookkeeping, guest memory
+access, flags), not at calls.
+
 ## Window calls (opt-in)
 
 `EmitOptions::window_calls` (`window-calls` in `ECHORA_LIFT_OPTIONS`; split
@@ -541,13 +634,14 @@ directly (`enter_window_<w>` in its own region, `window_call_at(i)` of a
 per-region copy of the root's window-call table elsewhere, as
 `function-table` does for functions), and reloads only what T may write.
 The other locals stay in host registers across the call. An entered
-window's body is an always-inlined `window_body_<w>`, held by both
-`run_window_<w>` (the table and dispatcher path, which keeps
-`enter_window()`'s diagnostics) and `enter_window_<w>` (direct calls, which
-skip them: a constant, aligned target). A wrapper calling the other would
-cost a real call: `Result<(), Trap>` returns through memory, so it is no
-tail jump. The price is a second copy of each entered window's machine
-code. The root's `install` fills every region's table; its
+window's body is compiled once, in `enter_window_<w>` (direct calls, which
+skip `enter_window()`'s diagnostics: a constant, aligned target);
+`run_window_<w>` (the table and dispatcher path) runs the diagnostics and
+calls it, one more call on that path (`Result<(), Trap>` returns through
+memory, so it is no tail jump). The body was once inlined into both, which
+doubled every entered window's machine code: on the game, bound by
+instruction fetch, 213 MB of copies with window calls (379 MB with long
+windows) in 2.7 GB of `.text`. The root's `install` fills every region's table; its
 `window_calls_installed()` says whether it did, and emission asserts the
 line it adds that to.
 
@@ -691,6 +785,124 @@ helper not known to leave these alone, fails it too). It found no
 mismatch. The whole `echora-aot-tests` suite passes with
 every program lifted with the game set and `window-calls`.
 
+## What a guest instruction costs inside a block (2026-11)
+
+**Method.** The game compiles its region crates at `opt-level` 1 with one
+codegen unit and no LTO (`echora`'s generated workspace), echora-guest at
+3, for the native CPU; the kernel benchmark builds at 3 with LTO. So the
+kernels were built the game's way (`--config
+profile.bench.package.echora-aot-tests.opt-level=1`, codegen-units 1, no
+LTO, echora-guest at 3; `-C target-cpu=x86-64-v3`, as valgrind decodes
+no AVX-512) and counted under valgrind's cachegrind (host instructions
+and its simulated branch mispredictions), the runs at `--scale 1` and
+`--scale 2` differenced so setup cancels: deterministic, unlike timings
+on this shared container (where removing work measured up to 49% slower,
+layout and the host dominating). `small-address-space` (aot-tests
+feature) makes the guest reservation fit valgrind. Each cost class was
+removed from the kernels' emitted Rust by `ECHORA_KERNEL_ABLATE` (a
+measuring-only rewrite in `build.rs`: the code is no longer faithful):
+`charges` (no block charges), `pc` (no PC stores only a trap or boundary
+reads), `memory` (accesses without the reservation and alignment tests).
+Game set plus window-calls; host instructions per guest instruction
+(mispredictions per 100 guest instructions):
+
+| kernel | game set | no charges | no PC stores | o3 | structured | deferred-charges | steps-local |
+|---|---|---|---|---|---|---|---|
+| gamecalls | 14.95 (6.1) | 11.76 | 14.36 | 14.79 | 21.68 | 15.76 | 15.30 |
+| gamefn | 12.41 (15.0) | 9.95 | 12.23 | 11.94 | 15.22 | 12.14 | 12.76 |
+| crossing | 10.95 (10.2) | 9.66 | 10.72 | 9.99 | 10.96 | 10.51 | 10.77 |
+| calls2 | 23.70 (38.5) | 16.00 | 23.23 | 23.00 | 45.96 | 23.70 | 24.54 |
+| vector | 28.14 | 27.71 | 27.86 | 23.86 | 29.00 | 28.14 | 28.71 |
+| floats | 17.11 | 16.67 | 17.06 | 16.84 | 17.45 | 17.11 | 17.28 |
+| scalar | 147.88 | 145.87 | 147.50 | 144.25 | 149.75 | 148.00 | 148.38 |
+| ldst | 5.20 | 4.20 | 5.00 | 5.60 | 6.40 | 5.60 | 5.40 |
+| arith | 5.29 | 1.61 | 5.15 | 5.29 | 5.43 | 5.29 | 5.15 |
+
+- **Block charges** are the largest single class: 20-21% of gamecalls'
+  and gamefn's instructions, 12% of crossing's, 32% of calls2's, 70% of
+  arith's (two-instruction blocks), 2-3% of the float kernels'. Each is
+  seven host instructions: the stop word's pointer and then the word (two
+  dependent loads), the steps loaded, added, compared, stored.
+- **PC stores** cost 1-4%.
+- **Memory checks**: the ablation's stand-in accessor made the code
+  larger at `opt-level` 1 (it cannot be priced that way); statically each
+  access adds a mask test and an alignment test, both predictable. In the
+  machine code there is less: the aligned path (a relaxed atomic) and the
+  misaligned one (`read_unaligned`) are the same x86-64 `mov`, which LLVM
+  merges, so a plain access is `andn mask, address; jne cold` and one
+  `mov` at the view's base plus the address (a dead `test $7` is left of
+  the alignment test). Page protections are the guest's permissions, with
+  no per-access lookup. See "Plain guest memory access" below.
+- **Dispatch**: a block ending in `next_pc = <constant>` goes back
+  through the window's `match` (a compare tree and a jump table; LLVM does
+  not thread the constant through the loop header at any level). In the
+  hot gamefn window a two-instruction block costs one useful instruction,
+  seven for its charge and about eleven for the dispatch.
+- **Register locals**: 22% of the hot gamefn window's instructions (265
+  of 1,173) touch stack slots: its 16 locals and temporaries do not fit
+  x86-64's registers.
+- **`opt-level` 3** for the regions changes 0-15% (vector -15%): not the
+  lever it might seem.
+- `deferred-charges`, `steps-local` and `structured` give nothing at
+  `opt-level` 1, or lose.
+
+**Tried on this basis** (each opt-in, measured the same way):
+
+- `threaded-successors`: a block's constant forward successor that keeps
+  its own arm runs as a copy in the arm instead of going back through the
+  `match` (no loop heads, no SVC or trap ends, `THREADED_LINE_BUDGET`
+  lines of copies per arm; each block keeps its arm, so resuming is
+  unchanged). With a 96-line budget and every successor: gamefn -7%
+  (mispredictions 15.0 to 8.2), gamecalls -6%, crossing -6%, but arith
+  +27% and ldst +12% (copying a loop's head into the outer arm changes
+  the registers of the whole loop), and the aot-tests programs' Rust 9.7x
+  larger. Without loop heads: gamefn -4%, the loops unchanged, 2.8x. With
+  24 lines: gamefn -3%, the rest unchanged, 1.6x the Rust. Not worth its
+  compile time on the game.
+- `cached-stop`: the stop word in a window local (loaded on entry, at
+  every backward dispatch and when an untagged charge does not clear it),
+  so an untagged block's charge is a compare and an add without the two
+  dependent loads; steps stay in the `Core`. +3-4% host instructions on
+  the game-shaped kernels and +13% on arith: under x86-64's register
+  pressure the local lives on the stack, and the backward-dispatch test
+  adds work. `tests/steps_local.rs` checks it charges and stops exactly as
+  per-block charging (every host check point and budget).
+- `known-returns` (earlier): no change at `opt-level` 1.
+- `arm-charges`: an arm (no dispatch inside, so its blocks form a tree)
+  tests once that all its charges fit under the stop word, and its
+  untagged blocks then only add their counts, with the exact checks where
+  the test failed; `tests/steps_local.rs` checks it stops exactly as
+  per-block charging. No gain (gamefn 12.31 to 12.33, ldst 5.20 to 5.60):
+  few arms hold more than one untagged block, and the flag costs a
+  register.
+- One body per entered window (`enter_window_<w>`, above): the kernels'
+  `.text` 550,947 to 544,371 bytes, executed instructions the same or
+  fewer (gamecalls 14.95 to 14.73); the codesize programs with window
+  calls 206.1 to 204.4 `.text` bytes per guest instruction (they enter
+  few windows; the game's copies were 8% of its `.text`).
+- The unaligned-SP trap built in a cold helper instead of an inline
+  `format!` at every stack access: no measurable `.text` change (LLVM
+  already merged those identical cold tails).
+- `long-windows` (earlier), counted the same way: crossing 10.95 to 4.90
+  host instructions per guest instruction (mispredictions 10.2 to 3.4
+  per 100), every other kernel unchanged, with or without
+  `known-returns`; the aot-tests programs' Rust 44% larger (75 to 109
+  MB). The game measured about 8% slower with window-calls, long-windows
+  and known-returns than plain (forest, three rounds): on the kernels
+  neither option adds instructions, so the extra code (instruction cache,
+  predictor capacity, which kernels this small cannot show) is the
+  candidate; a profile of the two translations decides it.
+
+**Where that leaves the cost.** On game-shaped code about 12-15 host
+instructions per guest instruction: roughly 2.5-3 for the charges, 1-1.5
+for the dispatch, a fraction for PC stores and memory checks, and the
+rest the instructions' own work plus the stack traffic of locals that do
+not fit the host's registers. No single change inside blocks found here
+is worth more than a few percent faithfully; the next candidates are
+fewer, larger blocks (charges and dispatch scale with blocks, not
+instructions), and fewer live locals per window (smaller windows or
+liveness-based locals) to cut the stack traffic.
+
 ## Long windows and known returns (opt-in)
 
 A profile of the game's worker threads (forest scene, main) put 69% of
@@ -712,7 +924,14 @@ reaches outside the window (`window_blocks`): breadth first through
 branches, both sides of conditional ones, fallthroughs and call return
 points (no BL targets, no PLT stubs, no indirect branches), within the
 same region, each block with those inlined into it, up to
-`WINDOW_EXTENSION_LIMIT` (256) extra instructions per window. Every block
+`WINDOW_EXTENSION_LIMIT` extra instructions per window, and of those only
+the ones from which the window's own blocks are reached again (loops
+across its edge; a straight run out of the window leaves it once either
+way). Window calls keep the targets plain windows give
+(`window_call_targets`), each with its long window's summary. The first
+version copied every reached block up to 256 instructions and let long
+windows add targets: about 8% slower on the game (forest), its `.text`
+4.4 GB against 2.7, fetch-bound; now 64 instructions and loops only. Every block
 keeps its arm in its own window, which the dispatcher, `Core::call` and
 resuming after a trap, boundary or budget use as before; a copy charges,
 tags and stores the PC exactly as the original, so nothing but the number
@@ -1008,6 +1227,409 @@ every other run edge values), data of random bytes, FZ and DN on and off
 and a rounding mode the float helpers trap on: every register, the data,
 FPSR and the trap must agree; the lift with the option keeps no TBL or
 structure transfer helper call.
+
+## Vector float groups checked by the host's flags (opt-in)
+
+**The game's hottest structured functions** (the regalloc candidate on the
+forest) are 4S multiplies, adds and subtracts: their special-value guards
+took about a quarter of their cycles, 2.3 times the arithmetic they
+protect, and their slow paths almost never ran.
+
+**`mxcsr-groups` (`EmitOptions::mxcsr_groups`, with `inline-vector`, on an
+x86-64 host).** A group (the consecutive operations `vector_runs_in` takes,
+or a single FADD, FSUB, FMUL, FDIV, FMLA or FMLS: `vector_groups_in`)
+whose operations are all vector FADD, FSUB, FMUL, FDIV, FMLA or FMLS
+(whole vectors or by element; 4S, 2S, 2D) computes natively with no
+operand tests (`crate::simd::vector_group_mxcsr`):
+
+- one test of the FPCR mode and the sticky IXC for the group;
+- `mxcsr_clear` clears MXCSR's flags, then the operands load (the clear
+  may write memory, so no load moves above it);
+- each operation's result lanes add to `bad` where they are a NaN, a
+  denormal or exactly the smallest normal (`mxcsr_suspect_4s`: SSE2
+  compares and a movemask; doubles lane by lane);
+- `mxcsr_read(bad)` reads MXCSR (with `bad` as an operand, so every result
+  is computed before it); the group commits when IE, DE, ZE, OE and UE are
+  clear and no lane was bad, else the exact copy reruns it from the
+  unchanged registers.
+
+Why that is exact: a denormal operand raises DE (the host's DAZ and FTZ
+are off), an invalid operation or a signalling NaN IE, a division by zero
+ZE, an overflow OE, a tiny inexact result UE; infinities and zeros
+otherwise give the IEEE results Arm gives and raise nothing; a quiet NaN
+operand gives a NaN result, which the lane test sees (so do DN's default
+NaNs). The lane test covers what the flags miss: x86 detects tininess
+after rounding and raises nothing for an exact denormal result, where Arm
+detects it before rounding and, under FZ, flushes and raises UFC, also for
+a value overwritten later in the group (every result is tested, not only
+the final ones). Groups with FMLA or FMLS need the host's FMA (`fmaf` in
+software rounds through double): without `target_feature = "fma"` they
+always take the exact copy. Groups with other operations keep the runs'
+own fast copy.
+
+`tests/mxcsr_groups.rs` lifts each form alone and a chain reusing
+registers, with the option, against the helpers alone: 60,000 runs from
+lanes drawn from normal, inexact, denormal, smallest normal, values
+rounding to it, zeros, infinities, quiet and signalling NaNs and values
+that overflow or underflow, under FZ, DN, round toward minus infinity and
+FPSR with and without IXC; vectors, FPCR, FPSR and the trap must agree
+(with and without FMA, and with regalloc). Dropping the lane test,
+ignoring the flags, or ignoring UE alone each fail it.
+
+Counted as above (`x86-64-v3`, so with FMA), the game set plus
+`window-calls` ("game") and the regalloc set, each with
+`vector-float-runs`, against the same with `mxcsr-groups`. `vchain` is a
+new kernel shaped like the game's functions: two vectors in, twelve 4S
+multiplies, adds and subtracts reusing V2-V5, one vector out:
+
+| kernel | game | + mxcsr-groups | regalloc | + mxcsr-groups |
+|---|---|---|---|---|
+| vector | 21.72 | 12.86 (-41%) | 20.94 | 12.27 (-41%) |
+| vchain | 13.24 | 10.24 (-23%) | 12.87 | 10.01 (-22%) |
+| vnorm, fpairs, misc, floats, gamefn | | unchanged | | unchanged |
+
+vnorm, fpairs and misc hold forms the groups do not take (FRSQRTE,
+pairwise operations, FABD, FMAXV), so their runs keep their own fast copy.
+The kernel binary's `.text` shrank 4.5 KB (game) and 8.9 KB (regalloc).
+The golden hashes moved by the new lifts alone (the `vchain` kernel and
+`mxcsr_group_code`'s programs; with both removed they are as before):
+`0x279a_09f4_0a57_d429` to `0xa3b3_121e_c0e4_5cd6`, and
+`0x153e_e794_08c5_1d4b` to `0xfdab_2aea_d9c7_830f`.
+
+A first version tested the result lanes in a `for` loop over the `u128`:
+at `opt-level` 1 the host compiler neither unrolls nor vectorizes it, and
+vchain went from 13.2 to 30.8.
+
+**`__m128` values and one test per group.** A group's 4S values are now
+`__m128` locals (`mx_singles` at the first use, `mx_bits` at the commit;
+2S and 2D lanes stay `u128`), and its arithmetic the SSE intrinsics
+themselves (`mx_add`, `mx_mul_add`, `mx_lane` for by element). That alone
+changed no machine code: LLVM had already kept the values in SSE
+registers through the `u128` transmutes. What the disassembly showed
+instead was the lane test: seven instructions after each one-instruction
+operation. A group now tracks its 4S results' extremes (`mx_track`: the
+unsigned minimum of each lane's magnitude minus one, a zero wrapping to
+the top, and the unsigned maximum of its magnitude; four instructions per
+result) and tests them once at its end (`mx_track_bad`: the same
+conditions as two SSE4.1 unsigned compares and one movemask). Its first
+form reduced the extremes lane by lane in scalar code, and the vector
+kernel's three-operation groups lost 18% to it.
+
+| kernel | before mxcsr-groups | per-result tests | one test per group |
+|---|---|---|---|
+| vchain (game) | 13.24 | 10.24 | 8.18 (-38% in all) |
+| vchain (regalloc) | 12.87 | 10.01 | 7.95 (-38%) |
+| vector (game) | 21.72 | 12.86 | 11.72 (-46%) |
+| vector (regalloc) | 20.94 | 12.27 | 11.13 (-47%) |
+
+vnorm is unchanged; `.text` within 200 bytes. `tests/mxcsr_groups.rs`
+fails with the minimum's half or the maximum's half of the tracking
+removed, or with the NaN half of the final test.
+
+**More forms, and groups mixing them with the runs' own.** In four
+singles a group also takes (`mxcsr_singles_only_op`):
+
+- FABD: the difference with the sign cleared (`mx_abs`); a NaN result is
+  the lane test's.
+- FMULX: a multiply; its 0 x infinity (Arm's 2) raises IE on the host.
+- FMAX, FMIN, FMAXNM, FMINNM (`mx_max`, `mx_min`): the host's `maxps` and
+  `minps` raise IE for any NaN operand (quiet ones too) and DE for a
+  denormal, so only lanes without either commit; where the lanes compare
+  equal the result is their AND (max) or OR (min), which is the lane
+  itself unless they are zeros of both signs: Arm's +0 and -0, where the
+  host would return the second operand.
+- FRECPS and FRSQRTS (`mx_recip_step`, `mx_rsqrt_step`): 2 - n * m and
+  (3 - n * m) / 2 with one rounding, so with the host's FMA only; Arm's
+  0 x infinity (2 and 1.5) raises IE; the halving is exact unless the
+  result underflows, which the lane test sees.
+- The pairwise FADDP, FMAXP, FMINP, FMAXNMP, FMINNMP: the adjacent pairs
+  of Vm:Vn as two shuffles (`mx_evens`, `mx_odds`), then the operation.
+
+A group may also hold the operations a vector run's fast copy computes
+with its own tests (`run_other_op`: FRSQRTE, FRECPE, FMAXV, scalar FADDP
+and the rest): they take that code, from the group's values so far
+converted to `u128`, and clear the group's `good` where their own fast
+path would not take a lane; the group commits only with `good`, clean
+flags and no bad lane. So FRSQRTE no longer sends vnorm's whole run to the
+runs' fast copy.
+
+| kernel | game | + these | regalloc | + these |
+|---|---|---|---|---|
+| fpairs | 36.70 | 16.10 (-56%) | 37.52 | 15.53 (-59%) |
+| misc | 63.77 | 48.77 (-24%) | 62.21 | 47.30 (-24%) |
+| vnorm | 22.60 | 20.30 (-10%) | 22.44 | 20.80 (-7%) |
+| vchain, vector | | unchanged | | unchanged |
+
+`.text` shrank 3.8 KB (game) and 8 KB (regalloc). The test now holds every
+one of these forms alone and three groups shaped like vnorm, fpairs and
+misc (FRSQRTE, scalar FADDP and FMAXV among the group's own operations):
+120,000 runs, with FMA, without it and with regalloc, none differing.
+Without the signed-zero correction of FMAX, with the pairs' evens taken as
+odds, or with FABD's sign kept, it fails.
+
+## Step accounting: what needs exact counts (2026-11)
+
+**Who uses the step count.** Generated code charges each block's
+instructions to `Core::steps`; with `regalloc` a structured function counts
+them in a local and tests the stop word (`steps + n + ahead > stop`) at its
+entries, loop heads and call returns, leaving to the windows, which take
+budgets and host boundaries on the same block as window code. The users:
+
+- **Guest-visible values: none by default.** `MRS CNTPCT`/`CNTVCT`
+  (`physical_counter_ticks`) reads host time (`PhysicalCounter` with no
+  rate: `epoch.elapsed()`); steps feed it only with the debug variable
+  `ECHORA_VIRTUAL_CLOCK`, where only monotonic and roughly proportional
+  values matter. NVN timestamps come from the same counter.
+  `GetSystemTick` (SVC 0x1E) is not implemented; `SleepThread` and timed
+  waits use host `Instant` deadlines. No SVC returns a value derived from
+  steps.
+- **Approximate progress accounting:**
+  - scheduler slices (1,000 steps, 50,000 with parallel workers), the
+    timed-wait and audio polling cadence (`HOST_TIMER_CHECK_INSTRUCTIONS`,
+    100,000);
+  - wake-scan throttling (5,000), spin backoff and density (200,000 and
+    64), `spin_hint`'s slice end;
+  - per-thread instruction credits, which are only reported.
+  Cross-worker preemption is driven by priority, not steps (another thread
+  sets `preempt` and stores 0 into the stop word), and the run report
+  already states that switch points depend on the generated block
+  partition, not exact instruction positions.
+- **Budget:** `u64::MAX` for players (the launcher); 1e9 by default for
+  CLI test runs, and synthesised from wall-clock limits. A test stop, not
+  semantics.
+- **Exactness only for tests and diagnostics:** budget traps at exact
+  steps and PCs, every host boundary's PC and step count compared between
+  lift options (`steps_local`, `counter_reads`, `kernel_calls`,
+  `window_calls`, the runtime's unit tests), the per-instruction refund of
+  a trapping block (`settle_block_trap`), trace hits.
+
+The one hard requirement is where execution stops, not the count: a host
+boundary or budget must leave the PC at a block start that can be resumed,
+with the state consistent at SVCs and traps.
+
+**What it costs with regalloc.** Kernels lifted with the regalloc set and
+`regalloc-loop-inlining`, counted as above; "no stop tests" removes the
+structured functions' stop word tests and "no step adds" also their
+per-block `*n += count` (`ECHORA_KERNEL_ABLATE=stop` and `stop,steps`,
+measuring only: neither is faithful):
+
+| kernel | regalloc | no stop tests | no stop tests, no step adds |
+|---|---|---|---|
+| gamefn | 2.67 | 2.63 (-1%) | 2.60 (-3%) |
+| gamecalls | 2.12 | 2.24 (+6%) | 2.05 (-3%) |
+| crossing | 2.30 | 1.88 (-18%) | 1.68 (-27%) |
+| calls2 | 1.39 | 1.31 (-6%) | 1.23 (-12%) |
+| calls | 1.23 | 0.36 (-71%) | 0.36 |
+| vcalls | 11.81 | 9.43 (-20%) | 8.90 (-25%) |
+| arith | 2.43 | 1.39 (-43%) | 1.39 |
+| ldst | 4.86 | 2.60 (-46%) | 2.60 |
+| memset | 7.21 | 5.67 (-21%) | 4.00 (-45%) |
+| switch | 2.55 | 2.18 (-15%) | 1.91 (-25%) |
+
+The game-shaped kernels (gamefn, gamecalls) move by 3%. The large figures
+are tight loops that, with no test left, have no side effect in the loop,
+so the host compiler collapses, unrolls or vectorizes them (calls -71%,
+arith -43%); a thread that must stay preemptible cannot have that. What a
+test actually costs shows in the machine code: in the ldst loop the stop
+word's pointer and the step count are already in registers (LLVM hoisted
+the `Arc` load), and the test is `mov 0x10(%r14), %rax; add $5, %rdx; cmp;
+ja`: one relaxed load and two or three instructions per iteration, plus
+the add of the count. Testing the stop word through a pointer kept in a
+local (tried as an option: the window body's `let stop_word = &*m.stop`)
+changed no kernel (gamefn 2.67 to 2.71, the rest identical) and was
+dropped.
+
+**The poll-flag design, and why it is not built.** A loop head testing
+only a per-thread flag (one relaxed load and a branch, about one
+instruction less than today's test) would end a slice only when something
+set the flag: slices are measured in steps (`host_check_at`), and nothing
+but the steps reaching it ends one today. It needs a host-side source of
+slice ends, such as a timer thread storing 0 into each running core's
+stop word every slice (the cross-worker preemption path already does that
+store), with steps then charged coarsely for the reports and the wait and
+spin heuristics (per call and per loop iteration, an estimate). That is
+an echora-runtime change, and it would make every exact-step test
+compare differently (each would need the exact accounting kept as a
+mode). The gain it can buy is the one instruction per loop iteration
+above, plus the per-block adds (memset's 21% to 45% is the most; the
+game-shaped kernels 1% to 3%). Not worth it before the game shows tight
+loops of this kind dominating.
+
+**A finding on the way: the alignment branch under regalloc.** In the
+structured ldst loop, unlike window code, LLVM did not merge the view's
+aligned (relaxed atomic) and misaligned (`read_unaligned`) paths: each
+access is `test $7, %reg; je` over two identical `mov`s. That is the
+branch the one-instruction access lowering ("Plain guest memory access"
+below) removed, and why it gained 7.4% on ldst with regalloc while losing
+on the window kernels. An inline accessor in `echora-guest` choosing the
+same instruction for both (or a single `asm!` access, as that lowering
+did) would remove it for regalloc; that is a guest change, for the batch.
+
+## Floating point on the regalloc set (2026-11)
+
+Counted as above (the kernels built the game's way, cachegrind, scale 2
+minus scale 1), with the game set plus window-calls ("game") and the
+regalloc set ("regalloc"); host instructions per guest instruction.
+
+**`float-run-loads` takes only loads between a run's operations.** A
+run (`float_runs_in`) no longer starts or ends with S loads: a load that
+leads or ends it runs before or after it as it would alone. The floats
+kernel's block starts with its three loads, which the run held; floatld's
+loads come between its operations.
+
+| kernel | no loads | loads before | loads now |
+|---|---|---|---|
+| floats (game) | 17.11 | 17.89 (+4.5%) | 17.11 |
+| floatld (game) | 26.00 | 18.37 (-29.3%) | 18.63 (-28.3%) |
+| floats (regalloc) | 17.05 | 17.89 (+4.9%) | 17.05 |
+| floatld (regalloc) | 25.98 | 18.36 (-29.3%) | 18.41 (-29.1%) |
+
+`.text` of the kernel binary: 538,851 to 538,707 bytes (game), 616,115 to
+616,019 (regalloc). The golden hashes moved with it (default
+`0xbf59_98a9_1cf0_05b2` to `0x14cd_5b18_6741_5324`, inline-vector
+`0xcf9f_4071_0fe5_727c` to `0xdd3b_fcd4_ea31_f1ae`), only through
+`float_run_load_code`, whose programs lift with float-run-loads on in every
+mode; with the trim undone both hashes are as before. Merged with
+`claude/vigilant-dirac-e24yg5` at 11d52d9 (whose own hashes are
+`0xc1cb_bbf7_f3dc_8b4b` and `0xefbe_5e0a_726e_0329`) they are
+`0x73bb_c562_6345_cce9` and `0x0946_818b_2c33_349f`, again its own with the
+trim undone; with the indirect call sites' statics named in upper-case hex
+(`CALL_SITE_{pc:X}`, so clippy's `non_upper_case_globals` passes on the
+lifted test programs) `0x9047_f551_4f90_3869` and
+`0xe217_ba2b_c432_2edf`. Merged with 5db8463 (its own hashes
+`0x5903_28ef_ed10_45e4` and `0x00d8_4736_2f4d_2c4a`, which this tree
+reproduces with the trim and the upper-case names undone):
+`0xa480_c0ef_6f90_8bd2` and `0xb832_7cb2_b09e_bf28`. Merged with 20bc158
+(its own `0x9e84_3648_63e5_219a` and `0xc443_a540_49d7_6f08`, reproduced the same way): `0x2b43_4d11_deee_88f8`
+and `0xedda_60da_f011_faae`. Merged with d463ae0 (which names call-site
+caches in upper case too; its own `0x7cf4_cca0_c48c_5dc6` and
+`0x3974_9197_5f6e_b628`, reproduced with the trim undone):
+`0xf2d8_5f49_31a5_18a0` and `0x3cbf_5c35_44e7_725a`. Merged with d85a654
+(its own `0x6692_75bb_232c_5e13` and `0x1a35_630d_2c0b_b08d`, reproduced
+with the trim undone): `0x279a_09f4_0a57_d429` and
+`0x153e_e794_08c5_1d4b`. `codegen::tests::float_runs_hold_only_loads_between_their_operations`
+checks the run's bounds; `tests/float_runs.rs` the semantics.
+
+**`cold-fp-exact` (opt-in, `EmitOptions::cold_fp_exact`).** A float run's
+exact copy is marked cold (`core::hint::cold_path`), and the exact scalar
+helpers the inline paths fall back to (`fp_binary`, `fp_ternary`,
+`fp_compare`) are called through one `#[cold] #[inline(never)]` wrapper
+per region. With float-run-loads, against the same without:
+
+| kernel | game | + cold-fp-exact | regalloc | + cold-fp-exact |
+|---|---|---|---|---|
+| floats | 17.11 | 17.06 (-0.3%) | 17.05 | 16.92 (-0.8%) |
+| floatld | 18.63 | 18.21 (-2.3%) | 18.41 | 18.28 (-0.7%) |
+| fpscalar | 66.34 | 66.34 | 65.50 | 65.43 (-0.1%) |
+| scalar | 147.88 | 148.13 (+0.2%) | 146.50 | 146.65 (+0.1%) |
+
+vector, vnorm, misc, gamefn and gamecalls are unchanged. The hot float
+windows' machine code moves by -3% to +4% (floats' function 7,440 to
+7,236 bytes; floatld's window 7,495 to 7,766 without regalloc). The exact
+helpers were already out of line (echora-simd's bodies are separate
+functions; the wrappers are 38-byte calls), so their call sites were
+small already: the hot float code is the inline fast paths' own checks
+(operands and results normal or zero, the FPCR mode and IXC test per
+operation outside runs). Not worth turning on for its gain alone.
+
+**The subtraction V flag.** Fused flags (`fused_condition`) already lower
+a subtraction's GE, LT, GT and LE to one signed host compare, as regalloc's
+`LazyFlags` do. VS and VC were the bit formula `((a ^ b) & (a ^ v)) >>
+63`, six host instructions; they are now the signed subtraction's
+overflow (`overflowing_sub`, `cmp` and `seto`, or one `jo` in a branch),
+and an addition's V (CMN, ADDS) its `overflowing_add`, a CMN's GE six
+host instructions to four. No kernel branches on VS or VC; the fused
+emission changes only there (not in the golden modes), and
+`tests/fused_flags.rs` checks every condition after every setter against
+the reference. Conditions that do not fuse in window code (a CSEL, a
+condition in another block) read the flags `echora-guest`'s `Flags`
+computed, which compute V by the formula and GE as `n == v`.
+
+**`hoist-fp-mode` (opt-in, `EmitOptions::hoist_fp_mode`).** Two or
+more consecutive inlined float operations in a block, outside float runs,
+test the inline paths' FPCR mode and sticky IXC once, before the first
+(`let fp_mode_<pc> = (mode && IXC, FPCR != 0 && mode && IXC)`), and each
+operation reads that instead of testing again; each keeps its operand and
+result tests and its exact fallback. No helper writes FPCR or clears an
+FPSR flag (echora-simd's writes of either are in its tests), so a test
+true before the group stays true, and one false stays false: the group's
+operations then take their exact helpers, as each would until IXC was
+raised. The fallback needs no restart. An MSR, or any instruction without
+the test, ends a group. Groups are per block (`emit_block_body`, which
+windows and regalloc's structured functions share); a structured
+function's straight-line stretch across blocks would need regalloc's own
+emission.
+
+`tests/fp_mode_groups.rs` lifts groups of FMUL, FADD, FDIV, FMADD and
+FSUB (singles and doubles, alone and with an MSR FPSR, which can clear
+IXC, or an MSR FPCR between them, and with FCMP and FMAX among them) with
+every inline path and the option, against the helpers alone: 7,120 runs
+from normal, inexact, denormal, zero, infinite, NaN and overflowing
+operands under FZ, DN, round-toward-minus-infinity, FPSR with and without
+IXC and each value the MSRs write; vectors, FPCR, FPSR, NZCV and the trap
+must agree, with and without regalloc. A hoisted test forced true fails
+`tests/float_runs.rs`; groups running past an instruction without the test
+(an MSR) fail it with 8 mismatches.
+
+| kernel | game | + hoist-fp-mode | regalloc | + hoist-fp-mode |
+|---|---|---|---|---|
+| vnorm | 93.79 | 93.49 (-0.3%) | 94.11 | 93.33 (-0.8%) |
+| fpscalar, floats, floatld, misc, gamefn | | unchanged | | unchanged |
+
+With `inline-fp-scalar` too (fpscalar 19.74, or 18.11 with regalloc,
+against 66.34 without it) nothing more moves: its conversions, FSQRT and
+FRINT test FPCR without IXC, and FMAX and FCMP do not use this test, so
+they form no group. The kernels hold three groups (vector, scalar, vnorm);
+the kernels' window and function code grows 203 bytes without regalloc
+and not at all with it. The per-operation mode test is not where the
+float kernels spend: it is a few predictable instructions on locals, and
+the operand and result tests dominate. Not worth turning on.
+
+## Plain guest memory access (2026-11)
+
+A plain load or store (`wmem.load_u*`/`store_u*`, `GuestAccess` in
+`echora-guest`) is already the view's host base plus the guest address,
+after one test against the reservation's power-of-two mask (an address
+outside it panics). The view's page protections hold the guest's
+permissions: an access the guest may not make faults in the host, whose
+handler names the guest address before the process ends (no guest data
+abort is delivered). Exclusive and ordered accesses check natural
+alignment, LSE atomics a 16-byte block, SP-based accesses SP's alignment,
+each a trap. Nothing on this path consults MMIO or GPU tracking.
+
+An opt-in lowering was tried (not kept): each plain access as one `asm!`
+`mov` (`ldr`/`str` on AArch64) at the base plus the address, after the same
+range test, to drop the alignment branch. Counted as above (game set plus
+window-calls, and the regalloc set), host instructions per guest
+instruction:
+
+| kernel | game set | + one-instruction access | regalloc | + one-instruction access |
+|---|---|---|---|---|
+| ldst | 5.20 | 5.60 | 4.86 | 4.50 |
+| memset | 8.34 | 8.34 | 7.21 | 7.50 |
+| gamefn | 12.49 | 12.44 | 4.68 | 5.14 |
+| gamecalls | 14.98 | 15.41 | 4.66 | 4.74 |
+
+The alignment branch was already gone from the machine code (above), so
+the lowering saved one dead instruction per access and lost it to
+register allocation: the asm cannot fold into memory operands, and its
+mask lived in a stack slot. With the base taken through
+`GuestView::host_span` (a call at every window entry) gamecalls was +20%;
+the figures above read it through inline accessors. What remains per
+access is the range test (two instructions and a register). Removing it
+faithfully needs either a constant base and mask (a fixed-address
+reservation: one guest memory per process) or proof that an address lies
+within the reservation's 1 MiB inaccessible tail of one already tested
+(the second half of a Q or pair access, a base used again with a small
+offset), which turns the panic at the space's end into a host fault.
+
+`tests/memory_faults.rs` checks the faults and traps of every plain,
+exclusive, ordered, atomic and SP-based form against a model of what each
+must do: completed accesses against the reference interpreter, traps by
+kind and address with nothing changed, the panic outside the space, and,
+in child processes, accesses to read-only, unmapped, translated-code and
+past-the-end bytes ending the process by SIGSEGV with the handler naming
+one of those bytes.
 
 ## Counting helper fallbacks (debugging, opt-in)
 

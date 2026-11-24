@@ -772,6 +772,13 @@ fn lift(
         calls.summarized_callers,
         calls.summarized_caller_sites
     );
+    println!(
+        "lifted functions: {} BL targets over the block limit; {} functions hold a jump table; {} instructions in function bodies ({:.0}% of the translation, compiled again as functions)",
+        calls.over_limit,
+        calls.with_jump_tables,
+        calls.function_instructions,
+        100.0 * calls.function_instructions as f64 / d.translation.instructions.len().max(1) as f64
+    );
     let (runs, operations) = echora_lift::codegen::float_run_report(&d.translation, false);
     let (load_runs, load_operations) = echora_lift::codegen::float_run_report(&d.translation, true);
     println!(
@@ -831,6 +838,17 @@ fn lift(
                 "steps-local" => options.steps_local = true,
                 "call-summaries" => options.call_summaries = true,
                 "transitive-summaries" => options.transitive_summaries = true,
+                "call-summaries-audit" => options.call_summaries_audit = true,
+                "threaded-successors" => options.threaded_successors = true,
+                "cached-stop" => options.cached_stop = true,
+                "arm-charges" => options.arm_charges = true,
+                "regalloc" => options.regalloc = true,
+                "regalloc-loop-inlining" => options.regalloc_loop_inlining = true,
+                "regalloc-resume-loops" => options.regalloc_resume_loops = true,
+                "regalloc-crates" => options.regalloc_crates = true,
+                "regalloc-span-regions" => options.regalloc_span_regions = true,
+                "regalloc-resume-returns" => options.regalloc_resume_returns = true,
+                "regalloc-indirect-entries" => options.regalloc_indirect_entries = true,
                 "deferred-charges" => options.deferred_charges = true,
                 "stub-windows" => options.stub_windows = true,
                 "float-runs" => options.float_runs = true,
@@ -840,6 +858,9 @@ fn lift(
                 "window-calls-audit" => options.window_calls_audit = true,
                 "long-windows" => options.long_windows = true,
                 "known-returns" => options.known_returns = true,
+                "cold-fp-exact" => options.cold_fp_exact = true,
+                "hoist-fp-mode" => options.hoist_fp_mode = true,
+                "mxcsr-groups" => options.mxcsr_groups = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
@@ -871,6 +892,43 @@ fn lift(
         }
         Err(_) => BTreeSet::new(),
     };
+    // ECHORA_LIFT_REPORT (comma-separated): extra reports on the lift.
+    // `vector-float`: what keeps vector float operations out of runs
+    // (`echora_lift::vector_float_report`), over the regions of
+    // ECHORA_LIFT_OPTIONS_REGIONS when that is set, weighted by window when
+    // ECHORA_LIFT_REPORT_WEIGHTS names a file of `WEIGHT REGIONHEX
+    // run_window_NAME` lines. `sizes`: every emitted crate's Rust bytes,
+    // functions and largest function (`echora_lift::size_report`), the
+    // largest printed and all of them in `lift-sizes.txt`.
+    let reports = std::env::var("ECHORA_LIFT_REPORT").unwrap_or_default();
+    let size_report = reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "sizes");
+    if reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "vector-float")
+    {
+        let weights = match std::env::var("ECHORA_LIFT_REPORT_WEIGHTS") {
+            Ok(path) => {
+                let text = std::fs::read_to_string(path.trim())
+                    .with_context(|| format!("read {}", path.trim()))?;
+                Some(
+                    echora_lift::vector_float_report::parse_weights(&text)
+                        .map_err(|error| anyhow::anyhow!("ECHORA_LIFT_REPORT_WEIGHTS: {error}"))?,
+                )
+            }
+            Err(_) => None,
+        };
+        let report = echora_lift::vector_float_report::vector_float_report(
+            &d.translation,
+            region_bits,
+            (!listed_regions.is_empty()).then_some(&listed_regions),
+            weights.as_ref(),
+        );
+        print!("{report}");
+    }
     let mut options = EmitOptions::default();
     let mut listed_options = EmitOptions::default();
     let extra = std::env::var("ECHORA_LIFT_OPTIONS").ok();
@@ -886,6 +944,16 @@ fn lift(
             listed_regions.len(),
             extra.as_deref().unwrap_or("")
         );
+    }
+    // ECHORA_REGALLOC_CRATE_BYTES: with regalloc-crates, the bytes of Rust
+    // per region crate (default echora_lift::codegen::REGALLOC_CRATE_BYTES).
+    if let Ok(bytes) = std::env::var("ECHORA_REGALLOC_CRATE_BYTES") {
+        let bytes: usize = bytes
+            .trim()
+            .parse()
+            .with_context(|| format!("ECHORA_REGALLOC_CRATE_BYTES {bytes:?}"))?;
+        options.regalloc_crate_bytes = bytes;
+        listed_options.regalloc_crate_bytes = bytes;
     }
     // The blocks each window runs, as the emission decides (long windows
     // also run blocks of other windows).
@@ -939,6 +1007,7 @@ fn lift(
     }
 
     let start = Instant::now();
+    let mut crate_sizes = Vec::new();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
     let root = emit_rust_split_to_regions(
@@ -955,6 +1024,9 @@ fn lift(
             );
             write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
             source_bytes += source.len() as u64;
+            if size_report {
+                crate_sizes.push(echora_lift::size_report::crate_size(region, &source));
+            }
             written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
             regions.push(region);
             if report_progress {
@@ -964,6 +1036,34 @@ fn lift(
         },
     )?;
     let emit_time = start.elapsed();
+    if size_report {
+        let all = echora_lift::size_report::SizeReport {
+            crates: crate_sizes,
+            top: usize::MAX,
+        };
+        std::fs::write(out.join("lift-sizes.txt"), all.to_string())
+            .context("write lift-sizes.txt")?;
+        let report = echora_lift::size_report::SizeReport {
+            crates: all.crates,
+            top: 30,
+        };
+        print!("{report}");
+        println!("(every crate in {})", out.join("lift-sizes.txt").display());
+    }
+    let capped = echora_lift::codegen::take_capped_functions();
+    if !capped.is_empty() {
+        let list: Vec<String> = capped
+            .iter()
+            .map(|(entry, cap)| format!("{entry:#x} ({cap})"))
+            .collect();
+        println!(
+            "regalloc: {} functions over the size caps ({} instructions, {} bytes of Rust) left to the windows: {}",
+            capped.len(),
+            echora_lift::codegen::FUNCTION_INSTRUCTIONS,
+            echora_lift::codegen::FUNCTION_BYTES,
+            list.join(", ")
+        );
+    }
     if !listed_regions.is_empty() {
         let emitted: BTreeSet<u64> = regions.iter().copied().collect();
         let (present, missing): (Vec<u64>, Vec<u64>) = listed_regions
