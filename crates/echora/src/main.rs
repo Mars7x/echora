@@ -1,6 +1,7 @@
 //! The `echora` command-line front end.
 
 mod host_paths;
+mod layout;
 mod prepare;
 mod shaders;
 
@@ -140,6 +141,24 @@ enum Command {
         /// Guest instruction budget.
         #[arg(long, default_value_t = 1_000_000_000)]
         budget: u64,
+    },
+    /// Write a translation's code layout from a run's host profile
+    /// (ECHORA_HOST_PROFILE): per library, the functions its guest threads
+    /// ran, hottest first, to <translation>/layout/<file>.order. The next
+    /// build links those functions first with 2 MiB aligned segments (only
+    /// the final links run again), and the runtime then puts their code on
+    /// 2 MiB pages.
+    Layout {
+        /// The translation directory (`translation:` in prepare's output).
+        translation: PathBuf,
+        /// The host profile of a run of that translation's build. Profile a
+        /// long stretch (the forest scene: some 2000 presents): its 1 kHz
+        /// samples over a few hundred presents miss warm functions, which
+        /// then fall outside the code put on huge pages.
+        profile: PathBuf,
+        /// Share of the guest-thread samples the ordered functions hold.
+        #[arg(long, default_value_t = 0.999)]
+        coverage: f64,
     },
     /// Extract a package subtree from a NUP, verifying every file.
     Extract {
@@ -350,6 +369,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 prepare::mark_ready(&lifted)?;
             }
             println!("{}ready", prepare::PREFIX);
+        }
+        Command::Layout {
+            translation,
+            profile,
+            coverage,
+        } => {
+            for (file, functions) in layout::write_order_files(&translation, &profile, coverage)? {
+                println!("{file}: {functions} functions");
+            }
+            println!(
+                "order files in {}; the next build of the translation links with them",
+                layout::layout_dir(&translation).display()
+            );
         }
         Command::Run {
             input,
@@ -826,6 +858,9 @@ fn lift(
                 "window-calls-audit" => options.window_calls_audit = true,
                 "long-windows" => options.long_windows = true,
                 "known-returns" => options.known_returns = true,
+                "cold-fp-exact" => options.cold_fp_exact = true,
+                "hoist-fp-mode" => options.hoist_fp_mode = true,
+                "mxcsr-groups" => options.mxcsr_groups = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }
@@ -857,6 +892,43 @@ fn lift(
         }
         Err(_) => BTreeSet::new(),
     };
+    // ECHORA_LIFT_REPORT (comma-separated): extra reports on the lift.
+    // `vector-float`: what keeps vector float operations out of runs
+    // (`echora_lift::vector_float_report`), over the regions of
+    // ECHORA_LIFT_OPTIONS_REGIONS when that is set, weighted by window when
+    // ECHORA_LIFT_REPORT_WEIGHTS names a file of `WEIGHT REGIONHEX
+    // run_window_NAME` lines. `sizes`: every emitted crate's Rust bytes,
+    // functions and largest function (`echora_lift::size_report`), the
+    // largest printed and all of them in `lift-sizes.txt`.
+    let reports = std::env::var("ECHORA_LIFT_REPORT").unwrap_or_default();
+    let size_report = reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "sizes");
+    if reports
+        .split(',')
+        .map(str::trim)
+        .any(|report| report == "vector-float")
+    {
+        let weights = match std::env::var("ECHORA_LIFT_REPORT_WEIGHTS") {
+            Ok(path) => {
+                let text = std::fs::read_to_string(path.trim())
+                    .with_context(|| format!("read {}", path.trim()))?;
+                Some(
+                    echora_lift::vector_float_report::parse_weights(&text)
+                        .map_err(|error| anyhow::anyhow!("ECHORA_LIFT_REPORT_WEIGHTS: {error}"))?,
+                )
+            }
+            Err(_) => None,
+        };
+        let report = echora_lift::vector_float_report::vector_float_report(
+            &d.translation,
+            region_bits,
+            (!listed_regions.is_empty()).then_some(&listed_regions),
+            weights.as_ref(),
+        );
+        print!("{report}");
+    }
     let mut options = EmitOptions::default();
     let mut listed_options = EmitOptions::default();
     let extra = std::env::var("ECHORA_LIFT_OPTIONS").ok();
@@ -866,6 +938,11 @@ fn lift(
     } else {
         apply(&mut options, DEFAULT_OPTIONS)?;
         apply(&mut listed_options, DEFAULT_OPTIONS)?;
+        // ECHORA_LIFT_OPTIONS_OTHERS: added to every region, listed or not.
+        if let Ok(others) = std::env::var("ECHORA_LIFT_OPTIONS_OTHERS") {
+            apply(&mut options, &others)?;
+            apply(&mut listed_options, &others)?;
+        }
         apply(&mut listed_options, extra.as_deref().unwrap_or(""))?;
         println!(
             "per-region options: {} regions (ECHORA_LIFT_OPTIONS_REGIONS) get the defaults plus {:?}; the others the defaults ({DEFAULT_OPTIONS})",
@@ -935,6 +1012,7 @@ fn lift(
     }
 
     let start = Instant::now();
+    let mut crate_sizes = Vec::new();
     let mut regions = Vec::new();
     let (mut written, mut source_bytes) = (0usize, 0u64);
     let root = emit_rust_split_to_regions(
@@ -951,6 +1029,9 @@ fn lift(
             );
             write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
             source_bytes += source.len() as u64;
+            if size_report {
+                crate_sizes.push(echora_lift::size_report::crate_size(region, &source));
+            }
             written += usize::from(write_if_changed(&dir.join("src/lib.rs"), &source)?);
             regions.push(region);
             if report_progress {
@@ -960,6 +1041,20 @@ fn lift(
         },
     )?;
     let emit_time = start.elapsed();
+    if size_report {
+        let all = echora_lift::size_report::SizeReport {
+            crates: crate_sizes,
+            top: usize::MAX,
+        };
+        std::fs::write(out.join("lift-sizes.txt"), all.to_string())
+            .context("write lift-sizes.txt")?;
+        let report = echora_lift::size_report::SizeReport {
+            crates: all.crates,
+            top: 30,
+        };
+        print!("{report}");
+        println!("(every crate in {})", out.join("lift-sizes.txt").display());
+    }
     let capped = echora_lift::codegen::take_capped_functions();
     if !capped.is_empty() {
         let list: Vec<String> = capped
@@ -1025,6 +1120,10 @@ fn lift(
         &out.join("guest/src/lib.rs"),
         "// Generated. Keep this file local.\npub use echora_guest::*;\nextern crate echora_simd;\n",
     )?;
+    write_if_changed(
+        &out.join("guest/build.rs"),
+        &layout::link_script("libechora_guest_shared.so", "../layout"),
+    )?;
     let mut imports = String::new();
     let bundles: Vec<&[u64]> = regions.chunks(BUNDLE_REGIONS).collect();
     for (index, members) in bundles.iter().enumerate() {
@@ -1049,6 +1148,10 @@ fn lift(
         let dir = out.join("bundles").join(index.to_string());
         write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
         write_if_changed(&dir.join("src/lib.rs"), &exports)?;
+        write_if_changed(
+            &dir.join("build.rs"),
+            &layout::link_script(&format!("libechora_bundle_{index}.so"), "../../layout"),
+        )?;
         dispatch.push_str(&format!(
             "echora-bundle-{index} = {{ path = \"../bundles/{index}\" }}\n"
         ));
@@ -1109,6 +1212,12 @@ fn lift(
             );
     }
     write_if_changed(&out.join("runner/src/main.rs"), &runner_main)?;
+    write_if_changed(
+        &out.join("runner/build.rs"),
+        &layout::link_script("echora-run", "../layout"),
+    )?;
+    // Order files of `echora layout`; the build scripts watch this directory.
+    std::fs::create_dir_all(layout::layout_dir(&out))?;
     // Generated code is compiled at a moderate level; the guest crate, the
     // runtime it calls into and the runtime's AV1 decoder (several times
     // slower at level 1) get full optimization.

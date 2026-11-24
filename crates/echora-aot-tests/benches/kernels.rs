@@ -119,6 +119,15 @@ fn prepare(m: &mut Machine, name: &str, scale: u64) -> Option<u64> {
             m.core.cpu.sp = DATA_BASE + DATA_SIZE;
         }
         "switch" => regs[0] = 5_000_000 * scale,
+        "vchain" => {
+            regs[0] = 200 * scale;
+            regs[1] = VECTOR_A;
+            regs[2] = VECTOR_B;
+            regs[3] = BUFFER / 32;
+            // As the game: flush-to-zero and sticky inexact.
+            m.core.cpu.fpsr |= echora_guest::simd::FPSR_IXC;
+            m.core.cpu.fpcr = echora_guest::simd::FPCR_FZ;
+        }
         "vector" => {
             regs[0] = 500 * scale;
             regs[1] = VECTOR_A;

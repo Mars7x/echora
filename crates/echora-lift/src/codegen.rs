@@ -22,7 +22,11 @@ pub const MAX_BLOCKS_PER_FUNCTION: usize = 128;
 const WINDOW_BITS: u32 = 12;
 /// Split crates use 1 KiB windows: densely seeded windows of FP-heavy code
 /// otherwise produce single functions too large to compile in bounded memory.
-const SPLIT_WINDOW_BITS: u32 = 10;
+pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
+
+#[path = "regalloc.rs"]
+mod regalloc;
+pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
 
 #[path = "regalloc.rs"]
 mod regalloc;
@@ -2531,6 +2535,53 @@ impl<T> At<T> for Result<T, Trap> { #[inline(always)] fn at(self, m: &mut echora
 /// The trap of a stack access with SP not 16-byte aligned (`SP_ALIGNMENT_CHECK`).\n\
 #[allow(dead_code)]\n#[cold]\n#[inline(never)]\nfn unaligned_sp(pc: u64) -> Trap { Trap::InvalidState { message: format!(\"unaligned SP memory access at {pc:#x}\") } }\n";
 
+/// With `EmitOptions::cold_fp_exact`, written into a region's source: the
+/// exact scalar float helpers the inline paths fall back to, each behind
+/// one cold, never-inlined wrapper the region's call sites share (the
+/// helpers are inlinable, so each site would otherwise hold a copy).
+const COLD_FP_HELPERS: &[(&str, &str, &str)] = &[
+    (
+        "fp_binary",
+        "op: echora_guest::simd::FpBinaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8",
+        "op, size, rd, rn, rm",
+    ),
+    (
+        "fp_ternary",
+        "op: echora_guest::simd::FpTernaryOp, size: echora_guest::simd::FpSize, rd: u8, rn: u8, rm: u8, ra: u8",
+        "op, size, rd, rn, rm, ra",
+    ),
+    (
+        "fp_compare",
+        "size: echora_guest::simd::FpSize, rn: u8, rm: Option<u8>, signaling: bool",
+        "size, rn, rm, signaling",
+    ),
+];
+
+/// A region's source with `EmitOptions::cold_fp_exact`: its calls of the
+/// helpers in `COLD_FP_HELPERS` through the region's cold wrappers
+/// (written after the header, `header_end` bytes in, for the helpers it
+/// calls).
+fn cold_fp_helpers(source: &str, header_end: usize) -> String {
+    let (header, body) = source.split_at(header_end);
+    let mut body = body.to_owned();
+    let mut wrappers = String::new();
+    for (name, parameters, arguments) in COLD_FP_HELPERS {
+        let call = format!("echora_guest::simd::{name}(");
+        if !body.contains(&call) {
+            continue;
+        }
+        body = body.replace(&call, &format!("cold_{name}("));
+        writeln!(
+            wrappers,
+            "/// `echora_guest::simd::{name}` out of the hot code (`EmitOptions::cold_fp_exact`).\n\
+             #[cold]\n#[inline(never)]\n\
+             fn cold_{name}(cpu: &mut echora_guest::cpu::Cpu, {parameters}) -> Result<(), Trap> {{ echora_guest::simd::{name}(cpu, {arguments}) }}"
+        )
+        .unwrap();
+    }
+    format!("{header}{wrappers}{body}")
+}
+
 /// Whether an instruction's emitted code might observe `m.cpu.pc`: it can
 /// trap or return early, reads the PC, or calls a CPU or SIMD helper other
 /// than the pure arithmetic ones.
@@ -3782,23 +3833,28 @@ fn emit_block_body(
     }
     let count = block.instructions.len();
     let fuse = FUSE.replace(fusion(block));
-    let mut body = String::new();
     let runs = if FLOAT_RUNS.get() {
         float_runs_in(block, FLOAT_RUN_LOADS.get() && INLINE_VECTOR.get())
     } else {
         Vec::new()
     };
     // Vector float runs hold no scalar float run's operation: disjoint.
-    let vector_runs = if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
+    let vector_runs = if MXCSR_GROUPS.get() {
+        vector_groups_in(block)
+    } else if VECTOR_FLOAT_RUNS.get() && INLINE_VECTOR.get() {
         vector_runs_in(block)
     } else {
         Vec::new()
     };
     let mut skip_to = 0;
+    // Each instruction's code, and whether it is an inlined float operation
+    // `hoist_fp_mode` may group (with its PC).
+    let mut pieces: Vec<(String, Option<u64>)> = Vec::new();
     for (index, instruction) in block.instructions.iter().enumerate() {
         if index < skip_to {
             continue;
         }
+        let mut body = String::new();
         if let Some(&(_, end)) = runs.iter().find(|&&(start, _)| start == index) {
             emit_float_run(
                 &mut body,
@@ -3807,6 +3863,7 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
         if let Some(&(_, end)) = vector_runs.iter().find(|&&(start, _)| start == index) {
@@ -3817,6 +3874,7 @@ fn emit_block_body(
                 resumable,
             );
             skip_to = end;
+            pieces.push((body, None));
             continue;
         }
         let block_size = (index == 0 && !REGALLOC_BODY.get()).then_some(count);
@@ -3849,7 +3907,11 @@ fn emit_block_body(
             check_entry,
             resumable,
         );
+        let grouped = (HOIST_FP_MODE.get() && index > 0 && fp_mode_test(&body).is_some())
+            .then_some(instruction.pc);
+        pieces.push((body, grouped));
     }
+    let body = hoist_fp_mode(pieces);
     FUSE.set(fuse);
     if REGALLOC_BODY.get() {
         writeln!(output, "                *n += {count};").unwrap();
@@ -3958,6 +4020,61 @@ fn emit_block_body(
     }
 }
 
+/// The inline paths' FPCR mode and sticky IXC test as an instruction's
+/// code spells it (on `m.cpu` or, with FPCR and FPSR in locals, `r`), if
+/// it holds one.
+fn fp_mode_test(code: &str) -> Option<String> {
+    let test = format!(
+        "{} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0",
+        crate::simd::FP_MODE
+    );
+    let local = test.replace("m.cpu.", "r.");
+    [test, local]
+        .into_iter()
+        .find(|test| code.contains(test.as_str()))
+}
+
+/// A block's instructions' code (`emit_block_body`), with
+/// `EmitOptions::hoist_fp_mode`: two or more consecutive inlined float
+/// operations test the FPCR mode and IXC once, before the first. The test
+/// is all a group's operations share: each keeps its operand and result
+/// tests and its exact fallback. No helper writes FPCR or clears an FPSR
+/// flag (they only add flags), so a test true before the group stays
+/// true; one false stays false, and the group's operations take their
+/// exact helpers, as each would have alone until IXC was raised.
+fn hoist_fp_mode(pieces: Vec<(String, Option<u64>)>) -> String {
+    let mut body = String::new();
+    let mut index = 0;
+    while index < pieces.len() {
+        let end = (index..pieces.len())
+            .find(|&at| pieces[at].1.is_none())
+            .unwrap_or(pieces.len());
+        let Some(first) = pieces[index].1.filter(|_| end - index >= 2) else {
+            body.push_str(&pieces[index].0);
+            index += 1;
+            continue;
+        };
+        let name = format!("fp_mode_{first:x}");
+        let test = fp_mode_test(&pieces[index].0).expect("a grouped operation tests the mode");
+        let fpcr = test.split(" & (").next().expect("the mode test reads FPCR");
+        let nonzero = format!("{fpcr} != 0 && {test}");
+        writeln!(
+            body,
+            "                let {name} = ({test}, {fpcr} != 0 && {test});"
+        )
+        .unwrap();
+        for (code, _) in &pieces[index..end] {
+            body.push_str(
+                &code
+                    .replace(&nonzero, &format!("{name}.1"))
+                    .replace(&test, &format!("{name}.0")),
+            );
+        }
+        index = end;
+    }
+    body
+}
+
 /// Scalar single-precision operations a float run needs at least.
 pub const FLOAT_RUN_MINIMUM: usize = 8;
 
@@ -3982,7 +4099,7 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             index += 1;
             continue;
         }
-        let start = index;
+        let mut start = index;
         let mut arithmetic = 0;
         while index + 1 < count
             && let Some(counts) = kind(&block.instructions[index])
@@ -3990,8 +4107,18 @@ fn float_runs_in(block: &BasicBlock, loads: bool) -> Vec<(usize, usize)> {
             arithmetic += usize::from(counts);
             index += 1;
         }
+        // With `loads`, only loads between the run's operations: one that
+        // leads or ends the run runs before or after it as it would alone.
+        let load = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::float_run_load(op));
+        let mut end = index;
+        while start < end && load(&block.instructions[start]) {
+            start += 1;
+        }
+        while start < end && load(&block.instructions[end - 1]) {
+            end -= 1;
+        }
         if arithmetic >= FLOAT_RUN_MINIMUM {
-            runs.push((start, index));
+            runs.push((start, end));
         }
     }
     runs
@@ -4061,7 +4188,12 @@ fn emit_float_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -4074,7 +4206,7 @@ fn emit_float_run(
 /// block's first instruction (which charges the block) or its last.
 /// Nothing between two of a run's operations writes FPCR, calls a helper
 /// or leaves the block: they are consecutive instructions.
-fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
     let count = block.instructions.len();
     let mut runs = Vec::new();
@@ -4094,6 +4226,311 @@ fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     }
     runs
 }
+
+/// Whether `EmitOptions::mxcsr_groups` is in effect: with `inline_vector`,
+/// on an x86-64 host (the translation builds on the machine that runs it).
+pub fn mxcsr_groups_on(options: &EmitOptions) -> bool {
+    options.mxcsr_groups && options.inline_vector && cfg!(target_arch = "x86_64")
+}
+
+/// Vector float groups in `block` (`EmitOptions::mxcsr_groups`): the runs
+/// `vector_runs_in` finds, and a single operation an MXCSR group takes
+/// (`crate::simd::mxcsr_group_op`) where no run holds it.
+pub(crate) fn vector_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
+    let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::vector_run_op(op));
+    let single = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::mxcsr_group_op(op));
+    let count = block.instructions.len();
+    let mut groups = Vec::new();
+    let mut index = 1;
+    while index + 1 < count {
+        if !held(&block.instructions[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < count && held(&block.instructions[index]) {
+            index += 1;
+        }
+        if index - start >= 2 || single(&block.instructions[start]) {
+            groups.push((start, index));
+        }
+    }
+    groups
+}
+
+/// With `EmitOptions::mxcsr_groups`, written into a region's header: the
+/// host's floating-point exception flags, cleared before a group and read
+/// after it. `mxcsr_read` takes a value computed from every result of the
+/// group as an operand, so the host compiler computes them first; the
+/// group loads its operands after `mxcsr_clear`, which may write memory.
+const MXCSR_HELPER: &str = r#"/// MXCSR's IE, DE, ZE, OE and UE flags (`EmitOptions::mxcsr_groups`).
+#[allow(dead_code)]
+const MXCSR_EXCEPTIONS: u32 = 0x1f;
+/// Clears MXCSR's exception flags.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_clear() {
+    let mut csr = 0u32;
+    // SAFETY: stores, changes and loads MXCSR through a local; only the
+    // sticky flags (bits 0-5) change.
+    unsafe { core::arch::asm!("stmxcsr [{p}]", "and dword ptr [{p}], -64", "ldmxcsr [{p}]", p = in(reg) &mut csr, options(nostack)) }
+}
+/// The lanes of a 4S (or 2S, upper lanes zero) result an MXCSR group
+/// cannot trust: a denormal, exactly the smallest normal, or a NaN (a bit
+/// per lane; `crate::simd::vector_group_mxcsr`). With the sign cleared the
+/// signed compares order the magnitudes.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_4s(value: u128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target; the transmutes keep
+    // all 128 bits in lane order.
+    unsafe {
+        let v: __m128i = core::mem::transmute::<u128, __m128i>(value);
+        let a = _mm_and_si128(v, _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// Four singles in an SSE register, and back (`crate::simd::vector_group_mxcsr`
+/// keeps a group's 4S values as `__m128`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_singles(value: u128) -> core::arch::x86_64::__m128 {
+    // SAFETY: both are 128 bits; the lanes keep their order.
+    unsafe { core::mem::transmute::<u128, core::arch::x86_64::__m128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_bits(value: core::arch::x86_64::__m128) -> u128 {
+    // SAFETY: as `mx_singles`.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128, u128>(value) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: SSE is part of every x86-64 target.
+    unsafe { core::arch::x86_64::_mm_add_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_sub_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_mul_ps(a, b) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_div(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_div_ps(a, b) }
+}
+/// a * b + c, one rounding (FMLA). Without the host's FMA the group never
+/// commits (its condition tests the feature); the lanes are then only
+/// placeholders.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_add(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_add(mx_mul(a, b), c);
+}
+/// c - a * b, one rounding (FMLS).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_mul_sub(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128, c: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    #[cfg(target_feature = "fma")]
+    // SAFETY: the target has FMA.
+    return unsafe { core::arch::x86_64::_mm_fnmadd_ps(a, b, c) };
+    #[cfg(not(target_feature = "fma"))]
+    return mx_sub(c, mx_mul(a, b));
+}
+/// |a| (FABD's last step: clears every lane's sign).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_abs(a: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe { _mm_and_ps(a, _mm_castsi128_ps(_mm_set1_epi32(0x7fff_ffff))) }
+}
+/// FMAX and FMAXNM where no lane is a NaN (any NaN raises IE): the larger
+/// lane, and +0 of +0 and -0 (where the lanes compare equal their AND,
+/// which is the lane itself unless they are zeros of both signs).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_max_ps(a, b)), _mm_and_ps(equal, _mm_and_ps(a, b)))
+    }
+}
+/// FMIN and FMINNM as `mx_max`: -0 of +0 and -0 (their OR).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let equal = _mm_cmpeq_ps(a, b);
+        _mm_or_ps(_mm_andnot_ps(equal, _mm_min_ps(a, b)), _mm_and_ps(equal, _mm_or_ps(a, b)))
+    }
+}
+/// FRECPS: 2 - a * b, one rounding (needs the host's FMA, as `mx_mul_add`).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_recip_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let two = unsafe { core::arch::x86_64::_mm_set1_ps(2.0) };
+    mx_mul_sub(a, b, two)
+}
+/// FRSQRTS: (3 - a * b) / 2, one rounding and an exact halving where the
+/// result is normal (the lane test sees the rest).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_rsqrt_step(a: core::arch::x86_64::__m128, b: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    let (three, half) = unsafe { (core::arch::x86_64::_mm_set1_ps(3.0), core::arch::x86_64::_mm_set1_ps(0.5)) };
+    mx_mul(mx_mul_sub(a, b, three), half)
+}
+/// The first of each adjacent pair of Vm:Vn (pairwise forms): n0, n2,
+/// m0, m2.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_evens(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b10_00_10_00>(n, m) }
+}
+/// The second of each pair: n1, n3, m1, m3.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_odds(n: core::arch::x86_64::__m128, m: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    // SAFETY: as `mx_add`.
+    unsafe { core::arch::x86_64::_mm_shuffle_ps::<0b11_01_11_01>(n, m) }
+}
+/// Lane `lane` of `a` in every lane (by element).
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lane(a: core::arch::x86_64::__m128, lane: u8) -> core::arch::x86_64::__m128 {
+    use core::arch::x86_64::_mm_shuffle_ps;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        match lane & 3 {
+            0 => _mm_shuffle_ps::<0x00>(a, a),
+            1 => _mm_shuffle_ps::<0x55>(a, a),
+            2 => _mm_shuffle_ps::<0xaa>(a, a),
+            _ => _mm_shuffle_ps::<0xff>(a, a),
+        }
+    }
+}
+/// `mxcsr_suspect_4s` of an `__m128`.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_suspect_singles(value: core::arch::x86_64::__m128) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: as `mx_add`.
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        let tiny = _mm_and_si128(_mm_cmpgt_epi32(a, _mm_setzero_si128()), _mm_cmplt_epi32(a, _mm_set1_epi32(0x0080_0001)));
+        let nan = _mm_cmpgt_epi32(a, _mm_set1_epi32(0x7f80_0000));
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(tiny, nan))) as u64
+    }
+}
+/// The running extremes of a group's 4S results (`mx_track`): the
+/// unsigned minimum of each lane's magnitude minus one (a zero wraps to the
+/// top) and the unsigned maximum of its magnitude.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_start() -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe { (_mm_set1_epi32(-1), _mm_setzero_si128()) }
+}
+/// Adds a result to the extremes: four instructions, where testing it
+/// alone (`mxcsr_suspect_singles`) takes seven.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track(value: core::arch::x86_64::__m128, lo: &mut core::arch::x86_64::__m128i, hi: &mut core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE4.1's `pminud`/`pmaxud` where the target has it (else
+    // the compiler emulates them with SSE2).
+    unsafe {
+        let a = _mm_and_si128(_mm_castps_si128(value), _mm_set1_epi32(0x7fff_ffff));
+        *lo = mx_min_u32(*lo, _mm_add_epi32(a, _mm_set1_epi32(-1)));
+        *hi = mx_max_u32(*hi, a);
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_min_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_min_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].min(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_max_u32(a: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    #[cfg(target_feature = "sse4.1")]
+    // SAFETY: the target has SSE4.1.
+    return unsafe { core::arch::x86_64::_mm_max_epu32(a, b) };
+    #[cfg(not(target_feature = "sse4.1"))]
+    {
+        let (x, y): ([u32; 4], [u32; 4]) = (mx_lanes(a), mx_lanes(b));
+        mx_from_lanes(std::array::from_fn(|lane| x[lane].max(y[lane])))
+    }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_lanes(a: core::arch::x86_64::__m128i) -> [u32; 4] {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<core::arch::x86_64::__m128i, [u32; 4]>(a) }
+}
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_from_lanes(a: [u32; 4]) -> core::arch::x86_64::__m128i {
+    // SAFETY: 128 bits either way.
+    unsafe { core::mem::transmute::<[u32; 4], core::arch::x86_64::__m128i>(a) }
+}
+/// Whether the extremes saw a denormal, the smallest normal (some lane's
+/// magnitude minus one below it) or a NaN (a magnitude above infinity's).
+/// Unsigned compares as SSE4.1's min and max and an equality: `lo` below
+/// 0x0080_0000 where min(lo, 0x007f_ffff) is `lo`, `hi` above 0x7f80_0000
+/// where max(hi, 0x7f80_0001) is `hi`; one movemask for both.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mx_track_bad(lo: core::arch::x86_64::__m128i, hi: core::arch::x86_64::__m128i) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of every x86-64 target.
+    unsafe {
+        let tiny = _mm_cmpeq_epi32(mx_min_u32(lo, _mm_set1_epi32(0x007f_ffff)), lo);
+        let nan = _mm_cmpeq_epi32(mx_max_u32(hi, _mm_set1_epi32(0x7f80_0001)), hi);
+        _mm_movemask_epi8(_mm_or_si128(tiny, nan)) as u64
+    }
+}
+/// MXCSR, read after `after` is computed.
+#[allow(dead_code, unsafe_code)]
+#[inline(always)]
+fn mxcsr_read(after: u64) -> u32 {
+    let mut csr = 0u32;
+    // SAFETY: stores MXCSR into a local; `after` only orders the read.
+    unsafe { core::arch::asm!("/* {a} */", "stmxcsr [{p}]", a = in(reg) after, p = in(reg) &mut csr, options(nostack)) }
+    csr
+}
+"#;
 
 /// A vector float run (`vector_runs_in`), emitted twice: the fast copy
 /// (`crate::simd::vector_run_fast`), committed only when FPCR is in the
@@ -4115,17 +4552,38 @@ fn emit_vector_run(
             _ => unreachable!("vector runs hold SIMD operations"),
         })
         .collect();
-    let (fast, finals) = crate::simd::vector_run_fast(&ops);
-    let commits: String = finals
-        .iter()
-        .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
-        .collect();
-    writeln!(
-        output,
-        "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
-        crate::simd::FP_MODE
-    )
-    .unwrap();
+    if MXCSR_GROUPS.get() && crate::simd::mxcsr_group(&ops) {
+        let (fast, finals, fused) = crate::simd::vector_group_mxcsr(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        // Fused operations need the host's FMA (`fmaf` in software rounds
+        // through double): without it the exact copy runs.
+        let fma = if fused {
+            " && cfg!(target_feature = \"fma\")"
+        } else {
+            ""
+        };
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0{fma} && {{ {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    } else {
+        let (fast, finals) = crate::simd::vector_run_fast(&ops);
+        let commits: String = finals
+            .iter()
+            .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
+            .collect();
+        writeln!(
+            output,
+            "                {{ let committed = {} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && {{ let mut good = true; {fast}if good {{ {commits}}} good }};",
+            crate::simd::FP_MODE
+        )
+        .unwrap();
+    }
     // The exact copy, marked for `crate::census` (which counts the tests of
     // the path taken when the fast copy commits).
     let (open, close) = if crate::simd::census_on() {
@@ -4133,7 +4591,12 @@ fn emit_vector_run(
     } else {
         ("", "")
     };
-    writeln!(output, "                if !committed {{{open}").unwrap();
+    let cold = if COLD_FP_EXACT.get() {
+        " core::hint::cold_path();"
+    } else {
+        ""
+    };
+    writeln!(output, "                if !committed {{{cold}{open}").unwrap();
     for record in run {
         emit_instruction(output, record, false, None, check_entry, resumable);
     }
@@ -4974,6 +5437,13 @@ thread_local! {
     static RET_LEAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::known_returns` of the region being emitted.
     static KNOWN_RETURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::cold_fp_exact` of the region being emitted.
+    static COLD_FP_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::hoist_fp_mode` of the region being emitted.
+    static HOIST_FP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::mxcsr_groups` of the region being emitted, on an
+    /// x86-64 host.
+    static MXCSR_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6110,6 +6580,27 @@ pub struct EmitOptions {
     /// limit) leaves the window, and its caller or the dispatcher goes on
     /// from the PC as with any exit.
     pub known_returns: bool,
+    /// The exact paths of inlined float operations out of the hot code: a
+    /// float run's exact copy is marked cold (`core::hint::cold_path`), and
+    /// each exact scalar helper the inline paths fall back to (`fp_binary`,
+    /// `fp_ternary`, `fp_compare`, inlinable in echora-simd) is called
+    /// through one cold, never-inlined wrapper per region
+    /// (`COLD_FP_HELPERS`), so the inline fast paths stay small.
+    pub cold_fp_exact: bool,
+    /// Consecutive inlined float operations in a block (outside float
+    /// runs) test the inline paths' FPCR mode and sticky IXC once, before
+    /// the first (`hoist_fp_mode`): no helper writes FPCR or clears an
+    /// FPSR flag, so the test cannot turn false inside the group, and each
+    /// operation keeps its own exact fallback.
+    pub hoist_fp_mode: bool,
+    /// With `inline_vector`, on an x86-64 host: vector float groups
+    /// (consecutive operations `vector_runs_in` takes, and single FADD,
+    /// FSUB, FMUL, FDIV, FMLA or FMLS) whose operations are all
+    /// `crate::simd::mxcsr_group_op` compute natively with no operand
+    /// tests, checked once by the host's exception flags and a test of
+    /// each result's lanes (`crate::simd::vector_group_mxcsr`); any hit
+    /// reruns the group exactly from its unchanged registers.
+    pub mxcsr_groups: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -6709,10 +7200,12 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
                     format!("(v >> {sign}) & 1 != 0"),
                     format!("(v >> {sign}) & 1 == 0"),
                 ),
-                3 => (
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 != 0"),
-                    format!("((a ^ b) & (a ^ v)) >> {sign} & 1 == 0"),
-                ),
+                // V: the signed subtraction overflows (one host subtract
+                // and its overflow flag).
+                3 => {
+                    let overflows = format!("{}.overflowing_sub({}).1", signed("a"), signed("b"));
+                    (overflows.clone(), format!("!{overflows}"))
+                }
                 4 => (compare(">", false), compare("<=", false)),
                 5 => (compare(">=", true), compare("<", true)),
                 _ => (compare(">", true), compare("<=", true)),
@@ -6726,7 +7219,9 @@ fn fused_condition(arithmetic: Option<bool>, bits: u8, condition: u8) -> String 
         Some(false) => format!(
             "let a = lhs & {mask}; let b = rhs & {mask}; let v = value & {mask}; \
              let n = (v >> {sign}) & 1 != 0; let z = v == 0; let c = v < a; \
-             let o = (!(a ^ b) & (a ^ v)) >> {sign} & 1 != 0;"
+             let o = {}.overflowing_add({}).1;",
+            signed("a"),
+            signed("b")
         ),
         // ANDS (TST): N and Z from the result, C and V clear.
         None => format!(
@@ -6843,6 +7338,9 @@ struct RegionSettings {
     ret_leaves: Flag,
     audit: Flag,
     known_returns: Flag,
+    cold_fp_exact: Flag,
+    hoist_fp_mode: Flag,
+    mxcsr_groups: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -6929,6 +7427,9 @@ impl RegionSettings {
                         && options.call_summaries_audit),
             ),
             known_returns: Flag::set(&KNOWN_RETURNS, options.known_returns),
+            cold_fp_exact: Flag::set(&COLD_FP_EXACT, options.cold_fp_exact),
+            hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
+            mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
@@ -7304,6 +7805,9 @@ pub fn emit_rust_split_to_regions<E>(
                 header.push_str("#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_at(m: &mut Machine, index: usize) -> Result<(), Trap> { function_at(index)(m) }\n#[allow(dead_code)]\n#[inline(always)]\nfn run_entry_pc(m: &mut Machine) -> Result<(), Trap> { m.run_function_at_pc() }\n");
             }
         }
+        if mxcsr_groups_on(&options) {
+            header.push_str(MXCSR_HELPER);
+        }
         if options.count_fallbacks {
             header.push_str(&format!(
                 "/// Calls of each helper inlined code fell back to (`FALLBACK_HELPERS` of the root).\n\
@@ -7489,6 +7993,7 @@ pub fn emit_rust_split_to_regions<E>(
             &window_calls,
         );
         let mut source = header_of(options);
+        let header_end = source.len();
         let split = options.functions
             && options.function_table
             && options.regalloc
@@ -7712,6 +8217,9 @@ pub fn emit_rust_split_to_regions<E>(
             for (_, text) in functions_first {
                 source.push_str(&text);
             }
+            if options.cold_fp_exact {
+                source = cold_fp_helpers(&source, header_end);
+            }
             placed.sources.push((region, unindent(&source)));
             REGALLOC_FUNCTION_BYTES.set(outer_bytes);
             return placed;
@@ -7768,6 +8276,13 @@ pub fn emit_rust_split_to_regions<E>(
         }
         for (index, text) in crates.into_iter().enumerate() {
             if index == 0 || text.len() > header.len() {
+                // Each crate starts with the header; with `cold_fp_exact`
+                // it gets its own wrappers after it.
+                let text = if options.cold_fp_exact {
+                    cold_fp_helpers(&text, header.len())
+                } else {
+                    text
+                };
                 placed.sources.push((id(index as u64), unindent(&text)));
             }
         }
@@ -8649,6 +9164,225 @@ mod tests {
         )
         .unwrap();
         assert!(!inlined_blocks(&translation).contains(&0x100c));
+    }
+
+    /// Where two options take the same thing, the emission with both is
+    /// the winner's alone, and the loser alone changes it (so the
+    /// comparison sees something): deferred charges turn the step-count
+    /// local off, and a BL to a lifted function calls it whatever
+    /// `direct_calls` says.
+    #[test]
+    fn overlapping_options_emit_the_winners_code() {
+        let emit = |translation: &Translation, options: EmitOptions| {
+            let (root, regions) = emit_rust_split_with(translation, 16, options);
+            let mut text = root;
+            for (_, source) in regions {
+                text.push_str(&source);
+            }
+            text
+        };
+        let base = EmitOptions {
+            split_ticks: true,
+            untagged_blocks: true,
+            ..EmitOptions::default()
+        };
+        // ADD X0, X0, #1; SUBS X1, X1, #1; B.NE -8; BL +12; SVC; (pad);
+        // ADD X2, X2, #1; RET.
+        let translation = discover(
+            &[region(&[
+                0x9100_0400,
+                0xf100_0421,
+                0x54ff_ffc1,
+                0x9400_0003,
+                0xd400_00e1,
+                0xd503_201f,
+                0x9100_0442,
+                0xd65f_03c0,
+            ])],
+            &[0x1000],
+            16,
+        )
+        .unwrap();
+        let deferred = EmitOptions {
+            deferred_charges: true,
+            ..base
+        };
+        let steps_local = EmitOptions {
+            steps_local: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, steps_local), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    steps_local: true,
+                    ..deferred
+                }
+            ),
+            emit(&translation, deferred)
+        );
+        let functions = EmitOptions {
+            functions: true,
+            ..base
+        };
+        let direct = EmitOptions {
+            direct_calls: true,
+            ..base
+        };
+        assert!(emit(&translation, direct).contains("m.call_window(0x1010, run_window_"));
+        let both = emit(
+            &translation,
+            EmitOptions {
+                direct_calls: true,
+                ..functions
+            },
+        );
+        assert!(
+            both.contains("m.call_window(0x1010, run_function_1018)"),
+            "{both}"
+        );
+        assert_eq!(both, emit(&translation, functions));
+        // Window calls give way to lifted functions; with direct calls, a
+        // BL to a summarized target is a window call.
+        let window_calls = EmitOptions {
+            window_calls: true,
+            ..base
+        };
+        assert_ne!(emit(&translation, window_calls), emit(&translation, base));
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    window_calls: true,
+                    ..functions
+                }
+            ),
+            emit(&translation, functions)
+        );
+        assert_eq!(
+            emit(
+                &translation,
+                EmitOptions {
+                    direct_calls: true,
+                    ..window_calls
+                }
+            ),
+            emit(&translation, window_calls)
+        );
+        // Long windows give way to lifted functions and deferred charges
+        // (on a loop across a window edge, which they change).
+        let (crossing, _) = crossing_function();
+        let long = EmitOptions {
+            long_windows: true,
+            ..base
+        };
+        assert_ne!(emit(&crossing, long), emit(&crossing, base));
+        for winner in [functions, deferred] {
+            assert_eq!(
+                emit(
+                    &crossing,
+                    EmitOptions {
+                        long_windows: true,
+                        ..winner
+                    }
+                ),
+                emit(&crossing, winner)
+            );
+        }
+    }
+
+    #[test]
+    fn cold_fp_exact_moves_the_exact_paths_out_of_line() {
+        // A float run of eight FMUL S2, S0, S1 between NOPs, an FADD S2,
+        // S2, S3, an FCMP S0, S1 and an FMADD S0, S1, S2, S3; SVC.
+        let mut words = vec![0xd503_201f];
+        words.extend([0x1e21_0802; 8]);
+        words.extend([
+            0xd503_201f,
+            0x1e23_2842,
+            0x1e21_2000,
+            0x1f02_0c20,
+            0xd400_00e1,
+        ]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let emit = |cold_fp_exact| {
+            let options = EmitOptions {
+                inline_vector: true,
+                float_runs: true,
+                split_ticks: true,
+                cold_fp_exact,
+                ..EmitOptions::default()
+            };
+            let (_, regions) = emit_rust_split_with(&translation, 16, options);
+            regions
+                .into_iter()
+                .map(|(_, source)| source)
+                .collect::<String>()
+        };
+        let (plain, cold) = (emit(false), emit(true));
+        for name in ["fp_binary", "fp_ternary", "fp_compare"] {
+            let direct = format!("echora_guest::simd::{name}(&mut m.cpu");
+            assert!(plain.contains(&direct), "{name}");
+            assert!(!cold.contains(&direct), "{name}");
+            assert_eq!(
+                cold.matches(&format!("fn cold_{name}(")).count(),
+                1,
+                "{name}: one wrapper per region"
+            );
+            assert_eq!(
+                cold.matches(&format!("cold_{name}(&mut m.cpu")).count(),
+                plain.matches(&direct).count(),
+                "{name}: every call through it"
+            );
+        }
+        assert!(cold.contains("if !committed { core::hint::cold_path();"));
+        assert!(!plain.contains("cold_path") && !plain.contains("fn cold_"));
+        // Nothing else changes.
+        let undone = COLD_FP_HELPERS.iter().fold(
+            cold.replace(" core::hint::cold_path();", ""),
+            |text, (name, _, _)| {
+                text.replace(
+                    &format!("cold_{name}("),
+                    &format!("echora_guest::simd::{name}("),
+                )
+            },
+        );
+        let without_wrappers: String = undone
+            .lines()
+            .filter(|line| {
+                !line.contains("out of the hot code (`EmitOptions::cold_fp_exact`)")
+                    && *line != "#[cold]"
+                    && *line != "#[inline(never)]"
+                    && !line.starts_with("fn echora_guest::simd::")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let plain_lines: String = plain
+            .lines()
+            .filter(|line| *line != "#[cold]" && *line != "#[inline(never)]")
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(without_wrappers, plain_lines);
+    }
+
+    #[test]
+    fn float_runs_hold_only_loads_between_their_operations() {
+        // NOP; LDR S0, [X1]; LDR S1, [X1, #4]; four FMUL S2, S0, S1;
+        // LDR S3, [X1, #8]; four FADD S2, S2, S3; LDR S4, [X1, #12]; SVC.
+        let mut words = vec![0xd503_201f, 0xbd40_0020, 0xbd40_0421];
+        words.extend([0x1e21_0802; 4]);
+        words.push(0xbd40_0823);
+        words.extend([0x1e23_2842; 4]);
+        words.extend([0xbd40_0c24, 0xd400_00e1]);
+        let translation = discover(&[region(&words)], &[0x1000], 32).unwrap();
+        let block = &translation.blocks[0];
+        assert_eq!(block.instructions.len(), words.len());
+        // The leading and trailing loads stay outside; the one between
+        // operations is held.
+        assert_eq!(float_runs_in(block, true), [(3, 12)]);
+        // Without loads, no eight consecutive operations.
+        assert!(float_runs_in(block, false).is_empty());
     }
 
     #[test]
@@ -10122,9 +10856,7 @@ mod tests {
         words[0x100] = 0x9100_0400; // 0x1400: add x0, x0, #1 (F's return point)
         words[0x101] = 0xd65f_03c0; // 0x1404: ret
         // 0x1408: G, too long to run inlined: 30 ADDs, RET.
-        for at in 0x102..0x102 + 30 {
-            words[at] = 0x9100_0400;
-        }
+        words[0x102..0x102 + 30].fill(0x9100_0400);
         words[0x102 + 30] = 0xd65f_03c0;
         let translation = discover(&[region(&words)], &[0x1000], words.len()).unwrap();
         let options = EmitOptions {

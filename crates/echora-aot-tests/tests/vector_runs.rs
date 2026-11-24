@@ -13,7 +13,13 @@
 //! three FPCR and FPSR settings of the edge-table tests, FPSR without IXC
 //! (no run commits) and a rounding mode the helpers trap on, with X5 any
 //! of those modes. The vector registers, FPCR, FPSR and the trap must
-//! agree, every program from every state.
+//! agree, every program from every state. The lift with runs has every
+//! per-instruction inline option (`inline-vector-unary`, `-int`,
+//! `-pairwise`, `inline-fp-scalar`, `inline-vector-misc`) in every other
+//! 1 KiB region as well (`split_alternate`), so a run's exact copy is
+//! there those options' code, the helpers' elsewhere: where a run and an
+//! option take the same form, the run's fast copy runs and falls back to
+//! the option's code.
 #![cfg(any(target_os = "linux", windows))]
 #![allow(clippy::unwrap_used)]
 
