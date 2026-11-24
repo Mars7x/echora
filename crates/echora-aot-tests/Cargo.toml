@@ -118,6 +118,9 @@ mxcsr-groups = []
 # With inline-vector and whole-vector-checks: lanes with infinite operands
 # whose results are exact run natively (EmitOptions::special_lanes).
 special-lanes = []
+# The inline paths' float tests as functions in each region's header, bound
+# by name in each operation (EmitOptions::shared_float_tests).
+shared-float-tests = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []
