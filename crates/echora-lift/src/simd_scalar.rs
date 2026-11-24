@@ -206,7 +206,8 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
             let target_kit = target_kit
                 .replace("let normal =", "let target_normal =")
                 .replace("let zero =", "let target_zero =")
-                .replace("let usable = |value", "let target_usable = |value")
+                // Closures or the header's functions bound by name.
+                .replace("let usable =", "let target_usable =")
                 .replace(
                     "normal(value) | zero(value)",
                     "target_normal(value) | target_zero(value)",

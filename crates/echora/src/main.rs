@@ -867,6 +867,7 @@ fn lift(
                 "hoist-fp-mode" => options.hoist_fp_mode = true,
                 "mxcsr-groups" => options.mxcsr_groups = true,
                 "special-lanes" => options.special_lanes = true,
+                "shared-float-tests" => options.shared_float_tests = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }

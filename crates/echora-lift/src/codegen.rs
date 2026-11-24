@@ -4432,6 +4432,23 @@ pub(crate) fn special_lanes_on() -> bool {
     SPECIAL_LANES.get()
 }
 
+/// `EmitOptions::shared_float_tests` of the region being emitted.
+pub(crate) fn shared_float_tests_on() -> bool {
+    SHARED_FLOAT_TESTS.get()
+}
+
+/// With `EmitOptions::shared_float_tests`, written into a region's header:
+/// the inline paths' tests of a raw single or double (`crate::simd`'s
+/// `float_kit`), which each operation binds by name.
+const FLOAT_TEST_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn fp_normal_32(value: u32) -> bool { let field = value & 0x7f80_0000u32; field != 0 && field != 0x7f80_0000u32 }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_zero_32(value: u32) -> bool { value & !0x8000_0000u32 == 0 }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_usable_32(value: u32) -> bool { fp_normal_32(value) | fp_zero_32(value) }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_smallest_normal_32(value: u32) -> bool { value & 0x7fff_ffffu32 == 0x0080_0000u32 }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_normal_64(value: u64) -> bool { let field = value & 0x7ff0_0000_0000_0000u64; field != 0 && field != 0x7ff0_0000_0000_0000u64 }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_zero_64(value: u64) -> bool { value & !0x8000_0000_0000_0000u64 == 0 }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_usable_64(value: u64) -> bool { fp_normal_64(value) | fp_zero_64(value) }\n\
+#[allow(dead_code)]\n#[inline(always)]\nfn fp_smallest_normal_64(value: u64) -> bool { value & 0x7fff_ffff_ffff_ffffu64 == 0x0010_0000_0000_0000u64 }\n";
+
 /// Whether `EmitOptions::mxcsr_groups` is in effect: with `inline_vector`,
 /// on an x86-64 host (the translation builds on the machine that runs it).
 pub fn mxcsr_groups_on(options: &EmitOptions) -> bool {
@@ -5769,6 +5786,8 @@ thread_local! {
     static MXCSR_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::special_lanes` of the region being emitted.
     static SPECIAL_LANES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::shared_float_tests` of the region being emitted.
+    static SHARED_FLOAT_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -6960,6 +6979,13 @@ pub struct EmitOptions {
     /// arithmetic on infinities is Arm's and raises nothing. Other lanes
     /// still take the exact single-lane helper (`special_lanes_on`).
     pub special_lanes: bool,
+    /// The inline paths' operand and result tests (`normal`, `zero`,
+    /// `usable`, `smallest_normal`) as functions written once into each
+    /// region's header (`FLOAT_TEST_HELPER`, `#[inline(always)]`) and bound
+    /// by name in each operation, in place of closures defined in every
+    /// one: the same code, but no closure for rustc to infer, check and
+    /// lower per inlined float operation.
+    pub shared_float_tests: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -7729,6 +7755,7 @@ struct RegionSettings {
     hoist_fp_mode: Flag,
     mxcsr_groups: Flag,
     special_lanes: Flag,
+    shared_float_tests: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -7824,6 +7851,7 @@ impl RegionSettings {
             hoist_fp_mode: Flag::set(&HOIST_FP_MODE, options.hoist_fp_mode),
             mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
             special_lanes: Flag::set(&SPECIAL_LANES, options.special_lanes),
+            shared_float_tests: Flag::set(&SHARED_FLOAT_TESTS, options.shared_float_tests),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
@@ -8215,6 +8243,9 @@ pub fn emit_rust_split_to_regions<E>(
         }
         if mxcsr_groups_on(&options) {
             header.push_str(MXCSR_HELPER);
+        }
+        if options.shared_float_tests {
+            header.push_str(FLOAT_TEST_HELPER);
         }
         if options.count_fallbacks {
             header.push_str(&format!(

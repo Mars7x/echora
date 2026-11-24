@@ -2368,24 +2368,52 @@ fn unary_path(op: FpUnaryOp) -> String {
 /// integer types, the lane width, and closures `normal`, `zero`,
 /// `usable` (normal or zero) and `smallest_normal` on raw lanes.
 pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
-    let (float, int, width, exponent, sign) = match size {
-        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+    let (float, int, width, sign) = match size {
+        FpSize::S => ("f32", "u32", 32, "0x8000_0000u32"),
+        FpSize::D => ("f64", "u64", 64, "0x8000_0000_0000_0000u64"),
+    };
+    let closures = format!(
+        "{} {} let sign = {sign}; let _ = sign;",
+        float_tests(size),
+        smallest_normal(size)
+    );
+    (float, int, width, closures)
+}
+
+/// The tests `normal`, `zero` and `usable` of a raw lane of `size`: closures,
+/// or with `EmitOptions::shared_float_tests` the region header's functions
+/// (`crate::codegen`'s `FLOAT_TEST_HELPER`) bound by name.
+pub(crate) fn float_tests(size: FpSize) -> String {
+    let (normal_zero, usable) = float_test_parts(size);
+    format!("{normal_zero} {usable}")
+}
+
+/// `float_tests` in two parts, `normal` and `zero`, then `usable`, for
+/// code that defines another test between them.
+pub(crate) fn float_test_parts(size: FpSize) -> (String, String) {
+    let (int, width, exponent, sign) = match size {
+        FpSize::S => ("u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
         FpSize::D => (
-            "f64",
             "u64",
             64,
             "0x7ff0_0000_0000_0000u64",
             "0x8000_0000_0000_0000u64",
         ),
     };
-    let closures = format!(
-        "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-         let zero = |value: {int}| value & !{sign} == 0; \
-         let usable = |value: {int}| normal(value) | zero(value); \
-         {} let sign = {sign}; let _ = sign;",
-        smallest_normal(size)
-    );
-    (float, int, width, closures)
+    if crate::codegen::shared_float_tests_on() {
+        (
+            format!("let normal = fp_normal_{width}; let zero = fp_zero_{width};"),
+            format!("let usable = fp_usable_{width};"),
+        )
+    } else {
+        (
+            format!(
+                "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+                 let zero = |value: {int}| value & !{sign} == 0;"
+            ),
+            format!("let usable = |value: {int}| normal(value) | zero(value);"),
+        )
+    }
 }
 
 /// The closure `smallest_normal`: whether a raw lane's magnitude is the
@@ -2401,6 +2429,12 @@ fn smallest_normal(size: FpSize) -> String {
             "0x0010_0000_0000_0000u64",
         ),
     };
+    if crate::codegen::shared_float_tests_on() {
+        let width = if size == FpSize::S { 32 } else { 64 };
+        return format!(
+            "let smallest_normal = fp_smallest_normal_{width}; let _ = smallest_normal;"
+        );
+    }
     format!(
         "let smallest_normal = |value: {int}| value & {magnitude} == {least}; let _ = smallest_normal;"
     )
@@ -2702,6 +2736,7 @@ fn vec_fp_arith(
     };
     let (value, exact) = arith_lane(fp_op, float);
     let smallest = smallest_normal(size);
+    let (normal_zero, usable) = float_test_parts(size);
     let raw_normal = result_normal(fp_op, "raw");
     let all_normal = result_normal_all(fp_op);
     // A zero divisor raises DZC: only normal divisors run natively.
@@ -2842,10 +2877,9 @@ fn vec_fp_arith(
         };
         return format!(
             "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
-             let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-             let zero = |value: {int}| value & !{sign} == 0; \
+             {normal_zero} \
              let infinite = |value: {int}| value & !{sign} == {exponent}; \
-             let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {smallest} {closures} \
+             {usable} let _ = usable; {smallest} {closures} \
              let mode = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
              && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
              let mut fast = mode && usable_all(n) && {second_usable}{d_usable}; \
@@ -2863,10 +2897,9 @@ fn vec_fp_arith(
     }
     format!(
         "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
-                 let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-                 let zero = |value: {int}| value & !{sign} == 0; \
+                 {normal_zero} \
                  let infinite = |value: {int}| value & !{sign} == {exponent}; \
-                 let usable = |value: {int}| normal(value) | zero(value); {smallest} \
+                 {usable} {smallest} \
                  let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
                  && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
                  let mut out = 0u128; let mut overflow = false; \

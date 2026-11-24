@@ -72,6 +72,7 @@ fn options() -> EmitOptions {
         hoist_fp_mode: std::env::var_os("CARGO_FEATURE_HOIST_FP_MODE").is_some(),
         mxcsr_groups: std::env::var_os("CARGO_FEATURE_MXCSR_GROUPS").is_some(),
         special_lanes: std::env::var_os("CARGO_FEATURE_SPECIAL_LANES").is_some(),
+        shared_float_tests: std::env::var_os("CARGO_FEATURE_SHARED_FLOAT_TESTS").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -578,6 +579,65 @@ fn codesize(out_dir: &std::path::Path) {
             ),
             ("game+recommended", recommended_set()),
             ("game+recommended+windows", recommended_windows_set()),
+            // As the game's hot regions in its candidates since 2026-11:
+            // the register allocator and its family, the float groups and
+            // special lanes, and the per-instruction inline paths (but
+            // `regalloc-crates`, which splits a region into crates; the
+            // game builds them at `codegen-units` 1).
+            (
+                "game+candidate",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    regalloc_loop_inlining: true,
+                    regalloc_span_regions: true,
+                    regalloc_resume_loops: true,
+                    regalloc_resume_returns: true,
+                    regalloc_indirect_entries: true,
+                    regalloc_return_entries: true,
+                    regalloc_summarized_entries: true,
+                    float_run_loads: true,
+                    mxcsr_groups: true,
+                    special_lanes: true,
+                    inline_fp_scalar: true,
+                    inline_vector_pairwise: true,
+                    inline_vector_misc: true,
+                    inline_vector_int: true,
+                    inline_vector_unary: true,
+                    ..game
+                },
+            ),
+            // The same with the float tests shared per region.
+            (
+                "game+candidate+shared",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    regalloc_loop_inlining: true,
+                    regalloc_span_regions: true,
+                    regalloc_resume_loops: true,
+                    regalloc_resume_returns: true,
+                    regalloc_indirect_entries: true,
+                    regalloc_return_entries: true,
+                    regalloc_summarized_entries: true,
+                    float_run_loads: true,
+                    mxcsr_groups: true,
+                    special_lanes: true,
+                    inline_fp_scalar: true,
+                    inline_vector_pairwise: true,
+                    inline_vector_misc: true,
+                    inline_vector_int: true,
+                    inline_vector_unary: true,
+                    shared_float_tests: true,
+                    ..game
+                },
+            ),
         ])
         .collect();
     let dir = out_dir.join("codesize");
@@ -1879,6 +1939,10 @@ fn fallback_count_code(out: &mut String) {
         inline_vector_unary: true,
         fp_status_locals: true,
         count_fallbacks: true,
+        // The per-operation inline paths' fallbacks: no MXCSR group (whose
+        // exact copy falls back instead) or special lane takes them.
+        mxcsr_groups: false,
+        special_lanes: false,
         ..options()
     };
     let (root, regions) = split(&translation, options);
@@ -2260,6 +2324,9 @@ fn fp_mode_group_code(out: &mut String) {
         inline_fp_scalar: true,
         fp_status_locals: true,
         hoist_fp_mode: true,
+        // The hoisted mode tests of single operations: no scalar MXCSR
+        // group takes them.
+        mxcsr_groups: false,
         ..options()
     };
     for (name, options) in [
@@ -2797,6 +2864,8 @@ fn vector_run_code(out: &mut String) {
             untagged_blocks: true,
             split_ticks: true,
             vector_float_runs: runs,
+            // The reference forms no run: no MXCSR group either.
+            mxcsr_groups: runs && options().mxcsr_groups,
             ..options()
         };
         // The runs' lift has every per-instruction inline option in every

@@ -1383,6 +1383,32 @@ operands with IXC set so the groups commit: 389,800 runs, without regalloc
 and with it, none differing; before the fix 73 programs differed, both
 angle-wrap blocks among them.
 
+**Compile cost of the candidates' set, and `shared-float-tests`.** The
+codesize crate (every test program as one crate, 94,098 guest
+instructions) lifted with the game's hot-region set of its candidates
+since 2026-11 (`game+candidate`: the register allocator and its family,
+MXCSR groups, special lanes and every per-instruction inline path; not
+`regalloc-crates`) is 100.8 MB of Rust, against 36.1 MB for the game set.
+At `opt-level` 1, `codegen-units` 1 and `target-cpu=native`, as the game
+builds a region, rustc ran out of this machine's memory at 13.6 GB after
+904 s, before LLVM wrote anything. Through the front end alone
+(`-Zno-codegen`, `-Ztime-passes`): type checking 128 s, borrow checking
+94 s (+5.9 GB), metadata 41 s, parsing, expansion and resolution 26 s
+(11 GB), and about 600 s in queries time-passes does not attribute.
+
+45,000 of its 47,759 closures were the inline paths' four tests (`normal`,
+`zero`, `usable`, `smallest_normal`), defined anew in every inlined float
+operation: each a closure for rustc to infer, check, lower and compile.
+`shared-float-tests` (`EmitOptions::shared_float_tests`) writes them once
+into each region's header as `#[inline(always)]` functions
+(`FLOAT_TEST_HELPER`) and binds them by name in each operation; the code
+is the same. With it the crate holds 2,403 closures and 99.3 MB, and its
+front end takes 851 s instead of 909 (−6.4%) at a 12.30 GB peak instead
+of 13.25 (−7%): type checking 127 s, borrow checking 88 s (+5.3 GB). The
+other large items are regalloc's: every block in its window and its
+structured function, and around 30 register reloads after each call
+(about 15 MB here).
+
 **Scalar groups.** With `mxcsr-groups`, consecutive scalar FADD, FSUB,
 FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT, FABS, FNEG and FMOV
 (single and double) and FCVT between single and double form a scalar
