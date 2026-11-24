@@ -82,7 +82,13 @@ fn options() -> EmitOptions {
         regalloc_resume_loops: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_LOOPS").is_some(),
         regalloc_crates: std::env::var_os("CARGO_FEATURE_REGALLOC_CRATES").is_some(),
         regalloc_crate_bytes: 0,
-        regalloc_function_bytes: 0,
+        // Tests only: every structured function over a few KB of Rust, so
+        // that with regalloc-split-capped every suite runs in pieces.
+        regalloc_function_bytes: if std::env::var_os("CARGO_FEATURE_REGALLOC_TINY_CAPS").is_some() {
+            6_000
+        } else {
+            0
+        },
         regalloc_span_regions: std::env::var_os("CARGO_FEATURE_REGALLOC_SPAN_REGIONS").is_some(),
         regalloc_resume_returns: std::env::var_os("CARGO_FEATURE_REGALLOC_RESUME_RETURNS")
             .is_some(),
@@ -91,6 +97,8 @@ fn options() -> EmitOptions {
         regalloc_vector_locals: std::env::var_os("CARGO_FEATURE_REGALLOC_VECTOR_LOCALS").is_some(),
         regalloc_lazy_pc: std::env::var_os("CARGO_FEATURE_REGALLOC_LAZY_PC").is_some(),
         regalloc_split_capped: std::env::var_os("CARGO_FEATURE_REGALLOC_SPLIT_CAPPED").is_some(),
+        regalloc_split_block_limit: 0,
+        shared_reloads: std::env::var_os("CARGO_FEATURE_SHARED_RELOADS").is_some(),
         regalloc_return_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_RETURN_ENTRIES")
             .is_some(),
         regalloc_summarized_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_SUMMARIZED_ENTRIES")
@@ -245,6 +253,7 @@ const OTHER_PROGRAMS: &[(&str, Generator)] = &[
     ("special_lane", special_lane_code),
     ("mxcsr_form", mxcsr_form_code),
     ("counter", counter_code),
+    ("split_loop", split_loop_code),
 ];
 
 /// Hashes of the split programs' emitted Rust with the default options and
@@ -574,6 +583,18 @@ fn codesize(out_dir: &std::path::Path) {
                     transitive_summaries: true,
                     regalloc: true,
                     regalloc_loop_inlining: true,
+                    ..game
+                },
+            ),
+            (
+                "game_regalloc_shared",
+                EmitOptions {
+                    functions: true,
+                    function_table: true,
+                    call_summaries: true,
+                    transitive_summaries: true,
+                    regalloc: true,
+                    shared_reloads: true,
                     ..game
                 },
             ),
@@ -2008,11 +2029,25 @@ fn q_pair_code(out: &mut String) {
             ],
         ));
     }
+    // A float operation beside the pairs: its function keeps FPSR in a
+    // local, so the helper calls on its lines are wrapped with the status
+    // stores (which must leave the pairs' own code alone).
+    const FADD_S0: u32 = 0x1e21_2800; // fadd s0, s0, s1
+    for (form, store, load) in FORMS {
+        programs.push((
+            format!("fadd s0; stp q0, q1, x2 {form} 1; ldp q3, q4, x2 {form} -1"),
+            vec![
+                FADD_S0,
+                encode(store, 1, 1, 2, 0),
+                encode(load, -1, 4, 2, 3),
+            ],
+        ));
+    }
     let mut words: Vec<u32> = Vec::new();
     let mut entries = Vec::new();
     let mut names = Vec::new();
     for (name, program) in &programs {
-        for &word in program {
+        for &word in program.iter().filter(|&&word| word != FADD_S0) {
             assert!(
                 matches!(decode(word, 0), Instruction::LoadStoreVectorPair { .. }),
                 "{name}: {word:#010x}"
@@ -2034,13 +2069,26 @@ fn q_pair_code(out: &mut String) {
         words.len() + 16,
     )
     .expect("q_pairs");
-    for (name, direct) in [("q_pair_code", true), ("q_pair_reference", false)] {
+    for (name, direct, regalloc) in [
+        ("q_pair_code", true, false),
+        ("q_pair_reference", false, false),
+        // The pairs in structured functions (every program's entry is a
+        // function entry), whose helper calls are wrapped with the FP
+        // status stores: the pairs' own code must be left alone.
+        ("q_pair_regalloc", true, true),
+    ] {
         let options = EmitOptions {
             direct_q_pairs: direct,
             window_memory: true,
             fp_status_locals: true,
-            // The census counts the windows' calls: no function copies.
-            regalloc: false,
+            // The census counts the windows' calls: no function copies,
+            // but in the regalloc lift.
+            regalloc,
+            functions: regalloc,
+            call_summaries: regalloc || options().call_summaries,
+            inline_vector: regalloc || options().inline_vector,
+            function_table: false,
+            regalloc_crates: false,
             ..options()
         };
         let (root, regions) = split(&translation, options);
@@ -2059,6 +2107,11 @@ fn q_pair_code(out: &mut String) {
         writeln!(out, "pub const ENTRIES: &[u64] = &{entries:#x?};").expect("write");
         writeln!(out, "pub const NAMES: &[&str] = &{names:?};").expect("write");
         writeln!(out, "/// Out-of-line `load_q_pair`/`store_q_pair` calls left (`echora_lift::census`).\npub const OUT_OF_LINE: usize = {out_of_line};").expect("write");
+        let structured: usize = regions
+            .iter()
+            .map(|(_, source)| source.matches("n: &mut u64) -> Result<(), Trap>").count())
+            .sum();
+        writeln!(out, "/// Functions emitted structured.\npub const STRUCTURED_FUNCTIONS: usize = {structured};").expect("write");
         for (region, source) in regions {
             writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
         }
@@ -5343,6 +5396,202 @@ fn counter_code(out: &mut String) {
     }
 }
 
+/// Programs for `tests/split_loops.rs`: a function whose loops cross the
+/// pieces `regalloc_split_capped` cuts it into, an FP compare deciding the
+/// inner loop's exit, another a mid-loop exit, branches inside the loop
+/// body; lifted as windows and as pieces under several caps (so the cuts
+/// fall at different places). `split_loop`: one call of a function of 24
+/// body repetitions. `split_big`: a caller holding a register across
+/// three calls of a function of 650 repetitions (past the block limit of
+/// one structured function), with a frame, calls of a leaf storing and
+/// loading memory inside its loop.
+fn split_loop_code(out: &mut String) {
+    split_loop_program(out, "split_loop", 0x1f0_0000, 24, false);
+    split_loop_program(out, "split_big", 0x1f4_0000, 650, true);
+}
+
+fn split_loop_program(out: &mut String, prefix: &str, base: u64, reps: u32, big: bool) {
+    let mut words: Vec<u32> = if big {
+        vec![
+            0xd280_00e9, // movz x9, #7
+            0x9400_0005, // L: bl F
+            0x9100_0d29, // add x9, x9, #3 (held across the call)
+            0xf100_054a, // subs x10, x10, #1
+            0x54ff_ffa1, // b.ne L
+            0xd400_00e1, // svc #7
+            0xa9bf_7bfd, // F: stp x29, x30, [sp, #-16]!
+            0xd280_00a6, // movz x6, #5
+        ]
+    } else {
+        vec![
+            0x9400_0003, // bl F
+            0xd400_00e1, // svc #7
+            0x0000_0000, // udf
+        ]
+    };
+    // F's outer loop.
+    let outer_head = words.len();
+    words.push(0x1e60_3800); // O: fsub d0, d0, d0
+    let inner = words.len();
+    let mut exits = Vec::new();
+    let mut leaf_calls = Vec::new();
+    for rep in 0..reps {
+        words.extend([
+            0x3600_0041 | ((rep % 3) << 19), // tbz x1, #(rep % 3), +8
+            0x1e61_28a5,                     // fadd d5, d5, d1
+            0x1e61_2800,                     // fadd d0, d0, d1
+            0x1e60_0802,                     // fmul d2, d0, d0
+            0x1e62_2884,                     // fadd d4, d4, d2
+            0x9100_0421,                     // add x1, x1, #1
+        ]);
+        if big && rep % 40 == 20 {
+            leaf_calls.push(words.len());
+            words.push(0x9400_0000); // bl LEAF
+        }
+        if rep % 8 == 7 {
+            // An exit of the inner loop from its middle, decided by an FP
+            // compare (patched below to the tail after the loop).
+            words.push(0x1e64_2000); // fcmp d0, d4
+            exits.push(words.len());
+            words.push(0x5400_000c); // b.gt TAIL
+        } else if rep % 8 == 3 {
+            // A forward branch inside the body, over the next pair.
+            words.push(0x1e65_2000); // fcmp d0, d5
+            words.push(0x5400_0064); // b.mi +3 words
+            words.push(0x9100_0463); // add x3, x3, #1
+            words.push(0x1e61_28c6); // fadd d6, d6, d1
+        }
+    }
+    // The exit's compare right after an FP operation: with mxcsr-groups
+    // one scalar group computes both and sets NZCV.
+    words.push(0x1e60_0802); // fmul d2, d0, d0
+    words.push(0x1e63_2000); // fcmp d0, d3
+    let back = (inner as i64 - words.len() as i64) as u32 & 0x7_ffff;
+    words.push(0x5400_000b | (back << 5)); // b.lt H
+    let tail = words.len();
+    for &at in &exits {
+        words[at] |= (((tail - at) as u32) & 0x7_ffff) << 5;
+    }
+    words.push(0x9100_0442); // TAIL: add x2, x2, #1
+    words.push(0xf100_04c6); // subs x6, x6, #1
+    let outer = (outer_head as i64 - words.len() as i64) as u32 & 0x7_ffff;
+    words.push(0x5400_0001 | (outer << 5)); // b.ne O
+    if big {
+        words.push(0xa8c1_7bfd); // ldp x29, x30, [sp], #16
+    }
+    words.push(0xd65f_03c0); // ret
+    if big {
+        let leaf = words.len();
+        for &at in &leaf_calls {
+            words[at] |= ((leaf - at) as u32) & 0x03ff_ffff;
+        }
+        words.extend([
+            0x9100_056b, // LEAF: add x11, x11, #1
+            0xfd00_0180, // str d0, [x12]
+            0xfd40_0187, // ldr d7, [x12]
+            0xd65f_03c0, // ret
+        ]);
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let region = CodeRegion {
+        name: prefix.into(),
+        base,
+        bytes,
+    };
+    let translation = discover(&[region], &[base], words.len()).expect("split loop");
+    let functions = EmitOptions {
+        functions: true,
+        function_table: true,
+        call_summaries: true,
+        transitive_summaries: true,
+        regalloc: true,
+        ..options()
+    };
+    let lifts = [
+        // The reference: windows, each float operation alone.
+        (
+            "windows",
+            EmitOptions {
+                mxcsr_groups: false,
+                regalloc: false,
+                functions: false,
+                function_table: false,
+                call_summaries: false,
+                transitive_summaries: false,
+                ..options()
+            },
+        ),
+        (
+            "whole",
+            EmitOptions {
+                regalloc_split_capped: false,
+                ..functions
+            },
+        ),
+        (
+            "default",
+            EmitOptions {
+                regalloc_split_capped: true,
+                ..functions
+            },
+        ),
+        (
+            "small",
+            EmitOptions {
+                regalloc_split_capped: true,
+                regalloc_function_bytes: if big { 12_000 } else { 2_000 },
+                ..functions
+            },
+        ),
+        (
+            "medium",
+            EmitOptions {
+                regalloc_split_capped: true,
+                regalloc_function_bytes: if big { 60_000 } else { 12_000 },
+                ..functions
+            },
+        ),
+        (
+            "large",
+            EmitOptions {
+                regalloc_split_capped: true,
+                regalloc_function_bytes: if big { 200_000 } else { 40_000 },
+                ..functions
+            },
+        ),
+    ];
+    for (name, options) in lifts {
+        LIFTED.set(LIFTED.get() + translation.instructions.len());
+        let (root, regions) = emit_rust_split_with(&translation, 16, options);
+        let count = |text: &str| {
+            regions
+                .iter()
+                .map(|(_, source)| source.matches(text).count())
+                .sum::<usize>()
+        };
+        writeln!(out, "pub mod {prefix}_{name} {{").expect("write");
+        writeln!(out, "pub const BASE: u64 = {base:#x};").expect("write");
+        writeln!(out, "pub const WORDS: &[u32] = &{words:#x?};").expect("write");
+        writeln!(
+            out,
+            "pub const BLOCKS: usize = {};",
+            translation.blocks.len()
+        )
+        .expect("write");
+        writeln!(
+            out,
+            "/// Pieces, and structured functions.\npub const PIECES: usize = {};\npub const STRUCTURED_FUNCTIONS: usize = {};",
+            count("fn run_piece_"),
+            count("n: &mut u64) -> Result<(), Trap>")
+        )
+        .expect("write");
+        for (region, source) in regions {
+            writeln!(out, "pub mod gen_r_{region:x} {{\n{source}\n}}").expect("write");
+        }
+        writeln!(out, "{root}\n}}").expect("write");
+    }
+}
+
 fn svc_wrapper_code(out: &mut String) {
     const BASE: u64 = 0x1d0_0000;
     let wrapper = BASE + 0x400;
@@ -6197,6 +6446,18 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             mxcsr_groups: true,
             float_runs: true,
             float_run_loads: true,
+            ..structured_functions
+        },
+    );
+    // Shared reloads and stores of the register locals, in windows and
+    // structured functions.
+    lift(
+        "regalloc_shared",
+        16,
+        EmitOptions {
+            shared_reloads: true,
+            regalloc_return_entries: true,
+            regalloc_resume_loops: true,
             ..structured_functions
         },
     );

@@ -1655,6 +1655,13 @@ const CALL_PREFIXES: &[(&str, &str)] = &[
 /// function (`REGALLOC_ENTRIES`), as a call that is no guest call.
 const RUN_ENTRY_HELPER: &str = "#[allow(dead_code)]\n#[inline(always)]\nfn run_entry(m: &mut Machine, function: fn(&mut Machine) -> Result<(), Trap>) -> Result<(), Trap> { function(m) }\n";
 
+/// The general registers from which a store or reload list's set is shared
+/// (`EmitOptions::shared_reloads`, `RegisterLocals::finalize`).
+const SHARED_SET_LENGTH: usize = 3;
+
+/// Delimits a shared set's placeholder until `RegisterLocals::finalize`.
+const SHARED_MARK: char = '\u{3}';
+
 /// Flag operations on the `Core`, done on the `fl` local instead.
 const FLAG_OPERATIONS: &[(&str, &str)] = &[
     ("m.cpu.nzcv", "r.fl.nzcv"),
@@ -1787,7 +1794,25 @@ impl RegisterLocals {
                 write!(values, "{field}: m.cpu.{field}, ").unwrap();
             }
         }
-        format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n")
+        let mut text = format!("    struct R {{ {fields}}}\n    let mut r = R {{ {values}}};\n");
+        if self.shared_reload() {
+            // One copy of the full reload (`EmitOptions::shared_reloads`),
+            // under the same names as the copies it replaces.
+            writeln!(
+                text,
+                "    impl R {{\n        #[inline(always)]\n        fn reload(&mut self, m: &Machine) {{ let r = self; {} }}\n    }}",
+                self.reload()
+            )
+            .unwrap();
+        }
+        text
+    }
+
+    /// Whether the full reload is one shared method (`r.reload(m)`,
+    /// `EmitOptions::shared_reloads`): with the option, where it reloads
+    /// more than a few locals.
+    fn shared_reload(&self) -> bool {
+        SHARED_RELOADS.get() && self.used.len() + usize::from(self.flags) >= 4
     }
 
     fn store(&self) -> String {
@@ -1844,6 +1869,83 @@ impl RegisterLocals {
 
     /// `reload`, of only the locals in `which` (FPCR and FPSR as `reload`).
     fn reload_subset(&self, which: Dirty) -> String {
+        let mask = self.reloaded_set(which);
+        if self.shared_reload()
+            && (mask & !(DIRTY_SP | DIRTY_NZCV)).count_ones() as usize >= SHARED_SET_LENGTH
+        {
+            return format!("{SHARED_MARK}R{mask:x}{SHARED_MARK}");
+        }
+        self.reload_subset_text(mask)
+    }
+
+    /// The text of the shared stores and reloads `text` holds as
+    /// placeholders (`shared_reloads`): a set used at least twice becomes
+    /// a method of `R` (`r.store_<set>(m)`, `r.reload_<set>(m)`, returned
+    /// as an `impl R` block to emit in the function), one used once its
+    /// assignments in place.
+    fn finalize(&self, text: &str) -> (String, String) {
+        if !text.contains(SHARED_MARK) {
+            return (text.to_owned(), String::new());
+        }
+        let parts: Vec<&str> = text.split(SHARED_MARK).collect();
+        // Odd parts are the placeholders.
+        let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+        for part in parts.iter().skip(1).step_by(2) {
+            *uses.entry(part).or_default() += 1;
+        }
+        let parse = |part: &str| -> (bool, Dirty) {
+            let (kind, mask) = part.split_at(1);
+            (
+                kind == "S",
+                Dirty::from_str_radix(mask, 16).expect("a shared set"),
+            )
+        };
+        let mut output = String::with_capacity(text.len());
+        for (index, part) in parts.iter().enumerate() {
+            if index % 2 == 0 {
+                output.push_str(part);
+                continue;
+            }
+            let (store, mask) = parse(part);
+            if uses[part] >= 2 {
+                let name = if store { "store" } else { "reload" };
+                write!(output, "r.{name}_{mask:x}(m); ").unwrap();
+            } else if store {
+                output.push_str(&self.store_dirty_text(mask));
+            } else {
+                output.push_str(&self.reload_subset_text(mask));
+            }
+        }
+        let mut methods = String::new();
+        for (part, &count) in &uses {
+            if count < 2 {
+                continue;
+            }
+            let (store, mask) = parse(part);
+            if store {
+                write!(
+                    methods,
+                    "        #[inline(always)]\n        fn store_{mask:x}(&self, m: &mut Machine) {{ let r = self; {} }}\n",
+                    self.store_dirty_text(mask)
+                )
+                .unwrap();
+            } else {
+                write!(
+                    methods,
+                    "        #[inline(always)]\n        fn reload_{mask:x}(&mut self, m: &Machine) {{ let r = self; {} }}\n",
+                    self.reload_subset_text(mask)
+                )
+                .unwrap();
+            }
+        }
+        if !methods.is_empty() {
+            methods = format!("    impl R {{\n{methods}    }}\n");
+        }
+        (output, methods)
+    }
+
+    /// `reload_subset`'s text, always written out.
+    fn reload_subset_text(&self, which: Dirty) -> String {
         let mut text = String::new();
         for &index in &self.used {
             if which & 1 << index != 0 {
@@ -1862,6 +1964,49 @@ impl RegisterLocals {
 
     /// `store`, of only the locals in `dirty` (FPCR and FPSR as `store`).
     fn store_dirty(&self, dirty: Dirty) -> String {
+        // A long list: a placeholder `finalize` makes a shared method of
+        // where the same set recurs.
+        let mask = self.stored_set(dirty);
+        if self.shared_reload()
+            && (mask & !(DIRTY_SP | DIRTY_NZCV)).count_ones() as usize >= SHARED_SET_LENGTH
+        {
+            return format!("{SHARED_MARK}S{mask:x}{SHARED_MARK}");
+        }
+        self.store_dirty_text(mask)
+    }
+
+    /// The locals in `dirty` that `store_dirty` stores, as a set.
+    fn stored_set(&self, dirty: Dirty) -> Dirty {
+        let mut mask = 0;
+        for &index in &self.written {
+            mask |= dirty & 1 << index;
+        }
+        if self.sp_written {
+            mask |= dirty & DIRTY_SP;
+        }
+        if self.flags {
+            mask |= dirty & DIRTY_NZCV;
+        }
+        mask
+    }
+
+    /// The locals in `which` that `reload_subset` reloads, as a set.
+    fn reloaded_set(&self, which: Dirty) -> Dirty {
+        let mut mask = 0;
+        for &index in &self.used {
+            mask |= which & 1 << index;
+        }
+        if self.sp_used {
+            mask |= which & DIRTY_SP;
+        }
+        if self.flags {
+            mask |= which & DIRTY_NZCV;
+        }
+        mask
+    }
+
+    /// `store_dirty`'s text, always written out.
+    fn store_dirty_text(&self, dirty: Dirty) -> String {
         let mut text = String::new();
         for index in &self.written {
             if dirty & 1 << index != 0 {
@@ -2046,7 +2191,11 @@ impl RegisterLocals {
         arms: Option<&BTreeMap<u64, usize>>,
         mut out: Option<&mut String>,
     ) -> Heads {
-        let reload = self.reload();
+        let reload = if self.shared_reload() {
+            "r.reload(m); ".to_owned()
+        } else {
+            self.reload()
+        };
         let tracked = heads.any != Dirty::MAX;
         let mut next = Heads {
             arms: vec![0; heads.arms.len()],
@@ -2480,20 +2629,21 @@ fn wrap_cpu_helpers(line: &str, store: &str, reload: &str) -> String {
     loop {
         // The earliest helper call left in the line: (start of the call,
         // index of its opening parenthesis, whether it may write).
+        // Only a free function handed the whole `Cpu` (`&m.cpu` then `,`
+        // or `)`), never a method (`.copy_from_slice(&m.cpu.vectors[7]..)`)
+        // nor a field of the `Cpu` passed by reference.
         let found = [("(&mut m.cpu", true), ("(&m.cpu", false)]
             .iter()
             .filter_map(|&(pattern, writes)| {
-                let at = rest.find(pattern)?;
-                let (start, open) = if pattern.starts_with('(') {
+                rest.match_indices(pattern).find_map(|(at, _)| {
+                    let whole = rest[at + pattern.len()..].starts_with([',', ')']);
                     // Back over the helper's path to the start of its name.
                     let start = rest[..at]
                         .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
                         .map_or(0, |i| i + 1);
-                    (start, at)
-                } else {
-                    (at, at + pattern.len() - 1)
-                };
-                Some((start, open, writes))
+                    let free = start < at && !rest[..start].ends_with('.');
+                    (whole && free).then_some((start, at, writes))
+                })
             })
             .min_by_key(|&(start, _, _)| start);
         let Some((start, open, writes)) = found else {
@@ -5931,7 +6081,8 @@ fn emit_function(
         "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R{pending}) -> Result<(), Trap> {{\n    let mut next_pc: u64 = {entry:#x};"
     )
     .unwrap();
-    let body = locals.rewrite(&cases);
+    let (body, methods) = locals.finalize(&locals.rewrite(&cases));
+    output.push_str(&methods);
     if WINDOW_MEMORY.get() {
         output.push_str("    let wmem = m.memory.window_memory();\n");
         output.push_str("    loop {\n        match next_pc {\n");
@@ -7082,6 +7233,17 @@ pub struct EmitOptions {
     /// structured pieces under a driver (`regalloc::split_capped`) instead
     /// of left to the windows.
     pub regalloc_split_capped: bool,
+    /// With `regalloc_split_capped`: the blocks a lifted function may
+    /// hold, 0 for `REGALLOC_SPLIT_BLOCK_LIMIT` (`REGALLOC_BLOCK_LIMIT`
+    /// keeps the functions of `regalloc` alone, splitting only those over
+    /// the size caps).
+    pub regalloc_split_block_limit: usize,
+    /// Windows' and structured functions' full reload of their register
+    /// locals after a call or helper as one `#[inline(always)]` method per
+    /// window or function (`r.reload(m)`) instead of a copy of every
+    /// assignment at each site: the same machine code, much less Rust for
+    /// rustc's front end.
+    pub shared_reloads: bool,
     /// With `regalloc`: the blocks a structured function's own calls
     /// return to outside its loops are entries of the function (window
     /// arms there run it), not only resume points.
@@ -7132,6 +7294,8 @@ thread_local! {
     static REGALLOC_LAZY_PC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_split_capped` of the region being emitted.
     static REGALLOC_SPLIT_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::shared_reloads` of the region being emitted.
+    static SHARED_RELOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_return_entries` of the region being emitted.
     static REGALLOC_RETURN_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::regalloc_summarized_entries` of the region being emitted.
@@ -7766,6 +7930,7 @@ struct RegionSettings {
     regalloc_vector_locals: Flag,
     regalloc_lazy_pc: Flag,
     regalloc_split_capped: Flag,
+    shared_reloads: Flag,
     regalloc_return_entries: Flag,
     regalloc_summarized_entries: Flag,
 }
@@ -7876,6 +8041,7 @@ impl RegionSettings {
             ),
             regalloc_lazy_pc: Flag::set(&REGALLOC_LAZY_PC, options.regalloc_lazy_pc),
             regalloc_split_capped: Flag::set(&REGALLOC_SPLIT_CAPPED, options.regalloc_split_capped),
+            shared_reloads: Flag::set(&SHARED_RELOADS, options.shared_reloads),
             regalloc_return_entries: Flag::set(
                 &REGALLOC_RETURN_ENTRIES,
                 options.regalloc_return_entries,
@@ -8270,7 +8436,13 @@ pub fn emit_rust_split_to_regions<E>(
             extra.extend(translation.deferred_roots.iter().copied());
         }
         let limit = if used(|o| o.functions && o.regalloc && o.regalloc_split_capped) {
-            REGALLOC_SPLIT_BLOCK_LIMIT
+            match base
+                .regalloc_split_block_limit
+                .max(listed.regalloc_split_block_limit)
+            {
+                0 => REGALLOC_SPLIT_BLOCK_LIMIT,
+                limit => limit,
+            }
         } else if used(|o| o.functions && o.regalloc) {
             REGALLOC_BLOCK_LIMIT
         } else {
@@ -8592,7 +8764,8 @@ pub fn emit_rust_split_to_regions<E>(
                 "    #[inline(always)]\n    fn body(m: &mut Machine, r: &mut R) -> Result<(), Trap> {\n    let mut next_pc = m.cpu.pc;\n"
             },
         );
-            let body = locals.rewrite(&cases);
+            let (body, methods) = locals.finalize(&locals.rewrite(&cases));
+            output.push_str(&methods);
             let header = if dense {
                 format!(
                     "    loop {{\n        match next_pc.wrapping_sub({base:#x}).rotate_right(2) {{\n"
@@ -11369,6 +11542,29 @@ mod tests {
     }
 
     #[test]
+    fn only_helpers_handed_the_whole_cpu_are_wrapped() {
+        // A Q pair's code (`direct_q_pairs`): methods on CPU fields, not
+        // helpers taking the CPU.
+        let pair = "{ let mut bytes = [0u8; 32]; bytes[..16].copy_from_slice(&m.cpu.vectors[7].to_le_bytes()); bytes[16..].copy_from_slice(&m.cpu.vectors[8].to_le_bytes()); }";
+        assert_eq!(wrap_cpu_helpers(pair, "S;", "L;"), pair);
+        // A field of the CPU by reference to a free function: not the CPU.
+        let field = "let x = helper(&m.cpu.vectors[3]);";
+        assert_eq!(wrap_cpu_helpers(field, "S;", "L;"), field);
+        // A helper taking the CPU, beside a pair on the same line.
+        let both = format!("{pair} echora_guest::simd::vec_fp(&mut m.cpu, 1, 2)?;");
+        assert_eq!(
+            wrap_cpu_helpers(&both, "S; ", "L; "),
+            format!(
+                "{pair} {{ S; let called = echora_guest::simd::vec_fp(&mut m.cpu, 1, 2); L; called? }};"
+            )
+        );
+        assert_eq!(
+            wrap_cpu_helpers("let v = read(&m.cpu);", "S; ", "L; "),
+            "let v = { S; let called = read(&m.cpu); called };"
+        );
+    }
+
+    #[test]
     fn a_function_over_the_caps_runs_in_structured_pieces() {
         // 0x1000: bl F; svc. F (0x1008): a loop of 800 `cbz x0, +8; add
         // x1, x1, #1` pairs (1,600 blocks, past REGALLOC_BLOCK_LIMIT), then
@@ -11418,7 +11614,7 @@ mod tests {
             split.matches("n: &mut u64) -> Result<(), Trap>").count() - 1,
             pieces
         );
-        assert_eq!(driver.matches("=> run_piece_1008_").count(), pieces);
+        assert_eq!(driver.matches("=> { run_piece_1008_").count(), pieces);
         assert_eq!(take_split_functions(), vec![0x1008]);
     }
 
