@@ -1367,6 +1367,38 @@ misc (FRSQRTE, scalar FADDP and FMAXV among the group's own operations):
 Without the signed-zero correction of FMAX, with the pairs' evens taken as
 odds, or with FABD's sign kept, it fails.
 
+**Scalar groups.** With `mxcsr-groups`, consecutive scalar FADD, FSUB,
+FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT, FABS, FNEG and FMOV
+(single and double) and FCVT between single and double form a scalar
+group (`scalar_groups_in`, `crate::simd::scalar_group_mxcsr`): one mode
+test, MXCSR cleared, each operation as the host's scalar SSE instruction
+(the negated fused forms as `mul_add` of negated operands: negation is
+exact, so still one rounding), each arithmetic result's magnitude tracked
+in scalar extremes per precision (`mx_track_scalar32`,
+`mx_track_scalar64`), one test and one MXCSR read at the end, the exact
+copy on any hit. FCVT to double raises DE for a denormal single; to
+single it raises IE, DE, OE and UE, and the extremes see a result that
+rounds to the smallest normal. FABS, FNEG and FMOV are bit operations on
+both sides (NaNs included) and are not tracked. A result is written
+zero-extended, as Arm writes a scalar. A float run holding a load keeps
+its own fast copy (no group overlaps it); the other float runs give way.
+
+| kernel | c58f197 | + scalar groups | regalloc | + scalar groups |
+|---|---|---|---|---|
+| floats | 16.50 | 10.00 (-39%) | 16.33 | 10.17 (-38%) |
+| scalar | 23.50 | 15.63 (-34%) | 23.49 | 16.29 (-31%) |
+| fpscalar | 66.07 | 45.47 (-31%) | 64.96 | 44.24 (-32%) |
+| floatld, vchain | | unchanged | | unchanged |
+
+(Both sides with `vector-float-runs`, `float-run-loads` and
+`mxcsr-groups`.) fpscalar gains from its FCVT and FSQRT although its
+conversions to and from integers (SCVTF, FCVTZS) still take their own
+paths; floatld's run holds its loads. `.text` within 400 bytes. The
+test holds every scalar form alone, a floats-shaped chain of twelve and
+doubles with conversions to single and back: 196,000 runs, with FMA,
+without it and with regalloc, none differing; it fails without the
+scalar tracking or with FMSUB's product sign kept.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's
