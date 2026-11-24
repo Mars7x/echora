@@ -90,6 +90,10 @@ fn options() -> EmitOptions {
         regalloc_vector_locals: std::env::var_os("CARGO_FEATURE_REGALLOC_VECTOR_LOCALS").is_some(),
         regalloc_lazy_pc: std::env::var_os("CARGO_FEATURE_REGALLOC_LAZY_PC").is_some(),
         regalloc_split_capped: std::env::var_os("CARGO_FEATURE_REGALLOC_SPLIT_CAPPED").is_some(),
+        regalloc_return_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_RETURN_ENTRIES")
+            .is_some(),
+        regalloc_summarized_entries: std::env::var_os("CARGO_FEATURE_REGALLOC_SUMMARIZED_ENTRIES")
+            .is_some(),
         stub_windows: false,
     }
 }
@@ -5950,6 +5954,7 @@ fn window_call_lifts(out: &mut String, fp: bool) {
         EmitOptions {
             // Most functions over the cap: left to the windows.
             regalloc_function_bytes: 4_000,
+            regalloc_split_capped: false,
             ..structured_functions
         },
     );
@@ -5963,6 +5968,37 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             mxcsr_groups: true,
             float_runs: true,
             float_run_loads: true,
+            ..structured_functions
+        },
+    );
+    // Window arms running summarized functions store only what they touch.
+    lift(
+        "regalloc_summarized",
+        16,
+        EmitOptions {
+            regalloc_summarized_entries: true,
+            regalloc_return_entries: true,
+            ..structured_functions
+        },
+    );
+    // Return points as entries, alone and with resume functions.
+    lift(
+        "regalloc_returns",
+        16,
+        EmitOptions {
+            regalloc_return_entries: true,
+            ..structured_functions
+        },
+    );
+    lift(
+        "regalloc_returns_resume",
+        10,
+        EmitOptions {
+            regalloc_return_entries: true,
+            regalloc_resume_loops: true,
+            regalloc_resume_returns: true,
+            regalloc_split_capped: true,
+            regalloc_summarized_entries: true,
             ..structured_functions
         },
     );
