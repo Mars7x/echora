@@ -28,10 +28,6 @@ pub(crate) const SPLIT_WINDOW_BITS: u32 = 10;
 mod regalloc;
 pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
 
-#[path = "regalloc.rs"]
-mod regalloc;
-pub use regalloc::{FUNCTION_BYTES, FUNCTION_INSTRUCTIONS, take_capped_functions};
-
 #[derive(Clone, Debug)]
 pub struct CodeRegion {
     pub name: String,
