@@ -1399,6 +1399,46 @@ doubles with conversions to single and back: 196,000 runs, with FMA,
 without it and with regalloc, none differing; it fails without the
 scalar tracking or with FMSUB's product sign kept.
 
+**Conversions and compares in scalar groups.** A scalar group also takes
+SCVTF and UCVTF (from a general register or a SIMD one), FCVT{N,P,M,Z,A}
+{S,U} to a general register and FCMP and FCMPE, single and double; these
+join a group but form none alone (each inline path tests as cheaply on
+its own, and a group of them would only add the MXCSR clear and read).
+SCVTF and UCVTF are the host's conversions, which round to nearest as
+Arm's do and raise nothing but the inexact flag the group requires
+sticky. A conversion to an integer is the inline path's: its operand
+normal or zero and its rounded value in range, accumulated into the
+group's `good`; its general register is written with the group's other
+results, and a later SCVTF in the group reads it back. FCMP needs both
+operands zero, normal or infinite and writes NZCV with the other results.
+A register holding a result the group tracked needs neither test again:
+the final test passes it only if it is zero, normal or infinite. The
+counts below are against 0898c4d, the line above with mxcsr-groups.
+
+| kernel | 0898c4d | + conversions, FCMP | regalloc | + conversions, FCMP |
+|---|---|---|---|---|
+| fpscalar | 45.47 | 36.00 (-21%) | 44.24 | 34.76 (-21%) |
+| scalar | 15.63 | 15.00 (-4%) | 16.29 | 14.56 (-11%) |
+| floats, vchain, convert | | unchanged | | unchanged |
+
+scalar's FCMP compares the group's own FMADD result with a load. Without
+the skip of a tracked operand's test it measured 16.13 (+3%) and 16.12
+(-1%). `.text` grew under 1 KB. The test adds
+each form after an FMUL of an unrelated register, a chain whose FCVTZS
+result a later SCVTF reads, and an FCMP feeding the block's branch; X0-X4
+hold integers at each width's edges, the float pools add the conversions'
+limits, ties and -0.5, and the general registers and NZCV are compared
+too: 276,000 runs, without regalloc and with it, none differing. It fails
+without the range test, the operand tests of FCVT and FCMP, the flags'
+order, the read back of a written general register, either commit, or
+with every register taken as tracked. Two checks back each other up: the
+range test's upper bound (2^63 and 2^64 also raise the host's IE) and
+the IE flag (every IE in a scalar group also fails a range or operand
+test or makes a NaN the tracking sees). Each mutated alone passes; both
+together fail. The test first ran each form after an FMUL of its own
+operands, whose NaNs and denormals sent every such group to the exact
+copy: the operand tests' mutations passed until the FMUL read V3.
+
 ## Step accounting: what needs exact counts (2026-11)
 
 **Who uses the step count.** Generated code charges each block's

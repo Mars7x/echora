@@ -4286,18 +4286,26 @@ pub(crate) fn vector_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
 /// Scalar float groups in `block` (`EmitOptions::mxcsr_groups`): maximal
 /// sequences of `crate::simd::scalar_group_op` operations, neither the
 /// block's first instruction (its charge) nor its last, holding at least
-/// one that is not a bit operation (FABS, FNEG, FMOV).
+/// one arithmetic operation: not a bit operation (FABS, FNEG, FMOV), and
+/// not a conversion from or to an integer or a compare, which the inline
+/// paths test as cheaply alone (a group of those would only add the MXCSR
+/// clear and read).
 pub(crate) fn scalar_groups_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     let held = |record: &TranslatedInstruction| matches!(&record.instruction, Instruction::Simd(op) if crate::simd::scalar_group_op(op));
     let arithmetic = |record: &TranslatedInstruction| {
         !matches!(
             &record.instruction,
-            Instruction::Simd(SimdOp::FpUnary {
-                op: crate::simd::FpUnaryOp::Abs
-                    | crate::simd::FpUnaryOp::Neg
-                    | crate::simd::FpUnaryOp::Mov,
-                ..
-            })
+            Instruction::Simd(
+                SimdOp::FpUnary {
+                    op: crate::simd::FpUnaryOp::Abs
+                        | crate::simd::FpUnaryOp::Neg
+                        | crate::simd::FpUnaryOp::Mov,
+                    ..
+                } | SimdOp::IntToFp { .. }
+                    | SimdOp::SimdIntToFp { .. }
+                    | SimdOp::FpToInt { .. }
+                    | SimdOp::FpCompare { .. }
+            )
         )
     };
     let count = block.instructions.len();
@@ -4337,11 +4345,17 @@ fn emit_scalar_group(
             _ => unreachable!("scalar groups hold SIMD operations"),
         })
         .collect();
-    let (fast, finals, fused) = crate::simd::scalar_group_mxcsr(&ops);
-    let commits: String = finals
+    let (fast, finals, writes, fused) = crate::simd::scalar_group_mxcsr(&ops);
+    let mut commits: String = finals
         .iter()
         .map(|(register, value)| format!("m.cpu.vectors[{register}] = {value}; "))
         .collect();
+    for (register, value) in &writes.general {
+        commits.push_str(&format!("m.cpu.regs[{register}] = {value}; "));
+    }
+    if let Some(nzcv) = &writes.nzcv {
+        commits.push_str(&format!("m.cpu.nzcv = {nzcv}; "));
+    }
     let fma = if fused {
         " && cfg!(target_feature = \"fma\")"
     } else {
