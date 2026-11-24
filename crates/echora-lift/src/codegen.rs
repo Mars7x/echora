@@ -4304,6 +4304,129 @@ pub(crate) fn vector_runs_in(block: &BasicBlock) -> Vec<(usize, usize)> {
     runs
 }
 
+/// `ECHORA_LIFT_REPORT=helpers`: the SIMD and float operations each
+/// region's options still emit as helper calls, by helper and form (the
+/// operation without its registers), largest first. Each instruction counts
+/// once, or with its window's weight (`weights`, as
+/// `crate::vector_float_report`'s); an operation a vector run, a float run or
+/// an MXCSR group takes is counted as emitted alone, which is what its
+/// group's exact copy runs.
+pub fn helper_report(
+    translation: &Translation,
+    region_bits: u32,
+    options: EmitOptions,
+    listed_options: EmitOptions,
+    listed_regions: &BTreeSet<u64>,
+    weights: Option<&BTreeMap<(u64, String), f64>>,
+) -> String {
+    let mut counts: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut total = 0.0;
+    let functions = Arc::new(BTreeMap::new());
+    let mut by_region: BTreeMap<u64, Vec<&BasicBlock>> = BTreeMap::new();
+    for block in &translation.blocks {
+        by_region
+            .entry(block.start >> region_bits)
+            .or_default()
+            .push(block);
+    }
+    for (region, blocks) in by_region {
+        let region_options = if listed_regions.contains(&region) {
+            listed_options
+        } else {
+            options
+        };
+        let _settings = RegionSettings::set(region_options, region_bits, &functions, &None, &None);
+        for block in blocks {
+            let weight = match weights {
+                Some(weights) => {
+                    let window = format!("run_window_{:x}", block.start >> SPLIT_WINDOW_BITS);
+                    weights.get(&(region, window)).copied().unwrap_or(0.0)
+                }
+                None => 1.0,
+            };
+            if weight == 0.0 {
+                continue;
+            }
+            for record in &block.instructions {
+                let simd = matches!(
+                    record.instruction,
+                    Instruction::Simd(_) | Instruction::LoadStoreVectorPair { .. }
+                );
+                if simd {
+                    total += weight;
+                }
+                let mut body = String::new();
+                emit_instruction_body(&mut body, record, false, false);
+                // A helper of `echora_guest::simd`, or the CPU's own Q pair
+                // transfers (`Cpu::load_q_pair`, `Cpu::store_q_pair`).
+                let found = ["load_q_pair", "store_q_pair"]
+                    .into_iter()
+                    .find(|name| body.contains(&format!("m.cpu.{name}(")))
+                    .or_else(|| {
+                        let at = body.find("echora_guest::simd::")?;
+                        let rest = &body[at + "echora_guest::simd::".len()..];
+                        let helper = &rest[..rest.find('(')?];
+                        (!helper.is_empty()
+                            && helper
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                        .then_some(helper)
+                    });
+                let Some(helper) = found else {
+                    continue;
+                };
+                if !simd {
+                    total += weight;
+                }
+                let text = match &record.instruction {
+                    Instruction::Simd(op) => format!("{op:?}"),
+                    other => format!("{other:?}"),
+                };
+                let form: String = text
+                    .split(", ")
+                    .filter(|field| {
+                        let field = field.trim_start();
+                        !["rd:", "rn:", "rm:", "ra:", "rt:", "rt2:"]
+                            .iter()
+                            .any(|name| {
+                                field.starts_with(name) || field.contains(&format!("{{ {name}"))
+                            })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                *counts.entry((helper.to_owned(), form)).or_default() += weight;
+            }
+        }
+    }
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let called: f64 = rows.iter().map(|row| row.1).sum();
+    let mut out = format!(
+        "helper calls: {:.0} of {:.0} SIMD and float operations ({:.1}%)\n",
+        called.abs(),
+        total.abs(),
+        if total > 0.0 {
+            100.0 * called / total
+        } else {
+            0.0
+        }
+    );
+    let mut by_helper: BTreeMap<&str, f64> = BTreeMap::new();
+    for ((helper, _), count) in &rows {
+        *by_helper.entry(helper).or_default() += count;
+    }
+    let mut helpers: Vec<_> = by_helper.into_iter().collect();
+    helpers.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (helper, count) in helpers {
+        out.push_str(&format!("{count:>12.0}  {helper}\n"));
+    }
+    out.push_str("by form:\n");
+    for ((helper, form), count) in rows.iter().take(200) {
+        out.push_str(&format!("{count:>12.0}  {helper}  {form}\n"));
+    }
+    out
+}
+
 /// `EmitOptions::special_lanes` of the region being emitted.
 pub(crate) fn special_lanes_on() -> bool {
     SPECIAL_LANES.get()
@@ -9033,6 +9156,46 @@ mod tests {
             assert_eq!(root.matches("::run_window_").count(), 2);
             assert!(root.contains("Err(Trap::MissingBlock { pc })"));
         }
+    }
+
+    #[test]
+    fn the_helper_report_counts_helper_calls_by_form() {
+        // FRINTM V1.2S (a helper call), FADD V3.4S (inlined), SVC.
+        let translation = discover(
+            &[region(&[0x0e21_9801, 0x4e21_d403, 0xd400_00e1])],
+            &[0x1000],
+            4,
+        )
+        .unwrap();
+        let options = EmitOptions {
+            inline_vector: true,
+            ..EmitOptions::default()
+        };
+        let report = helper_report(&translation, 16, options, options, &BTreeSet::new(), None);
+        assert!(report.starts_with("helper calls: 1 of 2 "), "{report}");
+        assert!(report.contains("vec_fp_unary  VecFpUnary { op: Round(Minus), size: S, q: false, scalar: false, fbits: 0 }"), "{report}");
+        assert!(!report.contains("VecFp { op: Add"), "{report}");
+        // Without inline_vector both call their helpers.
+        let report = helper_report(
+            &translation,
+            16,
+            EmitOptions::default(),
+            EmitOptions::default(),
+            &BTreeSet::new(),
+            None,
+        );
+        assert!(report.starts_with("helper calls: 2 of 2 "), "{report}");
+        // LDP Q0, Q1, [X2]: the CPU's own pair load, unless direct_q_pairs.
+        let translation = discover(&[region(&[0xad40_0440, 0xd400_00e1])], &[0x1000], 4).unwrap();
+
+        let report = helper_report(&translation, 16, options, options, &BTreeSet::new(), None);
+        assert!(report.contains("load_q_pair"), "{report}");
+        let direct = EmitOptions {
+            direct_q_pairs: true,
+            ..options
+        };
+        let report = helper_report(&translation, 16, direct, direct, &BTreeSet::new(), None);
+        assert!(report.starts_with("helper calls: 0 of 1 "), "{report}");
     }
 
     #[test]
