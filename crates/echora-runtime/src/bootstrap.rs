@@ -131,6 +131,8 @@ pub fn hle_call_sites(placed: &[PlacedModule]) -> Vec<u64> {
 }
 
 pub fn load_program(exefs: &Path, max_steps: u64) -> Result<LoadedProgram> {
+    #[cfg(target_os = "linux")]
+    crate::huge_text::remap_once();
     let modules = echora_loader::load_exefs(exefs)?;
     let npdm = crate::npdm::load_npdm(&exefs.join("main.npdm"))?;
     if !npdm.is_64bit {
