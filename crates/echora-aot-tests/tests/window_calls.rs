@@ -144,6 +144,7 @@ fn lifts() -> Vec<Lift> {
         lift!(regalloc_returns),
         lift!(regalloc_summarized),
         lift!(regalloc_shared),
+        lift!(regalloc_coarse),
         lift!(regalloc_returns_resume),
         lift!(regalloc_span),
         lift!(regalloc_resume),
@@ -609,6 +610,10 @@ fn window_call_lift_child() {
                 window_call_int::regalloc_span::dispatch,
                 window_call_int::regalloc_span::install,
             ),
+            "regalloc_coarse" => (
+                window_call_int::regalloc_coarse::dispatch,
+                window_call_int::regalloc_coarse::install,
+            ),
             "regalloc_indirect_base" => (
                 window_call_int::regalloc_indirect_base::dispatch,
                 window_call_int::regalloc_indirect_base::install,
@@ -713,6 +718,50 @@ fn child(lift: &str) -> Output {
             .is_some_and(|value| value == "true"),
         ring: field("RING ").first().cloned().unwrap_or_default(),
     }
+}
+
+/// `coarse-steps` (`regalloc_coarse`): every run to its end, whole or in
+/// slices, ends as the default emission's does (trap, PC, registers,
+/// vectors, memory, stack, flags) but for the step and boundary counts; the
+/// steps never fall below the instructions the default emission counts
+/// (each test charges the longest path to the next), and the charges are
+/// coarse (some runs count more). Budgeted runs stop where the coarse count
+/// reaches the budget, sooner: not compared.
+#[test]
+fn coarse_steps_end_as_the_default_emission() {
+    let base = child("window_call_base");
+    let coarse = child("regalloc_coarse");
+    assert_eq!(base.runs.len(), coarse.runs.len());
+    // The line without its step and boundary counts, and the steps.
+    let split = |line: &str| -> (String, u64) {
+        let at = line.find(" steps ").expect("a run line has its steps");
+        let (steps, rest) = line[at + 7..].split_once(' ').expect("steps, then more");
+        let rest = rest
+            .strip_prefix("boundaries ")
+            .expect("then the boundaries");
+        let (_, rest) = rest.split_once(' ').expect("then more");
+        (
+            format!("{} {rest}", &line[..at]),
+            steps.parse().expect("a count"),
+        )
+    };
+    let (mut compared, mut above) = (0, 0);
+    for (expected, actual) in base.runs.iter().zip(&coarse.runs) {
+        if expected.contains(" Budget(") {
+            continue;
+        }
+        let (expected_text, expected_steps) = split(expected);
+        let (actual_text, actual_steps) = split(actual);
+        assert_eq!(actual_text, expected_text);
+        assert!(
+            actual_steps >= expected_steps,
+            "{actual_steps} steps counted, {expected_steps} run: {actual}"
+        );
+        compared += 1;
+        above += usize::from(actual_steps > expected_steps);
+    }
+    println!("coarse steps: {compared} runs compared, {above} counted more");
+    assert!(compared > 0 && above > 0, "{compared} {above}");
 }
 
 #[test]
@@ -893,6 +942,7 @@ fn window_calls_match_the_reference() {
         "regalloc_loops",
         "regalloc_crates",
         "regalloc_span",
+        "regalloc_coarse",
         "regalloc_indirect_base",
         "regalloc_indirect",
     ] {

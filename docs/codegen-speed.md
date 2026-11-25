@@ -1765,6 +1765,78 @@ above, plus the per-block adds (memset's 21% to 45% is the most; the
 game-shaped kernels 1% to 3%). Not worth it before the game shows tight
 loops of this kind dominating.
 
+**Built, opt-in: coarse steps and timed slices.** Two halves, each
+off by default, so every exact-step test and the default emission are
+unchanged:
+
+- `coarse-steps` (`EmitOptions::coarse_steps`, lifter, with `regalloc`):
+  structured functions no longer add each block's count. Each stop word
+  test (entries, loop heads, call returns) charges the look-ahead it
+  already tests with, the most instructions any path from it runs before
+  the next test or a call, and then tests the count itself, `*n += A; if
+  m.steps + *n > stop { *n -= A; leave }`: one count for the host
+  compiler to keep. Testing `*n + A` and charging after made LLVM keep a
+  count per offset (three induction variables in memset's inner loop,
+  +19%). The steps run ahead of the instructions executed (by up to a
+  path's length per test: memset's inner loop charges 6 per iteration of
+  4), so step slices end sooner and counts at boundaries, budgets and
+  traps are not exact; windows still charge per block.
+- `ECHORA_TIMED_SLICES=MICROSECONDS` (runtime, with several workers): a
+  timer thread sets each worker core's preempt flag and stores 0 into its
+  stop word every period, as a cross-worker preemption does, and the
+  scheduler no longer ends slices after a number of steps; the next block
+  takes the host boundary and the scheduler's slice-end decision. Timed
+  waits, the spin heuristics and the reports still read the (coarse)
+  steps.
+
+Counted as above with the regalloc set and `regalloc-loop-inlining`
+(host instructions per guest instruction, the exact build's guest
+instructions for both), the bench's step slices out of the way
+(`ECHORA_KERNEL_SLICE=1000000000000`, as under timed slices; with its
+100,000-step slices the coarse counts end memset's twice as often):
+
+| kernel | regalloc | coarse-steps |
+|---|---|---|
+| gamefn | 2.38 | 2.31 (-3.1%) |
+| gamecalls | 2.05 | 2.00 (-2.6%) |
+| crossing | 2.16 | 2.09 (-3.2%) |
+| calls2 | 1.46 | 1.38 (-5.3%) |
+| calls | 7.43 | 7.39 (-0.6%) |
+| vcalls | 11.03 | 11.17 (+1.2%) |
+| arith | 2.43 | 2.43 |
+| ldst | 3.60 | 3.60 |
+| memset | 5.33 | 5.33 |
+| switch | 2.45 | 2.55 (+3.7%) |
+
+About the per-block adds' share the ablation above found (gamefn 3%),
+the tests kept. `window_calls`'s `coarse_steps_end_as_the_default_emission`
+runs every caller's starting states whole and in slices with
+`regalloc_coarse` against the default emission: the same trap, PC,
+registers, flags, vectors, memory and stack, never fewer steps than the
+instructions run and more in about half the runs (1,584 compared, 801
+above); it fails without the charge. The lift is also checked against
+the interpreter reference. The runtime's
+`the_slice_timer_ends_every_core_s_slice_until_stopped` checks the timer.
+
+**State and next steps (paused 2026-11-25).** Built and tested: the two
+opt-in halves above. Not yet done:
+
+- run the game with `coarse-steps` and `ECHORA_TIMED_SLICES` (a period to
+  choose: the 50,000-step parallel slices are tens of microseconds of
+  guest code; the timer's cost and the scheduling it gives need
+  measuring), and compare frame times and the run report with step
+  slices;
+- the single-worker runtime (no `parallel`) does not check the preempt
+  flag, so timed slices apply with several workers only;
+- the windows still charge every block exactly; coarse charges there (at
+  arm entries and loop heads) are the next lift-side step, and switch's
+  +3.7% and vcalls' +1.2% are unexplained;
+- the timed waits and spin heuristics still count steps, coarse ones
+  under `coarse-steps`;
+- with a timer only, the stop word test could become a load of the stop
+  word and a compare with zero (the poll flag above), dropping the step
+  count from structured functions altogether.
+
 **A finding on the way: the alignment branch under regalloc.** In the
 structured ldst loop, unlike window code, LLVM did not merge the view's
 aligned (relaxed atomic) and misaligned (`read_unaligned`) paths: each

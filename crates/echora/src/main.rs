@@ -869,6 +869,7 @@ fn lift(
                 "mxcsr-groups" => options.mxcsr_groups = true,
                 "special-lanes" => options.special_lanes = true,
                 "shared-float-tests" => options.shared_float_tests = true,
+                "coarse-steps" => options.coarse_steps = true,
                 "flat" => {}
                 other => bail!("unknown ECHORA_LIFT_OPTIONS entry {other:?}"),
             }

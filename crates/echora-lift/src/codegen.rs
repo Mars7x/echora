@@ -4134,7 +4134,10 @@ fn emit_block_body(
     let body = hoist_fp_mode(pieces);
     FUSE.set(fuse);
     if REGALLOC_BODY.get() {
-        writeln!(output, "                *n += {count};").unwrap();
+        // With `coarse_steps` the function's stop word tests charge.
+        if !COARSE_STEPS.get() {
+            writeln!(output, "                *n += {count};").unwrap();
+        }
         // A spin hint reads the steps (and may lower the stop word, which
         // the function's next test sees, as a preemption).
         output.push_str(&body.replace(
@@ -4578,6 +4581,43 @@ pub(crate) fn special_lanes_on() -> bool {
 /// `EmitOptions::shared_float_tests` of the region being emitted.
 pub(crate) fn shared_float_tests_on() -> bool {
     SHARED_FLOAT_TESTS.get()
+}
+
+/// A structured function's text with `EmitOptions::coarse_steps`: each
+/// stop word test (`if m.steps + *n + AHEAD > m.stop.load(..) { m.cpu.pc =
+/// ..`, one line, leaving when it fails) charges the look-ahead it tests
+/// first (`*n += AHEAD;`) and tests the count itself, the leaving path
+/// taking the charge back: one count for the host compiler to keep, not
+/// one per offset (the blocks no longer charge themselves).
+fn coarse_charges(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 32);
+    for line in text.lines() {
+        let test = line.trim_start();
+        if let Some(rest) = test.strip_prefix("if m.steps + *n + ")
+            && test.contains(" > m.stop.load(")
+            && let Some((ahead, _)) = rest.split_once(' ')
+            && ahead.parse::<u64>().is_ok()
+            && test.contains(" { m.cpu.pc = ")
+        {
+            let indent = &line[..line.len() - test.len()];
+            let test = test
+                .replacen(
+                    &format!("if m.steps + *n + {ahead} > "),
+                    "if m.steps + *n > ",
+                    1,
+                )
+                .replacen(
+                    " { m.cpu.pc = ",
+                    &format!(" {{ *n -= {ahead}; m.cpu.pc = "),
+                    1,
+                );
+            out.push_str(&format!("{indent}*n += {ahead};\n{indent}{test}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// With `EmitOptions::shared_float_tests`, written into a region's header:
@@ -5931,6 +5971,8 @@ thread_local! {
     static SPECIAL_LANES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::shared_float_tests` of the region being emitted.
     static SHARED_FLOAT_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `EmitOptions::coarse_steps` of the region being emitted.
+    static COARSE_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::threaded_successors` of the region being emitted.
     static THREADED_SUCCESSORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `EmitOptions::arm_charges` of the region being emitted (split
@@ -7132,6 +7174,16 @@ pub struct EmitOptions {
     /// one: the same code, but no closure for rustc to infer, check and
     /// lower per inlined float operation.
     pub shared_float_tests: bool,
+    /// With `regalloc`: structured functions charge steps coarsely, not
+    /// per block. Each stop word test (entries, loop heads, call returns)
+    /// adds, once it passes, the most instructions any path from it runs
+    /// before the next test or a call (the look-ahead it already tests
+    /// with), and the blocks add nothing. The steps then run ahead of the
+    /// instructions executed (by up to a path's length per test), so slices
+    /// end a little sooner and step counts at boundaries, budgets and traps
+    /// are not exact: for runs whose slices are timed (the runtime's
+    /// `ECHORA_TIMED_SLICES`), not for the exact-step tests.
+    pub coarse_steps: bool,
     /// With `functions` and `call_summaries`: every summarized call of a
     /// lifted function is audited as `window_calls_audit` audits window
     /// calls (all locals stored, markers in the registers outside the
@@ -7915,6 +7967,7 @@ struct RegionSettings {
     mxcsr_groups: Flag,
     special_lanes: Flag,
     shared_float_tests: Flag,
+    coarse_steps: Flag,
     threaded: Flag,
     cached_stop: Flag,
     arm_charges: Flag,
@@ -8012,6 +8065,7 @@ impl RegionSettings {
             mxcsr_groups: Flag::set(&MXCSR_GROUPS, mxcsr_groups_on(&options)),
             special_lanes: Flag::set(&SPECIAL_LANES, options.special_lanes),
             shared_float_tests: Flag::set(&SHARED_FLOAT_TESTS, options.shared_float_tests),
+            coarse_steps: Flag::set(&COARSE_STEPS, options.coarse_steps),
             threaded: Flag::set(&THREADED_SUCCESSORS, options.threaded_successors),
             arm_charges: Flag::set(
                 &ARM_CHARGES,
@@ -8577,6 +8631,9 @@ pub fn emit_rust_split_to_regions<E>(
                     }
                 });
                 REGALLOC_COVERED.with_borrow_mut(|covered| covered.extend(starts.iter().copied()));
+                if COARSE_STEPS.get() {
+                    *output = coarse_charges(output);
+                }
             } else if REGALLOC_CAPPED.with_borrow(|capped| capped.contains(&entry)) {
                 regalloc::capped_stub(output, entry);
             } else {

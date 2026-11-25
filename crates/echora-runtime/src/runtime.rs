@@ -334,6 +334,9 @@ pub struct Machine {
     preemptions: u64,
     /// Several workers run: an idle boundary returns instead of sleeping.
     parallel: bool,
+    /// With several workers and ECHORA_TIMED_SLICES: slices end on a host
+    /// timer (`slice_timer`), not after a number of steps.
+    timed_slices: bool,
     /// Workers parked without a thread, waiting for one to become runnable.
     parked_workers: usize,
     /// Audio frames (or audio-out releases) the audio thread did, against
@@ -462,6 +465,7 @@ impl Machine {
             preempt_stops: Vec::new(),
             preemptions: 0,
             parallel: false,
+            timed_slices: false,
             parked_workers: 0,
             audio_thread_frames: 0,
             lock_stats: [0; 3],
@@ -2604,16 +2608,18 @@ impl Machine {
                 .saturating_add(HOST_TIMER_CHECK_INSTRUCTIONS);
         }
         // Any other runnable thread, backing off from a spin or not, gets the
-        // processor back at slice ends.
+        // processor back at slice ends (with timed slices, when the timer
+        // ends the slice: no step limit).
         let current = self.core.current_thread_id;
-        if self.parallel
-            || (self.main_thread_state == ThreadState::Runnable
-                && self.layout.main_thread_id != current
-                && !self.running.contains(&Some(self.layout.main_thread_id)))
-            || self
-                .threads
-                .runnable_ids()
-                .any(|id| id != current && !self.running.contains(&Some(id)))
+        if !self.timed_slices
+            && (self.parallel
+                || (self.main_thread_state == ThreadState::Runnable
+                    && self.layout.main_thread_id != current
+                    && !self.running.contains(&Some(self.layout.main_thread_id)))
+                || self
+                    .threads
+                    .runnable_ids()
+                    .any(|id| id != current && !self.running.contains(&Some(id))))
         {
             let slice = if self.parallel {
                 self.layout.parallel_slice
@@ -2838,6 +2844,9 @@ impl Machine {
         self.core_threads[0] = Some(cores[0].current_thread_id);
         self.running[0] = Some(cores[0].current_thread_id);
         self.parallel = true;
+        let slice_period = timed_slice_period();
+        self.timed_slices = slice_period.is_some();
+        let slice_targets = (self.preempt_flags.clone(), self.preempt_stops.clone());
         let placeholder = self.nvn.entries_only();
         let recorder = self.nvn.recorder();
         let thunks = std::sync::RwLock::new(self.nvn.thunk_names());
@@ -2909,6 +2918,13 @@ impl Machine {
                     .spawn_scoped(scope, move || audio_thread(shared))
                     .expect("spawn audio thread");
             }
+            if let Some(period) = slice_period {
+                let shared = &shared;
+                std::thread::Builder::new()
+                    .name("echora-slices".into())
+                    .spawn_scoped(scope, move || slice_timer(shared, period, slice_targets))
+                    .expect("spawn slice timer");
+            }
             if let Some(core) = replay_core {
                 let shared = &shared;
                 std::thread::Builder::new()
@@ -2938,6 +2954,7 @@ impl Machine {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.parallel = false;
+        self.timed_slices = false;
         self.running.fill(None);
         self.worker_core = None;
         self.core_threads.clear();
@@ -5027,6 +5044,51 @@ impl<'a> Shared<'a> {
     }
 }
 
+/// ECHORA_TIMED_SLICES=MICROSECONDS (opt-in, with several workers): slices
+/// end every that many microseconds of host time instead of after a number
+/// of guest instructions, for lifts whose step counts are coarse
+/// (`coarse-steps`). Unset, empty or 0: slices by steps, as always.
+fn timed_slice_period() -> Option<std::time::Duration> {
+    let micros: u64 = crate::nvn::debug_var("ECHORA_TIMED_SLICES")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (micros > 0).then(|| std::time::Duration::from_micros(micros))
+}
+
+/// The slice timer of ECHORA_TIMED_SLICES: every `period` each worker's
+/// core gets its preempt flag set and its stop word lowered to 0 (as a
+/// cross-worker preemption does), so its next block takes the host
+/// boundary, where the scheduler hands the core to the next runnable thread
+/// (the same decision as at a slice end by steps). Stops with the workers.
+fn slice_timer(shared: &Shared, period: std::time::Duration, targets: SliceTargets) {
+    slice_timer_until(&shared.stop, period, targets);
+}
+
+/// Each worker core's preempt flag and stop word (`Core::preempt`,
+/// `Core::stop`).
+type SliceTargets = (
+    Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+);
+
+/// `slice_timer`'s loop, until `done`.
+fn slice_timer_until(
+    done: &std::sync::atomic::AtomicBool,
+    period: std::time::Duration,
+    (flags, stops): SliceTargets,
+) {
+    use std::sync::atomic::Ordering;
+    while !done.load(Ordering::Acquire) {
+        std::thread::sleep(period);
+        for (flag, stop) in flags.iter().zip(&stops) {
+            flag.store(true, Ordering::SeqCst);
+            stop.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Renders the audio renderers' frames when they come due, holding only
 /// the renderer's own lock: the mixing is a third of a millisecond every
 /// 5 ms, and under the machine lock (as the wait scans did it) every guest
@@ -6070,6 +6132,43 @@ fn rearm_lowered_dispatch_limit(core: &Core) {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    /// ECHORA_TIMED_SLICES's timer sets every core's preempt flag and
+    /// lowers its stop word, again after the host cleared them, and ends
+    /// when the workers do.
+    #[test]
+    fn the_slice_timer_ends_every_core_s_slice_until_stopped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let flags: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let stops: Vec<_> = (0..3).map(|_| Arc::new(AtomicU64::new(u64::MAX))).collect();
+        let done = AtomicBool::new(false);
+        let ended = |flags: &[Arc<AtomicBool>], stops: &[Arc<AtomicU64>]| {
+            flags.iter().all(|flag| flag.load(Ordering::SeqCst))
+                && stops.iter().all(|stop| stop.load(Ordering::SeqCst) == 0)
+        };
+        std::thread::scope(|scope| {
+            let targets = (flags.clone(), stops.clone());
+            let done = &done;
+            let timer = scope.spawn(move || {
+                slice_timer_until(done, std::time::Duration::from_micros(200), targets);
+            });
+            for _ in 0..2 {
+                let start = std::time::Instant::now();
+                while !ended(&flags, &stops) {
+                    assert!(start.elapsed().as_secs() < 10, "no slice end");
+                    std::thread::yield_now();
+                }
+                // The host's boundary clears the flag and rearms.
+                for (flag, stop) in flags.iter().zip(&stops) {
+                    flag.store(false, Ordering::SeqCst);
+                    stop.store(u64::MAX, Ordering::SeqCst);
+                }
+            }
+            done.store(true, Ordering::Release);
+            timer.join().unwrap();
+        });
+    }
 
     #[test]
     fn fixed_resolution_addon_can_preserve_or_force_the_guest_branch() {

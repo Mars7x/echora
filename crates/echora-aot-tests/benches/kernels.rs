@@ -34,6 +34,16 @@ const VECTOR_B: u64 = DATA_BASE + 3 * BUFFER;
 const FLAG: u64 = DATA_BASE + 4 * BUFFER;
 /// Guest instructions between host boundaries, as a scheduler slice.
 const SLICE: u64 = 100_000;
+
+/// The slice: `SLICE`, or ECHORA_KERNEL_SLICE instructions (measuring
+/// lifts whose step counts are coarse, `coarse-steps`, without their
+/// earlier slice ends: as under timed slices, where steps end none).
+fn slice() -> u64 {
+    std::env::var("ECHORA_KERNEL_SLICE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SLICE)
+}
 /// Slices the polling kernel spins before the other thread sets its flag.
 const POLL_SLICES: u64 = 500;
 
@@ -265,7 +275,8 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
         .expect("vector inputs are mapped");
     m.core.cpu.pc = KERNEL_BASE + entry;
     let other_thread = prepare(&mut m, name, scale);
-    m.core.host_check_at = SLICE;
+    let slice = slice();
+    m.core.host_check_at = slice;
     m.core.rearm();
     let mut flag_set = false;
     let start = Instant::now();
@@ -287,12 +298,12 @@ fn run(name: &str, entry: u64, scale: u64) -> (u64, Duration) {
                 // after as many instructions as its slices would take (the
                 // spin hint ends a polling slice early, so counting slices
                 // would end it almost at once).
-                if !flag_set && other_thread.is_some_and(|slices| m.core.steps >= slices * SLICE) {
+                if !flag_set && other_thread.is_some_and(|slices| m.core.steps >= slices * slice) {
                     m.memory.write(FLAG, &1_u32.to_le_bytes()).expect("flag");
                     flag_set = true;
                 }
                 m.core.spin_polls = 0;
-                m.core.host_check_at = m.core.steps + SLICE;
+                m.core.host_check_at = m.core.steps + slice;
                 m.core.rearm();
             }
             Trap::SupervisorCall { number: 7 } => break,

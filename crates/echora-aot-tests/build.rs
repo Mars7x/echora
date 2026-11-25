@@ -73,6 +73,7 @@ fn options() -> EmitOptions {
         mxcsr_groups: std::env::var_os("CARGO_FEATURE_MXCSR_GROUPS").is_some(),
         special_lanes: std::env::var_os("CARGO_FEATURE_SPECIAL_LANES").is_some(),
         shared_float_tests: std::env::var_os("CARGO_FEATURE_SHARED_FLOAT_TESTS").is_some(),
+        coarse_steps: std::env::var_os("CARGO_FEATURE_COARSE_STEPS").is_some(),
         call_summaries_audit: std::env::var_os("CARGO_FEATURE_CALL_SUMMARIES_AUDIT").is_some(),
         threaded_successors: std::env::var_os("CARGO_FEATURE_THREADED_SUCCESSORS").is_some(),
         cached_stop: std::env::var_os("CARGO_FEATURE_CACHED_STOP").is_some(),
@@ -6458,6 +6459,17 @@ fn window_call_lifts(out: &mut String, fp: bool) {
             shared_reloads: true,
             regalloc_return_entries: true,
             regalloc_resume_loops: true,
+            ..structured_functions
+        },
+    );
+    // Coarse step charges in structured functions: at their stop word
+    // tests, not per block (inexact step counts).
+    lift(
+        "regalloc_coarse",
+        16,
+        EmitOptions {
+            coarse_steps: true,
+            regalloc_loop_inlining: true,
             ..structured_functions
         },
     );
