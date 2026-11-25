@@ -2368,24 +2368,52 @@ fn unary_path(op: FpUnaryOp) -> String {
 /// integer types, the lane width, and closures `normal`, `zero`,
 /// `usable` (normal or zero) and `smallest_normal` on raw lanes.
 pub(crate) fn float_kit(size: FpSize) -> (&'static str, &'static str, u32, String) {
-    let (float, int, width, exponent, sign) = match size {
-        FpSize::S => ("f32", "u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
+    let (float, int, width, sign) = match size {
+        FpSize::S => ("f32", "u32", 32, "0x8000_0000u32"),
+        FpSize::D => ("f64", "u64", 64, "0x8000_0000_0000_0000u64"),
+    };
+    let closures = format!(
+        "{} {} let sign = {sign}; let _ = sign;",
+        float_tests(size),
+        smallest_normal(size)
+    );
+    (float, int, width, closures)
+}
+
+/// The tests `normal`, `zero` and `usable` of a raw lane of `size`: closures,
+/// or with `EmitOptions::shared_float_tests` the region header's functions
+/// (`crate::codegen`'s `FLOAT_TEST_HELPER`) bound by name.
+pub(crate) fn float_tests(size: FpSize) -> String {
+    let (normal_zero, usable) = float_test_parts(size);
+    format!("{normal_zero} {usable}")
+}
+
+/// `float_tests` in two parts, `normal` and `zero`, then `usable`, for
+/// code that defines another test between them.
+pub(crate) fn float_test_parts(size: FpSize) -> (String, String) {
+    let (int, width, exponent, sign) = match size {
+        FpSize::S => ("u32", 32, "0x7f80_0000u32", "0x8000_0000u32"),
         FpSize::D => (
-            "f64",
             "u64",
             64,
             "0x7ff0_0000_0000_0000u64",
             "0x8000_0000_0000_0000u64",
         ),
     };
-    let closures = format!(
-        "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-         let zero = |value: {int}| value & !{sign} == 0; \
-         let usable = |value: {int}| normal(value) | zero(value); \
-         {} let sign = {sign}; let _ = sign;",
-        smallest_normal(size)
-    );
-    (float, int, width, closures)
+    if crate::codegen::shared_float_tests_on() {
+        (
+            format!("let normal = fp_normal_{width}; let zero = fp_zero_{width};"),
+            format!("let usable = fp_usable_{width};"),
+        )
+    } else {
+        (
+            format!(
+                "let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
+                 let zero = |value: {int}| value & !{sign} == 0;"
+            ),
+            format!("let usable = |value: {int}| normal(value) | zero(value);"),
+        )
+    }
 }
 
 /// The closure `smallest_normal`: whether a raw lane's magnitude is the
@@ -2401,6 +2429,12 @@ fn smallest_normal(size: FpSize) -> String {
             "0x0010_0000_0000_0000u64",
         ),
     };
+    if crate::codegen::shared_float_tests_on() {
+        let width = if size == FpSize::S { 32 } else { 64 };
+        return format!(
+            "let smallest_normal = fp_smallest_normal_{width}; let _ = smallest_normal;"
+        );
+    }
     format!(
         "let smallest_normal = |value: {int}| value & {magnitude} == {least}; let _ = smallest_normal;"
     )
@@ -2429,6 +2463,44 @@ pub(crate) fn result_normal(fp_op: VecFpOp, raw: &str) -> String {
 /// under it, an inlined float operation traps exactly when its helper
 /// would, that is never.
 pub(crate) const FP_MODE: &str = "m.cpu.fpcr & (echora_guest::simd::FPCR_RMODE | echora_guest::simd::FPCR_AH | echora_guest::simd::FPCR_FZ16) == 0";
+
+/// The per-lane operand test of an inlined compare, FMAX or FMIN: `bad`
+/// gets the lanes the exact helper must make. Without
+/// `EmitOptions::special_lanes`, every lane not normal or zero; with it,
+/// only a NaN's, the operands (`x`, `y`) flushed first under FPCR.FZ (a
+/// denormal a zero of its sign, FPUnpack) and `idc` set for a native lane
+/// that flushed one (the helper raises it for its own). Returns the code
+/// before the loop, the lane's test, and the code after the loop.
+fn compare_lane_test(size: FpSize) -> (String, String, String) {
+    if !crate::codegen::special_lanes_on() {
+        return (
+            String::new(),
+            "bad |= u32::from(!(usable(x) & usable(y))) << lane;".to_owned(),
+            String::new(),
+        );
+    }
+    let (int, exponent, sign) = match size {
+        FpSize::S => ("u32", "0x7f80_0000u32", "0x8000_0000u32"),
+        FpSize::D => (
+            "u64",
+            "0x7ff0_0000_0000_0000u64",
+            "0x8000_0000_0000_0000u64",
+        ),
+    };
+    let p = "echora_guest::simd";
+    (
+        format!(
+            "let fz = m.cpu.fpcr & {p}::FPCR_FZ != 0; let mut idc = false; \
+             let flush = |value: {int}| if fz && value & {exponent} == 0 && value & !{sign} != 0 {{ (value & {sign}, true) }} else {{ (value, false) }}; "
+        ),
+        format!(
+            "let ((x, fx), (y, fy)) = (flush(x), flush(y)); \
+             let ok = x & !{sign} <= {exponent} && y & !{sign} <= {exponent}; \
+             bad |= u32::from(!ok) << lane; idc |= ok & (fx | fy);"
+        ),
+        format!("if mode && idc {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_IDC; }} "),
+    )
+}
 
 /// After an inlined compare, FMAX or FMIN whose `bad` lanes (bit per lane)
 /// held a NaN or a denormal: those lanes of `out` are made again by the
@@ -2510,9 +2582,9 @@ fn unary_lane(unary: VecFpUnaryOp, size: FpSize) -> Option<(String, String)> {
     };
     Some(match unary {
         // Square roots of positive normals are normal; of a zero, that
-        // zero. Neither raises anything (the helper models no IXC here).
+        // zero. A rounded root raises IXC: native with IXC already set.
         VecFpUnaryOp::Sqrt => (
-            "usable(x) & ((x & sign == 0) | zero(x))".to_owned(),
+            "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & ((x & sign == 0) | zero(x))".to_owned(),
             "f.sqrt().to_bits()".to_owned(),
         ),
         VecFpUnaryOp::Round(rounding) => {
@@ -2526,25 +2598,25 @@ fn unary_lane(unary: VecFpUnaryOp, size: FpSize) -> Option<(String, String)> {
             ("usable(x)".to_owned(), format!("f.{function}().to_bits()"))
         }
         // Toward zero: in range exactly when the truncated value fits (no
-        // IOC); a fraction raises nothing in the helper.
+        // IOC); a fraction raises IXC: native with IXC already set.
         VecFpUnaryOp::ToSigned(Rounding::Zero) => match size {
             FpSize::S => (
-                "usable(x) & (f >= -2147483648.0) & (f < 2147483648.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f >= -2147483648.0) & (f < 2147483648.0)".to_owned(),
                 "f as i32 as u32".to_owned(),
             ),
             FpSize::D => (
-                "usable(x) & (f >= -9223372036854775808.0) & (f < 9223372036854775808.0)"
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f >= -9223372036854775808.0) & (f < 9223372036854775808.0)"
                     .to_owned(),
                 "f as i64 as u64".to_owned(),
             ),
         },
         VecFpUnaryOp::ToUnsigned(Rounding::Zero) => match size {
             FpSize::S => (
-                "usable(x) & (f > -1.0) & (f < 4294967296.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f > -1.0) & (f < 4294967296.0)".to_owned(),
                 "f as u32".to_owned(),
             ),
             FpSize::D => (
-                "usable(x) & (f > -1.0) & (f < 18446744073709551616.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f > -1.0) & (f < 18446744073709551616.0)".to_owned(),
                 "f as u64".to_owned(),
             ),
         },
@@ -2702,6 +2774,7 @@ fn vec_fp_arith(
     };
     let (value, exact) = arith_lane(fp_op, float);
     let smallest = smallest_normal(size);
+    let (normal_zero, usable) = float_test_parts(size);
     let raw_normal = result_normal(fp_op, "raw");
     let all_normal = result_normal_all(fp_op);
     // A zero divisor raises DZC: only normal divisors run natively.
@@ -2771,6 +2844,14 @@ fn vec_fp_arith(
             } else {
                 ""
             };
+            // A normal number divided by zero: the host's signed infinity,
+            // and DZC (FPDiv).
+            let by_zero = if fp_op == VecFpOp::Div {
+                "else if normal(x) & zero(y) { m.cpu.fpsr = m.cpu.fpsr | echora_guest::simd::FPSR_DZC; raw } "
+                    .to_owned()
+            } else {
+                String::new()
+            };
             let invalid = if fused {
                 " & !(nan(z) & (infinite(x) & zero(y) | zero(x) & infinite(y)))"
             } else {
@@ -2791,7 +2872,7 @@ fn vec_fp_arith(
                 FpSize::D => "0x7ff8_0000_0000_0000u64",
             };
             format!(
-                "else if ordinary(x) & ordinary(y){ordinary_z} & ((infinite(raw) & (infinite(x) | infinite(y){infinite_z})){quotient}) {{ raw }} \
+                "else if ordinary(x) & ordinary(y){ordinary_z} & ((infinite(raw) & (infinite(x) | infinite(y){infinite_z})){quotient}) {{ raw }} {by_zero}\
                  else if (nan(x) | nan(y){nan_z}) & plain(x) & plain(y){plain_z}{invalid} {{ \
                  if m.cpu.fpcr & {p}::FPCR_DN != 0 {{ {default_nan} }} else {{ {picked} }} }} "
             )
@@ -2842,10 +2923,9 @@ fn vec_fp_arith(
         };
         return format!(
             "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
-             let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-             let zero = |value: {int}| value & !{sign} == 0; \
+             {normal_zero} \
              let infinite = |value: {int}| value & !{sign} == {exponent}; \
-             let usable = |value: {int}| normal(value) | zero(value); let _ = usable; {smallest} {closures} \
+             {usable} let _ = usable; {smallest} {closures} \
              let mode = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
              && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
              let mut fast = mode && usable_all(n) && {second_usable}{d_usable}; \
@@ -2863,10 +2943,9 @@ fn vec_fp_arith(
     }
     format!(
         "{{ let n = m.cpu.vectors[{rn}]; {second} let d = m.cpu.vectors[{rd}]; \
-                 let normal = |value: {int}| {{ let field = value & {exponent}; field != 0 && field != {exponent} }}; \
-                 let zero = |value: {int}| value & !{sign} == 0; \
+                 {normal_zero} \
                  let infinite = |value: {int}| value & !{sign} == {exponent}; \
-                 let usable = |value: {int}| normal(value) | zero(value); {smallest} \
+                 {usable} {smallest} \
                  let mut fast = m.cpu.fpcr & ({p}::FPCR_RMODE | {p}::FPCR_AH | {p}::FPCR_FZ16) == 0 \
                  && m.cpu.fpsr & {p}::FPSR_IXC != 0; \
                  let mut out = 0u128; let mut overflow = false; \
@@ -3274,6 +3353,27 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
                 Some(rm) => format!("m.cpu.vectors[{rm}] as {int}"),
                 None => "0".to_owned(),
             };
+            if crate::codegen::special_lanes_on() {
+                // `EmitOptions::special_lanes`: every operand but a NaN.
+                // Under FPCR.FZ a denormal is a zero of its sign (FPUnpack,
+                // raising IDC); without, the host compares it exactly.
+                let (exponent, sign) = match size {
+                    FpSize::S => ("0x7f80_0000u32", "0x8000_0000u32"),
+                    FpSize::D => ("0x7ff0_0000_0000_0000u64", "0x8000_0000_0000_0000u64"),
+                };
+                let p = "echora_guest::simd";
+                return Some(format!(
+                    "{{ let x = m.cpu.vectors[{rn}] as {int}; let y: {int} = {y}; \
+                     if {FP_MODE} && x & !{sign} <= {exponent} && y & !{sign} <= {exponent} {{ \
+                     let fz = m.cpu.fpcr & {p}::FPCR_FZ != 0; \
+                     let flush = |value: {int}| if fz && value & {exponent} == 0 && value & !{sign} != 0 {{ (value & {sign}, true) }} else {{ (value, false) }}; \
+                     let ((x, fx), (y, fy)) = (flush(x), flush(y)); \
+                     if fx | fy {{ m.cpu.fpsr = m.cpu.fpsr | {p}::FPSR_IDC; }} \
+                     let (a, b) = ({float}::from_bits(x), {float}::from_bits(y)); \
+                     m.cpu.nzcv = if a == b {{ 0b0110 }} else if a < b {{ 0b1000 }} else {{ 0b0010 }}; \
+                     }} else {{\n{call}\n}} }}"
+                ));
+            }
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; let y: {int} = {y}; {kit} \
                  let plain = |value: {int}| usable(value) || {float}::from_bits(value).is_infinite(); \
@@ -3313,15 +3413,16 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
             };
             let call = emit_call(op)?;
             let lanewise = exact_lanes(fp_op, size, lanes, width, int, rd);
+            let (before, lane_test, after) = compare_lane_test(size);
             Some(format!(
                 "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
-                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; \
+                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; {before}\
                  for lane in 0..{lanes} {{ \
                  let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
-                 bad |= u32::from(!(usable(x) & usable(y))) << lane; \
+                 {lane_test} \
                  let hit = {float}::from_bits(x){abs} {test} {float}::from_bits(y){abs}; \
                  out |= u128::from(if hit {{ {int}::MAX }} else {{ 0 }}) << (lane * {width}); }} \
-                 if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
+                 {after}if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
             ))
         }
         SimdOp::VecFp {
@@ -3343,14 +3444,15 @@ fn emit_inline_base(op: &SimdOp) -> Option<String> {
             let value = min_max(max, float);
             let call = emit_call(op)?;
             let lanewise = exact_lanes(fp_op, size, lanes, width, int, rd);
+            let (before, lane_test, after) = compare_lane_test(size);
             Some(format!(
                 "{{ let n = m.cpu.vectors[{rn}]; let v = m.cpu.vectors[{rm}]; {kit} \
-                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; \
+                 let mode = {FP_MODE}; let mut bad = 0u32; let mut out = 0u128; {before}\
                  for lane in 0..{lanes} {{ \
                  let x = (n >> (lane * {width})) as {int}; let y = (v >> (lane * {width})) as {int}; \
-                 bad |= u32::from(!(usable(x) & usable(y))) << lane; \
+                 {lane_test} \
                  out |= u128::from({value}) << (lane * {width}); }} \
-                 if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
+                 {after}if mode && bad == 0 {{ m.cpu.vectors[{rd}] = out; }} else if mode {{ {lanewise} }} else {{ {call} }} }}"
             ))
         }
         SimdOp::VecFp {
@@ -5669,7 +5771,10 @@ mod tests {
             fp_to_int(&mut cpu, 0, 1, 64, FpSize::S, true, rounding).unwrap();
             assert_eq!(cpu.regs[0] as i64, expected, "{rounding:?}");
         }
-        assert_eq!(cpu.fpsr, 0);
+        // -2.5 is no integer: Inexact (FPToFixed).
+        assert_eq!(cpu.fpsr, FPSR_IXC);
+        cpu.fpsr = 0;
+        // Out of range: Invalid Operation alone.
         fp_to_int(&mut cpu, 0, 1, 32, FpSize::S, false, Rounding::Zero).unwrap();
         assert_eq!((cpu.regs[0], cpu.fpsr), (0, FPSR_IOC));
         cpu.fpsr = 0;

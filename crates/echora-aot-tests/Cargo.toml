@@ -118,6 +118,9 @@ mxcsr-groups = []
 # With inline-vector and whole-vector-checks: lanes with infinite operands
 # whose results are exact run natively (EmitOptions::special_lanes).
 special-lanes = []
+# The inline paths' float tests as functions in each region's header, bound
+# by name in each operation (EmitOptions::shared_float_tests).
+shared-float-tests = []
 # With call-summaries: every summarized call of a lifted function audited
 # (EmitOptions::call_summaries_audit).
 call-summaries-audit = []
@@ -161,6 +164,13 @@ regalloc-lazy-pc = []
 # With regalloc: functions over the size caps in structured pieces
 # (EmitOptions::regalloc_split_capped).
 regalloc-split-capped = []
+# Register locals' full reloads as one method per window or function
+# (EmitOptions::shared_reloads).
+shared-reloads = []
+# Tests only: structured functions capped at 6 KB of Rust
+# (EmitOptions::regalloc_function_bytes), so that every program's
+# functions are capped, or with regalloc-split-capped run in pieces.
+regalloc-tiny-caps = []
 # With regalloc: call return points outside loops are function entries
 # (EmitOptions::regalloc_return_entries).
 regalloc-return-entries = []

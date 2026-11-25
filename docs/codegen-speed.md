@@ -1383,6 +1383,150 @@ operands with IXC set so the groups commit: 389,800 runs, without regalloc
 and with it, none differing; before the fix 73 programs differed, both
 angle-wrap blocks among them.
 
+**Compares under FZ.** The helpers' scalar fast paths took only FPCR 0
+(`default_mode`, now `fast_mode`); the game runs with FZ, so every FCMP through a helper
+took the exact path, and a candidate's run counted 17.5 million FCMPs of
+a normal and a denormal under FZ, 4 million of two normals and 2.7
+million of a zero and a normal. `fp_compare` now compares natively in any
+FPCR the helpers accept, with or without IXC (a compare rounds nothing),
+a denormal operand flushed to a zero of its sign (IDC) under FZ; only a
+NaN takes the exact path. With `special-lanes`, the inlined FCMP and
+FCMPE do the same (they took only normal, zero and infinite operands).
+`compares_run_natively_as_the_exact_path` (echora-simd) compares every
+pair of 14 single and 13 double values, a register and #0.0, FCMP and
+FCMPE, FPCR 0, FZ, DN and FZ+DN, FPSR with and without IXC, against the
+exact path: NZCV and FPSR agree; it fails without the flush, with the
+flush outside FZ, without IDC or with NaNs taken. `tests/special_lanes.rs`
+holds FCMP and FCMPE S, FCMP D and FCMP D with #0.0: 80,000 runs, none
+differing; it fails without the flush, without IDC or with NaNs taken.
+
+**Vector compares, FMAX and FMIN, and division by zero.** The same run
+counted 3.8 million FCMGE lanes of a normal and an infinity, 2.2 million
+divisions of a normal by zero, 1.5 million FMIN and 1.4 million FMAX of
+an infinity and a normal, 1.2 million FCMGE of two infinities and more of
+NaNs, zeros and denormals. With `special-lanes` the inlined FCMEQ, FCMGE,
+FCMGT, FACGE, FACGT, FMAX, FMIN, FMAXNM and FMINNM take every lane but a
+NaN's natively (`compare_lane_test`): IEEE's compares and the maximum and
+minimum of infinities are Arm's, and under FZ a denormal operand is a
+zero of its sign, IDC raised for a native lane that flushed one (the
+helper raises it for the NaN lanes it takes). A normal number divided by
+zero is the host's infinity with DZC, inlined with `special-lanes` and in
+the helpers' `native_arith_lane` always (an infinity divided by zero is
+exact and raises nothing; zero by zero and a denormal by zero under FZ are
+NaNs, the exact path's). `tests/special_lanes.rs` holds FCMGT, FCMGE,
+FCMEQ, FACGE, FMAX, FMIN, FMAXNM 4S, FCMGT, FMINNM 2D and FMAX 2S:
+120,000 runs, none differing; it fails without the flush, without IDC,
+with NaN lanes taken, without DZC or with any dividend over zero; the
+echora-simd lane test fails without DZC or with an infinity's division
+by zero raising it.
+
+**The helpers' inline paths under FZ.** `fp_binary`'s and `fp_ternary`'s
+inline paths (the part of the helper inlined into translated code) took
+only FPCR 0, which the game never has: under its FZ every scalar FADD,
+FSUB, FMUL, FDIV and fused multiply-add the lifter leaves to a helper
+called the out-of-line exact path, its FPCR decoding and
+`native_arith_lane`. They now take FPCR with FZ, DN or both (`fast_mode`):
+a denormal operand is a zero of its sign under FZ (IDC raised when the
+native result is kept); DN changes only NaN results, which the exact path
+takes; and under FZ a denormal sum or difference (exact without FZ, but
+flushed with UFC under it) takes the exact path as a tiny product,
+quotient or fused result already did. Any other FPCR bit, a directed
+rounding mode included, takes the exact path (which traps on one). Default translations call
+these helpers, so this is not an option. The echora-simd test
+`fast_modes_match_the_exact_path` runs the four operations on every pair,
+and the four fused ones on every triple, of 17 single and 14 double
+special and boundary values (zeros, denormals, the smallest normals,
+infinities, NaNs, near-overflow and near-underflow normals) under FPCR 0,
+FZ, DN, FZ+DN and FZ with round toward plus infinity, with and without
+IXC, against the exact path: the trap or not, the result and FPSR bit for bit. It fails
+without the flush of either helper, without IDC in either, without the
+denormal sum's check, or with a directed rounding admitted.
+
+**Inexact and underflow in conversions and roots (a fix).** The exact
+paths of FCVT between single and double, FCVT{N,P,M,Z,A}{S,U} to a
+general register (and their vector and fixed-point forms), FRINTX, FSQRT
+(scalar and vector) and SCVTF/UCVTF from a general or SIMD register
+raised no Inexact, and FCVT to single raised no Underflow and Overflow
+without Inexact: invisible once IXC is set, as in the game, but not Arm's.
+They now follow the pseudocode: FPRoundBase for FCVT to single
+(tininess before rounding; under FZ a tiny result is a zero of its sign
+with Underflow alone, otherwise Inexact when rounded, with Underflow when
+tiny, and Overflow with Inexact), FPToFixed (Invalid Operation on
+overflow, else Inexact when rounded), FPRoundInt for FRINTX and FPSqrt
+(Inexact when rounded), each decided exactly: a round trip through the
+wider format, a comparison with the unrounded value, and for a double's
+root one fused multiply-add on operands scaled by an even power of two
+where the residual could underflow. Still unmodeled: SCVTF/UCVTF with
+fixed-point fraction bits (computed through a double, which may round
+twice), vector SCVTF and UCVTF, and the half-precision conversions.
+The lifted inline paths that modeled the same omission now take only
+what raises nothing new: `inline-fp-scalar`'s FSQRT, FRINTX, FCVT to
+single, FCVT to an integer and SCVTF/UCVTF (but a 32-bit integer to a
+double, exact) with IXC already set, and its FCVT to single not from
+below the single's normal range (no zero but of a zero, no smallest
+normal); `inline-vector-unary`'s FSQRT and FCVTZS/FCVTZU lanes with IXC
+set. With the sticky IXC, as in the game, nothing changes; without it the
+helper raises it. The MXCSR groups and float runs already required it.
+`conversion_and_root_flags_are_arms` (echora-simd) holds the cases with
+FPSR clear before each, through the helpers and the exact paths alike; it
+fails without any one of these flags, with tininess after rounding, with
+Inexact on FZ's flush, or without the root's scaling.
+
+**Fast paths for FSQRT, FRINT and conversions.** Under the game's FZ the
+scalar kernel's helper calls were FSQRT and FRINT (`fp_unary`, 120 host
+instructions a call), FCVT (`fp_convert`, 106), FCVTZS and its family
+(`fp_to_int`, 105) and FCMP (92): the runtime-sized format code of the
+exact paths, FPCR decoding and NaN tests. Each now starts with a fast path
+specialized by size, in every FPCR the helpers accept (`accepted_mode`):
+a denormal operand is a zero of its sign under FZ (IDC); FSQRT of a
+non-negative number or a zero, FRINT* of anything but a NaN, FCVT of a
+number within the target's normal range (or a zero) and a conversion to
+an integer in range are the host's, with Inexact computed as the exact
+path does; everything else is the exact path's. The echora-simd test
+`unary_and_conversion_fast_paths_match_the_exact_path` runs every
+operation, rounding and integer width on special, boundary and range-edge
+values of both sizes under FPCR 0, FZ, DN, FZ+DN and a directed rounding,
+with and without IXC, against the exact paths: the trap or not, the
+result and FPSR bit for bit. The two tests fail without the fast
+paths' tiny-input check or their Inexact.
+
+Counted as above (the game set plus window-calls, under FZ with IXC set;
+host instructions per guest instruction, before and after the flags fix
+and these fast paths together): scalar 157.00 to 154.13 (-1.8%),
+fpscalar 71.20 to 69.67 (-2.2%), floats, misc and vnorm unchanged, and
+convert 192.60 to 200.10 (+3.9%), the vector FCVT lanes' Inexact test
+(faithfulness, not a fast path). The fast paths gain little: translated
+code calls the exported helpers with the operation and size as
+arguments, so a helper's fast path is still generic code (about 100 host
+instructions a call before, a few less after). The large cut is code the
+lifter emits per instruction, as `inline-fp-scalar` does.
+
+**Compile cost of the candidates' set, and `shared-float-tests`.** The
+codesize crate (every test program as one crate, 94,098 guest
+instructions) lifted with the game's hot-region set of its candidates
+since 2026-11 (`game+candidate`: the register allocator and its family,
+MXCSR groups, special lanes and every per-instruction inline path; not
+`regalloc-crates`) is 100.8 MB of Rust, against 36.1 MB for the game set.
+At `opt-level` 1, `codegen-units` 1 and `target-cpu=native`, as the game
+builds a region, rustc ran out of this machine's memory at 13.6 GB after
+904 s, before LLVM wrote anything. Through the front end alone
+(`-Zno-codegen`, `-Ztime-passes`): type checking 128 s, borrow checking
+94 s (+5.9 GB), metadata 41 s, parsing, expansion and resolution 26 s
+(11 GB), and about 600 s in queries time-passes does not attribute.
+
+45,000 of its 47,759 closures were the inline paths' four tests (`normal`,
+`zero`, `usable`, `smallest_normal`), defined anew in every inlined float
+operation: each a closure for rustc to infer, check, lower and compile.
+`shared-float-tests` (`EmitOptions::shared_float_tests`) writes them once
+into each region's header as `#[inline(always)]` functions
+(`FLOAT_TEST_HELPER`) and binds them by name in each operation; the code
+is the same. With it the crate holds 2,403 closures and 99.3 MB, and its
+front end takes 851 s instead of 909 (−6.4%) at a 12.30 GB peak instead
+of 13.25 (−7%): type checking 127 s, borrow checking 88 s (+5.3 GB). The
+other large items are regalloc's: every block in its window and its
+structured function, and around 30 register reloads after each call
+(about 15 MB here).
+
 **Scalar groups.** With `mxcsr-groups`, consecutive scalar FADD, FSUB,
 FMUL, FDIV, FNMUL, FMADD, FMSUB, FNMADD, FNMSUB, FSQRT, FABS, FNEG and FMOV
 (single and double) and FCVT between single and double form a scalar

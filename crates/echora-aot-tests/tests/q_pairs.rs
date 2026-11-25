@@ -35,7 +35,7 @@ use echora_aot_tests::{Machine, Trap};
 mod lifted {
     include!(concat!(env!("OUT_DIR"), "/lifted_q_pair.rs"));
 }
-use lifted::{q_pair_code, q_pair_reference};
+use lifted::{q_pair_code, q_pair_reference, q_pair_regalloc};
 
 const DATA: u64 = 0x1000_0000;
 const DATA_SIZE: u64 = 0x4000;
@@ -95,7 +95,9 @@ fn the_option_leaves_no_out_of_line_pair_call() {
     const { assert!(q_pair_code::OUT_OF_LINE == 0) };
     const {
         assert!(
-            q_pair_reference::OUT_OF_LINE == q_pair_code::WORDS.len() - q_pair_code::ENTRIES.len()
+            // Every word a pair but the SVCs and the three FADDs.
+            q_pair_reference::OUT_OF_LINE
+                == q_pair_code::WORDS.len() - q_pair_code::ENTRIES.len() - 3
         )
     };
 }
@@ -117,6 +119,26 @@ fn pairs_inside_mapped_memory_match_the_checked_calls() {
         for base in bases {
             let expected = run(q_pair_reference::dispatch, &mut m, entry, base);
             let actual = run(q_pair_code::dispatch, &mut m, entry, base);
+            assert_eq!(
+                actual,
+                expected,
+                "{} from base {base:#x}",
+                q_pair_code::NAMES[index]
+            );
+        }
+    }
+}
+
+#[test]
+fn pairs_in_structured_functions_match_the_checked_calls() {
+    // Every program structured: its entry is a function entry.
+    const { assert!(q_pair_regalloc::STRUCTURED_FUNCTIONS >= q_pair_code::ENTRIES.len()) };
+    const { assert!(q_pair_code::STRUCTURED_FUNCTIONS == 0) };
+    let mut m = machine();
+    for (index, &entry) in q_pair_code::ENTRIES.iter().enumerate() {
+        for base in [DATA + 0x1800, DATA + 0x1ff8, DATA + 0x2004] {
+            let expected = run(q_pair_reference::dispatch, &mut m, entry, base);
+            let actual = run(q_pair_regalloc::dispatch, &mut m, entry, base);
             assert_eq!(
                 actual,
                 expected,
