@@ -141,6 +141,11 @@ mod unix {
                 }
             }
             text.push('\n');
+            // How many mappings the process holds (a failed mmap leaves
+            // libraries with pointers to nothing).
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                let _ = writeln!(text, "  mappings {}", maps.lines().count());
+            }
             // The general registers, for what the faulting instruction used.
             // SAFETY: as above.
             let registers = unsafe { (*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
