@@ -5068,6 +5068,16 @@ mod tests {
     /// (n, 0, 0)): each invocation's general registers, the barriers passed
     /// and the problems found.
     fn run_group(count: usize, inputs: &[u32], words: &[u128]) -> GroupRun {
+        run_group_with_shared(count, None, inputs, words)
+    }
+
+    /// `run_group` with `shared_bytes` of shared memory.
+    fn run_group_with_shared(
+        count: usize,
+        shared_bytes: Option<u32>,
+        inputs: &[u32],
+        words: &[u128],
+    ) -> GroupRun {
         let mut program: Vec<u128> = inputs
             .iter()
             .enumerate()
@@ -5076,7 +5086,10 @@ mod tests {
         program.extend_from_slice(words);
         program.push(EXIT);
         let code: Vec<_> = program.iter().map(|&raw| decode(raw)).collect();
-        let layout = Layout::workgroup([count as u32, 1, 1]);
+        let layout = Layout {
+            shared_bytes,
+            ..Layout::workgroup([count as u32, 1, 1])
+        };
         let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
         let machine = Machine::new(&translated.spirv);
         let group = machine.run_workgroup(count, 32, |n| {
@@ -6984,6 +6997,180 @@ mod tests {
             );
             let or = running.iter().fold(0, |x, m| x | m);
             assert_eq!(r[&13], or, "invocation {n}: or");
+        }
+    }
+
+    #[test]
+    fn matches_compare_values_across_the_running_lanes() {
+        let guarded = |raw: u128, guard: u128| raw & !(0xf << 12) | guard << 12;
+        let and = |d: u128, a: u128, imm: u32| {
+            word(&[
+                (0, 12, 0x812),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 32, u128::from(imm)),
+                (64, 8, 255),
+                (72, 8, 0xc0),
+                (81, 3, 7),
+            ])
+        };
+        // ISETP.EQ.U32.AND P2, PT, R1, R5, PT (R5 = 5)
+        let equal = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 1),
+            (32, 8, 5),
+            (76, 3, 2),
+            (81, 3, 2),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        // MATCH.ANY / .ALL Rd, Pp, Ra (.U64 with `wide`)
+        let matching = |d: u128, p: u128, a: u128, wide: u128, any: u128| {
+            word(&[
+                (0, 12, 0x3a1),
+                (16, 8, d),
+                (24, 8, a),
+                (73, 1, wide),
+                (79, 1, any),
+                (81, 3, p),
+            ])
+        };
+        let program = [
+            // S2R R0, SR_TID.X; R1 = R0 & 7; @(R1 == 5) EXIT
+            word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]),
+            and(1, 0, 7),
+            equal,
+            guarded(EXIT, 2),
+            // R2 = R0 & 3: MATCH.ANY R3, R2
+            and(2, 0, 3),
+            matching(3, 7, 2, 0, 1),
+            // MATCH.ALL R4, P1, R2 (lanes differ); @P1 R6 += 1
+            matching(4, 1, 2, 0, 0),
+            guarded(add(6, 6, 1), 1),
+            // R7 = 9 in every lane: MATCH.ALL R8, P3, R7; @P3 R9 += 1
+            mov(7, 9),
+            matching(8, 3, 7, 0, 0),
+            guarded(add(9, 9, 1), 3),
+            // R10:R11 = (R0 & 1, R0 & 4): MATCH.ANY.U64 R12, R10
+            and(10, 0, 1),
+            and(11, 0, 4),
+            matching(12, 7, 10, 1, 1),
+        ];
+        let (registers, _, problems) = run_group(40, &[0, 0, 0, 0, 0, 5], &program);
+        assert!(problems.is_empty(), "{problems:?}");
+        for (n, r) in registers.iter().enumerate() {
+            let n = n as u32;
+            if n & 7 == 5 {
+                continue;
+            }
+            let running: Vec<u32> = (n / 32 * 32..(n / 32 * 32 + 32).min(40))
+                .filter(|m| m & 7 != 5)
+                .collect();
+            let mask = |same: &dyn Fn(u32) -> bool| {
+                running
+                    .iter()
+                    .filter(|&&m| same(m))
+                    .fold(0u32, |mask, &m| mask | 1 << (m % 32))
+            };
+            assert_eq!(
+                r[&3],
+                mask(&|m| m & 3 == n & 3),
+                "invocation {n}: MATCH.ANY"
+            );
+            assert_eq!(
+                (r[&4], r[&6]),
+                (0, 0),
+                "invocation {n}: MATCH.ALL of differing values"
+            );
+            assert_eq!(
+                r[&8],
+                mask(&|_| true),
+                "invocation {n}: MATCH.ALL of one value"
+            );
+            assert_eq!(r[&9], 1, "invocation {n}: MATCH.ALL's predicate");
+            assert_eq!(
+                r[&12],
+                mask(&|m| m & 5 == n & 5),
+                "invocation {n}: MATCH.ANY.U64"
+            );
+        }
+    }
+
+    #[test]
+    fn population_increments_add_one_per_lane_in_lane_order() {
+        let guarded = |raw: u128, guard: u128| raw & !(0xf << 12) | guard << 12;
+        let and = |d: u128, a: u128, imm: u32| {
+            word(&[
+                (0, 12, 0x812),
+                (16, 8, d),
+                (24, 8, a),
+                (32, 32, u128::from(imm)),
+                (64, 8, 255),
+                (72, 8, 0xc0),
+                (81, 3, 7),
+            ])
+        };
+        // ISETP.EQ.U32.AND P2, PT, R1, R5, PT (R5 = 5)
+        let equal = word(&[
+            (0, 12, 0x20c),
+            (24, 8, 1),
+            (32, 8, 5),
+            (76, 3, 2),
+            (81, 3, 2),
+            (84, 3, 7),
+            (87, 3, 7),
+        ]);
+        // ATOMS.POPC.INC R2, [R10+URZ]
+        let increment = word(&[
+            (0, 12, 0xf8c),
+            (16, 8, 2),
+            (24, 8, 10),
+            (64, 8, 0x3f),
+            (87, 4, 10),
+            (91, 1, 1),
+        ]);
+        let program = [
+            // S2R R0, SR_TID.X; R1 = R0 & 7; @(R1 == 5) EXIT
+            word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]),
+            and(1, 0, 7),
+            equal,
+            guarded(EXIT, 2),
+            // R10 = R0 & 4: two shared words, lanes alternating in fours.
+            and(10, 0, 4),
+            increment,
+        ];
+        let (registers, _, problems) =
+            run_group_with_shared(40, Some(64), &[0, 0, 0, 0, 0, 5], &program);
+        assert!(problems.is_empty(), "{problems:?}");
+        let running: Vec<u32> = (0..40).filter(|n| n & 7 != 5).collect();
+        for word in [0, 4] {
+            let lanes: Vec<u32> = running.iter().copied().filter(|n| n & 4 == word).collect();
+            // Every running lane added one: they received distinct old
+            // values covering 0 to their count.
+            let mut olds: Vec<u32> = lanes.iter().map(|&n| registers[n as usize][&2]).collect();
+            olds.sort_unstable();
+            assert_eq!(
+                olds,
+                (0..lanes.len() as u32).collect::<Vec<_>>(),
+                "word {word}"
+            );
+            // Within a subgroup the lanes sharing an address count up in
+            // lane order from one old value.
+            for subgroup in [0, 1] {
+                let group: Vec<u32> = lanes
+                    .iter()
+                    .copied()
+                    .filter(|n| n / 32 == subgroup)
+                    .collect();
+                let first = group.first().map(|&n| registers[n as usize][&2]);
+                for (rank, &n) in group.iter().enumerate() {
+                    assert_eq!(
+                        Some(registers[n as usize][&2]),
+                        first.map(|old| old + rank as u32),
+                        "lane {n}: rank {rank}"
+                    );
+                }
+            }
         }
     }
 

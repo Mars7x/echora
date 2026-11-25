@@ -1008,6 +1008,48 @@ impl Emitter {
 
     /// Register `n`: a general register, or a uniform register in a
     /// uniform instruction.
+    /// MATCH.ANY's mask for this lane: the running lanes whose `words` all
+    /// equal this lane's (its own lane among them), and the running lanes'
+    /// mask. Lane i's words are shuffled from lane i when it runs and from
+    /// this lane otherwise (never from a lane that is not running), and
+    /// the running mask leaves those out.
+    fn match_any(&mut self, index: usize, words: &[u32]) -> Result<(u32, u32), Unsupported> {
+        self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
+        self.module
+            .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
+        let subgroup = self.constant(SCOPE_SUBGROUP);
+        let uvec4 = self.module.ty(Type::Vector {
+            component: self.u32,
+            count: 4,
+        });
+        let all = self.module.bool_constant(true);
+        let running = self.value(op::GROUP_NON_UNIFORM_BALLOT, uvec4, &[subgroup, all]);
+        let running = self.value(op::COMPOSITE_EXTRACT, self.u32, &[running, 0]);
+        let zero = self.constant(0);
+        let me = self.special_register(index, 0)?;
+        let mut mask = zero;
+        for lane in 0..32u32 {
+            let bit = self.constant(1 << lane);
+            let held = self.value(op::BITWISE_AND, self.u32, &[running, bit]);
+            let runs = self.value(op::I_NOT_EQUAL, self.bool, &[held, zero]);
+            let lane_id = self.constant(lane);
+            let source = self.value(op::SELECT, self.u32, &[runs, lane_id, me]);
+            let mut same = runs;
+            for &word in words {
+                let other = self.value(
+                    op::GROUP_NON_UNIFORM_SHUFFLE,
+                    self.u32,
+                    &[subgroup, word, source],
+                );
+                let equal = self.value(op::I_EQUAL, self.bool, &[other, word]);
+                same = self.value(op::LOGICAL_AND, self.bool, &[same, equal]);
+            }
+            let with = self.value(op::BITWISE_OR, self.u32, &[mask, bit]);
+            mask = self.value(op::SELECT, self.u32, &[same, with, mask]);
+        }
+        Ok((mask, running))
+    }
+
     fn read_register(&mut self, n: u8) -> u32 {
         if self.uniform {
             return self.read_uniform(n.min(63));
@@ -2228,6 +2270,42 @@ impl Emitter {
                     self.uniform = false;
                 }
             }
+            Op::Match { d, p, a, wide, any } => {
+                self.module.capability(capability::GROUP_NON_UNIFORM_VOTE);
+                self.module.capability(capability::GROUP_NON_UNIFORM_BALLOT);
+                let subgroup = self.constant(SCOPE_SUBGROUP);
+                let mut words = vec![self.read_register(a.0)];
+                if wide {
+                    words.push(self.read_register(if a.0 == 255 { 255 } else { a.0 + 1 }));
+                }
+                let uvec4 = self.module.ty(Type::Vector {
+                    component: self.u32,
+                    count: 4,
+                });
+                let all = self.module.bool_constant(true);
+                let running = self.value(op::GROUP_NON_UNIFORM_BALLOT, uvec4, &[subgroup, all]);
+                let running = self.value(op::COMPOSITE_EXTRACT, self.u32, &[running, 0]);
+                let zero = self.constant(0);
+                if any {
+                    let (mask, _) = self.match_any(index, &words)?;
+                    self.write_register(d.0, mask);
+                } else {
+                    let mut equal = all;
+                    for &word in &words {
+                        let same = self.value(
+                            op::GROUP_NON_UNIFORM_ALL_EQUAL,
+                            self.bool,
+                            &[subgroup, word],
+                        );
+                        equal = self.value(op::LOGICAL_AND, self.bool, &[equal, same]);
+                    }
+                    let mask = self.value(op::SELECT, self.u32, &[equal, running, zero]);
+                    self.write_register(d.0, mask);
+                    if p != 7 {
+                        self.write_predicate(p, equal);
+                    }
+                }
+            }
             Op::Fswzadd { d, a, b, pattern } => {
                 // The lane's operation: bits 6 - 2n of the pattern for quad
                 // lane n (NAK's SM70 encoding, the reverse of SM50's, which
@@ -3440,6 +3518,7 @@ impl Emitter {
                     Op::R2ur { .. }
                         | Op::Shfl { .. }
                         | Op::Vote { .. }
+                        | Op::Match { .. }
                         | Op::Redux { .. }
                         | Op::S2r { .. }
                         | Op::Cs2r { .. }
@@ -4508,6 +4587,39 @@ mod tests {
         ]);
         // .MMIO is refused.
         assert!(matches!(decode(membar(2) | 1 << 72).op, Op::Unknown { .. }));
+    }
+
+    #[test]
+    fn matches_and_population_increments_validate() {
+        let layout = Layout {
+            shared_bytes: Some(64),
+            ..Layout::workgroup([64, 1, 1])
+        };
+        valid_with(
+            &[
+                // MATCH.ALL P0, RZ, R10; MATCH.ANY.U64 R2, R4
+                word(&[(0, 12, 0x3a1), (16, 8, 255), (24, 8, 10), (81, 3, 0)]),
+                word(&[
+                    (0, 12, 0x3a1),
+                    (16, 8, 2),
+                    (24, 8, 4),
+                    (73, 1, 1),
+                    (79, 1, 1),
+                ]),
+                // ATOMS.POPC.INC R3, [R10+URZ+0x4] (as the game encodes it)
+                word(&[
+                    (0, 12, 0xf8c),
+                    (16, 8, 3),
+                    (24, 8, 10),
+                    (40, 24, 4),
+                    (64, 8, 0x3f),
+                    (87, 4, 10),
+                    (91, 1, 1),
+                ]),
+                EXIT,
+            ],
+            &layout,
+        );
     }
 
     #[test]

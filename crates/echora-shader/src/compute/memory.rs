@@ -360,6 +360,9 @@ impl Emitter {
             self.page_table_stores = true;
             self.module.note_store();
         }
+        if operation == 10 && compare.is_none() && matches!(kind, 0 | 1) && space == Space::Shared {
+            return self.atomic_population_increment(index, d, address);
+        }
         let float = kind == 3;
         let opcode = match (compare.is_some(), operation, kind) {
             (true, _, 0 | 1) => op::ATOMIC_COMPARE_EXCHANGE,
@@ -446,6 +449,57 @@ impl Emitter {
         let old = self.value(op::LOAD, self.u32, &[result]);
         if !self.zero_register(d) {
             self.write_register(d, old);
+        }
+        Ok(())
+    }
+
+    /// ATOMS.POPC.INC (operation 10, opcode 0xf8c, no data register): each
+    /// running lane adds one to its shared word. Inferred from the game's
+    /// warp-aggregated counters (after MATCH.ALL, beside ATOMS.ADD), the
+    /// operation NAK's table (0-8) leaves out: as the hardware does it, one
+    /// add per address, the lowest lane of the lanes sharing an address
+    /// adding their count, and each lane receiving the old word plus the
+    /// number of those lanes below it.
+    fn atomic_population_increment(
+        &mut self,
+        index: usize,
+        d: u8,
+        address: Address,
+    ) -> Result<(), Unsupported> {
+        let (variable, bytes) = self.array(index, Space::Shared)?;
+        let at = self.array_address(address);
+        let (group, _) = self.match_any(index, &[at])?;
+        let lane = self.special_register(index, 0)?;
+        let (zero, one) = (self.constant(0), self.constant(1));
+        let below = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[one, lane]);
+        let below = self.value(op::I_SUB, self.u32, &[below, one]);
+        let below = self.value(op::BITWISE_AND, self.u32, &[group, below]);
+        let rank = self.value(op::BIT_COUNT, self.u32, &[below]);
+        let count = self.value(op::BIT_COUNT, self.u32, &[group]);
+        let leads = self.value(op::I_EQUAL, self.bool, &[rank, zero]);
+        let result = self.result_variables(1)[0];
+        let (element, inside) = self.array_word(variable, storage::WORKGROUP, bytes, at, 0);
+        let adds = self.value(op::LOGICAL_AND, self.bool, &[leads, inside]);
+        let scope = self.constant(SCOPE_WORKGROUP);
+        self.when(adds, |e| {
+            let old = e.value(op::ATOMIC_I_ADD, e.u32, &[element, scope, zero, count]);
+            e.function.emit(op::STORE, &[result, old]);
+            Ok(())
+        })?;
+        let old = self.value(op::LOAD, self.u32, &[result]);
+        // The leader: the group's lowest lane (its lowest set bit).
+        let negated = self.value(op::S_NEGATE, self.u32, &[group]);
+        let lowest = self.value(op::BITWISE_AND, self.u32, &[group, negated]);
+        let leader = self.glsl(self.u32, glsl::FIND_U_MSB, &[lowest]);
+        let subgroup = self.constant(super::SCOPE_SUBGROUP);
+        let shared = self.value(
+            op::GROUP_NON_UNIFORM_SHUFFLE,
+            self.u32,
+            &[subgroup, old, leader],
+        );
+        let value = self.value(op::I_ADD, self.u32, &[shared, rank]);
+        if !self.zero_register(d) {
+            self.write_register(d, value);
         }
         Ok(())
     }
