@@ -50,11 +50,17 @@ automated test covers it).
 ## Performance
 
 - The console runs the game at 60 frames per second. The opening movie
-  reaches that speed in Echora. With a Ryzen 7 5800X3D, a Radeon RX 9070 XT
-  and a warm shader cache, an isolated 2560×1440 Wayland test averaged
-  about 11 FPS over 175 frames on a saved forest route. An earlier stock
-  Linux build ran at around 6 FPS toward the end of a different village
-  route. Camera position, effects and scene loading change the workload.
+  runs at about 73 pictures per second in Echora. In the first 3D scene
+  (the Great Deku Tree, presents 10,500 to 10,700 of a scripted run from a
+  new game, Ryzen 7 5800X3D, Radeon RX 9070 XT, Mesa 26.2.7), the default
+  translation runs at about 23.4 frames per second, and a translation with
+  the opt-in structured-function and floating-point group options on the
+  148 hottest regions at about 26.3 (November 2026). Earlier route tests at
+  2560×1440 measured about 11 FPS on a saved forest route. Camera position,
+  effects and scene loading change the workload.
+- In that scene about 61% of CPU time is the game's own threads, mostly
+  translated game code (window code 27%, structured functions 16%), and
+  about 14% is the thread that replays the game's GPU work into Vulkan.
 - Guest threads run on one host thread per CPU by default, at most six, one
   per application core (`ECHORA_WORKERS`, or the launcher's CPU cores setting).
   The game's submitted GPU work is replayed into Vulkan on a thread of its

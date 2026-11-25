@@ -27,8 +27,9 @@ game.
 ## Status
 
 Echora runs the game's code with its own shader translator and plays the
-game's audio. The opening movie reaches 60 FPS, and early gameplay runs
-well below that speed.
+game's audio. The opening movie runs above 60 FPS, and the first 3D scene
+runs at about 23 FPS by default and about 26 FPS with the faster code
+generation that is still opt-in.
 
 What works today:
 
@@ -39,11 +40,11 @@ What works today:
   input, and gets through New Game and the opening movie into its first 3D
   scene. Manual Linux runs have also loaded a save, moved through the forest
   and entered the village.
-- Echora's own shader translator, written in Rust, translates all 6,215
-  shader stages the game has used in test runs so far. The old shader
-  recompiler is no longer needed. It can still be loaded as an optional
-  plugin, to compare with or for a program Echora's translator refuses
-  ([shader plugins](docs/shader-plugin.md)).
+- Echora's own shader translator, written in Rust, is the only shader
+  translator Echora uses. It translates 34,264 of the 34,275 GPU programs
+  captured from the game so far. A program it can't translate yet no longer
+  stops the game: its draws are skipped and the run reports which program it
+  was.
 - The first 3D scene is drawn: the forest floor with its ground cover,
   plants, fireflies, mist with shafts of light, the canopy, and the Great
   Deku Tree, lit and shadowed by the game's own passes. The opening
@@ -57,10 +58,13 @@ What works today:
 
 What doesn't work yet:
 
-- Water color, flicker and texture detail need further verification across
-  scenes. Some effects, including fog, use a lower internal resolution.
-- Sustained 60 FPS during gameplay. A fixed-1440p test averaged about 11 FPS
-  on a forest route after the scene loaded. See the
+- Water and fog don't match the console yet. They are being compared
+  against real-hardware footage of the same scenes.
+- Gameplay past the opening scene. Around the flight through Kokiri Forest
+  the graphics driver sometimes crashes, and memory use keeps growing after
+  that point. Both are being investigated.
+- Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
+  about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
@@ -81,7 +85,9 @@ I want Echora to behave like the console rather than work around it. It
 reimplements the Switch's kernel, system services and NVN graphics API and
 leaves the game's own code alone. When the game asks for something that is not
 supported yet, the run stops and reports exactly what was missing instead of
-pretending it worked. The translated code is tested against a reference
+pretending it worked. The one exception is a GPU program the shader
+translator can't handle yet: its draws are skipped and reported, so the game
+can keep going. The translated code is tested against a reference
 interpreter written from Arm's specification, and the game is read straight
 from your NUP file or dump without unpacking it.
 
@@ -165,10 +171,22 @@ the first 3D scene from about 2 to about 14 frames per second. More recent
 improvements to shader translation, texture uploads and CPU scheduling
 brought that scene to about 20 frames per second.
 
-The next step is the rest of the way to the console's 60 frames per
-second for that scene, by making each of the game's draws cheaper to turn
-into Vulkan work and the translated game code faster. After that come the scene's
-last faults and gameplay.
+Measurements then showed that most of a frame goes into the translated game
+code itself, so the code generator is being redesigned. Instead of small
+windows of code that keep the game's registers in memory and count every
+block, each game function becomes one native function that keeps its
+registers in local variables, and groups of floating-point operations run
+natively, checked once through the CPU's own exception flags with an exact
+fallback for the rare special values. On test kernels this runs about three
+times faster; in the game it currently gives about 12%, because much of the
+hot code still falls back to the older form. These options are opt-in until
+they win clearly in the game ([lifter redesign](docs/lifter-redesign.md),
+[code generation speed](docs/codegen-speed.md)).
+
+Right now the focus is on accuracy and on getting into gameplay: making
+water and fog match real-hardware footage of the same scenes, and fixing the
+driver crash and the memory growth that stop runs past the opening scene.
+Speed work continues after that.
 
 ## Building
 
