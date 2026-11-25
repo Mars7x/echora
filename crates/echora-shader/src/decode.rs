@@ -317,6 +317,19 @@ pub enum Op {
         /// uniform predicate.
         uniform_out: bool,
     },
+    /// MATCH.ANY / MATCH.ALL d, p, a: which running lanes of the warp hold
+    /// the same value as this lane in `a` (with `wide`, bit 73: a and a + 1
+    /// as one 64-bit value). ANY (bit 79): d gets the mask of the lanes
+    /// whose value equals this lane's (its own among them). ALL: d gets the
+    /// running lanes' mask when they all hold one value and 0 otherwise,
+    /// and p (bits 81-83) whether they do. As NAK encodes OpMatch (0x3a1).
+    Match {
+        d: Reg,
+        p: u8,
+        a: Reg,
+        wide: bool,
+        any: bool,
+    },
     /// REDUX d, src: the subgroup's and, or, xor, sum, min or max
     /// (`operation`, bits 78-80; min and max `signed` at 73) of src, into
     /// a uniform register.
@@ -1211,6 +1224,15 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 uniform_out: opcode == 0x886,
             });
         }
+        0x3a1 => {
+            return Some(Op::Match {
+                d,
+                p: word.bits(81, 3) as u8,
+                a: word.reg(24),
+                wide: word.bit(73),
+                any: word.bit(79),
+            });
+        }
         0x3c4 => {
             return Some(Op::Redux {
                 d: UniformReg(word.bits(16, 6) as u8),
@@ -1375,7 +1397,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 strong: space == Space::Global && strong(word),
             });
         }
-        0x98e | 0x9a8 | 0x3a8 | 0x3a9 | 0x38c | 0x98c | 0x38d => {
+        0x98e | 0x9a8 | 0x3a8 | 0x3a9 | 0x38c | 0x98c | 0xf8c | 0x38d => {
             let (space, address) = match opcode {
                 // RED: with a uniform address (bit 91) the register's .E is
                 // bit 90 and the uniform register's 72; with a register
@@ -1390,7 +1412,9 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                     word.address(Some(70), Some(64), Some(72), false),
                 ),
                 0x3a8 | 0x3a9 => (Space::Global, word.address(Some(72), None, None, false)),
-                0x98c => (Space::Shared, word.address(None, Some(64), None, true)),
+                // 0xf8c: ATOMS.POPC.INC, the uniform-address form with no
+                // data register.
+                0x98c | 0xf8c => (Space::Shared, word.address(None, Some(64), None, true)),
                 _ => (Space::Shared, word.address(None, None, None, true)),
             };
             let exchange = matches!(opcode, 0x3a9 | 0x38d);
@@ -1398,7 +1422,11 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 d: if opcode == 0x98e { Reg::ZERO } else { d },
                 space,
                 address,
-                data: word.reg(if exchange { 64 } else { 32 }),
+                data: if opcode == 0xf8c {
+                    Reg::ZERO
+                } else {
+                    word.reg(if exchange { 64 } else { 32 })
+                },
                 compare: exchange.then(|| word.reg(32)),
                 operation: if exchange {
                     0

@@ -141,6 +141,40 @@ mod unix {
                 }
             }
             text.push('\n');
+            // How many mappings the process holds (a failed mmap leaves
+            // libraries with pointers to nothing).
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                let _ = writeln!(text, "  mappings {}", maps.lines().count());
+            }
+            // The general registers, for what the faulting instruction used.
+            // SAFETY: as above.
+            let registers = unsafe { (*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
+            let names = [
+                ("rax", libc::REG_RAX),
+                ("rbx", libc::REG_RBX),
+                ("rcx", libc::REG_RCX),
+                ("rdx", libc::REG_RDX),
+                ("rsi", libc::REG_RSI),
+                ("rdi", libc::REG_RDI),
+                ("rbp", libc::REG_RBP),
+                ("rsp", libc::REG_RSP),
+                ("r8", libc::REG_R8),
+                ("r9", libc::REG_R9),
+                ("r10", libc::REG_R10),
+                ("r11", libc::REG_R11),
+                ("r12", libc::REG_R12),
+                ("r13", libc::REG_R13),
+                ("r14", libc::REG_R14),
+                ("r15", libc::REG_R15),
+            ];
+            for (index, (name, register)) in names.into_iter().enumerate() {
+                let separator = if index % 4 == 3 { '\n' } else { ' ' };
+                let _ = write!(
+                    text,
+                    "  {name} {:#018x}{separator}",
+                    registers[register as usize] as u64
+                );
+            }
             // SAFETY: write(2) with a valid buffer.
             unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
         }
