@@ -566,6 +566,10 @@ pub struct Nvn {
     /// Stage code windows by GPU address (see `stage_code`).
     #[serde(skip)]
     stage_cache: std::cell::RefCell<StageCodeCache>,
+    /// Set while `translate_stage` translates a stage again after finding
+    /// its cached code stale, so it does so once.
+    #[serde(skip)]
+    pub(super) stage_code_retry: bool,
     /// Ranges for CPU address lookup and GPU page-table construction,
     /// rebuilt when a memory pool or virtual mapping changes.
     #[serde(skip)]
@@ -7040,6 +7044,23 @@ impl Nvn {
         Some((code, key))
     }
 
+    /// Whether the code window cached for the stage at `gpu` (`code`) is no
+    /// longer what guest memory holds there. The cache is checked against
+    /// the first 512 bytes only; a program written after its first bytes
+    /// were read (or rewritten past them) is found here, its entry dropped
+    /// so the next `stage_code` reads it again.
+    pub(super) fn stage_code_changed(&self, core: &Guest, gpu: u64, code: &[u8]) -> bool {
+        let Some((guest, remaining)) = self.pool_for(gpu) else {
+            return false;
+        };
+        let current = read_prefix(core, guest, remaining.min(0x40000));
+        if current.as_slice() == code {
+            return false;
+        }
+        self.stage_cache.borrow_mut().entries.remove(&gpu);
+        true
+    }
+
     /// With ECHORA_DRAW_LOG set, append one JSON line per executed draw or
     /// dispatch:
     /// the bound program's stage keys (as in ECHORA_SHADER_DIR) and the
@@ -10930,6 +10951,64 @@ mod tests {
         let (unreadable, unreadable_key) = nvn.stage_code(&guest, gpu).unwrap();
         assert!(unreadable.is_empty());
         assert_ne!(unreadable_key, registered_key);
+    }
+
+    #[test]
+    fn stale_shader_code_past_the_prefix_is_found_and_read_again() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let base = 0x10_000;
+        let size = 0x2000;
+        memory
+            .map(base, size, READ | WRITE, STATE_NORMAL, "shader pool")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let gpu = GPU_ADDRESS_BASE;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, size, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([gpu, 0, 0, 0]));
+        guest
+            .memory
+            .write_u32(
+                base + 0x300,
+                (crate::sass::ALWAYS << 12) | crate::sass::opcode::EXIT,
+            )
+            .unwrap();
+        guest
+            .memory
+            .write_u32(base + 0x308, crate::sass::ALWAYS << 23)
+            .unwrap();
+        let (first, key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(!nvn.stage_code_changed(&guest, gpu, &first));
+
+        // Written past the 512 bytes the cache compares, with no flush: the
+        // cached window is stale until it is checked whole.
+        guest.memory.write(base + 0x250, &[9]).unwrap();
+        let (cached, cached_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &cached));
+        assert_eq!(cached_key, key);
+        assert!(nvn.stage_code_changed(&guest, gpu, &cached));
+        let (fresh, fresh_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert_eq!(fresh[0x250], 9);
+        assert_ne!(fresh_key, key);
+        assert!(!nvn.stage_code_changed(&guest, gpu, &fresh));
     }
 
     #[test]

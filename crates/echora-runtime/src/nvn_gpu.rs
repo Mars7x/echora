@@ -2849,6 +2849,29 @@ impl Nvn {
                 .map(Arc::new)
                 .map_err(|error| format!("stage {key:016x}: {error}"))
         };
+        // A refused program whose cached code is not what guest memory holds
+        // now (written after its first bytes were read) is translated again
+        // from the current bytes, once.
+        if translated.is_err()
+            && !self.stage_code_retry
+            && self.stage_code_changed(core, gpu, &code)
+        {
+            self.stage_code_retry = true;
+            let again = self.translate_stage(
+                core,
+                gpu,
+                base,
+                previous_stores,
+                generic_input_types,
+                compute,
+                mesh,
+                stage_constants,
+                sampled_textures,
+                storage_images,
+            );
+            self.stage_code_retry = false;
+            return again;
+        }
         let backend = self.gpu.as_mut().unwrap();
         for note in notes {
             backend.note(note);
@@ -2861,6 +2884,14 @@ impl Nvn {
             && (stage_constants.is_none() || compute[0] != 0)
             && (typed_outputs || !shader::available())
         {
+            // The refused code, for a report: in the shader cache directory
+            // as failed-stage-<key>.code.
+            if let Some(directory) = super::debug_var_os("ECHORA_SHADER_CACHE") {
+                let _ = std::fs::write(
+                    std::path::Path::new(&directory).join(format!("failed-stage-{key:016x}.code")),
+                    code.as_slice(),
+                );
+            }
             backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
         }
         if let Ok(stage) = &translated
