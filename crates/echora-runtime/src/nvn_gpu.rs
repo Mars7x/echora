@@ -2877,8 +2877,10 @@ impl Nvn {
             backend.note(note);
         }
         // Without a translator plugin, a program the Rust translator does
-        // not handle stops the run with its report: nothing is drawn wrong
-        // in silence.
+        // not handle is reported once (its translation is kept as failed)
+        // and the draws and dispatches that use it are skipped, so the game
+        // goes on; ECHORA_UNTRANSLATED_STOP=1 stops the run with the report
+        // instead. Nothing is drawn wrong in silence either way.
         // A failed fragment specialization can keep the general shader.
         if let Err(error) = &translated
             && (stage_constants.is_none() || compute[0] != 0)
@@ -2886,13 +2888,22 @@ impl Nvn {
         {
             // The refused code, for a report: in the shader cache directory
             // as failed-stage-<key>.code.
+            let mut kept = String::new();
             if let Some(directory) = super::debug_var_os("ECHORA_SHADER_CACHE") {
-                let _ = std::fs::write(
-                    std::path::Path::new(&directory).join(format!("failed-stage-{key:016x}.code")),
-                    code.as_slice(),
-                );
+                let path =
+                    std::path::Path::new(&directory).join(format!("failed-stage-{key:016x}.code"));
+                if std::fs::write(&path, code.as_slice()).is_ok() {
+                    kept = format!(" (code in {})", path.display());
+                }
             }
-            backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
+            if super::debug_var_os("ECHORA_UNTRANSLATED_STOP").is_some_and(|value| value == "1") {
+                backend.renderer.fatal = Some(format!("untranslated shader: {error}"));
+            } else {
+                eprintln!(
+                    "gpu: untranslated shader, its draws and dispatches skipped: {error}{kept}"
+                );
+                backend.stat("stat: untranslated shaders", 1);
+            }
         }
         if let Ok(stage) = &translated
             && stage.texture_pool_bindings != 0
