@@ -489,19 +489,21 @@ type StageCode = (std::sync::Arc<Vec<u8>>, u64);
 
 #[derive(Debug, Default)]
 struct StageCodeCache {
-    entries: HashMap<u64, (u64, StageCode)>,
+    /// By GPU address: the guest address, the code window and its key, and
+    /// how many of its bytes the key covers.
+    entries: HashMap<u64, (u64, StageCode, usize)>,
     /// An envelope around the current guest ranges. Most pool flushes
     /// miss it without walking any entries.
     guest_span: Option<std::ops::Range<u64>>,
 }
 
 impl StageCodeCache {
-    fn insert(&mut self, gpu: u64, guest: u64, stage: StageCode) {
+    fn insert(&mut self, gpu: u64, guest: u64, stage: StageCode, keyed: usize) {
         let end = guest + stage.0.len() as u64;
         let span = self.guest_span.get_or_insert(guest..end);
         span.start = span.start.min(guest);
         span.end = span.end.max(end);
-        self.entries.insert(gpu, (guest, stage));
+        self.entries.insert(gpu, (guest, stage, keyed));
     }
 
     fn invalidate(&mut self, range: &std::ops::Range<u64>) -> bool {
@@ -514,7 +516,7 @@ impl StageCodeCache {
             return false;
         }
         let before = self.entries.len();
-        self.entries.retain(|_, (guest, (code, _))| {
+        self.entries.retain(|_, (guest, (code, _), _)| {
             *guest >= range.end || range.start >= *guest + code.len() as u64
         });
         if self.entries.is_empty() {
@@ -7020,13 +7022,28 @@ impl Nvn {
     fn stage_code(&self, core: &Guest, gpu: u64) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
         let (guest, remaining) = self.pool_for(gpu)?;
         let length = remaining.min(0x40000);
-        if let Some((cached_guest, (code, key))) = self.stage_cache.borrow().entries.get(&gpu)
+        // A cached window is reused while guest memory still holds the
+        // bytes its key covers (the program, and at least its first 512
+        // bytes): a program rewritten anywhere is read again, whether or not
+        // a flush or a SetShaders said so.
+        if let Some((cached_guest, (code, key), keyed)) =
+            self.stage_cache.borrow().entries.get(&gpu)
             && *cached_guest == guest
             && code.len() as u64 == length
         {
-            let mut buffer = [0; 512];
-            let prefix = &mut buffer[..length.min(512) as usize];
-            if core.memory.read(guest, prefix).is_ok() && code.starts_with(prefix) {
+            let checked = (*keyed).max(code.len().min(512)).min(code.len());
+            let mut buffer = [0; 4096];
+            let same = code[..checked]
+                .chunks(buffer.len())
+                .enumerate()
+                .all(|(index, cached)| {
+                    let current = &mut buffer[..cached.len()];
+                    core.memory
+                        .read(guest + (index * 4096) as u64, current)
+                        .is_ok()
+                        && current == cached
+                });
+            if same {
                 return Some((code.clone(), *key));
             }
         }
@@ -7040,15 +7057,13 @@ impl Nvn {
         let code = std::sync::Arc::new(code);
         self.stage_cache
             .borrow_mut()
-            .insert(gpu, guest, (code.clone(), key));
+            .insert(gpu, guest, (code.clone(), key), end);
         Some((code, key))
     }
 
     /// Whether the code window cached for the stage at `gpu` (`code`) is no
-    /// longer what guest memory holds there. The cache is checked against
-    /// the first 512 bytes only; a program written after its first bytes
-    /// were read (or rewritten past them) is found here, its entry dropped
-    /// so the next `stage_code` reads it again.
+    /// longer what guest memory holds there, past the program too; its
+    /// entry is then dropped so the next `stage_code` reads it again.
     pub(super) fn stage_code_changed(&self, core: &Guest, gpu: u64, code: &[u8]) -> bool {
         let Some((guest, remaining)) = self.pool_for(gpu) else {
             return false;
@@ -10954,7 +10969,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_shader_code_past_the_prefix_is_found_and_read_again() {
+    fn shader_code_rewritten_past_the_prefix_is_read_again() {
         let mut cpu = Cpu::default();
         let mut memory = Memory::new(1 << 39);
         let base = 0x10_000;
@@ -10998,17 +11013,29 @@ mod tests {
         let (first, key) = nvn.stage_code(&guest, gpu).unwrap();
         assert!(!nvn.stage_code_changed(&guest, gpu, &first));
 
-        // Written past the 512 bytes the cache compares, with no flush: the
-        // cached window is stale until it is checked whole.
-        guest.memory.write(base + 0x250, &[9]).unwrap();
-        let (cached, cached_key) = nvn.stage_code(&guest, gpu).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&first, &cached));
-        assert_eq!(cached_key, key);
-        assert!(nvn.stage_code_changed(&guest, gpu, &cached));
+        // An instruction rewritten past the first 512 bytes, still a whole
+        // program, with no flush or SetShaders: the next lookup reads it.
+        let nop = (crate::sass::ALWAYS << 12) | 0x918;
+        guest.memory.write_u32(base + 0x250, nop).unwrap();
+        let (rewritten, rewritten_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &rewritten));
+        assert_eq!(rewritten[0x250..0x254], nop.to_le_bytes());
+        assert_ne!(rewritten_key, key);
+        assert_eq!(
+            crate::sass::program_length(&rewritten),
+            crate::sass::program_length(&first)
+        );
+
+        // Bytes after the program are not part of its identity: the cached
+        // window stays (`stage_code_changed` still compares all of it).
+        guest.memory.write(base + 0x400, &[5]).unwrap();
+        let (kept, kept_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &kept));
+        assert_eq!(kept_key, rewritten_key);
+        assert!(nvn.stage_code_changed(&guest, gpu, &kept));
         let (fresh, fresh_key) = nvn.stage_code(&guest, gpu).unwrap();
-        assert_eq!(fresh[0x250], 9);
-        assert_ne!(fresh_key, key);
-        assert!(!nvn.stage_code_changed(&guest, gpu, &fresh));
+        assert_eq!(fresh[0x400], 5);
+        assert_eq!(fresh_key, rewritten_key);
     }
 
     #[test]
