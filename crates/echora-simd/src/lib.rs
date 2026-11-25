@@ -411,11 +411,95 @@ fn rounded(format: Format, size: FpSize, op: FpBinaryOp, a: u64, b: u64, raw: u6
 // Execution
 // ----------------------------------------------------------------------------
 
+/// Whether the helpers accept `cpu`'s FPCR (no directed rounding, no
+/// alternate half-precision or FZ16 handling), and with FZ: `Some(fz)`.
+#[inline(always)]
+fn accepted_mode(cpu: &Cpu) -> Option<bool> {
+    (cpu.fpcr & (FPCR_RMODE | FPCR_AH | FPCR_FZ16) == 0).then_some(cpu.fpcr & FPCR_FZ != 0)
+}
+
+/// A float's class by its raw bits, for the fast paths below: `Number`
+/// for a normal or a zero, `Denormal`, or `Special` (an infinity or a NaN).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Number,
+    Denormal,
+    Special,
+}
+
+#[inline(always)]
+fn class(size: FpSize, value: u64) -> Class {
+    let (exponent, magnitude) = match size {
+        FpSize::S => (0x7f80_0000, value & 0x7fff_ffff),
+        FpSize::D => (0x7ff0_0000_0000_0000, value & 0x7fff_ffff_ffff_ffff),
+    };
+    let field = value & exponent;
+    if field == exponent {
+        Class::Special
+    } else if field == 0 && magnitude != 0 {
+        Class::Denormal
+    } else {
+        Class::Number
+    }
+}
+
+#[inline(always)]
+fn sign_of(size: FpSize, value: u64) -> u64 {
+    match size {
+        FpSize::S => value & 0x8000_0000,
+        FpSize::D => value & 0x8000_0000_0000_0000,
+    }
+}
+
+/// `fp_unary`'s fast path: FSQRT of a non-negative number or a zero, and
+/// FRINT* of anything but a NaN, are the host's as the exact path computes
+/// them, raising Inexact as it does (an inexact root, FRINTX of a
+/// non-integer); under FZ a denormal operand is flushed to a zero of its
+/// sign first (IDC).
+#[inline]
 pub fn fp_unary(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> Result<(), Trap> {
     let value = read_fp(cpu, rn, size);
     if stats::enabled() {
         stats::note_scalar("fp_unary", &format!("{op:?}"), cpu, size, &[value]);
     }
+    if let (Some(fz), FpUnaryOp::Sqrt | FpUnaryOp::Round(_) | FpUnaryOp::RoundExact) =
+        (accepted_mode(cpu), op)
+    {
+        let class = class(size, value);
+        let flush = fz && class == Class::Denormal;
+        let operand = if flush { sign_of(size, value) } else { value };
+        let sign = sign_of(size, operand);
+        let native = match op {
+            // A negative number but a zero is an invalid operation (IOC).
+            FpUnaryOp::Sqrt => (class != Class::Special && (sign == 0 || operand == sign))
+                .then(|| native!(size, operand, 0, |x, _y| x.sqrt())),
+            FpUnaryOp::Round(rounding) => (!Format::of(size).is_nan(operand))
+                .then(|| native!(size, operand, 0, |x, _y| round(x, rounding))),
+            _ => (!Format::of(size).is_nan(operand))
+                .then(|| native!(size, operand, 0, |x, _y| round(x, Rounding::Nearest))),
+        };
+        if let Some(raw) = native {
+            let inexact = match op {
+                FpUnaryOp::Sqrt => sqrt_inexact(size, operand, raw),
+                FpUnaryOp::RoundExact => raw != operand,
+                _ => false,
+            };
+            if flush {
+                cpu.fpsr |= FPSR_IDC;
+            }
+            if inexact {
+                cpu.fpsr |= FPSR_IXC;
+            }
+            write_fp(cpu, rd, size, raw);
+            return Ok(());
+        }
+    }
+    fp_unary_exact(cpu, op, size, rd, rn)
+}
+
+#[inline(never)]
+fn fp_unary_exact(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> Result<(), Trap> {
+    let value = read_fp(cpu, rn, size);
     let format = Format::of(size);
     let result = match op {
         // FMOV, FABS and FNEG are bitwise and never trap or flush.
@@ -432,6 +516,9 @@ pub fn fp_unary(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> R
                 format.default_nan()
             } else {
                 let raw = native!(size, value, 0, |x, _y| x.sqrt());
+                if sqrt_inexact(size, value, raw) {
+                    fp.raise(FPSR_IXC);
+                }
                 fp.output(raw, false)
             }
         }
@@ -446,12 +533,44 @@ pub fn fp_unary(cpu: &mut Cpu, op: FpUnaryOp, size: FpSize, rd: u8, rn: u8) -> R
             if let Some(nan) = fp.process_nans(&[value]) {
                 nan
             } else {
-                native!(size, value, 0, |x, _y| round(x, rounding))
+                let raw = native!(size, value, 0, |x, _y| round(x, rounding));
+                // FRINTX raises Inexact when the result is not the operand
+                // (FPRoundInt with exact); the other FRINTs raise nothing.
+                if op == FpUnaryOp::RoundExact && raw != value {
+                    fp.raise(FPSR_IXC);
+                }
+                raw
             }
         }
     };
     write_fp(cpu, rd, size, result);
     Ok(())
+}
+
+/// Whether `raw`, the host's correctly rounded square root of the
+/// non-negative number or zero `value`, is inexact: whether `raw * raw` is
+/// not `value`, computed exactly (a single's square in a double; a double's
+/// by one fused multiply-add, scaled by an even power of two out of the
+/// range where the residual could underflow).
+fn sqrt_inexact(size: FpSize, value: u64, raw: u64) -> bool {
+    match size {
+        FpSize::S => {
+            let r = f64::from(f32::from_bits(raw as u32));
+            r * r != f64::from(f32::from_bits(value as u32))
+        }
+        FpSize::D => {
+            let (x, r) = (f64::from_bits(value), f64::from_bits(raw));
+            if !x.is_finite() || x == 0.0 {
+                return false;
+            }
+            let (x, r) = if x < 1.0e-200 {
+                (x * 2f64.powi(600), r * 2f64.powi(300))
+            } else {
+                (x, r)
+            };
+            r.fused(r, -x) != 0.0
+        }
+    }
 }
 
 trait Rint: Copy {
@@ -486,11 +605,60 @@ fn round<T: Rint>(value: T, rounding: Rounding) -> T {
     value.round_with(rounding)
 }
 
+/// `fp_convert`'s fast path: a number (a normal or a zero, or under FZ a
+/// flushed denormal, raising IDC) converted to a normal or a zero from
+/// within the target's normal range is the host's conversion, with Inexact
+/// when rounded, as the exact path computes it.
+#[inline]
 pub fn fp_convert(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Result<(), Trap> {
     if stats::enabled() {
         let value = read_fp(cpu, rn, from);
         stats::note_scalar("fp_convert", &format!("to {to:?}"), cpu, from, &[value]);
     }
+    if let Some(fz) = accepted_mode(cpu) {
+        let value = read_fp(cpu, rn, from);
+        let class = class(from, value);
+        let flush = fz && class == Class::Denormal;
+        if class == Class::Number || flush {
+            let operand = if flush { sign_of(from, value) } else { value };
+            // A single is a double exactly; a double outside the single's
+            // normal range (but a zero) takes the exact path (overflow,
+            // underflow), and else rounds to a normal, inexact or not.
+            let converted = match (from, to) {
+                (FpSize::S, FpSize::D) => {
+                    Some((f64::from(f32::from_bits(operand as u32)).to_bits(), false))
+                }
+                (FpSize::D, FpSize::S) => {
+                    let x = f64::from_bits(operand);
+                    let r = x as f32;
+                    (x == 0.0 || x.abs() >= f64::from(f32::MIN_POSITIVE))
+                        .then_some((u64::from(r.to_bits()), f64::from(r) != x))
+                }
+                _ => None,
+            };
+            if let Some((raw, inexact)) = converted.filter(|&(raw, _)| class_of_result(to, raw)) {
+                if flush {
+                    cpu.fpsr |= FPSR_IDC;
+                }
+                if inexact {
+                    cpu.fpsr |= FPSR_IXC;
+                }
+                write_fp(cpu, rd, to, raw);
+                return Ok(());
+            }
+        }
+    }
+    fp_convert_exact(cpu, rd, rn, from, to)
+}
+
+/// A converted result the fast path keeps: a normal or a zero.
+#[inline(always)]
+fn class_of_result(size: FpSize, raw: u64) -> bool {
+    class(size, raw) == Class::Number
+}
+
+#[inline(never)]
+fn fp_convert_exact(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Result<(), Trap> {
     let mode = mode(cpu)?;
     let source = Format::of(from);
     let target = Format::of(to);
@@ -521,34 +689,64 @@ pub fn fp_convert(cpu: &mut Cpu, rd: u8, rn: u8, from: FpSize, to: FpSize) -> Re
             sign | target.exponent_mask() | target.quiet_bit() | shifted
         }
     } else {
-        let converted = match (from, to) {
+        match (from, to) {
+            // Every single is a double: exact, raising nothing.
             (FpSize::S, FpSize::D) => f64::from(f32::from_bits(value as u32)).to_bits(),
-            (FpSize::D, FpSize::S) => u64::from((f64::from_bits(value) as f32).to_bits()),
+            (FpSize::D, FpSize::S) => {
+                // FPRound: tininess before rounding (below the single's
+                // normal range, not zero); with FZ a tiny result is a zero
+                // of its sign, raising Underflow alone; otherwise an inexact
+                // result raises Inexact, and Underflow too when tiny; an
+                // overflow raises Overflow and Inexact.
+                let x = f64::from_bits(value);
+                let tiny = x != 0.0 && x.abs() < f64::from(f32::MIN_POSITIVE);
+                if tiny && mode.fz {
+                    cpu.fpsr |= FPSR_UFC;
+                    (value >> 32) & 0x8000_0000
+                } else {
+                    let r = x as f32;
+                    if x.is_finite() && f64::from(r) != x {
+                        cpu.fpsr |= FPSR_IXC;
+                        if r.is_infinite() {
+                            cpu.fpsr |= FPSR_OFC;
+                        } else if tiny {
+                            cpu.fpsr |= FPSR_UFC;
+                        }
+                    }
+                    u64::from(r.to_bits())
+                }
+            }
             _ => value,
-        };
-        if is_infinity(target, converted) && !is_infinity(source, value) {
-            cpu.fpsr |= FPSR_OFC;
-        }
-        if mode.fz && target.is_denormal(converted) {
-            converted & target.sign_bit()
-        } else {
-            converted
         }
     };
     write_fp(cpu, rd, to, result);
     Ok(())
 }
 
-/// Fast paths: with FPCR in its default mode (round to nearest, no flush,
-/// no default NaN), FPSR.IXC already set (it is sticky, and the exact
-/// helpers raise it for a rounded result) and no NaN or infinity in the
-/// result, the exact helpers return the host's native result unchanged and
-/// raise no new flag. The fast
-/// paths below are inlined into translated code and fall back to the exact
-/// helpers otherwise.
+/// Fast paths: with FPCR rounding to nearest (FZ and DN allowed, nothing
+/// else), FPSR.IXC already set (it is sticky, and the exact helpers raise it
+/// for a rounded result) and no NaN, infinity or tiny value in the result,
+/// the exact helpers return the host's native result of the operands (flushed
+/// under FZ, raising IDC) and raise no new flag. DN only changes NaN results,
+/// which take the exact path. The fast paths below are inlined into
+/// translated code and fall back to the exact helpers otherwise. `Some(fz)`
+/// when they apply.
 #[inline(always)]
-fn default_mode(cpu: &Cpu) -> bool {
-    cpu.fpcr == 0 && cpu.fpsr & FPSR_IXC != 0
+fn fast_mode(cpu: &Cpu) -> Option<bool> {
+    (cpu.fpcr & !(FPCR_FZ | FPCR_DN) == 0 && cpu.fpsr & FPSR_IXC != 0)
+        .then_some(cpu.fpcr & FPCR_FZ != 0)
+}
+
+/// `value` as FPUnpack reads it: a denormal is a zero of its sign under FZ.
+/// Sets `*flushed` when it was.
+#[inline(always)]
+fn flush_operand(format: Format, fz: bool, value: u64, flushed: &mut bool) -> u64 {
+    if fz && format.is_denormal(value) {
+        *flushed = true;
+        value & format.sign_bit()
+    } else {
+        value
+    }
 }
 
 /// Whether raw `value` of `size` is finite (not an infinity or NaN).
@@ -567,9 +765,11 @@ pub fn fp_binary(
     rn: u8,
     rm: u8,
 ) -> Result<(), Trap> {
-    if default_mode(cpu) {
-        let a = read_fp(cpu, rn, size);
-        let b = read_fp(cpu, rm, size);
+    if let Some(fz) = fast_mode(cpu) {
+        let format = Format::of(size);
+        let mut flushed = false;
+        let a = flush_operand(format, fz, read_fp(cpu, rn, size), &mut flushed);
+        let b = flush_operand(format, fz, read_fp(cpu, rm, size), &mut flushed);
         let raw = match op {
             FpBinaryOp::Add => Some(native!(size, a, b, |x, y| x + y)),
             FpBinaryOp::Sub => Some(native!(size, a, b, |x, y| x - y)),
@@ -580,15 +780,21 @@ pub fn fp_binary(
         // A tiny product or quotient of nonzero operands (a subnormal or a
         // zero, or the smallest normal it rounded up to) is an inexact
         // underflow, which raises UFC: the exact path takes it. A tiny sum
-        // or difference is exact and raises nothing.
-        let format = Format::of(size);
+        // or difference is exact and raises nothing, but FZ flushes a
+        // denormal one (raising UFC): the exact path takes that too.
         let zero = |value: u64| value & !format.sign_bit() == 0;
         let underflow = |raw: u64| {
-            matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div)
-                && raw & !format.sign_bit() <= format.smallest_normal()
-                && !(zero(a) || op == FpBinaryOp::Mul && zero(b))
+            if matches!(op, FpBinaryOp::Mul | FpBinaryOp::Div) {
+                raw & !format.sign_bit() <= format.smallest_normal()
+                    && !(zero(a) || op == FpBinaryOp::Mul && zero(b))
+            } else {
+                fz && format.is_denormal(raw)
+            }
         };
         if let Some(raw) = raw.filter(|raw| finite(size, *raw) && !underflow(*raw)) {
+            if flushed {
+                cpu.fpsr |= FPSR_IDC;
+            }
             write_fp(cpu, rd, size, raw);
             return Ok(());
         }
@@ -923,17 +1129,21 @@ pub fn fp_ternary(
     rm: u8,
     ra: u8,
 ) -> Result<(), Trap> {
-    if default_mode(cpu) {
-        let sign = Format::of(size).sign_bit();
+    if let Some(fz) = fast_mode(cpu) {
+        let format = Format::of(size);
+        let sign = format.sign_bit();
         let (negate_addend, negate_product) = match op {
             FpTernaryOp::MulAdd => (false, false),
             FpTernaryOp::MulSub => (false, true),
             FpTernaryOp::NegMulAdd => (true, true),
             FpTernaryOp::NegMulSub => (true, false),
         };
-        let n = read_fp(cpu, rn, size) ^ if negate_product { sign } else { 0 };
-        let m = read_fp(cpu, rm, size);
-        let a = read_fp(cpu, ra, size) ^ if negate_addend { sign } else { 0 };
+        let mut flushed = false;
+        let n = flush_operand(format, fz, read_fp(cpu, rn, size), &mut flushed)
+            ^ if negate_product { sign } else { 0 };
+        let m = flush_operand(format, fz, read_fp(cpu, rm, size), &mut flushed);
+        let a = flush_operand(format, fz, read_fp(cpu, ra, size), &mut flushed)
+            ^ if negate_addend { sign } else { 0 };
         let raw = match size {
             FpSize::S => u64::from(
                 f32::from_bits(n as u32)
@@ -947,11 +1157,13 @@ pub fn fp_ternary(
         // A tiny fused result (or the smallest normal, which a tiny one
         // rounds up to) may be an inexact underflow (UFC): the exact path
         // decides, unless it is the exact zero of zero operands.
-        let format = Format::of(size);
         let zero = |value: u64| value & !format.sign_bit() == 0;
         let tiny = raw & !format.sign_bit() <= format.smallest_normal()
             && !((zero(n) || zero(m)) && zero(a));
         if finite(size, raw) && !tiny {
+            if flushed {
+                cpu.fpsr |= FPSR_IDC;
+            }
             write_fp(cpu, rd, size, raw);
             return Ok(());
         }
@@ -1198,6 +1410,28 @@ fn int_to_fp_bits(value: u64, int_bits: u32, signed: bool, size: FpSize) -> u64 
     }
 }
 
+/// Whether `bits`, `int_to_fp_bits`'s result for `value`, is not the
+/// integer exactly (FPSR.IXC). The float is an integer (exact in a double);
+/// a 32-bit integer is exact in a double and compares as an i64, and a
+/// 64-bit one compares after the float is checked to be in its range (the
+/// casts saturate: a float rounded up to 2^63 or 2^64 is inexact).
+#[inline(always)]
+fn int_to_fp_inexact(value: u64, int_bits: u32, signed: bool, size: FpSize, bits: u64) -> bool {
+    if size == FpSize::D && int_bits == 32 {
+        return false;
+    }
+    let float = match size {
+        FpSize::S => f64::from(f32::from_bits(bits as u32)),
+        FpSize::D => f64::from_bits(bits),
+    };
+    match (signed, int_bits) {
+        (true, 32) => float as i64 != i64::from(value as u32 as i32),
+        (false, 32) => float as i64 != i64::from(value as u32),
+        (true, _) => float >= 9_223_372_036_854_775_808.0 || float as i64 != value as i64,
+        (false, _) => float >= 18_446_744_073_709_551_616.0 || float as u64 != value,
+    }
+}
+
 pub fn int_to_fp(
     cpu: &mut Cpu,
     rd: u8,
@@ -1211,6 +1445,9 @@ pub fn int_to_fp(
     let bits = int_to_fp_bits(value, u32::from(gp_bits), signed, size);
     // Integer conversions cannot produce denormals; FZ needs no flush here.
     let _ = mode;
+    if int_to_fp_inexact(value, u32::from(gp_bits), signed, size, bits) {
+        cpu.fpsr |= FPSR_IXC;
+    }
     write_fp(cpu, rd, size, bits);
     Ok(())
 }
@@ -1225,11 +1462,15 @@ pub fn simd_int_to_fp(
     mode(cpu)?;
     let value = read_fp(cpu, rn, size);
     let bits = int_to_fp_bits(value, bits_of(size), signed, size);
+    if int_to_fp_inexact(value, bits_of(size), signed, size, bits) {
+        cpu.fpsr |= FPSR_IXC;
+    }
     write_fp(cpu, rd, size, bits);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn fp_to_int(
     cpu: &mut Cpu,
     rd: u8,
@@ -1247,6 +1488,60 @@ pub fn fp_to_int(
         );
         stats::note_scalar("fp_to_int", &form, cpu, size, &[raw]);
     }
+    // The fast path: a number (or under FZ a flushed denormal, raising IDC)
+    // whose rounded value is in range converts natively, with Inexact when
+    // rounded, as the exact path computes it.
+    if let Some(fz) = accepted_mode(cpu) {
+        let class = class(size, raw);
+        if class != Class::Special {
+            let flush = fz && class == Class::Denormal;
+            let unrounded = if flush {
+                0.0
+            } else {
+                match size {
+                    FpSize::S => f64::from(f32::from_bits(raw as u32)),
+                    FpSize::D => f64::from_bits(raw),
+                }
+            };
+            let x = round(unrounded, rounding);
+            let in_range = match (signed, gp_bits) {
+                (true, 32) => (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x),
+                (true, _) => (i64::MIN as f64..9_223_372_036_854_775_808.0).contains(&x),
+                (false, 32) => (0.0..=f64::from(u32::MAX)).contains(&x),
+                (false, _) => (0.0..18_446_744_073_709_551_616.0).contains(&x),
+            };
+            if in_range {
+                if flush {
+                    cpu.fpsr |= FPSR_IDC;
+                }
+                if x != unrounded {
+                    cpu.fpsr |= FPSR_IXC;
+                }
+                let value = match (signed, gp_bits) {
+                    (true, 32) => x as i32 as u32 as u64,
+                    (true, _) => x as i64 as u64,
+                    (false, 32) => x as u32 as u64,
+                    (false, _) => x as u64,
+                };
+                cpu.write_reg(rd, gp_bits, false, value);
+                return Ok(());
+            }
+        }
+    }
+    fp_to_int_exact(cpu, rd, raw, gp_bits, size, signed, rounding)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn fp_to_int_exact(
+    cpu: &mut Cpu,
+    rd: u8,
+    raw: u64,
+    gp_bits: u8,
+    size: FpSize,
+    signed: bool,
+    rounding: Rounding,
+) -> Result<(), Trap> {
     let mut fp = Fp::new(cpu, size)?;
     let raw = fp.input(raw);
     let format = fp.format;
@@ -1254,7 +1549,8 @@ pub fn fp_to_int(
         fp.raise(FPSR_IOC);
         0
     } else {
-        let x = round(fp.to_f64(raw), rounding);
+        let unrounded = fp.to_f64(raw);
+        let x = round(unrounded, rounding);
         // f32 inputs are exact in f64, so the rounding above is exact too.
         let (min, max) = match (signed, gp_bits) {
             (true, 32) => (f64::from(i32::MIN), f64::from(i32::MAX)),
@@ -1267,8 +1563,12 @@ pub fn fp_to_int(
         } else {
             x < min || x > max
         };
+        // FPToFixed: Invalid Operation on overflow, else Inexact when the
+        // integer is not the operand.
         if out_of_range {
             fp.raise(FPSR_IOC);
+        } else if x != unrounded {
+            fp.raise(FPSR_IXC);
         }
         match (signed, gp_bits) {
             (true, 32) => x as i32 as u32 as u64,
@@ -2675,6 +2975,8 @@ fn fp_to_integer_lane(
     }
     let scaled = fp.to_f64(input) * fixed_point_scale(fbits, false);
     let x = round(scaled, rounding);
+    // FPToFixed: Inexact when the integer is not the (scaled) operand.
+    let inexact = x != scaled;
     let (min, max) = match (signed, bits) {
         (true, 32) => (f64::from(i32::MIN), f64::from(i32::MAX)),
         (true, _) => (i64::MIN as f64, 9_223_372_036_854_775_808.0),
@@ -2688,6 +2990,8 @@ fn fp_to_integer_lane(
     };
     if out_of_range {
         fp.raise(FPSR_IOC);
+    } else if inexact {
+        fp.raise(FPSR_IXC);
     }
     match (signed, bits) {
         (true, 32) => x as i32 as u32 as u64,
@@ -2805,6 +3109,9 @@ pub fn vec_fp_unary(
                     format.default_nan()
                 } else {
                     let raw = native!(size, a, 0, |x, _y| x.sqrt());
+                    if sqrt_inexact(size, a, raw) {
+                        fp.raise(FPSR_IXC);
+                    }
                     fp.output(raw, false)
                 }
             }
@@ -2871,7 +3178,8 @@ pub fn fp_to_fixed(
         fp.raise(FPSR_IOC);
         0
     } else {
-        let x = (fp.to_f64(input) * fixed_point_scale(fbits, false)).trunc();
+        let unrounded = fp.to_f64(input) * fixed_point_scale(fbits, false);
+        let x = unrounded.trunc();
         let (min, max) = match (signed, gp_bits) {
             (true, 32) => (f64::from(i32::MIN), f64::from(i32::MAX)),
             (true, _) => (i64::MIN as f64, 9_223_372_036_854_775_808.0),
@@ -2883,8 +3191,12 @@ pub fn fp_to_fixed(
         } else {
             x < min || x > max
         };
+        // FPToFixed: Invalid Operation on overflow, else Inexact when the
+        // integer is not the operand.
         if out_of_range {
             fp.raise(FPSR_IOC);
+        } else if x != unrounded {
+            fp.raise(FPSR_IXC);
         }
         match (signed, gp_bits) {
             (true, 32) => x as i32 as u32 as u64,
@@ -5846,6 +6158,652 @@ mod sticky_inexact_tests {
                         (u128::from(exact as u32), exact_flags),
                         "{op:?} {a} {b}"
                     );
+                }
+            }
+        }
+    }
+
+    /// `fp_binary`'s and `fp_ternary`'s inline paths: every operation on
+    /// every pair (and, fused, triple) of special and boundary values, in
+    /// every FZ/DN mode (and one directed rounding), with and without IXC:
+    /// the outcome (a trap or not), result and FPSR are the exact path's.
+    #[test]
+    fn fast_modes_match_the_exact_path() {
+        let singles: &[u64] = &[
+            0,
+            0x8000_0000,
+            1,
+            0x807f_ffff,
+            0x0040_0000,
+            0x0080_0000,
+            0x0080_0001,
+            0x3f80_0000,
+            0xbfc0_0000,
+            0x3f80_0001,
+            0x1f80_0000,
+            0x2000_0001,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7f80_0001,
+        ];
+        let doubles: &[u64] = &[
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            0x800f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x0010_0000_0000_0001,
+            0x3ff0_0000_0000_0000,
+            0xbff8_0000_0000_0000,
+            0x3ff0_0000_0000_0001,
+            0x1ff0_0000_0000_0000,
+            0x2000_0000_0000_0001,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+        ];
+        let setup = |fpcr: u32, fpsr: u32, values: &[u64]| {
+            let mut cpu = Cpu {
+                fpcr,
+                fpsr,
+                ..Cpu::default()
+            };
+            for (i, &value) in values.iter().enumerate() {
+                cpu.vectors[i + 1] = u128::from(value);
+            }
+            cpu
+        };
+        for (size, pool) in [(FpSize::S, singles), (FpSize::D, doubles)] {
+            // Round toward +inf (RMODE 1) traps: the inline path must not
+            // take it.
+            for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN, FPCR_FZ | 1 << 22] {
+                for fpsr in [0, FPSR_IXC] {
+                    for &a in pool {
+                        for &b in pool {
+                            for op in [
+                                FpBinaryOp::Add,
+                                FpBinaryOp::Sub,
+                                FpBinaryOp::Mul,
+                                FpBinaryOp::Div,
+                            ] {
+                                let mut inline = setup(fpcr, fpsr, &[a, b]);
+                                let inline_ok = fp_binary(&mut inline, op, size, 0, 1, 2).is_ok();
+                                let mut exact = setup(fpcr, fpsr, &[a, b]);
+                                let exact_ok =
+                                    fp_binary_exact(&mut exact, op, size, 0, 1, 2).is_ok();
+                                assert_eq!(
+                                    (inline_ok, inline.vectors[0], inline.fpsr),
+                                    (exact_ok, exact.vectors[0], exact.fpsr),
+                                    "{size:?} {op:?} fpcr {fpcr:#x} fpsr {fpsr:#x}: {a:#x} {b:#x}"
+                                );
+                            }
+                            for &c in pool {
+                                for op in [
+                                    FpTernaryOp::MulAdd,
+                                    FpTernaryOp::MulSub,
+                                    FpTernaryOp::NegMulAdd,
+                                    FpTernaryOp::NegMulSub,
+                                ] {
+                                    let mut inline = setup(fpcr, fpsr, &[a, b, c]);
+                                    let inline_ok =
+                                        fp_ternary(&mut inline, op, size, 0, 1, 2, 3).is_ok();
+                                    let mut exact = setup(fpcr, fpsr, &[a, b, c]);
+                                    let exact_ok =
+                                        fp_ternary_exact(&mut exact, op, size, 0, 1, 2, 3).is_ok();
+                                    assert_eq!(
+                                        (inline_ok, inline.vectors[0], inline.fpsr),
+                                        (exact_ok, exact.vectors[0], exact.fpsr),
+                                        "{size:?} {op:?} fpcr {fpcr:#x} fpsr {fpsr:#x}: {a:#x} {b:#x} {c:#x}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The flags of conversions, square roots and FRINTX as the Arm
+    /// pseudocode raises them (FPRoundBase, FPToFixed, FPRoundInt, FPSqrt),
+    /// with FPSR clear before each: the result and FPSR bit for bit, through
+    /// the helpers (fast path and all) and the exact paths alike.
+    #[test]
+    fn conversion_and_root_flags_are_arms() {
+        let d = |x: f64| x.to_bits();
+        let s = |x: f32| u64::from(x.to_bits());
+        let below_single_normal = f64::from(f32::MIN_POSITIVE) * (1.0 - 2f64.powi(-30));
+        // FCVT Sd, Dn: (fpcr, operand, result, fpsr).
+        type Convert = (u32, u64, u64, u32);
+        type ToInt = (u32, FpSize, u64, bool, u8, Rounding, u64, u32);
+        type Unary = (u32, FpSize, FpUnaryOp, u64, u64, u32);
+        type FromInt = (u8, FpSize, bool, u64, u64, u32);
+        let narrow: &[Convert] = &[
+            (0, d(1.0), s(1.0), 0),
+            (0, d(0.1), s(0.1), FPSR_IXC),
+            (0, d(-0.0), s(-0.0), 0),
+            (0, d(1.0e39), s(f32::INFINITY), FPSR_OFC | FPSR_IXC),
+            (0, d(-1.0e39), s(f32::NEG_INFINITY), FPSR_OFC | FPSR_IXC),
+            (0, d(f64::INFINITY), s(f32::INFINITY), 0),
+            (0, d(1.0e-40), s(1.0e-40), FPSR_UFC | FPSR_IXC),
+            (0, d(2f64.powi(-130)), u64::from(1u32 << 19), 0),
+            (0, d(below_single_normal), 0x0080_0000, FPSR_UFC | FPSR_IXC),
+            (0, d(1.0e-50), 0, FPSR_UFC | FPSR_IXC),
+            (FPCR_FZ, d(0.1), s(0.1), FPSR_IXC),
+            (FPCR_FZ, d(-1.0e-40), s(-0.0), FPSR_UFC),
+            (FPCR_FZ, d(2f64.powi(-130)), 0, FPSR_UFC),
+            (FPCR_FZ, d(below_single_normal), 0, FPSR_UFC),
+            (FPCR_FZ, 1, 0, FPSR_IDC),
+            (FPCR_FZ, d(f64::MAX), s(f32::INFINITY), FPSR_OFC | FPSR_IXC),
+        ];
+        // FCVT Dd, Sn: exact.
+        let widen: &[Convert] = &[
+            (0, s(0.1), d(f64::from(0.1f32)), 0),
+            (0, 1, d(2f64.powi(-149)), 0),
+            (FPCR_FZ, 0x8000_0001, d(-0.0), FPSR_IDC),
+        ];
+        let run = |fpcr: u32, value: u64, exact: bool, f: &dyn Fn(&mut Cpu, bool)| {
+            let mut cpu = Cpu {
+                fpcr,
+                ..Cpu::default()
+            };
+            cpu.vectors[1] = u128::from(value);
+            f(&mut cpu, exact);
+            cpu
+        };
+        for exact in [false, true] {
+            for (to, cases) in [(FpSize::S, narrow), (FpSize::D, widen)] {
+                let from = if to == FpSize::S {
+                    FpSize::D
+                } else {
+                    FpSize::S
+                };
+                for &(fpcr, value, result, fpsr) in cases {
+                    let cpu = run(fpcr, value, exact, &|cpu, exact| {
+                        if exact {
+                            fp_convert_exact(cpu, 0, 1, from, to).unwrap();
+                        } else {
+                            fp_convert(cpu, 0, 1, from, to).unwrap();
+                        }
+                    });
+                    assert_eq!(
+                        (cpu.vectors[0] as u64, cpu.fpsr),
+                        (result, fpsr),
+                        "fcvt {from:?} to {to:?} fpcr {fpcr:#x} {value:#x} exact {exact}"
+                    );
+                }
+            }
+            // FCVT{N,Z}{S,U} to a general register: (fpcr, size, operand,
+            // signed, bits, rounding, result, fpsr).
+            let to_int: &[ToInt] = &[
+                (0, FpSize::D, d(1.5), true, 32, Rounding::Zero, 1, FPSR_IXC),
+                (0, FpSize::D, d(2.0), true, 32, Rounding::Zero, 2, 0),
+                (
+                    0,
+                    FpSize::D,
+                    d(-2.5),
+                    true,
+                    64,
+                    Rounding::Nearest,
+                    (-2i64) as u64,
+                    FPSR_IXC,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    d(3.0e9),
+                    true,
+                    32,
+                    Rounding::Zero,
+                    0x7fff_ffff,
+                    FPSR_IOC,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    d(-1.0),
+                    false,
+                    32,
+                    Rounding::Zero,
+                    0,
+                    FPSR_IOC,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    d(-0.5),
+                    false,
+                    32,
+                    Rounding::Zero,
+                    0,
+                    FPSR_IXC,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    d(f64::NAN),
+                    true,
+                    64,
+                    Rounding::Zero,
+                    0,
+                    FPSR_IOC,
+                ),
+                (0, FpSize::D, 1, true, 64, Rounding::Zero, 0, FPSR_IXC),
+                (FPCR_FZ, FpSize::D, 1, true, 64, Rounding::Plus, 0, FPSR_IDC),
+                (0, FpSize::D, 1, true, 64, Rounding::Plus, 1, FPSR_IXC),
+                (
+                    0,
+                    FpSize::S,
+                    s(16_777_216.0),
+                    false,
+                    64,
+                    Rounding::Zero,
+                    16_777_216,
+                    0,
+                ),
+                (0, FpSize::S, s(0.75), true, 32, Rounding::Away, 1, FPSR_IXC),
+            ];
+            for &(fpcr, size, value, signed, bits, rounding, result, fpsr) in to_int {
+                let cpu = run(fpcr, value, exact, &|cpu, exact| {
+                    if exact {
+                        fp_to_int_exact(cpu, 0, value, bits, size, signed, rounding).unwrap();
+                    } else {
+                        fp_to_int(cpu, 0, 1, bits, size, signed, rounding).unwrap();
+                    }
+                });
+                assert_eq!(
+                    (cpu.regs[0], cpu.fpsr),
+                    (result, fpsr),
+                    "fcvt {rounding:?} {size:?} {value:#x} exact {exact}"
+                );
+            }
+            // FSQRT and FRINT: (fpcr, size, op, operand, result, fpsr).
+            let unary: &[Unary] = &[
+                (0, FpSize::D, FpUnaryOp::Sqrt, d(4.0), d(2.0), 0),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::Sqrt,
+                    d(2.0),
+                    d(2f64.sqrt()),
+                    FPSR_IXC,
+                ),
+                (
+                    0,
+                    FpSize::S,
+                    FpUnaryOp::Sqrt,
+                    s(2.0),
+                    s(2f32.sqrt()),
+                    FPSR_IXC,
+                ),
+                (0, FpSize::S, FpUnaryOp::Sqrt, s(0.25), s(0.5), 0),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::Sqrt,
+                    1,
+                    d(f64::from_bits(486 << 52)),
+                    0,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::Sqrt,
+                    2,
+                    d(f64::from_bits(2).sqrt()),
+                    FPSR_IXC,
+                ),
+                (0, FpSize::D, FpUnaryOp::Sqrt, d(-0.0), d(-0.0), 0),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::Sqrt,
+                    d(f64::INFINITY),
+                    d(f64::INFINITY),
+                    0,
+                ),
+                (FPCR_FZ, FpSize::D, FpUnaryOp::Sqrt, 2, 0, FPSR_IDC),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::RoundExact,
+                    d(1.5),
+                    d(2.0),
+                    FPSR_IXC,
+                ),
+                (0, FpSize::D, FpUnaryOp::RoundExact, d(2.0), d(2.0), 0),
+                (
+                    0,
+                    FpSize::S,
+                    FpUnaryOp::RoundExact,
+                    s(-0.25),
+                    s(-0.0),
+                    FPSR_IXC,
+                ),
+                (
+                    0,
+                    FpSize::D,
+                    FpUnaryOp::Round(Rounding::Nearest),
+                    d(1.5),
+                    d(2.0),
+                    0,
+                ),
+                (
+                    0,
+                    FpSize::S,
+                    FpUnaryOp::Round(Rounding::Minus),
+                    s(-0.25),
+                    s(-1.0),
+                    0,
+                ),
+            ];
+            for &(fpcr, size, op, value, result, fpsr) in unary {
+                let cpu = run(fpcr, value, exact, &|cpu, exact| {
+                    if exact {
+                        fp_unary_exact(cpu, op, size, 0, 1).unwrap();
+                    } else {
+                        fp_unary(cpu, op, size, 0, 1).unwrap();
+                    }
+                });
+                assert_eq!(
+                    (cpu.vectors[0] as u64, cpu.fpsr),
+                    (result, fpsr),
+                    "{op:?} {size:?} {value:#x} exact {exact}"
+                );
+            }
+        }
+        // SCVTF and UCVTF: (gp bits, size, signed, integer, result, fpsr).
+        let from_int: &[FromInt] = &[
+            (32, FpSize::S, true, 16_777_216, s(16_777_216.0), 0),
+            (32, FpSize::S, true, 16_777_217, s(16_777_216.0), FPSR_IXC),
+            (
+                64,
+                FpSize::D,
+                true,
+                (1 << 53) + 1,
+                d(9_007_199_254_740_992.0),
+                FPSR_IXC,
+            ),
+            (
+                64,
+                FpSize::D,
+                false,
+                u64::MAX,
+                d(18_446_744_073_709_551_616.0),
+                FPSR_IXC,
+            ),
+            (64, FpSize::S, true, (-3i64) as u64, s(-3.0), 0),
+            (
+                32,
+                FpSize::D,
+                false,
+                u64::from(u32::MAX),
+                d(4_294_967_295.0),
+                0,
+            ),
+            (
+                32,
+                FpSize::S,
+                true,
+                u64::from(i32::MAX as u32),
+                s(2_147_483_648.0),
+                FPSR_IXC,
+            ),
+            (
+                32,
+                FpSize::S,
+                false,
+                u64::from(u32::MAX),
+                s(4_294_967_296.0),
+                FPSR_IXC,
+            ),
+            (
+                64,
+                FpSize::S,
+                true,
+                i64::MAX as u64,
+                s(9_223_372_036_854_775_808.0),
+                FPSR_IXC,
+            ),
+            (
+                64,
+                FpSize::D,
+                true,
+                i64::MAX as u64,
+                d(9_223_372_036_854_775_808.0),
+                FPSR_IXC,
+            ),
+            (
+                64,
+                FpSize::D,
+                true,
+                i64::MIN as u64,
+                d(-9_223_372_036_854_775_808.0),
+                0,
+            ),
+            (
+                64,
+                FpSize::D,
+                false,
+                1 << 63,
+                d(9_223_372_036_854_775_808.0),
+                0,
+            ),
+            (
+                64,
+                FpSize::S,
+                false,
+                u64::MAX,
+                s(18_446_744_073_709_551_616.0),
+                FPSR_IXC,
+            ),
+        ];
+        for &(bits, size, signed, integer, result, fpsr) in from_int {
+            let mut cpu = Cpu::default();
+            cpu.regs[1] = integer;
+            int_to_fp(&mut cpu, 0, 1, bits, size, signed).unwrap();
+            assert_eq!(
+                (cpu.vectors[0] as u64, cpu.fpsr),
+                (result, fpsr),
+                "scvtf {integer:#x}"
+            );
+        }
+        // The vector forms share the root's and the integer lane's rules.
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(d(2.0)) | u128::from(d(4.0)) << 64;
+        vec_fp_unary(
+            &mut cpu,
+            VecFpUnaryOp::Sqrt,
+            FpSize::D,
+            true,
+            false,
+            0,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cpu.fpsr, FPSR_IXC, "fsqrt 2d");
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(d(4.0));
+        vec_fp_unary(
+            &mut cpu,
+            VecFpUnaryOp::Sqrt,
+            FpSize::D,
+            false,
+            true,
+            0,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cpu.fpsr, 0, "fsqrt d exact");
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(d(2.5));
+        vec_fp_unary(
+            &mut cpu,
+            VecFpUnaryOp::ToSigned(Rounding::Zero),
+            FpSize::D,
+            false,
+            true,
+            0,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!((cpu.vectors[0] as u64, cpu.fpsr), (2, FPSR_IXC), "fcvtzs d");
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(d(2.5));
+        cpu.fpcr = 0;
+        fp_to_fixed(&mut cpu, 0, 1, 64, FpSize::D, true, 1).unwrap();
+        assert_eq!((cpu.regs[0], cpu.fpsr), (5, 0), "fcvtzs #1 exact");
+        let mut cpu = Cpu::default();
+        cpu.vectors[1] = u128::from(d(2.3));
+        fp_to_fixed(&mut cpu, 0, 1, 64, FpSize::D, true, 1).unwrap();
+        assert_eq!((cpu.regs[0], cpu.fpsr), (4, FPSR_IXC), "fcvtzs #1 inexact");
+    }
+
+    /// The fast paths of `fp_unary` (FSQRT, FRINT*), `fp_convert` and
+    /// `fp_to_int`: special, boundary and range-edge values of both sizes, in
+    /// FPCR 0, FZ, DN, FZ+DN and FZ with a directed rounding (a trap), with
+    /// and without IXC: the trap or not, the result and FPSR are the exact
+    /// path's.
+    #[test]
+    fn unary_and_conversion_fast_paths_match_the_exact_path() {
+        let mut singles: Vec<u64> = vec![
+            0,
+            0x8000_0000,
+            1,
+            0x807f_ffff,
+            0x0040_0000,
+            0x0080_0000,
+            0x7f7f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0xffc0_1234,
+            0x7f80_0001,
+            0xff80_0001,
+        ];
+        let mut doubles: Vec<u64> = vec![
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            0x800f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff8_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+        ];
+        let numbers: [f64; 31] = [
+            0.5,
+            -0.5,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            1.0,
+            -1.0,
+            0.25,
+            3.75,
+            -7.5,
+            2.0,
+            2_147_483_647.0,
+            2_147_483_647.5,
+            2_147_483_648.0,
+            -2_147_483_648.0,
+            -2_147_483_648.5,
+            -2_147_483_649.0,
+            4_294_967_295.0,
+            4_294_967_295.5,
+            4_294_967_296.0,
+            9_223_372_036_854_775_808.0,
+            -9_223_372_036_854_775_808.0,
+            9_223_372_036_854_774_784.0,
+            18_446_744_073_709_551_616.0,
+            18_446_744_073_709_549_568.0,
+            1.0e39,
+            -1.0e39,
+            1.0e-40,
+            1.0e-50,
+            3.402_823_567_797_336_6e38,
+        ];
+        for x in numbers {
+            doubles.push(x.to_bits());
+            singles.push(u64::from((x as f32).to_bits()));
+        }
+        singles.push(u64::from(1.0e-39f32.to_bits()));
+        singles.push(u64::from(16_777_217.0f32.to_bits()));
+        let roundings = [
+            Rounding::Nearest,
+            Rounding::Plus,
+            Rounding::Minus,
+            Rounding::Zero,
+            Rounding::Away,
+        ];
+        let mut unary_ops = vec![FpUnaryOp::Sqrt, FpUnaryOp::RoundExact];
+        unary_ops.extend(roundings.map(FpUnaryOp::Round));
+        for (size, pool) in [(FpSize::S, &singles), (FpSize::D, &doubles)] {
+            for fpcr in [0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN, FPCR_FZ | 1 << 22] {
+                for fpsr in [0, FPSR_IXC] {
+                    for &value in pool.iter() {
+                        let setup = || {
+                            let mut cpu = Cpu {
+                                fpcr,
+                                fpsr,
+                                ..Cpu::default()
+                            };
+                            cpu.vectors[1] = u128::from(value);
+                            cpu.vectors[0] = u128::MAX;
+                            cpu.regs[0] = u64::MAX;
+                            cpu
+                        };
+                        let context = format!("{size:?} fpcr {fpcr:#x} fpsr {fpsr:#x}: {value:#x}");
+                        for &op in &unary_ops {
+                            let (mut fast, mut exact) = (setup(), setup());
+                            let fast_ok = fp_unary(&mut fast, op, size, 0, 1).is_ok();
+                            let exact_ok = fp_unary_exact(&mut exact, op, size, 0, 1).is_ok();
+                            assert_eq!(
+                                (fast_ok, fast.vectors[0], fast.fpsr),
+                                (exact_ok, exact.vectors[0], exact.fpsr),
+                                "{op:?} {context}"
+                            );
+                        }
+                        let to = match size {
+                            FpSize::S => FpSize::D,
+                            FpSize::D => FpSize::S,
+                        };
+                        let (mut fast, mut exact) = (setup(), setup());
+                        let fast_ok = fp_convert(&mut fast, 0, 1, size, to).is_ok();
+                        let exact_ok = fp_convert_exact(&mut exact, 0, 1, size, to).is_ok();
+                        assert_eq!(
+                            (fast_ok, fast.vectors[0], fast.fpsr),
+                            (exact_ok, exact.vectors[0], exact.fpsr),
+                            "fcvt to {to:?} {context}"
+                        );
+                        for signed in [false, true] {
+                            for gp_bits in [32, 64] {
+                                for rounding in roundings {
+                                    let (mut fast, mut exact) = (setup(), setup());
+                                    let fast_ok =
+                                        fp_to_int(&mut fast, 0, 1, gp_bits, size, signed, rounding)
+                                            .is_ok();
+                                    let exact_ok = fp_to_int_exact(
+                                        &mut exact, 0, value, gp_bits, size, signed, rounding,
+                                    )
+                                    .is_ok();
+                                    assert_eq!(
+                                        (fast_ok, fast.regs[0], fast.fpsr),
+                                        (exact_ok, exact.regs[0], exact.fpsr),
+                                        "fcvt {rounding:?} signed {signed} {gp_bits} {context}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

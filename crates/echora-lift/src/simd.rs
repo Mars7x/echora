@@ -2582,9 +2582,9 @@ fn unary_lane(unary: VecFpUnaryOp, size: FpSize) -> Option<(String, String)> {
     };
     Some(match unary {
         // Square roots of positive normals are normal; of a zero, that
-        // zero. Neither raises anything (the helper models no IXC here).
+        // zero. A rounded root raises IXC: native with IXC already set.
         VecFpUnaryOp::Sqrt => (
-            "usable(x) & ((x & sign == 0) | zero(x))".to_owned(),
+            "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & ((x & sign == 0) | zero(x))".to_owned(),
             "f.sqrt().to_bits()".to_owned(),
         ),
         VecFpUnaryOp::Round(rounding) => {
@@ -2598,25 +2598,25 @@ fn unary_lane(unary: VecFpUnaryOp, size: FpSize) -> Option<(String, String)> {
             ("usable(x)".to_owned(), format!("f.{function}().to_bits()"))
         }
         // Toward zero: in range exactly when the truncated value fits (no
-        // IOC); a fraction raises nothing in the helper.
+        // IOC); a fraction raises IXC: native with IXC already set.
         VecFpUnaryOp::ToSigned(Rounding::Zero) => match size {
             FpSize::S => (
-                "usable(x) & (f >= -2147483648.0) & (f < 2147483648.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f >= -2147483648.0) & (f < 2147483648.0)".to_owned(),
                 "f as i32 as u32".to_owned(),
             ),
             FpSize::D => (
-                "usable(x) & (f >= -9223372036854775808.0) & (f < 9223372036854775808.0)"
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f >= -9223372036854775808.0) & (f < 9223372036854775808.0)"
                     .to_owned(),
                 "f as i64 as u64".to_owned(),
             ),
         },
         VecFpUnaryOp::ToUnsigned(Rounding::Zero) => match size {
             FpSize::S => (
-                "usable(x) & (f > -1.0) & (f < 4294967296.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f > -1.0) & (f < 4294967296.0)".to_owned(),
                 "f as u32".to_owned(),
             ),
             FpSize::D => (
-                "usable(x) & (f > -1.0) & (f < 18446744073709551616.0)".to_owned(),
+                "(m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0) & usable(x) & (f > -1.0) & (f < 18446744073709551616.0)".to_owned(),
                 "f as u64".to_owned(),
             ),
         },
@@ -5771,7 +5771,10 @@ mod tests {
             fp_to_int(&mut cpu, 0, 1, 64, FpSize::S, true, rounding).unwrap();
             assert_eq!(cpu.regs[0] as i64, expected, "{rounding:?}");
         }
-        assert_eq!(cpu.fpsr, 0);
+        // -2.5 is no integer: Inexact (FPToFixed).
+        assert_eq!(cpu.fpsr, FPSR_IXC);
+        cpu.fpsr = 0;
+        // Out of range: Invalid Operation alone.
         fp_to_int(&mut cpu, 0, 1, 32, FpSize::S, false, Rounding::Zero).unwrap();
         assert_eq!((cpu.regs[0], cpu.fpsr), (0, FPSR_IOC));
         cpu.fpsr = 0;
