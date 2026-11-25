@@ -325,7 +325,8 @@ pub(crate) fn emit_misc(op: &SimdOp) -> Option<String> {
             ))
         }
         // FCVTZS/FCVTZU (scalar, fixed point) to a general register: as
-        // FCVTZS, the value scaled by 2^fbits first (exactly).
+        // FCVTZS, the value scaled by 2^fbits first (exactly), with IXC
+        // already set (sticky) as a rounded result raises it.
         SimdOp::FpToFixed {
             rd,
             rn,
@@ -355,7 +356,7 @@ pub(crate) fn emit_misc(op: &SimdOp) -> Option<String> {
             };
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; {kit} let rounded = (f64::from({float}::from_bits(x)) * {}).trunc(); \
-                 if {FP_MODE} && usable(x) && rounded >= {min} && rounded {upper} {max} {{ let value = {convert}; {write} }} else {{\n{}\n}} }}",
+                 if {FP_MODE} && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0 && usable(x) && rounded >= {min} && rounded {upper} {max} {{ let value = {convert}; {write} }} else {{\n{}\n}} }}",
                 power_of_two(i32::from(fbits)),
                 emit_call(op)?
             ))
@@ -438,8 +439,9 @@ pub(crate) fn emit_misc(op: &SimdOp) -> Option<String> {
         }
         // Vector FCVT*S/U in a directed rounding or with fraction bits
         // (`inline_vector_unary` takes toward zero without): per lane, a
-        // normal or zero lane whose scaled, rounded value fits; any other
-        // lane through the helper's scalar form, in Vd (written last).
+        // normal or zero lane whose scaled, rounded value fits, with IXC
+        // already set (sticky) as a rounded lane raises it; any other lane
+        // through the helper's scalar form, in Vd (written last).
         SimdOp::VecFpUnary {
             op: unary @ (VecFpUnaryOp::ToSigned(rounding) | VecFpUnaryOp::ToUnsigned(rounding)),
             size,
@@ -477,7 +479,7 @@ pub(crate) fn emit_misc(op: &SimdOp) -> Option<String> {
                 }
             };
             Some(format!(
-                "{{ let vn = m.cpu.vectors[{rn}]; {kit} if {FP_MODE} {{ let mut out = 0u128; \
+                "{{ let vn = m.cpu.vectors[{rn}]; {kit} if {FP_MODE} && m.cpu.fpsr & {p}::FPSR_IXC != 0 {{ let mut out = 0u128; \
                  for lane in 0..{lanes}u32 {{ let x = (vn >> (lane * {width})) as {int}; \
                  let rounded = (f64::from({float}::from_bits(x)) * {}).{}(); \
                  let raw: u64 = if usable(x) && rounded >= {min} && rounded {upper} {max} {{ {convert} }} else {{ \

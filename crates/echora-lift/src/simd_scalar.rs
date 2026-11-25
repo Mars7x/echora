@@ -19,6 +19,11 @@ thread_local! {
 
 /// Sets whether scalar float moves and conversions are inlined; returns
 /// the previous setting.
+/// FPSR.IXC already set (sticky): an inlined operation that may round
+/// raises nothing new then. `IXC_SET` joins it to a condition.
+const IXC_TEST: &str = "m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0";
+const IXC_SET: &str = " && m.cpu.fpsr & echora_guest::simd::FPSR_IXC != 0";
+
 pub(crate) fn set_inline_fp_scalar(on: bool) -> bool {
     ON.replace(on)
 }
@@ -122,8 +127,9 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
                 format!("m.cpu.vectors[{rd}] = u128::from({value});")
             })
         }
-        // The helper's only check is the FPCR (`mode`): then the host
-        // conversion, rounding to nearest.
+        // The helper's checks are the FPCR (`mode`) and Inexact: the host
+        // conversion, rounding to nearest, with IXC already set (sticky)
+        // unless the conversion is exact (a 32-bit integer to a double).
         SimdOp::IntToFp {
             rd,
             rn,
@@ -132,8 +138,13 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
             signed,
         } => {
             let value = int_to_fp("value", u32::from(gp_bits), signed, size);
+            let ixc = if gp_bits == 32 && size == FpSize::D {
+                ""
+            } else {
+                IXC_SET
+            };
             Some(format!(
-                "{{ let value = {}; if {FP_MODE} {{ {} }} else {{\n{}\n}} }}",
+                "{{ let value = {}; if {FP_MODE}{ixc} {{ {} }} else {{\n{}\n}} }}",
                 general(rn, gp_bits),
                 write_fp(rd, size, &value),
                 call()?
@@ -151,13 +162,13 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
             };
             let value = int_to_fp("value", bits, signed, size);
             Some(format!(
-                "{{ let value = {read}; if {FP_MODE} {{ {} }} else {{\n{}\n}} }}",
+                "{{ let value = {read}; if {FP_MODE}{IXC_SET} {{ {} }} else {{\n{}\n}} }}",
                 write_fp(rd, size, &value),
                 call()?
             ))
         }
         // A normal or zero operand whose rounded value fits: no IOC, and
-        // the helper models no IXC for conversions.
+        // IXC already set (sticky), as a rounded conversion raises it.
         SimdOp::FpToInt {
             rd,
             rn,
@@ -183,13 +194,16 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
             let method = rounding_method(rounding);
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; {kit} let rounded = f64::from({float}::from_bits(x)).{method}(); \
-                 if {FP_MODE} && usable(x) && rounded >= {min} && rounded {upper} {max} {{ let value = {convert}; {} }} else {{\n{}\n}} }}",
+                 if {FP_MODE}{IXC_SET} && usable(x) && rounded >= {min} && rounded {upper} {max} {{ let value = {convert}; {} }} else {{\n{}\n}} }}",
                 write_general(rd, "value"),
                 call()?
             ))
         }
         // FCVT between single and double: a normal or zero operand whose
-        // converted value is normal or zero (no flush, no overflow).
+        // converted value is normal or zero (no flush, no overflow). To a
+        // single, with IXC already set (sticky) as a rounded result raises
+        // it, and not from below the single's normal range (tininess before
+        // rounding: a zero only from a zero, never the smallest normal).
         SimdOp::FpConvert {
             rd,
             rn,
@@ -198,9 +212,19 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
         } if from != to => {
             let (_, int, _, kit) = float_kit(from);
             let (_, _, _, target_kit) = float_kit(to);
-            let (converted, target_int) = match from {
-                FpSize::S => ("f64::from(f32::from_bits(x)).to_bits()", "u64"),
-                FpSize::D => ("(f64::from_bits(x) as f32).to_bits()", "u32"),
+            let (converted, target_int, narrowing) = match from {
+                FpSize::S => (
+                    "f64::from(f32::from_bits(x)).to_bits()",
+                    "u64",
+                    String::new(),
+                ),
+                FpSize::D => (
+                    "(f64::from_bits(x) as f32).to_bits()",
+                    "u32",
+                    format!(
+                        "{IXC_SET} && target_zero(converted) == zero(x) && converted & 0x7fff_ffff != 0x0080_0000"
+                    ),
+                ),
             };
             // The target's tests, renamed.
             let target_kit = target_kit
@@ -216,7 +240,7 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
                 .replace("let _ = sign;", "let _ = target_sign;");
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; {kit} {target_kit} let converted: {target_int} = {converted}; \
-                 if {FP_MODE} && usable(x) && target_usable(converted) {{ {} }} else {{\n{}\n}} }}",
+                 if {FP_MODE}{narrowing} && usable(x) && target_usable(converted) {{ {} }} else {{\n{}\n}} }}",
                 write_fp(rd, to, "converted"),
                 call()?
             ))
@@ -228,17 +252,22 @@ pub(crate) fn emit_fp_scalar(op: &SimdOp) -> Option<String> {
             rn,
         } => {
             let (float, int, _, kit) = float_kit(size);
+            // FSQRT and FRINTX raise Inexact when rounded: with IXC already
+            // set (sticky). The other FRINTs raise nothing.
             let (native, value) = match unary {
                 FpUnaryOp::Sqrt => (
-                    "usable(x) && ((x & sign) == 0 || zero(x))",
+                    format!("{IXC_TEST} && usable(x) && ((x & sign) == 0 || zero(x))"),
                     "f.sqrt()".to_owned(),
                 ),
-                FpUnaryOp::Round(rounding) => {
-                    ("usable(x)", format!("f.{}()", rounding_method(rounding)))
-                }
-                // FRINTX: to nearest (the FPCR's mode here); the helper
-                // models no IXC.
-                _ => ("usable(x)", "f.round_ties_even()".to_owned()),
+                FpUnaryOp::Round(rounding) => (
+                    "usable(x)".to_owned(),
+                    format!("f.{}()", rounding_method(rounding)),
+                ),
+                // FRINTX: to nearest (the FPCR's mode here).
+                _ => (
+                    format!("{IXC_TEST} && usable(x)"),
+                    "f.round_ties_even()".to_owned(),
+                ),
             };
             Some(format!(
                 "{{ let x = m.cpu.vectors[{rn}] as {int}; {kit} let f = {float}::from_bits(x); \
