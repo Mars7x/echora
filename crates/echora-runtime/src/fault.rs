@@ -106,7 +106,46 @@ mod unix {
         });
     }
 
-    extern "C" fn report(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    extern "C" fn report(_: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+        // Where the host faulted: the instruction, the address it touched and
+        // the object holding the instruction (with its offset there, for
+        // `addr2line`/`nm` on that file). A dying process can afford
+        // `dladdr` and formatting.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // SAFETY: the kernel passes a valid siginfo and ucontext to an
+            // SA_SIGINFO handler.
+            let (rip, address) = unsafe {
+                let context = &*(context as *const libc::ucontext_t);
+                (
+                    context.uc_mcontext.gregs[libc::REG_RIP as usize] as usize,
+                    (*info).si_addr() as usize,
+                )
+            };
+            let mut text = format!("host fault: rip {rip:#x} address {address:#x}");
+            // SAFETY: dladdr reads the loader's tables; `found` is filled in
+            // when it returns nonzero.
+            unsafe {
+                let mut found: libc::Dl_info = std::mem::zeroed();
+                if libc::dladdr(rip as *const libc::c_void, &mut found) != 0 {
+                    let file = if found.dli_fname.is_null() {
+                        "?".into()
+                    } else {
+                        std::ffi::CStr::from_ptr(found.dli_fname).to_string_lossy()
+                    };
+                    let _ = write!(text, " in {file} +{:#x}", rip - found.dli_fbase as usize);
+                    if !found.dli_sname.is_null() {
+                        let symbol = std::ffi::CStr::from_ptr(found.dli_sname).to_string_lossy();
+                        let _ = write!(text, " ({symbol})");
+                    }
+                }
+            }
+            text.push('\n');
+            // SAFETY: write(2) with a valid buffer.
+            unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let _ = (info, context);
         let core = CORE.with(Cell::get) as *const Core;
         if !core.is_null() {
             // SAFETY: `watch` registered a core its caller keeps alive while
@@ -160,7 +199,12 @@ mod unix {
                     )
                 };
                 let mark = if other == core { " (faulted)" } else { "" };
-                let _ = writeln!(text, "core slot {index}{mark}: thread {thread} pc {pc:#x}");
+                let _ = write!(text, "core slot {index}{mark}: thread {thread} pc {pc:#x}");
+                // An NVN thunk: the entry point being run on the host.
+                if let Some(name) = crate::nvn::thunk_name(pc) {
+                    let _ = write!(text, " (NVN {name})");
+                }
+                text.push('\n');
                 for entry in recent.iter().rev().take(24).rev() {
                     let _ = writeln!(text, "  recent t{} {:#x}", entry.thread_id, entry.pc);
                 }
