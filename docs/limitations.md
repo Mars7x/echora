@@ -14,6 +14,11 @@ automated test covers it).
   scene targets. The adaptive path used 854×480 targets in the sampled scene.
   Water color and temporal stability still need verification. Unimplemented
   operations can stop the run and produce a report.
+- Finalizing a texture removes its texel buffer and alternate 1D, 3D and
+  array images from the lookup caches. Pending GPU commands retain their
+  resources until completion. Vulkan tests cover both retirement and a
+  reused handle reading new buffer contents. The effect on memory growth
+  during the flight through Kokiri Forest still needs measurement.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the

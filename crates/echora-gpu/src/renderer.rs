@@ -15,6 +15,11 @@ use crate::compute::StorageImage;
 use crate::draw::ImageShape;
 use crate::vulkan::Gpu;
 
+// Alternate upload images for bindings with a different image dimension.
+const ROW_UPLOAD_BIT: u64 = 1 << 63;
+const FLAT_VOLUME_UPLOAD_BIT: u64 = 1 << 62;
+const VOLUME_ARRAY_UPLOAD_BIT: u64 = 1 << 61;
+
 pub struct Target {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -2502,15 +2507,20 @@ impl Renderer {
         {
             let alias = match *shape {
                 ImageShape::D2 { layers } if matches!(texture_type, 0 | 1) => {
-                    Some((key ^ 1 << 63, 1, ImageShape::D1 { layers }))
+                    Some((key ^ ROW_UPLOAD_BIT, 1, ImageShape::D1 { layers }))
                 }
-                ImageShape::D2 { layers: 1 } if texture_type == 4 => {
-                    Some((key ^ 1 << 62, *height, ImageShape::D3 { depth: 1 }))
+                ImageShape::D2 { layers: 1 } if texture_type == 4 => Some((
+                    key ^ FLAT_VOLUME_UPLOAD_BIT,
+                    *height,
+                    ImageShape::D3 { depth: 1 },
+                )),
+                ImageShape::D3 { depth } if depth > 0 && matches!(texture_type, 2 | 3) => {
+                    levels.iter().any(|region| region.level == 0).then_some((
+                        key ^ VOLUME_ARRAY_UPLOAD_BIT,
+                        *height,
+                        ImageShape::D2 { layers: depth },
+                    ))
                 }
-                ImageShape::D3 { depth } if depth > 0 && matches!(texture_type, 2 | 3) => levels
-                    .iter()
-                    .any(|region| region.level == 0)
-                    .then_some((key ^ 1 << 61, *height, ImageShape::D2 { layers: depth })),
                 _ => None,
             };
             if let Some((alias, alias_height, alias_shape)) = alias {
@@ -7563,10 +7573,17 @@ impl Renderer {
         self.read_target_level(key, 0)
     }
 
-    /// Release the upload kept for `key` (and its one-dimensional alias):
-    /// the texture it held was finalized.
+    /// Retire a finalized texture’s images and texel buffer after pending GPU use.
     pub fn forget_upload(&mut self, key: u64) {
-        for key in [key, key ^ 1 << 63] {
+        if let Some((_, buffer, view)) = self.texel_buffers.remove(&key) {
+            self.slot.retired_texel_buffers.push((buffer, view));
+        }
+        for key in [
+            key,
+            key ^ ROW_UPLOAD_BIT,
+            key ^ FLAT_VOLUME_UPLOAD_BIT,
+            key ^ VOLUME_ARRAY_UPLOAD_BIT,
+        ] {
             if let Some((_, target)) = self.uploads.remove(&key) {
                 self.texture_epoch += 1;
                 self.slot.retired_uploads.push(target);
@@ -9811,6 +9828,79 @@ mod tests {
             }
             assert!(renderer.texture_view(&source, alias_type).is_err());
         }
+    }
+
+    #[test]
+    fn finalized_uploads_discard_all_dimensional_aliases() {
+        use crate::draw::{TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 20;
+        for (shape, bindings) in [
+            (ImageShape::D2 { layers: 1 }, &[2, 0, 4][..]),
+            (ImageShape::D3 { depth: 2 }, &[4, 3][..]),
+        ] {
+            let depth = shape.depth();
+            let source = TextureSource::Upload {
+                key,
+                generation: 1,
+                width: 4,
+                height: 4,
+                shape,
+                format: vk::Format::R8G8B8A8_UNORM,
+                texels: std::sync::Arc::new(vec![0x3a; 64 * depth as usize]),
+                levels: [UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 4,
+                    height: 4,
+                    depth,
+                    offset: 0,
+                }]
+                .into(),
+            };
+            for &binding in bindings {
+                renderer.texture_view(&source, binding).unwrap();
+            }
+            assert_eq!(renderer.uploads.len(), bindings.len());
+            let retired = renderer.slot.retired_uploads.len();
+            renderer.forget_upload(key);
+            assert!(renderer.uploads.is_empty());
+            assert!(renderer.upload_lengths.is_empty());
+            assert_eq!(
+                renderer.slot.retired_uploads.len() - retired,
+                bindings.len()
+            );
+        }
+    }
+
+    #[test]
+    fn recycled_texture_handle_reads_its_new_buffer_texels() {
+        use crate::draw::TextureSource;
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 21;
+        for byte in [0x11, 0x77] {
+            let source = TextureSource::Upload {
+                key,
+                generation: 1,
+                width: 4,
+                height: 1,
+                shape: ImageShape::D1 { layers: 1 },
+                format: vk::Format::R32_UINT,
+                texels: std::sync::Arc::new(vec![byte; 16]),
+                levels: Default::default(),
+            };
+            renderer.texel_buffer_view(&source).unwrap();
+            assert_eq!(renderer.texel_buffers[&key].1.read_bytes(16), [byte; 16]);
+            renderer.forget_upload(key);
+        }
+        assert!(renderer.texel_buffers.is_empty());
+        assert_eq!(renderer.slot.retired_texel_buffers.len(), 2);
     }
 
     #[test]
