@@ -2369,10 +2369,12 @@ pub fn thunk_in<'a>(names: &'a [impl AsRef<str>], pc: u64) -> Option<&'a str> {
 }
 
 /// Every thunk's entry point in thunk order, for fault reports (`thunk_name`).
+#[cfg(unix)]
 static THUNK_NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
 /// The entry point of the thunk at `pc`, if `pc` is one handed out in this
 /// process (fault reports: it does not wait for the list's lock).
+#[cfg(unix)]
 pub(crate) fn thunk_name(pc: u64) -> Option<&'static str> {
     let names = THUNK_NAMES.try_lock().ok()?;
     names.get(thunk_index(pc)?).copied()
@@ -2799,6 +2801,7 @@ impl Nvn {
         let name = intern(name);
         self.thunks.push(name);
         self.by_name.insert(name, address);
+        #[cfg(unix)]
         if let Ok(mut names) = THUNK_NAMES.lock()
             && names.len() < self.thunks.len()
         {
