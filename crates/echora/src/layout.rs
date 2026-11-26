@@ -261,6 +261,12 @@ impl Symbols {
 mod tests {
     use super::*;
 
+    // Uses the host test executable as the Linux translation ELF.
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
     #[test]
     fn the_running_test_binary_resolves_its_own_functions() {
         let exe = std::env::current_exe().unwrap();
@@ -274,16 +280,19 @@ mod tests {
 
     #[test]
     fn order_files_rank_guest_samples_by_function() {
-        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
-        let symbols = Symbols::read(&exe).unwrap();
+        let elf = include_bytes!("../tests/fixtures/layout.elf");
+        let symbols = Symbols::parse(elf).unwrap();
         let release = std::env::temp_dir().join(format!("echora-layout-{}", std::process::id()));
         let target = release.join("target/release");
         std::fs::create_dir_all(&target).unwrap();
         let copy = target.join("echora-run");
-        std::fs::copy(&exe, &copy).unwrap();
+        std::fs::write(&copy, elf).unwrap();
+        let copy = copy.canonicalize().unwrap();
         // One mapping of the whole file at 0x10000000, offset 0.
         let len = std::fs::metadata(&copy).unwrap().len();
-        let (hot, warm) = (&symbols.functions[10], &symbols.functions[20]);
+        let [hot, warm] = &symbols.functions[..] else {
+            panic!("expected two fixture functions");
+        };
         let profile = format!(
             "10000000-{:x} r-xp 00000000 00:00 0 {}\n--\n\
              7 {:#x} 1 0x0 5\n3 {:#x} 1 0x0 5\n50 {:#x} 1 0x0 0\n",
@@ -298,7 +307,7 @@ mod tests {
         let written = write_order_files(&release, &path, 1.0).unwrap();
         assert_eq!(written, vec![("echora-run".to_owned(), 2)]);
         let order = std::fs::read_to_string(release.join("layout/echora-run.order")).unwrap();
-        assert_eq!(order, format!("{}\n{}\n", hot.2, warm.2));
+        assert_eq!(order, "hot\nwarm\n");
         std::fs::remove_dir_all(&release).unwrap();
     }
 
