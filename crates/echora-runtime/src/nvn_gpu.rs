@@ -8729,9 +8729,7 @@ impl Nvn {
         let mut run_hints = std::cell::OnceCell::new();
         let mut entries = match previous {
             Some(built) => {
-                if built.entries.len() == count {
-                    run_hints = built.run_hints;
-                }
+                run_hints = built.run_hints;
                 built_pools = built.pools;
                 built.entries
             }
@@ -8739,7 +8737,11 @@ impl Nvn {
         };
         // The table grew or shrank at its end; pools gone (finalized, or
         // made again elsewhere) lose their pages.
+        let previous_count = entries.len();
         entries.resize(count, 0);
+        if let Some(hints) = run_hints.get_mut() {
+            hints.resize(previous_count, &entries, PAGE_SIZE);
+        }
         let gone: Vec<_> = built_pools
             .keys()
             .filter(|pool| !current.contains(pool))

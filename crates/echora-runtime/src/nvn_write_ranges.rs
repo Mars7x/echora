@@ -50,6 +50,29 @@ impl PageRunHints {
             .count()) as u16
     }
 
+    /// Resize after the table's existing prefix was preserved and any new
+    /// pages were zero-filled. Only the old last block can mix old and new pages.
+    pub(super) fn resize(&mut self, previous: usize, entries: &[u64], page_size: u64) {
+        if previous == entries.len() {
+            return;
+        }
+        self.0
+            .resize(entries.len().div_ceil(Self::BLOCK), Self::BLOCK as u16);
+        if entries.len() > previous && !previous.is_multiple_of(Self::BLOCK) {
+            let block = previous / Self::BLOCK;
+            let start = block * Self::BLOCK;
+            self.0[block] = Self::prefix(
+                &entries[start..(start + Self::BLOCK).min(entries.len())],
+                page_size,
+            );
+        }
+        let tail = entries.len() % Self::BLOCK;
+        if tail != 0 {
+            let last = &mut self.0[entries.len() / Self::BLOCK];
+            *last = (*last).min(tail as u16);
+        }
+    }
+
     pub(super) fn update(&mut self, entries: &[u64], page_size: u64, patches: &[Range<u64>]) {
         let mut next = 0;
         for patch in patches.iter().filter(|p| !p.is_empty()) {
@@ -209,6 +232,28 @@ pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resized_page_runs_match_a_full_scan_across_partial_blocks() {
+        let page = 4096;
+        let mut entries = Vec::new();
+        let mut hints = PageRunHints::new(&entries, page);
+        for size in [257, 258, 300, 900, 511, 256, 255, 256, 1024, 1, 0, 517] {
+            let previous = entries.len();
+            entries.resize(size, 0);
+            hints.resize(previous, &entries, page);
+            assert_eq!(hints.0, PageRunHints::new(&entries, page).0);
+            // Alternate holes and consecutive device pages before the next resize.
+            for (i, value) in entries.iter_mut().enumerate() {
+                *value = if (i / PageRunHints::BLOCK + size).is_multiple_of(3) {
+                    0
+                } else {
+                    (1 + i as u64) * page
+                };
+            }
+            hints.update(&entries, page, std::slice::from_ref(&(0..size as u64)));
+        }
+    }
 
     #[test]
     fn page_run_hints_follow_holes_remaps_and_short_final_blocks() {
