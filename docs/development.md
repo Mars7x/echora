@@ -94,6 +94,7 @@ read.
 | `ECHORA_REPLAY_CHUNK=N` | Let other threads access NVN state after at most N replayed commands. The default is 96, and 0 runs the replay without yielding between commands. |
 | `ECHORA_CPU_INDIRECT=1` | Read indirect draw and dispatch arguments back on the CPU instead of letting the GPU read them (debugging). |
 | `ECHORA_PAGE_TABLE=0` | Give translated programs an empty GPU page table, so their global memory reads return zeros (debugging). The page table is on by default. |
+| `ECHORA_KEEP_PAGE_TABLE_EXTENT=0` | Shrink the GPU page table to the rounded size of the live pools on every rebuild. The default retains up to 32 MiB of empty tail entries per table to reduce repeated resizing. |
 
 **Translation**
 

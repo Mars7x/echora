@@ -266,6 +266,11 @@ synthetic fixtures and runs without the game files.
 
 ## Performance
 
+- With the same Radeon build and saved forest route at 2560×1440, retaining
+  a bounded GPU page-table extent averaged 9.66 FPS over presents
+  4,200–5,100, compared with 8.90 FPS with exact resizing. The renderer
+  allocated 61 page-table buffers instead of 680. Both runs reached the
+  forest title, completed normally and preserved the cloned checkpoint.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700

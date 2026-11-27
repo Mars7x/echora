@@ -441,6 +441,7 @@ pub struct Backend {
     /// GPU address, flags), the sharing it was mapped with (None: some
     /// pages unmapped, so mapped again next time).
     page_build: Option<PageBuild>,
+    keep_page_table_extent: bool,
     /// ECHORA_LOOP_TRACE (debugging): each traced compute program's
     /// counter buffer (`Renderer::debug_buffer` index and address) and the
     /// present it was last reported at.
@@ -820,6 +821,8 @@ impl Backend {
             native_programs: Default::default(),
             page_table: None,
             page_build: None,
+            keep_page_table_extent: super::debug_var_os("ECHORA_KEEP_PAGE_TABLE_EXTENT")
+                .is_none_or(|value| value != "0"),
             loop_traces: HashMap::default(),
             vertex_traces: HashMap::default(),
             vertex_trace_addresses: Vec::new(),
@@ -8811,7 +8814,24 @@ impl Nvn {
         // Rounded up to 262144 pages (1 GiB): pools are made at rising GPU
         // addresses, about one a present, and a table that grows by a page
         // each time would be built whole each time.
-        let count = (end - first).next_multiple_of(1 << 18).min(16 << 20) as usize;
+        let required = (end - first).next_multiple_of(1 << 18).min(16 << 20) as usize;
+        let backend = self.gpu.as_mut().unwrap();
+        let mut count = required;
+        // Short-lived pools can repeatedly move the end of the table. Keep
+        // a bounded tail while those pools come and go. The removed mappings
+        // still clear their entries below, so the extra pages read as unmapped.
+        const MAX_EXTRA_PAGES: usize = (32 << 20) / size_of::<u64>();
+        if backend.keep_page_table_extent
+            && required != 0
+            && let Some(previous) = &backend.page_build
+            && previous.first == first
+            && let Some(extra) = previous.entries.len().checked_sub(required)
+            && (1..=MAX_EXTRA_PAGES).contains(&extra)
+        {
+            count += extra;
+            backend.stat("stat: retained GPU page table extent", 1);
+            backend.stat("stat: extra GPU page table entries", extra as u64);
+        }
         let traced = super::debug_var("ECHORA_POOL_TRACE")
             .ok()
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok());
@@ -17614,12 +17634,13 @@ mod pool_tests {
 
     #[test]
     fn virtual_gpu_pages_use_the_physical_pool_and_follow_remapping() {
-        let Ok(Some(backend)) = Backend::create(None) else {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
         };
         if !backend.renderer.gpu.buffer_device_address {
             return;
         }
+        backend.keep_page_table_extent = false;
         let mut nvn = Nvn {
             gpu: Some(backend),
             gpu_checked: true,
@@ -17892,6 +17913,23 @@ mod pool_tests {
             );
         }
         assert_eq!(page(&mut nvn, &mut guest, gpu + distant), 0);
+
+        // Keeping the previous extent still unmaps the pages of pools that
+        // vanished. A subsequent addition must not revive the old mapping.
+        nvn.gpu.as_mut().unwrap().keep_page_table_extent = true;
+        update(
+            &mut nvn,
+            &mut guest,
+            &[[0, 0, distant + PAGE_SIZE, PAGE_SIZE]],
+        )
+        .unwrap();
+        let retained = nvn.page_table(&mut guest).unwrap();
+        assert_eq!(retained.page_count, 2 << 18);
+        assert_eq!(page(&mut nvn, &mut guest, gpu + distant + PAGE_SIZE), 0);
+        assert_eq!(neighbor(&mut nvn, &mut guest), sides);
+        update(&mut nvn, &mut guest, &[[physical, 0, distant, PAGE_SIZE]]).unwrap();
+        assert_eq!(page(&mut nvn, &mut guest, gpu + distant), sides[0]);
+        assert_eq!(page(&mut nvn, &mut guest, gpu + distant + PAGE_SIZE), 0);
 
         // A request list with an invalid range leaves every mapping intact.
         assert!(
