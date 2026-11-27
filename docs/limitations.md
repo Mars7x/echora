@@ -32,6 +32,12 @@ synthetic fixtures and runs without the game files.
   than 20/255 across three frames. None did in the matching compressed
   console footage. No 4×4 block in either patch showed a reversal above
   12/255 after averaging its pixels.
+  A separate Radeon comparison captured six frames with and without SMAA
+  at camera positions within two source pixels. With fixed 1440p rendering
+  and sharpening enabled, neither sample showed a black flash. Motion-aligned
+  4×4 brightness reversals above 12/255 fell from 2.11% to 1.80% with SMAA.
+  At native pixel scale, foreground reversals above 20/255 changed from
+  0.17% to 0.25%. These short samples show mixed behavior.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
