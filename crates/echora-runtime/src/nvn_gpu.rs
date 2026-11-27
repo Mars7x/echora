@@ -1685,6 +1685,16 @@ fn storage_contains(base: u64, size: u64, address: u64, length: u64) -> bool {
         .is_some_and(|end| end <= size)
 }
 
+/// The SDK selects the polygon offset enable bit for the raster mode.
+fn polygon_raster(mode: u64, offset_enables: u64) -> (vk::PolygonMode, bool) {
+    let (mode, bit) = match mode {
+        0 => (vk::PolygonMode::POINT, 1),
+        1 => (vk::PolygonMode::LINE, 2),
+        _ => (vk::PolygonMode::FILL, 4),
+    };
+    (mode, offset_enables & bit != 0)
+}
+
 /// Draw primitive modes, GL numbering (inferred: DrawElementsBaseVertex
 /// mode 4 draws six indices per quad).
 fn topology(mode: u64) -> Option<vk::PrimitiveTopology> {
@@ -12275,9 +12285,10 @@ impl Nvn {
             props.get(key).map(|args| args.x[index])
         };
         let polygon = self.render.properties("BindPolygonState");
-        // The polygon state the draw binds (its address) and the props taken
-        // for it, with their element's offset from that address (a nonzero
-        // offset is another object's bag: the bound one has none).
+        let (polygon_mode, offset_enabled) = polygon_raster(
+            arg(polygon, "PolygonMode", 0).unwrap_or(2),
+            arg(polygon, "PolygonOffsetEnables", 0).unwrap_or(0),
+        );
         let depth_state = self.render.properties("BindDepthStencilState");
         let color_state = self.render.properties("BindColorState");
         let mask_state = self.render.properties("BindChannelMaskState");
@@ -12334,11 +12345,7 @@ impl Nvn {
                 (0, false) | (1.., true) => vk::FrontFace::CLOCKWISE,
                 _ => vk::FrontFace::COUNTER_CLOCKWISE,
             },
-            polygon_mode: match arg(polygon, "PolygonMode", 0).unwrap_or(2) {
-                0 => vk::PolygonMode::POINT,
-                1 => vk::PolygonMode::LINE,
-                _ => vk::PolygonMode::FILL,
-            },
+            polygon_mode,
             // ECHORA_GPU_NODEPTH=<fragment key>[,...] (debugging): those
             // programs draw without the depth test.
             depth_test: arg(depth_state, "DepthTestEnable", 0).unwrap_or(0) != 0
@@ -12386,12 +12393,9 @@ impl Nvn {
             // sets), maps clip z in [-w, w] to the depth range; 1,
             // NEAR_IS_ZERO, maps [0, w].
             depth_minus_one_to_one: self.depth_mode() == 0,
-            // PolygonState SetPolygonOffsetEnables (bit 0x4 fill, after
-            // point 0x1 and line 0x2, as NVN1; inferred) with the command
-            // buffer's SetPolygonOffsetClamp(factor, units, clamp) (S0-S2):
-            // ground decals drawn at the ground's depth rely on it, and
-            // z-fought with the ground in alternating rows without it.
-            depth_bias: (arg(polygon, "PolygonOffsetEnables", 0).unwrap_or(0) & 4 != 0)
+            // SetPolygonOffsetClamp supplies factor, units and clamp in S0–S2.
+            // Vulkan takes constant factor, clamp and slope factor.
+            depth_bias: offset_enabled
                 .then(|| self.render.state.get("SetPolygonOffsetClamp"))
                 .flatten()
                 .map(|bind| {
@@ -15917,6 +15921,22 @@ mod target_tests {
             .read_target_bytes(texture, 4)
             .unwrap();
         assert_eq!(pixels, [17, 255, 100, 190].repeat(32));
+    }
+
+    #[test]
+    fn polygon_offset_enables_select_only_the_current_raster_mode() {
+        use super::vk::PolygonMode;
+        for (mode, expected) in [PolygonMode::POINT, PolygonMode::LINE, PolygonMode::FILL]
+            .into_iter()
+            .enumerate()
+        {
+            for enables in 0..16 {
+                assert_eq!(
+                    super::polygon_raster(mode as u64, enables),
+                    (expected, enables & (1 << mode) != 0)
+                );
+            }
+        }
     }
 
     #[test]

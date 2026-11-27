@@ -8237,12 +8237,7 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
 /// state, as on the console.
-const TAGGED_STATES: [&str; 4] = [
-    "BlendState",
-    "PolygonState",
-    "DepthStencilState",
-    "MultisampleState",
-];
+const TAGGED_STATES: [&str; 3] = ["BlendState", "DepthStencilState", "MultisampleState"];
 
 /// The contents of tagged state structures by tag, including the snapshot
 /// shared by recorded Bind commands.
@@ -8488,9 +8483,14 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
     if base == 0 {
         return Ok(());
     }
-    if matches!(kind, "ColorState" | "ChannelMaskState") {
-        command.states =
-            packed_color_snapshot(core.memory.read_u32(base)?, kind == "ChannelMaskState");
+    let packed = match kind {
+        "ColorState" => Some(PackedState::Color),
+        "ChannelMaskState" => Some(PackedState::ChannelMask),
+        "PolygonState" => Some(PackedState::Polygon),
+        _ => None,
+    };
+    if let Some(kind) = packed {
+        command.states = packed_state_snapshot(core.memory.read_u32(base)?, kind);
         return Ok(());
     }
     // A single tagged state: what the bound structure's bytes hold; an
@@ -8645,53 +8645,83 @@ fn stencil_face_property<'a>(
     })
 }
 
-/// Color and channel-mask binds use one native word each. Keep the property
-/// names archived commands use, and share the decoded snapshot across binds.
-fn packed_color_snapshot(word: u32, channel_mask: bool) -> StateSnapshots {
+#[derive(Clone, Copy)]
+enum PackedState {
+    Color,
+    ChannelMask,
+    Polygon,
+}
+
+// PolygonState's four byte word, as read by its getters and BindPolygonState.
+const POLYGON_FIELDS: [(&str, u32, u32); 4] = [
+    ("CullFace", 0, 3),
+    ("FrontFace", 2, 1),
+    ("PolygonMode", 3, 3),
+    ("PolygonOffsetEnables", 15, 15),
+];
+
+/// Share decoded single-word states across binds, retaining the property
+/// names older archived commands use.
+fn packed_state_snapshot(word: u32, kind: PackedState) -> StateSnapshots {
     thread_local! {
-        static SNAPSHOTS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 32]> =
-            const { std::cell::RefCell::new([const { None }; 32]) };
+        static SNAPSHOTS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 48]> =
+            const { std::cell::RefCell::new([const { None }; 48]) };
     }
     SNAPSHOTS.with_borrow_mut(|entries| {
         let index = (word.wrapping_mul(0x9e37_79b9) >> 28) as usize;
-        let slot = &mut entries[16 * usize::from(channel_mask) + index];
+        let slot = &mut entries[16 * kind as usize + index];
         if let Some((known, snapshot)) = slot
             && *known == word
         {
             return snapshot.clone();
         }
         let mut properties = BTreeMap::from([("@Offset".into(), Args::default())]);
-        if channel_mask {
-            for index in 0..8 {
-                let mask = u64::from(word >> (index * 4));
-                // The fifth argument (alpha) is in V1 in archived binds.
-                properties.insert(
-                    format!("ChannelMask/{index}"),
-                    Args {
-                        x: [index, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1],
-                        v: [0, (mask >> 3) & 1],
-                    },
-                );
-            }
-        } else {
-            for (name, value) in [
-                ("LogicOp", (word >> 16) & 255),
-                ("AlphaTest", (word >> 24) & 15),
-            ] {
-                properties.insert(
-                    name.into(),
-                    Args {
-                        x: [u64::from(value), 0, 0, 0],
-                        ..Args::default()
-                    },
-                );
-            }
-            for target in 0..8 {
-                if word & (1 << (8 + target)) != 0 {
+        match kind {
+            PackedState::ChannelMask => {
+                for index in 0..8 {
+                    let mask = u64::from(word >> (index * 4));
+                    // The fifth argument (alpha) is in V1 in archived binds.
                     properties.insert(
-                        format!("BlendEnable/{target}"),
+                        format!("ChannelMask/{index}"),
                         Args {
-                            x: [target, 1, 0, 0],
+                            x: [index, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1],
+                            v: [0, (mask >> 3) & 1],
+                        },
+                    );
+                }
+            }
+            PackedState::Color => {
+                for (name, value) in [
+                    ("LogicOp", (word >> 16) & 255),
+                    ("AlphaTest", (word >> 24) & 15),
+                ] {
+                    properties.insert(
+                        name.into(),
+                        Args {
+                            x: [u64::from(value), 0, 0, 0],
+                            ..Args::default()
+                        },
+                    );
+                }
+                for target in 0..8 {
+                    if word & (1 << (8 + target)) != 0 {
+                        properties.insert(
+                            format!("BlendEnable/{target}"),
+                            Args {
+                                x: [target, 1, 0, 0],
+                                ..Args::default()
+                            },
+                        );
+                    }
+                }
+            }
+            PackedState::Polygon => {
+                for (property, shift, mask) in POLYGON_FIELDS {
+                    let value = (word >> shift) & mask;
+                    properties.insert(
+                        property.into(),
+                        Args {
+                            x: [u64::from(value), 0, 0, 0],
                             ..Args::default()
                         },
                     );
@@ -8702,6 +8732,33 @@ fn packed_color_snapshot(word: u32, channel_mask: bool) -> StateSnapshots {
         *slot = Some((word, snapshot.clone()));
         snapshot
     })
+}
+
+fn polygon_state_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
+    let [state, value, ..] = core.cpu.regs;
+    if rest == "SetDefaults" {
+        core.memory.write_u32(state, 0x14)?;
+        return Ok(true);
+    }
+    let Some(property) = rest
+        .strip_prefix("Set")
+        .or_else(|| rest.strip_prefix("Get"))
+    else {
+        return Ok(false);
+    };
+    let Some((_, shift, mask)) = POLYGON_FIELDS.into_iter().find(|field| field.0 == property)
+    else {
+        return Ok(false);
+    };
+    let word = core.memory.read_u32(state)?;
+    if rest.starts_with("Set") {
+        // The SDK clears just the old field and ORs the shifted W1 as given.
+        core.memory
+            .write_u32(state, (word & !(mask << shift)) | ((value as u32) << shift))?;
+    } else {
+        core.cpu.regs[0] = u64::from((word >> shift) & mask);
+    }
+    Ok(true)
 }
 
 fn channel_mask_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
@@ -8842,6 +8899,7 @@ fn bag_call(
         "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
         "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
         "ColorState" => Some(color_state_call(core, rest)?),
+        "PolygonState" => Some(polygon_state_call(core, rest)?),
         _ => None,
     };
     if let Some(handled) = native {
@@ -10487,6 +10545,94 @@ mod tests {
         assert_eq!(call(&mut nvn, &mut core, "nvnSyncWait", &[sync, 0]), 0);
         assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 1);
         assert_eq!(nvn.sync_timeouts[&sync], 1);
+    }
+
+    #[test]
+    fn polygon_state_uses_the_guest_word_and_snapshots_copied_fields() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "polygon state")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let rec = nvn.recorder();
+        let (buffer, state, copy) = (0x1020, 0x1100, 0x1ffc);
+        core.memory.write_u64(state, u64::MAX).unwrap();
+        core.cpu.regs[0] = state;
+        assert!(rec.front("nvnPolygonStateSetDefaults", &mut core).unwrap());
+        assert_eq!(core.memory.read_u64(state).unwrap(), 0xffff_ffff_0000_0014);
+
+        // The setters clear the field, then OR the shifted W1. Preserve
+        // unrelated bytes and the SDK's spill from out-of-range values.
+        core.memory.write_u32(state, 0x8100_0014).unwrap();
+        for (name, value) in [
+            ("nvnPolygonStateSetCullFace", 2),
+            ("nvnPolygonStateSetFrontFace", 0),
+            ("nvnPolygonStateSetPolygonMode", 1),
+            ("nvnPolygonStateSetPolygonOffsetEnables", 0x12),
+        ] {
+            call(&mut nvn, &mut core, name, &[state, value]);
+        }
+        let word = core.memory.read_u32(state).unwrap();
+        assert_eq!(word, 0x8109_000a);
+        core.memory.write_u32(copy, word | 4).unwrap();
+        for (name, expected) in [
+            ("nvnPolygonStateGetCullFace", 2),
+            ("nvnPolygonStateGetFrontFace", 1),
+            ("nvnPolygonStateGetPolygonMode", 1),
+            ("nvnPolygonStateGetPolygonOffsetEnables", 2),
+        ] {
+            assert_eq!(call(&mut nvn, &mut core, name, &[copy]), expected);
+        }
+
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        core.cpu.regs[..2].copy_from_slice(&[buffer, copy]);
+        assert!(
+            rec.record("nvnCommandBufferBindPolygonState", &mut core)
+                .unwrap()
+        );
+        call(&mut nvn, &mut core, "nvnPolygonStateSetDefaults", &[copy]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBindPolygonState",
+            &[buffer, copy],
+        );
+        let list = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let binds = ArchivedList::pack(&nvn.use_command_list(list).unwrap()).unpack();
+        assert_eq!(binds.len(), 2);
+        for (bind, expected) in binds.iter().zip([[2, 1, 1, 2], [0, 1, 2, 0]]) {
+            nvn.execute(bind, &mut core).unwrap();
+            let props = nvn.render.properties("BindPolygonState");
+            for (key, expected) in [
+                "CullFace",
+                "FrontFace",
+                "PolygonMode",
+                "PolygonOffsetEnables",
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(props[key].x[0], expected, "{key}");
+            }
+        }
     }
 
     #[test]
