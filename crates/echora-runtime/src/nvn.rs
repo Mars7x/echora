@@ -1043,9 +1043,7 @@ pub struct RenderState {
     /// individual bindings and for gathering all handles from a stage.
     pub bound_textures: TextureBindings,
     bound_uniforms: StageBindings<Command>,
-    /// Slots set in each stage's 16-entry storage buffer table, including
-    /// explicit bindings with a zero address or size.
-    storage_slots: [u16; 8],
+    bound_storage: StageBindings<Command>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1156,10 +1154,23 @@ impl RenderState {
             .unwrap_or(&EMPTY)
     }
 
-    fn set_storage_slot(&mut self, stage: u64, slot: u64) {
-        if stage < self.storage_slots.len() as u64 && slot < u64::from(u16::BITS) {
-            self.storage_slots[stage as usize] |= 1 << slot;
-        }
+    /// Bindings read through the driver's fixed 16-entry storage table.
+    /// Explicit zero bindings remain present in the table.
+    fn storage_table(&self, stage: usize) -> impl Iterator<Item = (usize, &Command)> {
+        self.bound_storage.stages[stage]
+            .iter()
+            .take(16)
+            .enumerate()
+            .filter_map(|(slot, binding)| Some((slot, binding.as_ref()?)))
+    }
+
+    fn named_storage_bindings(&self) -> impl Iterator<Item = (&'static str, &Command)> {
+        self.bound_storage.iter().map(|((stage, slot), command)| {
+            (
+                gpu::bind_key("BindStorageBuffer", Some(stage), slot),
+                command,
+            )
+        })
     }
 
     fn named_uniform_bindings(&self) -> impl Iterator<Item = (&'static str, &Command)> {
@@ -1177,6 +1188,7 @@ impl RenderState {
             .filter(|(key, _)| key.contains('/'))
             .map(|(&key, bind)| (key, bind))
             .chain(self.named_uniform_bindings())
+            .chain(self.named_storage_bindings())
     }
 }
 
@@ -4427,10 +4439,7 @@ impl Nvn {
                             let range = gpu.x[0]..gpu.x[0] + storage.x[1];
                             let mut stale: Vec<&str> = self
                                 .render
-                                .state
-                                .iter()
-                                .filter(|(key, _)| key.starts_with("BindStorageBuffer/"))
-                                .map(|(&key, bind)| (key, bind))
+                                .named_storage_bindings()
                                 .chain(self.render.named_uniform_bindings())
                                 .filter(|(_, bind)| range.contains(&bind.x[3]))
                                 .map(|(key, _)| key)
@@ -6490,13 +6499,12 @@ impl Nvn {
                         {
                             *self.stage_binds.entry(command.x[1]).or_default() += 1;
                         }
-                        if single == "BindStorageBuffer" {
-                            self.render.set_storage_slot(command.x[1], slot);
-                        }
                         if single == "BindUniformBuffer" {
                             self.render
                                 .bound_uniforms
                                 .insert((command.x[1], slot), bind);
+                        } else if single == "BindStorageBuffer" {
+                            self.render.bound_storage.insert((command.x[1], slot), bind);
                         } else {
                             self.render
                                 .state
@@ -6568,8 +6576,13 @@ impl Nvn {
                                 .insert((command.x[1], command.x[2]), command.clone());
                             return Ok(());
                         }
+                        "BindStorageBuffer" => {
+                            self.render
+                                .bound_storage
+                                .insert((command.x[1], command.x[2]), command.clone());
+                            return Ok(());
+                        }
                         "BindTexture"
-                        | "BindStorageBuffer"
                         | "BindImage"
                         | "BindSeparateTexture"
                         | "BindSeparateSampler" => {
@@ -6620,9 +6633,6 @@ impl Nvn {
                             != Some(command.x[3])
                     {
                         *self.stage_binds.entry(command.x[1]).or_default() += 1;
-                    }
-                    if rest == "BindStorageBuffer" {
-                        self.render.set_storage_slot(command.x[1], command.x[2]);
                     }
                     self.render.state.insert(key, command.clone());
                     return Ok(());
@@ -7523,11 +7533,8 @@ impl Nvn {
                     .collect()
             })
             .unwrap_or_default();
-        for (key, bind) in &self.render.state {
-            if !(key.starts_with("BindStorageBuffer/5/")
-                || key.starts_with("BindStorageBuffer/6/")
-                || key.starts_with("BindStorageBuffer/7/"))
-            {
+        for ((stage, _), bind) in self.render.bound_storage.iter() {
+            if !matches!(stage, 5..=7) {
                 continue;
             }
             let length = bind.x[4].min(4096) & !7;
@@ -13246,9 +13253,15 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(nvn.render.storage_slots, [0, 0xc008, 0, 0, 0, 0, 0, 4]);
-        assert_eq!(nvn.render.state["BindStorageBuffer/1/16"].x[3], 0x1300);
-        assert_eq!(nvn.render.state["BindStorageBuffer/7/2"].x[3..5], [0, 0]);
+        let entries: Vec<_> = nvn
+            .render
+            .storage_table(1)
+            .map(|(slot, bind)| (slot, bind.x[3]))
+            .collect();
+        assert_eq!(entries, [(3, 0x1000), (14, 0x1100), (15, 0x1200)]);
+        assert_eq!(nvn.render.bound_storage.get(1, 16).unwrap().x[3], 0x1300);
+        assert_eq!(nvn.render.bound_storage.get(7, 2).unwrap().x[3..5], [0, 0]);
+        assert_eq!(nvn.render.named_storage_bindings().count(), 5);
     }
 
     #[test]

@@ -306,6 +306,12 @@ synthetic fixtures and runs without the game files.
   The matched pair averaged 8.82 and 9.05 FPS across presents 4,200–5,100
   and peaked at 13,639 and 13,780 MiB resident. Both runs reached the same
   forest checkpoints and preserved the cloned save.
+- Indexing storage buffers by stage and slot reduced driver constant-table
+  preparation from 2.03 to 0.43 ms per present in a 12-present profile.
+  The paired 1440p saved-forest runs averaged 9.11 and 9.23 FPS over
+  presents 4,200–5,100 and 10.00 and 10.50 FPS over 4,600–5,100.
+  The candidate issued about 2% fewer draws over the longer interval.
+  Both runs reached the same outdoor checkpoints and preserved the save.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700

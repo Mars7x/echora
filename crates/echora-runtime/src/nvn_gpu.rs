@@ -39,6 +39,8 @@ pub(super) struct DrawBindings {
     guest_uniforms: echora_gpu::FastMap<(usize, u32), (u64, usize)>,
     textures: echora_gpu::FastMap<(usize, u32), (TextureSource, Sampler)>,
     stage_variants: Vec<Arc<Translated>>,
+    /// Stage index, driver constant offset, GPU address and size.
+    storage_entries: Vec<(usize, u32, u64, u64)>,
 }
 
 /// A statistic's name, hashed and compared by its address: a static
@@ -6967,11 +6969,7 @@ impl Nvn {
                 if entry + 12 > texture_base as usize || entry + 12 > c0.len() {
                     break;
                 }
-                if let Some(bind) =
-                    self.render
-                        .state
-                        .get(bind_key("BindStorageBuffer", Some(5), slot as u64))
-                {
+                if let Some(bind) = self.render.bound_storage.get(5, u64::from(slot)) {
                     c0[entry..entry + 8].copy_from_slice(&bind.x[3].to_le_bytes());
                     c0[entry + 8..entry + 12].copy_from_slice(&(bind.x[4] as u32).to_le_bytes());
                 }
@@ -7016,8 +7014,8 @@ impl Nvn {
                         Some(slot) => {
                             let bind = self
                                 .render
-                                .state
-                                .get(bind_key("BindStorageBuffer", Some(5), slot as u64))
+                                .bound_storage
+                                .get(5, u64::from(slot))
                                 .ok_or_else(|| {
                                     format!(
                                         "storage buffer 5/{slot} is not bound: {}",
@@ -11203,6 +11201,7 @@ impl Nvn {
         bindings.guest_uniforms.clear();
         bindings.textures.clear();
         bindings.stage_variants.clear();
+        bindings.storage_entries.clear();
         self.draw_bindings = bindings;
         result
     }
@@ -11456,6 +11455,7 @@ impl Nvn {
             guest_uniforms,
             textures,
             stage_variants,
+            storage_entries,
         } = bindings;
         uniforms.reserve(program.uniforms);
         guest_uniforms.reserve(program.uniforms);
@@ -11468,9 +11468,6 @@ impl Nvn {
         // Copied storage buffers a stage writes: guest address and GPU
         // address, by (stage index, binding).
         let mut storage_written = HashMap::default();
-        // Driver constant entries of bound storage buffers: (stage index,
-        // c0 offset, GPU address, size).
-        let mut storage_entries: Vec<(usize, u32, u64, u64)> = Vec::new();
         let (mut uniform_time, mut texture_time) = Default::default();
         let mut uniform_bytes = 0u64;
         // Time per kind of binding (the statistics' "draw us binding ...").
@@ -11611,15 +11608,14 @@ impl Nvn {
                         let slot = (descriptor.cbuf_offset - c0_storage_table(nvn)) / 16;
                         let bind = self
                             .render
-                            .state
-                            .get(bind_key("BindStorageBuffer", Some(nvn as u64), slot as u64))
+                            .bound_storage
+                            .get(u64::from(nvn), u64::from(slot))
                             .ok_or_else(|| {
                                 let bound: Vec<&str> = self
                                     .render
-                                    .state
-                                    .keys()
-                                    .filter(|key| key.starts_with(&format!("BindStorageBuffer/{nvn}/")))
-                                    .copied()
+                                    .named_storage_bindings()
+                                    .filter(|(_, bind)| bind.x[1] == u64::from(nvn))
+                                    .map(|(key, _)| key)
                                     .collect();
                                 format!(
                                     "storage buffer {nvn}/{slot} (c0+{:#x}) is not bound (bound [{}])",
@@ -11779,11 +11775,8 @@ impl Nvn {
                         // which the driver constant layout can be inferred.
                         let bound: Vec<String> = self
                             .render
-                            .state
-                            .iter()
-                            .filter(|(key, _)| {
-                                key.starts_with(&format!("BindStorageBuffer/{nvn}/"))
-                            })
+                            .named_storage_bindings()
+                            .filter(|(_, bind)| bind.x[1] == u64::from(nvn))
                             .map(|(key, bind)| format!("{key}={:#x}+{:#x}", bind.x[3], bind.x[4]))
                             .collect();
                         return Err(format!(
@@ -11826,18 +11819,9 @@ impl Nvn {
                 continue;
             }
             let nvn = nvn_stage(stage.stage);
-            let mut slots = self.render.storage_slots[nvn as usize];
-            while slots != 0 {
-                let slot = u64::from(slots.trailing_zeros());
-                slots &= slots - 1;
-                if let Some(bind) =
-                    self.render
-                        .state
-                        .get(bind_key("BindStorageBuffer", Some(nvn as u64), slot))
-                {
-                    let offset = u64::from(c0_storage_table(nvn)) + 16 * slot;
-                    storage_entries.push((index, offset as u32, bind.x[3], bind.x[4]));
-                }
+            for (slot, bind) in self.render.storage_table(nvn as usize) {
+                let offset = c0_storage_table(nvn) + 16 * slot as u32;
+                storage_entries.push((index, offset, bind.x[3], bind.x[4]));
             }
         }
         // The driver's other words in each stage's c0: the largest point
@@ -11862,7 +11846,7 @@ impl Nvn {
             let Some(bytes) = uniforms.get_mut(&(index, c0.binding)) else {
                 continue;
             };
-            for &(owner, offset, gpu, size) in &storage_entries {
+            for &(owner, offset, gpu, size) in storage_entries.iter() {
                 if owner != index {
                     continue;
                 }
@@ -12853,7 +12837,7 @@ impl Nvn {
             // a listing).
             if index < most {
                 let mut listing = String::new();
-                for &(stage, offset, gpu, size) in &storage_entries {
+                for &(stage, offset, gpu, size) in storage_entries.iter() {
                     if let Ok(bytes) = self.gpu_bytes(core, gpu, size) {
                         let _ = std::fs::write(
                             directory
