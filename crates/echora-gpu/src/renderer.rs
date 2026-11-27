@@ -8220,7 +8220,15 @@ impl Renderer {
                 .collect();
             return Ok((texels, read_width, read_height));
         }
-        // Blit to an RGBA32F image so every color format reads back alike.
+        // Integer blits must preserve signedness. Widen channels on the GPU
+        // and convert them to the public readback's f32 values on the host.
+        use crate::shader::SampleType;
+        let numeric = sampled_texture_type(format);
+        let staging_format = match numeric {
+            SampleType::Signed => vk::Format::R32G32B32A32_SINT,
+            SampleType::Unsigned => vk::Format::R32G32B32A32_UINT,
+            SampleType::Float => vk::Format::R32G32B32A32_SFLOAT,
+        };
         // Keep the full blit transform when resampling so nearest filtering
         // chooses precisely the same source texel as a full-level read.
         let (origin, end, staging_extent, copy_origin) =
@@ -8234,7 +8242,7 @@ impl Renderer {
             staging_key,
             staging_extent.0,
             staging_extent.1,
-            vk::Format::R32G32B32A32_SFLOAT,
+            staging_format,
         )?;
         self.transition(key, vk::ImageLayout::GENERAL)?;
         self.order_target(key)?;
@@ -8330,7 +8338,7 @@ impl Renderer {
             );
         }
         self.flush()?;
-        let texels = buffer.read_f32x4((size / 16) as usize);
+        let texels = buffer.read_rgba32((size / 16) as usize, numeric);
         buffer.destroy(self.device());
         Ok((texels, read_width, read_height))
     }
@@ -8838,11 +8846,20 @@ impl HostBuffer {
         unsafe { std::slice::from_raw_parts(self.mapped, length) }.to_vec()
     }
 
-    fn read_f32x4(&self, count: usize) -> Vec<[f32; 4]> {
+    fn read_rgba32(&self, count: usize, numeric: crate::shader::SampleType) -> Vec<[f32; 4]> {
+        use crate::shader::SampleType;
         assert!(count * 16 <= self.size as usize);
-        // SAFETY: in bounds; the GPU work writing it has completed.
-        let floats = unsafe { std::slice::from_raw_parts(self.mapped.cast::<f32>(), count * 4) };
-        floats.as_chunks::<4>().0.to_vec()
+        // SAFETY: the mapped allocation is aligned and in bounds. The GPU
+        // has completed the copy of four 32-bit components for each pixel.
+        let words = unsafe { std::slice::from_raw_parts(self.mapped.cast::<[u32; 4]>(), count) };
+        words
+            .iter()
+            .map(|pixel| match numeric {
+                SampleType::Signed => pixel.map(|word| word as i32 as f32),
+                SampleType::Unsigned => pixel.map(|word| word as f32),
+                SampleType::Float => pixel.map(f32::from_bits),
+            })
+            .collect()
     }
 
     pub fn destroy(self, device: &ash::Device) {
@@ -10664,6 +10681,68 @@ mod tests {
     }
 
     #[test]
+    fn color_readback_converts_signed_and_unsigned_channels_to_float() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 7;
+        let cases = [
+            (
+                vk::Format::R16G16_SINT,
+                vk::ClearColorValue {
+                    int32: [-300, 511, 0, 0],
+                },
+                [-300., 511., 0., 1.],
+            ),
+            (
+                vk::Format::R8G8B8A8_UINT,
+                vk::ClearColorValue {
+                    uint32: [128, 1, 255, 37],
+                },
+                [128., 1., 255., 37.],
+            ),
+            (
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ClearColorValue {
+                    float32: [1., 0., 0., 1.],
+                },
+                [1., 0., 0., 1.],
+            ),
+        ];
+        for (format, clear, expected) in cases {
+            renderer.target(key, 2, 1, format).unwrap();
+            renderer.clear_color(key, None, clear).unwrap();
+            assert_eq!(
+                renderer.read_target_level(key, 0).unwrap(),
+                [expected; 2],
+                "{format:?}"
+            );
+            assert_eq!(
+                renderer.read_target_pixel(key, 1, 0).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn packed_integer_color_formats_use_their_declared_signedness() {
+        use crate::shader::SampleType;
+        use vk::Format as F;
+        assert_eq!(
+            sampled_texture_type(F::A2B10G10R10_SINT_PACK32),
+            SampleType::Signed
+        );
+        assert_eq!(
+            sampled_texture_type(F::A2B10G10R10_UINT_PACK32),
+            SampleType::Unsigned
+        );
+        assert_eq!(
+            sampled_texture_type(F::A2B10G10R10_SNORM_PACK32),
+            SampleType::Float
+        );
+    }
+
+    #[test]
     fn reusing_a_target_cancels_its_pending_archive() {
         let Some(mut renderer) = renderer() else {
             return;
@@ -11743,7 +11822,8 @@ pub fn sampled_texture_type(format: vk::Format) -> crate::shader::SampleType {
         | F::R32_SINT
         | F::R32G32_SINT
         | F::R32G32B32_SINT
-        | F::R32G32B32A32_SINT => SampleType::Signed,
+        | F::R32G32B32A32_SINT
+        | F::A2B10G10R10_SINT_PACK32 => SampleType::Signed,
         _ => SampleType::Float,
     }
 }
