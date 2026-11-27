@@ -184,6 +184,11 @@ synthetic fixtures and runs without the game files.
   render-target index time dropped from 2.27 to 1.14 seconds, and
   full rebuilds fell from 1,518 to zero. The run exited cleanly at
   present 4,700 and the cloned save digest matched.
+  In a separate profiled outdoor run at `2a1156e`, the host spent
+  14.49 seconds feeding streaming decompression and 6 milliseconds
+  decoding standalone frame requests. In a 12-present timeline, the
+  busiest guest thread's NVN lock waits overlapped replay for 44.87 ms
+  per present.
   A private trial used the same executable for two guarded runs with
   plain and losslessly filtered archives. At present 6,200 the filter
   reduced retained payloads from 1,812 to 1,003 MiB. Peak process RSS
