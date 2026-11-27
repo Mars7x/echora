@@ -44,6 +44,14 @@ synthetic fixtures and runs without the game files.
   sharpening reduced brightness reversals above 20/255 from 203 to 23 in
   those patches. The full images differed, including outside the measured
   foreground.
+  A same-input Radeon test of the fixed 1440p resolve reproduced every
+  texel of the live forest output on a separate render target. Changing
+  only the sharpening strength from 2.5 to zero changed display luma
+  by more than 20/255 in 160,498 pixels (4.4% of the frame). In nine
+  matched patches, the median RMS luma gradient was 29.5 with the
+  game's strength, 12.2 with zero strength, and 9.0 in compressed console
+  footage. The test isolates sharpening for one frame. The compressed
+  footage provides a reference for detail levels across those patches.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
