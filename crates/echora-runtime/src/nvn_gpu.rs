@@ -2007,8 +2007,8 @@ impl Nvn {
         if self.stage_cache.get_mut().invalidate(&range)
             || self
                 .code_pools
-                .iter()
-                .any(|(&start, &size)| start < range.end && range.start < start + size)
+                .values()
+                .any(|pool| pool.start < range.end && range.start < pool.end)
         {
             self.flush_epoch += 1;
         }

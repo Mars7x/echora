@@ -823,9 +823,9 @@ pub struct Nvn {
         (u64, u64),
         HashMap<([Option<u64>; 8], [u8; MAX_COLOR_TARGETS]), std::sync::Arc<gpu::BoundProgram>>,
     ),
-    /// SHADER_CODE pools' guest storage (start, size).
+    /// Guest storage for each live SHADER_CODE pool, indexed by its handle.
     #[serde(skip)]
-    code_pools: BTreeMap<u64, u64>,
+    code_pools: BTreeMap<u64, std::ops::Range<u64>>,
     /// Bound programs draws resolved, by the two program handles,
     /// with the vertex attribute snapshot they were resolved with; valid
     /// for a (present, flush epoch) (see `bound_program`).
@@ -3268,7 +3268,7 @@ impl Nvn {
                 // SHADER_CODE (0x40): program code lives here; a flush over
                 // it resolves bound programs again (`program_memo`).
                 if flags.is_some_and(|flags| flags.x[0] & 0x40 != 0) {
-                    self.code_pools.insert(memory, size);
+                    self.code_pools.insert(this, memory..memory + size);
                 }
                 let pool = self.objects.get_mut(&this).unwrap();
                 pool.state.insert(
@@ -4456,7 +4456,7 @@ impl Nvn {
                         }
                         self.new_pools.extend(others);
                     }
-                    self.code_pools.remove(&base);
+                    self.code_pools.remove(&this);
                     if base != 0 {
                         self.stage_cache.get_mut().invalidate(&(base..base + size));
                     }
@@ -13843,6 +13843,71 @@ mod tests {
     }
 
     #[test]
+    fn shader_code_flushes_follow_each_live_pool_at_the_same_guest_address() {
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn {
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let (device, builder, base) = (0x10000, 0x11000, 0x20000);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetDefaults",
+            &[builder],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetDevice",
+            &[builder, device],
+        );
+        for (handle, size, flags) in [(1, 8192, 0x40), (2, 4096, 0x40), (3, 8192, 0x21)] {
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnMemoryPoolBuilderSetStorage",
+                &[builder, base, size],
+            );
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnMemoryPoolBuilderSetFlags",
+                &[builder, flags],
+            );
+            assert_eq!(
+                call(
+                    &mut nvn,
+                    &mut core,
+                    "nvnMemoryPoolInitialize",
+                    &[handle, builder]
+                ),
+                1
+            );
+        }
+        let flush = |nvn: &mut Nvn, offset: u64| {
+            let previous = nvn.flush_epoch;
+            nvn.gpu_invalidate(base + offset..base + offset + 4, None);
+            nvn.flush_epoch != previous
+        };
+        assert!(flush(&mut nvn, 5000));
+        call(&mut nvn, &mut core, "nvnMemoryPoolFinalize", &[3]);
+        assert!(flush(&mut nvn, 0));
+        call(&mut nvn, &mut core, "nvnMemoryPoolFinalize", &[1]);
+        assert!(flush(&mut nvn, 0));
+        assert!(!flush(&mut nvn, 5000));
+        call(&mut nvn, &mut core, "nvnMemoryPoolFinalize", &[2]);
+        assert!(!flush(&mut nvn, 0));
+    }
+
+    #[test]
     fn failed_memory_pool_initialization_keeps_gpu_addresses_available() {
         let mut memory = Memory::new(1 << 39);
         let mut cpu = Cpu::default();
@@ -13898,7 +13963,7 @@ mod tests {
             Err(Trap::InvalidState { .. })
         ));
         assert_eq!(nvn.next_gpu_address, next);
-        assert!(!nvn.code_pools.contains_key(&0x30000));
+        assert!(!nvn.code_pools.contains_key(&pool));
 
         set_storage(&mut nvn, &mut core, 0, u64::MAX);
         assert!(matches!(
@@ -13919,7 +13984,7 @@ mod tests {
             ),
             next
         );
-        assert_eq!(nvn.code_pools[&0x30000], 0x1000);
+        assert_eq!(nvn.code_pools[&other_pool], 0x30000..0x31000);
     }
 
     #[test]
