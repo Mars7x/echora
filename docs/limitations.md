@@ -159,6 +159,12 @@ synthetic fixtures and runs without the game files.
   The last build reached present 6,200, retired nine device buffers
   totaling 383 MiB, and peaked at 13,741 MiB process RSS. The longer
   run did not reproduce the reported interactive crash.
+  A repeat at `bdb1c86` averaged 8.43 FPS in the same outdoor window,
+  exited cleanly at present 6,200 and peaked at 13,289 MiB process RSS.
+  Distinct compressed target archives grew from 225 MiB at present
+  3,800 to 1,952 MiB at present 6,200. Restoring 416 archives took
+  1.39 seconds of cumulative host time across the full run, including
+  1.09 seconds in decompression.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
