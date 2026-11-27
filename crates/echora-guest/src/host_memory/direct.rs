@@ -15,9 +15,9 @@ struct Unaligned<T>(T);
 pub(crate) struct GuestAccess {
     base: usize,
     size: u64,
-    /// Bits an in-range address may have (the reservation's power-of-two
-    /// size minus one).
-    mask: u64,
+    /// The last offset in the power-of-two reservation, including the
+    /// inaccessible tail beyond the guest address space.
+    last_offset: u64,
 }
 
 impl GuestAccess {
@@ -25,17 +25,16 @@ impl GuestAccess {
         Self {
             base,
             size,
-            mask: size.next_power_of_two() - 1,
+            last_offset: size.next_power_of_two() - 1,
         }
     }
 
-    /// The host address of an access. One test against the reservation's
-    /// power-of-two mask: an access starting past the address space (or
-    /// running past its end) lands in the reservation's inaccessible tail
-    /// and faults in the host, which reports the guest address.
+    /// The host address of an access. A comparison rejects addresses
+    /// outside the reservation. Accesses in its inaccessible tail fault
+    /// through the host page protections, which report the guest address.
     #[inline(always)]
     fn at<T>(&self, address: u64) -> *mut T {
-        if address & !self.mask != 0 {
+        if address > self.last_offset {
             super::outside(address);
         }
         (self.base + address as usize) as *mut T
