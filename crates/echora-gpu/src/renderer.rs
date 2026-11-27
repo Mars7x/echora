@@ -693,10 +693,8 @@ pub struct Renderer {
     guest_target_keys: Vec<u64>,
     /// Guest textures uploaded for sampling, with the generation uploaded.
     uploads: FastMap<u64, (u64, Target)>,
-    /// The texel bytes each upload was made from: a caller may drop its
-    /// copy once the image holds them (`has_upload`), and `with_texels`
-    /// reads them back from the image when needed again.
-    upload_lengths: FastMap<u64, u64>,
+    /// Byte length and subresource layout for reconstructing CPU uploads.
+    upload_layouts: FastMap<u64, (u64, std::sync::Arc<[crate::draw::UploadRegion]>)>,
     /// Texel buffers made from guest buffer textures (shaders read them as
     /// samplerBuffer), by upload key: the generation copied, the buffer and
     /// its view.
@@ -1370,7 +1368,7 @@ impl Renderer {
             archive_compressor: std::cell::OnceCell::new(),
             guest_target_keys: Vec::new(),
             uploads: FastMap::default(),
-            upload_lengths: FastMap::default(),
+            upload_layouts: FastMap::default(),
             texel_buffers: FastMap::default(),
             labels: Vec::new(),
             work_items: 0,
@@ -3324,7 +3322,8 @@ impl Renderer {
             self.register_views(&target);
         }
         self.uploads.insert(*key, (*generation, target));
-        self.upload_lengths.insert(*key, size as u64);
+        self.upload_layouts
+            .insert(*key, (size as u64, levels.clone()));
         Ok(())
     }
 
@@ -3334,6 +3333,34 @@ impl Renderer {
         self.uploads
             .get(&key)
             .is_some_and(|(uploaded, _)| *uploaded == generation)
+    }
+
+    /// A resident image can supply this upload's contents without CPU texels.
+    pub fn has_upload_source(&self, source: &crate::draw::TextureSource) -> bool {
+        self.resident_upload_length(source).is_some()
+    }
+
+    fn resident_upload_length(&self, source: &crate::draw::TextureSource) -> Option<u64> {
+        let crate::draw::TextureSource::Upload {
+            key,
+            generation,
+            width,
+            height,
+            format,
+            shape,
+            levels,
+            ..
+        } = source
+        else {
+            return None;
+        };
+        let (uploaded, target) = self.uploads.get(key)?;
+        let (length, resident) = self.upload_layouts.get(key)?;
+        (uploaded == generation
+            && (target.width, target.height, target.format, target.shape)
+                == (*width, *height, *format, *shape)
+            && (std::sync::Arc::ptr_eq(levels, resident) || levels == resident))
+            .then_some(*length)
     }
 
     /// `source` with its texels: when the caller released them (an
@@ -3346,7 +3373,6 @@ impl Renderer {
     ) -> Result<crate::draw::TextureSource, String> {
         let crate::draw::TextureSource::Upload {
             key,
-            generation,
             texels,
             levels,
             ..
@@ -3357,10 +3383,8 @@ impl Renderer {
         if !texels.is_empty() {
             return Ok(source.clone());
         }
-        let length = *self
-            .upload_lengths
-            .get(key)
-            .filter(|_| self.has_upload(*key, *generation))
+        let length = self
+            .resident_upload_length(source)
             .ok_or_else(|| format!("upload {key:#x}: texels released and no current image"))?;
         let (image, image_levels, image_layers, format) = {
             let (_, target) = &self.uploads[key];
@@ -8106,7 +8130,7 @@ impl Renderer {
                 self.texture_epoch += 1;
                 self.slot.retired_uploads.push(target);
             }
-            self.upload_lengths.remove(&key);
+            self.upload_layouts.remove(&key);
         }
     }
 
@@ -10348,6 +10372,16 @@ mod tests {
             assert_eq!((range.base_mip_level, range.level_count), (1, 1));
             assert_eq!((range.base_array_layer, range.layer_count), selected);
         }
+        // A reused key and content hash can describe the same bytes with
+        // different layer offsets. A matching extent alone cannot release them.
+        let mut remapped = source.clone();
+        let TextureSource::Upload { levels, .. } = &mut remapped else {
+            unreachable!()
+        };
+        let regions = std::sync::Arc::make_mut(levels);
+        (regions[0].layer, regions[1].layer) = (1, 0);
+        assert!(!renderer.has_upload_source(&remapped));
+        assert!(renderer.has_upload_source(&source));
     }
 
     #[test]
@@ -10825,7 +10859,7 @@ mod tests {
             assert_eq!(remaining, 0);
             assert_eq!(after - retired_bytes, upload_bytes);
             assert!(renderer.uploads.is_empty());
-            assert!(renderer.upload_lengths.is_empty());
+            assert!(renderer.upload_layouts.is_empty());
             assert_eq!(
                 renderer.slot.retired_uploads.len() - retired,
                 bindings.len()

@@ -228,6 +228,10 @@ impl TextureBacking {
     }
 }
 
+fn has_large_texels(source: &TextureSource) -> bool {
+    matches!(source, TextureSource::Upload { texels, .. } if texels.len() >= 1 << 16)
+}
+
 fn texture_row_pitch(
     props: &BTreeMap<String, super::Args>,
     info: crate::nvn_format::FormatInfo,
@@ -461,6 +465,8 @@ pub struct Backend {
     /// Untiled guest textures with a sample of their raw storage and its
     /// guest address range (see `texture_source`).
     textures: HashMap<u64, (u64, TextureSource, TextureBacking)>,
+    /// Large CPU uploads still waiting for a matching Vulkan image.
+    pending_texel_releases: super::FastSet<u64>,
     /// The present during which each cached texture's sample last matched:
     /// within one frame a texture is sampled once, not on every draw.
     texture_checked: HashMap<u64, u64>,
@@ -814,6 +820,7 @@ impl Backend {
             watched_pixels: PixelWatchHistory::default(),
             presenter: None,
             textures: HashMap::default(),
+            pending_texel_releases: Default::default(),
             texture_checked: HashMap::default(),
             dirty: HashMap::default(),
             storage_hashes: HashMap::default(),
@@ -1093,6 +1100,21 @@ impl Backend {
             *index = (stamp, ranges);
         }
         ranges_overlap(&index.1, range)
+    }
+
+    /// Drop only the canonical CPU owner. Previously captured sources
+    /// keep their own Arc, and unmaterialized uploads keep their bytes.
+    fn release_upload_texels(&mut self, texture: u64) {
+        let Some((_, source, _)) = self.textures.get_mut(&texture) else {
+            return;
+        };
+        if has_large_texels(source)
+            && self.renderer.has_upload_source(source)
+            && let TextureSource::Upload { texels, .. } = source
+        {
+            *texels = Arc::default();
+            self.stat("stat: upload texels released", 1);
+        }
     }
 
     fn remove_texture_upload(&mut self, texture: u64) {
@@ -5010,34 +5032,47 @@ impl Nvn {
             .initialize_target(key, &source)?;
         // Subsequent draws sample the initialized target directly, so the
         // upload cache may never be looked up again to release these bytes.
-        self.release_upload_texels(key);
+        self.gpu.as_mut().unwrap().release_upload_texels(key);
         Ok(())
     }
 
-    /// A cached upload of 64 KiB or more whose image the renderer holds
-    /// keeps no host copy of its texels: the renderer reads them back from
-    /// the image when it needs them again (an alias image, a texel
-    /// buffer). The forest's 436 uploads kept 2.7 GB on the host.
-    fn release_upload_texels(&mut self, texture: u64) {
-        let backend = self.gpu.as_mut().unwrap();
-        let Some((
-            _,
-            TextureSource::Upload {
-                key,
-                generation,
-                texels,
-                ..
-            },
-            _,
-        )) = backend.textures.get_mut(&texture)
-        else {
+    /// Some sampled textures materialize only after their source was looked
+    /// up for the last time. The next present can release that CPU copy too.
+    pub(super) fn release_present_upload_texels(&mut self) {
+        let Some(backend) = self.gpu.as_mut() else {
             return;
         };
-        if texels.len() < 1 << 16 || !backend.renderer.has_upload(*key, *generation) {
+        if backend.pending_texel_releases.is_empty() {
             return;
         }
-        *texels = Arc::new(Vec::new());
-        backend.stat("stat: upload texels released", 1);
+        let mut pending = std::mem::take(&mut backend.pending_texel_releases);
+        let before = pending.len();
+        pending.retain(|&texture| {
+            backend.release_upload_texels(texture);
+            backend
+                .textures
+                .get(&texture)
+                .is_some_and(|(_, source, _)| has_large_texels(source))
+        });
+        let processed = before != pending.len();
+        backend.pending_texel_releases = pending;
+        if processed {
+            // Upload memo entries must resolve again after the present, even
+            // on idle queues. A stage's pool list also carries the present in
+            // its stamp. Remove stale owners of large CPU pixel buffers.
+            self.binding_memo
+                .1
+                .retain(|_, binding| !has_large_texels(&binding.source));
+            for (_, memo) in self.queue_memos.values_mut() {
+                memo.retain(|_, binding| !has_large_texels(&binding.source));
+            }
+            self.pool_entry_cache.retain(|_, list| {
+                !list
+                    .entries
+                    .iter()
+                    .any(|entry| has_large_texels(&entry.source))
+            });
+        }
     }
 
     /// The upload of a texture's guest memory, cached while it holds.
@@ -5071,11 +5106,22 @@ impl Nvn {
             }
         }
         let frame = self.presented_frames;
-        let backend = self.gpu.as_ref().unwrap();
+        let backend = self.gpu.as_mut().unwrap();
+        // A previously captured source can put another revision back at this
+        // key. Reconstruct released texels from guest storage if that occurs.
+        if backend
+            .textures
+            .get(&texture)
+            .is_some_and(|(_, source, _)| {
+                matches!(source, TextureSource::Upload { texels, .. } if texels.is_empty())
+                    && !backend.renderer.has_upload_source(source)
+            })
+        {
+            backend.remove_texture_upload(texture);
+        }
         if backend.texture_checked.get(&texture) == Some(&frame) {
             if backend.textures.contains_key(&texture) {
-                self.release_upload_texels(texture);
-                let backend = self.gpu.as_ref().unwrap();
+                backend.release_upload_texels(texture);
                 return Ok(backend.textures[&texture].1.clone());
             }
         }
@@ -5217,8 +5263,8 @@ impl Nvn {
         }
         if let Some((sampled, _, _)) = self.gpu.as_ref().unwrap().textures.get(&texture) {
             if *sampled == sample && !stale && content_matches != Some(false) && !mapping_changed {
-                self.release_upload_texels(texture);
                 let backend = self.gpu.as_mut().unwrap();
+                backend.release_upload_texels(texture);
                 let source = backend.textures[&texture].1.clone();
                 backend.texture_checked.insert(texture, frame);
                 backend.stat("stat: texture checks", 1);
@@ -5710,6 +5756,9 @@ impl Nvn {
         }
         if matches!(&backing, TextureBacking::Virtual { .. }) {
             backend.stat("stat: texture uploads across virtual mappings", 1);
+        }
+        if has_large_texels(&source) {
+            backend.pending_texel_releases.insert(texture);
         }
         backend
             .textures
@@ -14335,6 +14384,132 @@ mod target_tests {
             .map(base, size, READ | WRITE, STATE_NORMAL, "texture storage")
             .unwrap();
         Some((nvn, memory, base, texture))
+    }
+
+    #[test]
+    fn present_releases_materialized_uploads_and_preserves_pending_sources() {
+        use super::{Sampler, TextureSource, has_large_texels};
+        use std::sync::Arc;
+
+        let Some((mut nvn, mut memory, base, texture)) =
+            texture_cache_fixture_of_size(0x24, 128, 128)
+        else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let expected: Vec<u8> = (0..(128 * 128 * 4))
+            .map(|i| (i * 31 + i / 251) as u8)
+            .collect();
+        guest.memory.write(base, &expected).unwrap();
+        let source = nvn.guest_texture(&guest, texture).unwrap();
+        let TextureSource::Upload { texels, .. } = &source else {
+            panic!("expected upload")
+        };
+        let original_bytes = Arc::downgrade(texels);
+
+        // A different revision at the same key must leave our CPU data
+        // available for the first real bind, including during a later frame.
+        let mut stale = source.clone();
+        let TextureSource::Upload { generation, .. } = &mut stale else {
+            unreachable!()
+        };
+        *generation = generation.wrapping_add(1);
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .texture_view_for(&stale)
+            .unwrap();
+        drop(stale);
+        nvn.present_frame(&mut guest, 0, texture).unwrap();
+        assert!(has_large_texels(
+            &nvn.gpu.as_ref().unwrap().textures[&texture].1
+        ));
+        assert!(
+            nvn.gpu
+                .as_ref()
+                .unwrap()
+                .pending_texel_releases
+                .contains(&texture)
+        );
+
+        let sampler = Sampler::default();
+        nvn.switch_render_queue(41, &mut guest).unwrap();
+        nvn.remember_binding(10, texture, source.clone(), sampler, None);
+        nvn.switch_render_queue(42, &mut guest).unwrap();
+        nvn.remember_binding(20, texture, source.clone(), sampler, None);
+        let list: Arc<[echora_gpu::pool::PoolEntry]> = vec![echora_gpu::pool::PoolEntry {
+            texture: 2,
+            sampler: 0,
+            source: source.clone(),
+            sampler_state: sampler,
+        }]
+        .into();
+        nvn.pool_entry_cache.insert(
+            0,
+            crate::nvn::CachedPoolEntries {
+                stamp: nvn.pool_list_stamp(0),
+                entries: Arc::clone(&list),
+                handles: vec![20],
+                additional: vec![],
+            },
+        );
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .texture_view_for(&source)
+            .unwrap();
+        drop(source);
+        nvn.present_frame(&mut guest, 0, texture).unwrap();
+        let backend = nvn.gpu.as_ref().unwrap();
+        assert!(!has_large_texels(&backend.textures[&texture].1));
+        assert!(backend.pending_texel_releases.is_empty());
+        assert!(
+            original_bytes.upgrade().is_some(),
+            "a held list is still a valid snapshot"
+        );
+        drop(list);
+        assert!(
+            original_bytes.upgrade().is_none(),
+            "expired texture memos must release the final owner"
+        );
+
+        // The normal lookup and a new handle can bind the GPU-resident
+        // image again without recreating a host copy. Check every channel.
+        let rebound = nvn.guest_texture(&guest, texture).unwrap();
+        assert!(!has_large_texels(&rebound));
+        nvn.remember_binding(30, texture, rebound, sampler, None);
+        let (rebound, _, _) = nvn.memoized_binding(30).unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer.texture_view_for(&rebound).unwrap();
+        let pixels = renderer.read_upload_level(texture, 0).unwrap();
+        let actual: Vec<u8> = pixels
+            .into_iter()
+            .flatten()
+            .map(|channel| (channel * 255.).round() as u8)
+            .collect();
+        assert_eq!(actual, expected);
+
+        // The same key can be reused after release. A subsequent lookup must
+        // recover the current guest bytes even within the same frame.
+        renderer.forget_upload(texture);
+        let restored = nvn.guest_texture(&guest, texture).unwrap();
+        let TextureSource::Upload { texels, .. } = &restored else {
+            unreachable!()
+        };
+        assert_eq!(texels.as_slice(), expected);
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .texture_view_for(&restored)
+            .unwrap();
     }
 
     #[test]

@@ -4701,6 +4701,7 @@ impl Nvn {
             self.replay_captured_frame(core, texture).map_err(stop)?;
         }
         self.presented_frames += 1;
+        self.release_present_upload_texels();
         crate::timeline::present(self.presented_frames);
         self.arm_call_watch();
         // ECHORA_PRESENT_RATE=N: every N presents, the count, the
