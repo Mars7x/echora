@@ -283,6 +283,12 @@ synthetic fixtures and runs without the game files.
   4,200–5,100, compared with 8.90 FPS with exact resizing. The renderer
   allocated 61 page-table buffers instead of 680. Both runs reached the
   forest title, completed normally and preserved the cloned checkpoint.
+  A later trial remapped completed page tables in place 753 times. Outdoor
+  throughput across presents 4,600–5,100 measured 9.84 FPS versus 9.42 FPS
+  in the control. Across the 900-present profiling window, guest instruction
+  count fell by about 3% and page-table allocations rose from 19 to 129.
+  Peak resident memory for the full runs rose from 13,343 to 13,854 MiB.
+  The trial was kept local.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700
