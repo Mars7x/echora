@@ -7165,6 +7165,21 @@ impl Nvn {
         for range in written {
             self.gpu_invalidate(range, None);
         }
+        // A successful full pitch-linear write with no row or trailing
+        // padding replaces the complete backing. Old rendered texels must
+        // no longer override these bytes when another texture aliases them.
+        if result.is_ok()
+            && to_texture
+            && target == 1
+            && levels == 1
+            && (rx, ry, rz, rd) == (0, 0, 0, 1)
+            && (rw, rh) == (width, height)
+            && stride == row_size
+            && row_size.checked_mul(u64::from(rows)) == Some(size)
+            && let gpu::TextureBacking::Linear((0, range)) = &backing
+        {
+            self.discard_overwritten_targets(range);
+        }
         result
     }
 

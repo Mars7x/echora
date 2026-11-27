@@ -2050,10 +2050,10 @@ impl Nvn {
         }
     }
 
-    /// A buffer fill writes every byte in its range. An initialized target can
-    /// override guest RAM on sampling, including through a finalized texture's
-    /// storage alias. Discard it only when the fill replaces its entire image.
-    fn discard_targets_overwritten_by_buffer(&mut self, written: &std::ops::Range<u64>) {
+    /// An initialized target can override guest RAM on sampling, including
+    /// through a finalized texture's storage alias. Discard it only when a
+    /// guest write has replaced every byte of its backing.
+    pub(super) fn discard_overwritten_targets(&mut self, written: &std::ops::Range<u64>) {
         if self.gpu.is_none() || written.is_empty() {
             return;
         }
@@ -2114,7 +2114,7 @@ impl Nvn {
         range: std::ops::Range<u64>,
         value: u32,
     ) -> Result<(), String> {
-        self.discard_targets_overwritten_by_buffer(&range);
+        self.discard_overwritten_targets(&range);
         self.gpu_invalidate(range.clone(), None);
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
@@ -16110,6 +16110,64 @@ mod target_tests {
                 assert_eq!(&renderer.take_reads(&[read])[&read][..4], &[255, 0, 0, 255]);
             }
         }
+    }
+
+    #[test]
+    fn whole_pitch_linear_texel_write_supersedes_old_rendering() {
+        use super::{Scale, TextureSource};
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let (width, height) = (64_u32, 16_u32);
+        let Some((mut nvn, mut memory, _, texture)) =
+            texture_cache_fixture_of_size(0x24, width.into(), height.into())
+        else {
+            return;
+        };
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .set_resolution_scale(Scale::ONE);
+        let alias = 3;
+        nvn.initialize(alias, "Texture", nvn.objects[&texture].builder.clone())
+            .unwrap();
+        let region_address = 0x20_0000;
+        let source = region_address + 64;
+        memory
+            .map(
+                region_address,
+                8192,
+                READ | WRITE,
+                STATE_NORMAL,
+                "texel input",
+            )
+            .unwrap();
+        for (index, value) in [0, 0, 0, width, height, 1].into_iter().enumerate() {
+            memory
+                .write_u32(region_address + index as u64 * 4, value)
+                .unwrap();
+        }
+        let expected = [0x11, 0x22, 0x33, 0xff].repeat((width * height) as usize);
+        memory.write(source, &expected).unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (texture, 0, 0), red, None, 15, 0)
+            .unwrap();
+        assert!(matches!(
+            nvn.texture_source(&core, alias),
+            Ok(TextureSource::Target(_))
+        ));
+        core.cpu.regs[..4].copy_from_slice(&[texture, 0, region_address, source]);
+        assert!(nvn.call("nvnTextureWriteTexels", &mut core).unwrap());
+        let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, alias).unwrap() else {
+            panic!("alias must see the new texels after a complete write");
+        };
+        assert_eq!(&**texels, &expected);
     }
 
     #[test]
