@@ -106,6 +106,15 @@ synthetic fixtures and runs without the game files.
   The corrected Radeon run reached present 6,032 at native 1440p, exited
   normally and preserved the cloned save. The effect on the reported
   forest flicker has not been isolated.
+  An existing but uninitialized render target also invalidates those
+  bindings on its first use. A separate GPU-enabled regression proves an
+  alias switches from guest storage to the newly written target and reads
+  back the expected color. The corrected 1440p opening reached present
+  10,560, exited normally and preserved its cloned save; the 200-present
+  3D sample ending at 10,500 averaged 20 FPS. Six consecutive captured
+  frames had no whole-frame black flash. Their camera poses did not
+  match the previous comparison, so they do not establish a visual
+  improvement or regression in the forest.
 - Min/max filtering uses the host's Vulkan sampler reduction support. On
   Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
   levels at LOD 0.5 returned 0.4375 for both minimum and maximum reduction.

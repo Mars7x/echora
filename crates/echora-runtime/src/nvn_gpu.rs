@@ -18620,6 +18620,84 @@ mod pool_tests {
     }
 
     #[test]
+    fn first_render_target_write_evicts_cached_storage_aliases() {
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10_0000;
+        let args = |x| Args {
+            x,
+            ..Default::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        let texture = BTreeMap::from([
+            ("Width".into(), scalar(16)),
+            ("Height".into(), scalar(16)),
+            ("Format".into(), scalar(37)),
+            ("Storage".into(), args([1, 0, 0, 0])),
+        ]);
+        nvn.initialize(2, "Texture", texture.clone()).unwrap();
+        nvn.initialize(3, "Texture", texture).unwrap();
+        nvn.ensure_render_target(2).unwrap();
+        assert!(nvn.gpu.as_ref().unwrap().renderer.target_is_undefined(2));
+        // The newly allocated image has no contents yet. A sampling
+        // alias legitimately reads guest storage until its first write.
+        nvn.evict_bindings();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x10000, READ | WRITE, STATE_NORMAL, "target alias")
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let (source, backing) = nvn.resolve_sampled_texture(&mut guest, 3).unwrap();
+        assert!(matches!(source, TextureSource::Upload { .. }));
+        nvn.remember_binding(3, 3, source, Sampler::default(), backing);
+        nvn.gpu_clear_color(&guest, (2, 0, 0), [0.5_f32.to_bits(); 4], None, 0xf, 0)
+            .unwrap();
+        assert!(matches!(
+            nvn.texture_source_resolved(&guest, 3).unwrap(),
+            TextureSource::Target(2)
+        ));
+        nvn.evict_bindings();
+        assert!(
+            nvn.memoized_binding(3).is_none(),
+            "obsolete upload survived the first target write"
+        );
+        let (source, _) = nvn.resolve_sampled_texture(&mut guest, 3).unwrap();
+        assert!(matches!(source, TextureSource::Target(2)));
+        let pixels = nvn
+            .gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .read_target_slice(2, 0, 0)
+            .unwrap();
+        assert_eq!(pixels.len(), 16 * 16);
+        assert!(
+            pixels
+                .iter()
+                .all(|pixel| pixel.iter().all(|value| (*value - 0.5).abs() < 0.01))
+        );
+    }
+
+    #[test]
     fn binding_evictions_do_not_carry_over_to_the_next_batch() {
         let mut nvn = Nvn::default();
         let base = 0x20_0000;

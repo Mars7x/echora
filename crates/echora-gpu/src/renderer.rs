@@ -7087,6 +7087,7 @@ impl Renderer {
         }
         let commands = self.commands()?;
         let target = self.targets.get_mut(&key).ok_or("no such target")?;
+        let was_undefined = target.layout == vk::ImageLayout::UNDEFINED;
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
@@ -7103,6 +7104,13 @@ impl Renderer {
                 ..range(target.format)
             });
         target.layout = layout;
+        if was_undefined && key < STAGING_KEYS {
+            // An allocated target that had no contents was not eligible
+            // for sampled storage aliases. Its first recorded use can
+            // change a binding that was resolved to a guest upload.
+            self.target_changes += 1;
+            self.changed_targets.push(key);
+        }
         // SAFETY: recording; the image is live.
         unsafe {
             *self
