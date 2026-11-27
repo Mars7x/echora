@@ -64,8 +64,9 @@ What doesn't work yet:
 - Gameplay past the opening scene. Around the flight through Kokiri Forest
   the graphics driver sometimes crashes, and memory use keeps growing after
   that point. The renderer now retires finalized uploads, releases shared
-  image archives after their last use, and writes compressed texture blocks
-  back to the selected mip and layer. The long-run impact still needs measurement.
+  image archives after their last use, and preserves untouched blocks when
+  drawing or clearing part of a compressed texture. The long-run impact
+  still needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
   about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.

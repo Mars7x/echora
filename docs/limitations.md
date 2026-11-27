@@ -19,8 +19,11 @@ automated test covers it).
   resources until completion. Vulkan tests cover both retirement and a
   reused handle reading new buffer contents. Rendering into a compressed
   texture through an integer view loads and writes back the selected mip and
-  layer. A Vulkan test checks that partial writes preserve neighboring blocks
-  and that recycling the scratch attachment preserves each texture's contents.
+  layer. Color clears through a block view also preserve the scissor and
+  channel mask. A Vulkan test checks that partial writes preserve neighboring
+  blocks and that recycling the scratch attachment preserves each texture's
+  contents. A clear on a compressed image without a compatible block view is
+  reported as unsupported before the renderer records a Vulkan clear.
 - Inactive targets can share a compressed host archive. Restoring or replacing
   the final target using one releases its backing allocation immediately.
   `ECHORA_CACHE_SIZES` reports Vulkan allocation bytes for render targets,

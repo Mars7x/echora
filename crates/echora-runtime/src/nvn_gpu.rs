@@ -1975,6 +1975,16 @@ impl Nvn {
         // A texture object over one level of another target clears that
         // target's level, as draws into it render there.
         let (texture, level) = self.resolve_color_target(texture, level)?;
+        let plane = (texture, level, layer);
+        let view = vk_format(view_format);
+        let value = vk::ClearColorValue { uint32: color };
+        if let Some(view) = view
+            && let Some((alias, _)) = self.block_alias_target(core, 0, plane, view)?
+        {
+            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            renderer.clear_color_view((alias, 0, 0), None, rect, value, mask)?;
+            return renderer.copy_block_plane((alias, 0, 0), plane);
+        }
         let started = std::time::Instant::now();
         self.ensure_render_target(texture)?;
         let ensured = std::time::Instant::now();
@@ -1986,22 +1996,17 @@ impl Nvn {
             self.initialize_new_targets(core);
         }
         let backend = self.gpu.as_mut().unwrap();
+        backend
+            .renderer
+            .clear_color_view(plane, view, rect, value, mask)?;
         backend.renderer.defined(texture);
-        let value = vk::ClearColorValue { uint32: color };
-        let cleared = backend.renderer.clear_color_view(
-            (texture, level, layer),
-            vk_format(view_format),
-            rect,
-            value,
-            mask,
-        );
         crate::timeline::span(
             u64::MAX - 2,
             "clear: clear",
             ensured,
             std::time::Instant::now(),
         );
-        cleared
+        Ok(())
     }
 
     /// ClearDepthStencil on the GPU, preserving masked-off depth and stencil.
@@ -14029,6 +14034,23 @@ mod target_tests {
             expected[at + 4..at + 8].copy_from_slice(&words[1].to_le_bytes());
         }
 
+        // Clear just the second word of one block through the captured
+        // RG32UI view. The rectangle is in view texels (compressed blocks).
+        nvn.gpu_clear_color(
+            &core,
+            plane,
+            [0, 0x1234_5678, 0, 0],
+            Some([1, 0, 1, 1]),
+            2,
+            23,
+        )
+        .unwrap();
+        expected[12..16].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        assert!(
+            nvn.gpu_clear_color(&core, plane, [0; 4], None, 0xf, 0)
+                .unwrap_err()
+                .contains("compatible block view")
+        );
         assert!(nvn.memoized_binding(0x42).is_none());
         assert!(
             matches!(nvn.texture_source(&core, texture).unwrap(), super::TextureSource::Target(key) if key == texture)

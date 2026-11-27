@@ -7267,6 +7267,9 @@ impl Renderer {
             return Ok(());
         }
         let target = self.targets.get(&key).ok_or("no such target")?;
+        if bc_block_bytes(target.format).is_some() {
+            return Err("clearing a compressed image requires a compatible block view".into());
+        }
         if level >= target.levels || layer >= target.shape.layers() {
             return Err(format!(
                 "level {level} layer {layer} of a {}-level {}-layer target",
