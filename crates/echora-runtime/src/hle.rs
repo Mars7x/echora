@@ -186,6 +186,24 @@ pub struct ZstdStreams {
     output: Vec<u8>,
 }
 
+/// Checked guest memory for a streaming decoder. A parallel worker may
+/// acquire the machine lock for each access, leaving it free during decoding.
+pub(crate) trait ZstdMemory {
+    fn access<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Memory) -> Result<T, Trap>,
+    ) -> Result<T, Trap>;
+}
+
+impl ZstdMemory for Memory {
+    fn access<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Memory) -> Result<T, Trap>,
+    ) -> Result<T, Trap> {
+        operation(self)
+    }
+}
+
 /// One call of the streaming reader's decoder (see [`ZstdStreamBuild`]):
 /// `Some(result)` when the host performed it, `None` when the guest decoder
 /// must (a frame without a content size, or a stream the guest began).
@@ -197,48 +215,22 @@ pub fn zstd_stream_feed(
     size: i32,
     dictionary: u64,
 ) -> Result<Option<u32>, Trap> {
+    zstd_stream_feed_checked(streams, memory, stream, source, size, dictionary)
+}
+
+pub(crate) fn zstd_stream_feed_checked(
+    streams: &mut ZstdStreams,
+    memory: &mut impl ZstdMemory,
+    stream: u64,
+    source: u64,
+    size: i32,
+    dictionary: u64,
+) -> Result<Option<u32>, Trap> {
+    use std::ops::ControlFlow::{Break, Continue};
     use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer};
     const FAILED: u8 = 3;
     const FINISHED: u8 = 4;
     const SCRATCH_SIZE: usize = 1 << 20;
-    let state = memory.read_u8(stream)?;
-    match state {
-        FAILED => return Ok(Some(-1i32 as u32)),
-        FINISHED => return Ok(Some(-3i32 as u32)),
-        1 => {
-            let mut header = [0u8; 18];
-            let length = header.len().min(size.max(0) as usize);
-            memory.read(source, &mut header[..length])?;
-            let Ok(Some(content)) = zstd::zstd_safe::get_frame_content_size(&header[..length])
-            else {
-                return Ok(None);
-            };
-            let Ok(content) = u32::try_from(content) else {
-                return Ok(None);
-            };
-            memory.write_u32(stream + 0x14, content)?;
-            let context = memory.read_u64(stream + 0x18)?;
-            memory.write_u64(stream + 0x30, context)?;
-            let mut fresh = DCtx::create();
-            if dictionary != 0 {
-                // A DDict: its content at +0x8, its size at +0x10.
-                let content = memory.read_u64(dictionary + 0x8)?;
-                let length = memory.read_u64(dictionary + 0x10)?;
-                if length > MAX_INPUT {
-                    return Ok(None);
-                }
-                let mut bytes = vec![0; length as usize];
-                memory.read(content, &mut bytes)?;
-                if fresh.load_dictionary(&bytes).is_err() {
-                    return Ok(None);
-                }
-            }
-            memory.write_u8(stream, 2)?;
-            streams.contexts.insert(stream, fresh);
-        }
-        _ if !streams.contexts.contains_key(&stream) => return Ok(None),
-        _ => {}
-    }
     let input_length = u64::try_from(size.max(0)).unwrap_or(0).min(MAX_INPUT) as usize;
     let mut large_input = Vec::new();
     let input_bytes = if input_length <= SCRATCH_SIZE {
@@ -246,8 +238,51 @@ pub fn zstd_stream_feed(
     } else {
         &mut large_input
     };
-    input_bytes.resize(input_length, 0);
-    memory.read(source, input_bytes)?;
+    let prepared = memory.access(|memory| {
+        match memory.read_u8(stream)? {
+            FAILED => return Ok(Break(Some(-1i32 as u32))),
+            FINISHED => return Ok(Break(Some(-3i32 as u32))),
+            1 => {
+                let mut header = [0u8; 18];
+                let length = header.len().min(size.max(0) as usize);
+                memory.read(source, &mut header[..length])?;
+                let Ok(Some(content)) = zstd::zstd_safe::get_frame_content_size(&header[..length])
+                else {
+                    return Ok(Break(None));
+                };
+                let Ok(content) = u32::try_from(content) else {
+                    return Ok(Break(None));
+                };
+                memory.write_u32(stream + 0x14, content)?;
+                let context = memory.read_u64(stream + 0x18)?;
+                memory.write_u64(stream + 0x30, context)?;
+                let mut fresh = DCtx::create();
+                if dictionary != 0 {
+                    // A DDict: its content at +0x8, its size at +0x10.
+                    let content = memory.read_u64(dictionary + 0x8)?;
+                    let length = memory.read_u64(dictionary + 0x10)?;
+                    if length > MAX_INPUT {
+                        return Ok(Break(None));
+                    }
+                    let mut bytes = vec![0; length as usize];
+                    memory.read(content, &mut bytes)?;
+                    if fresh.load_dictionary(&bytes).is_err() {
+                        return Ok(Break(None));
+                    }
+                }
+                memory.write_u8(stream, 2)?;
+                streams.contexts.insert(stream, fresh);
+            }
+            _ if !streams.contexts.contains_key(&stream) => return Ok(Break(None)),
+            _ => {}
+        }
+        input_bytes.resize(input_length, 0);
+        memory.read(source, input_bytes)?;
+        Ok(Continue(()))
+    })?;
+    if let Break(result) = prepared {
+        return Ok(result);
+    }
     let context = streams.contexts.get_mut(&stream).expect("present above");
     let mut input = InBuffer::around(input_bytes);
     let chunk = &mut streams.output;
@@ -255,19 +290,21 @@ pub fn zstd_stream_feed(
     let mut finished = false;
     let mut failed = None;
     loop {
-        let room = memory.read_u32(stream + 0x10)? as i32;
+        let room = memory.access(|memory| memory.read_u32(stream + 0x10))? as i32;
         let limit = chunk.len().min(room.max(0) as usize);
         let consumed = input.pos;
         let mut output = OutBuffer::around(&mut chunk[..limit]);
         let result = context.decompress_stream(&mut output, &mut input);
         let produced = output.pos();
         if produced != 0 {
-            let cursor = memory.read_u64(stream + 0x8)?;
-            memory.write(cursor, &chunk[..produced])?;
-            memory.write_u64(stream + 0x8, cursor + produced as u64)?;
-            memory.write_u32(stream + 0x10, room.wrapping_sub(produced as i32) as u32)?;
-            let expected = memory.read_u32(stream + 0x14)? as i32;
-            memory.write_u32(stream + 0x14, expected.wrapping_sub(produced as i32) as u32)?;
+            memory.access(|memory| {
+                let cursor = memory.read_u64(stream + 0x8)?;
+                memory.write(cursor, &chunk[..produced])?;
+                memory.write_u64(stream + 0x8, cursor + produced as u64)?;
+                memory.write_u32(stream + 0x10, room.wrapping_sub(produced as i32) as u32)?;
+                let expected = memory.read_u32(stream + 0x14)? as i32;
+                memory.write_u32(stream + 0x14, expected.wrapping_sub(produced as i32) as u32)
+            })?;
         }
         match result {
             Err(code) => {
@@ -294,7 +331,7 @@ pub fn zstd_stream_feed(
     }
     if let Some(code) = failed {
         streams.contexts.remove(&stream);
-        memory.write_u8(stream, FAILED)?;
+        memory.access(|memory| memory.write_u8(stream, FAILED))?;
         let result = if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL {
             -2
         } else {
@@ -304,9 +341,13 @@ pub fn zstd_stream_feed(
     }
     if finished {
         streams.contexts.remove(&stream);
-        memory.write_u8(stream, FINISHED)?;
     }
-    Ok(Some(memory.read_u32(stream + 0x14)?))
+    memory.access(|memory| {
+        if finished {
+            memory.write_u8(stream, FINISHED)?;
+        }
+        Ok(Some(memory.read_u32(stream + 0x14)?))
+    })
 }
 
 /// The `bl inflate` / Z_FINISH call sites present with their exact code.

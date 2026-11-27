@@ -189,6 +189,17 @@ synthetic fixtures and runs without the game files.
   decoding standalone frame requests. In a 12-present timeline, the
   busiest guest thread's NVN lock waits overlapped replay for 44.87 ms
   per present.
+  Two same-executable comparisons ran streaming decompression under and
+  outside the machine lock. Outdoor throughput improved from 8.06 to
+  8.88 FPS, then from 8.34 to 8.93 FPS in reverse run order. The faster
+  runs processed about 6–7% less compressed input. Aggregate host-call
+  lock time in the 900-present window fell from 14.6 seconds to 6.0 seconds.
+  With parallel decoding enabled by default, another run averaged
+  9.22 FPS over the same window, peaked at 13,675 MiB resident and reached
+  the same forest checkpoints with an unchanged cloned save. A guarded
+  opening run exited at present 10,586 and peaked at 10,123 MiB resident.
+  The startup movie reported 75.5 pictures per second, followed by 24.1
+  presents per second in the gameplay sample ending at present 10,500.
   A private trial used the same executable for two guarded runs with
   plain and losslessly filtered archives. At present 6,200 the filter
   reduced retained payloads from 1,812 to 1,003 MiB. Peak process RSS

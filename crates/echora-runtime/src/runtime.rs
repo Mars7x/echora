@@ -304,6 +304,8 @@ pub struct Machine {
     user_preemption_deferrals: u64,
     /// Host streams of the game's streaming zstd reader.
     zstd_streams: crate::hle::ZstdStreams,
+    /// Decode on parallel workers with checked memory at copy boundaries.
+    zstd_offlock: bool,
     /// Where a host call continues instead of its link register (a hooked
     /// call site the guest performs after all).
     host_call_continue: Option<u64>,
@@ -472,6 +474,8 @@ impl Machine {
             pc_stacks: Default::default(),
             user_preemption_deferrals: 0,
             zstd_streams: Default::default(),
+            zstd_offlock: crate::nvn::debug_var_os("ECHORA_ZSTD_OFFLOCK")
+                .is_none_or(|value| value != "0"),
             host_call_continue: None,
             pc_sample_tick: 0,
             spin_backoff: Default::default(),
@@ -2775,12 +2779,7 @@ impl Machine {
     /// for the next instruction. Generated code branches only to translated
     /// code, so host-chosen PCs are where execute permission is checked.
     fn boundary(&mut self, result: Result<(), Trap>) -> Result<(), Trap> {
-        self.core.settle_block_trap();
-        // A requested preemption is this boundary's scheduling decision.
-        self.core
-            .preempt
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.boundary_kinds[boundary_kind(&result)] += 1;
+        self.begin_boundary(&result);
         match result {
             Ok(()) => return Ok(()),
             Err(Trap::SupervisorCall { number }) => {
@@ -2808,6 +2807,15 @@ impl Machine {
             machine.host_ready()
         })?;
         self.check_entry_pc()
+    }
+
+    fn begin_boundary(&mut self, result: &Result<(), Trap>) {
+        self.core.settle_block_trap();
+        // A requested preemption is this boundary's scheduling decision.
+        self.core
+            .preempt
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.boundary_kinds[boundary_kind(result)] += 1;
     }
 
     /// After a host function: return to the link register and continue (or
@@ -2875,6 +2883,9 @@ impl Machine {
         let placeholder = self.nvn.entries_only();
         let recorder = self.nvn.recorder();
         let thunks = std::sync::RwLock::new(self.nvn.thunk_names());
+        let zstd_streams = self
+            .zstd_offlock
+            .then(|| std::sync::Mutex::new(std::mem::take(&mut self.zstd_streams)));
         let nvn = parking_lot::Mutex::new(std::mem::replace(&mut self.nvn, placeholder));
         let shared = Shared {
             machine: std::sync::Mutex::new(&mut *self),
@@ -2883,6 +2894,7 @@ impl Machine {
             nvn_waiters: &crate::nvn::NVN_WAITERS,
             recorder,
             cpu_hooks,
+            zstd_streams,
             thunks,
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
@@ -2969,6 +2981,11 @@ impl Machine {
             finished
         });
         let mut renderer = shared.nvn.into_inner();
+        if let Some(streams) = shared.zstd_streams {
+            self.zstd_streams = streams
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         merge_cpu_hook_counts(&mut self.nvn, &mut renderer);
         self.nvn = renderer;
         self.parallel = false;
@@ -3078,7 +3095,6 @@ impl Machine {
             // the host call returns; when the host cannot perform it, the
             // guest decoder runs as the `bl` would have run it.
             let site = self.core.cpu.pc;
-            self.core.cpu.regs[30] = site + 4;
             let regs = self.core.cpu.regs;
             let started = self
                 .zstd_profile
@@ -3094,24 +3110,7 @@ impl Machine {
             );
             let input = (regs[2] as i32).max(0) as u64;
             self.note_zstd_call("stream", input, input, started);
-            match fed? {
-                Some(result) => {
-                    *self.nvn.calls.entry(name).or_default() += 1;
-                    self.core.cpu.regs[0] = u64::from(result);
-                }
-                None => {
-                    *self
-                        .nvn
-                        .calls
-                        .entry("hle:zstd_stream (guest)".into())
-                        .or_default() += 1;
-                    let decoder = (site as i64
-                        + (((self.memory.read_u32(site)? << 6) as i32 >> 4) as i64))
-                        as u64;
-                    self.host_call_continue = Some(decoder);
-                }
-            }
-            return Ok(());
+            return self.finish_zstd_stream_call(site, fed);
         }
         if entry == HostEntry::InflateFinishCall {
             *self.nvn.calls.entry(name).or_default() += 1;
@@ -3274,6 +3273,30 @@ impl Machine {
             command_id: None,
             message: format!("{name} is not implemented"),
         })
+    }
+
+    fn finish_zstd_stream_call(
+        &mut self,
+        site: u64,
+        fed: Result<Option<u32>, Trap>,
+    ) -> Result<(), Trap> {
+        self.core.cpu.regs[30] = site + 4;
+        match fed? {
+            Some(result) => {
+                *self.nvn.calls.entry("hle:zstd_stream".into()).or_default() += 1;
+                self.core.cpu.regs[0] = u64::from(result);
+            }
+            None => {
+                *self
+                    .nvn
+                    .calls
+                    .entry("hle:zstd_stream (guest)".into())
+                    .or_default() += 1;
+                let offset = ((self.memory.read_u32(site)? << 6) as i32 >> 4) as i64;
+                self.host_call_continue = Some((site as i64 + offset) as u64);
+            }
+        }
+        Ok(())
     }
 
     /// Once per presented frame, the window's keyboard state becomes a
@@ -5032,6 +5055,8 @@ fn merge_cpu_hook_counts(entries: &mut crate::nvn::Nvn, renderer: &mut crate::nv
 /// What the workers of a parallel run share.
 struct Shared<'a> {
     cpu_hooks: Vec<u64>,
+    // Acquire this before acquiring machine memory for a stream call.
+    zstd_streams: Option<std::sync::Mutex<crate::hle::ZstdStreams>>,
     machine: std::sync::Mutex<&'a mut Machine>,
     /// The NVN state while workers run: an NVN call locks it alone (see
     /// `Worker::held_nvn_call`), and a boundary that needs it under the
@@ -5126,6 +5151,35 @@ impl<'a> Shared<'a> {
                 wake.notify_one();
             }
         }
+    }
+}
+
+struct ZstdMachineMemory<'a, 'machine> {
+    shared: &'a Shared<'machine>,
+    thread: u64,
+    waited: std::time::Duration,
+    held: std::time::Duration,
+}
+
+impl crate::hle::ZstdMemory for ZstdMachineMemory<'_, '_> {
+    fn access<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Memory) -> Result<T, Trap>,
+    ) -> Result<T, Trap> {
+        let asked = std::time::Instant::now();
+        let mut machine = self.shared.lock_machine();
+        let acquired = std::time::Instant::now();
+        if self.shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Trap::Exit { code: 0 });
+        }
+        let result = operation(&mut machine.memory);
+        let finished = std::time::Instant::now();
+        drop(machine);
+        self.waited += acquired - asked;
+        self.held += finished - acquired;
+        crate::timeline::span(self.thread, "machine-lock-wait", asked, acquired);
+        crate::timeline::span(self.thread, "zstd-guest-memory", acquired, finished);
+        result
     }
 }
 
@@ -5601,12 +5655,68 @@ impl Worker {
                 let yielded =
                     kind == 0x0b && (-2..=QUIET_SLEEP_NS).contains(&(self.core.cpu.regs[0] as i64));
                 let sleep_ns = self.core.cpu.regs[0] as i64;
+                let mut decoded = None;
+                let mut released = None;
+                let mut decoder_memory_held = std::time::Duration::ZERO;
+                if let Some(streams) = &shared.zstd_streams
+                    && let Err(Trap::MissingBlock { pc }) = &result
+                    && machine.nvn.entry(*pc) == Some(crate::nvn::HostEntry::ZstdStreamCall)
+                {
+                    // Keep this guest thread assigned to the worker while
+                    // the independent stream context produces output.
+                    self.swap_in(&mut machine);
+                    machine.begin_boundary(&result);
+                    if let Err(trap) = machine.flush_core_counts() {
+                        return self.stop(shared, machine, trap);
+                    }
+                    self.swap_out(&mut machine, true);
+                    let r = self.core.cpu.regs;
+                    let started = std::time::Instant::now();
+                    drop(machine);
+                    let mut memory = ZstdMachineMemory {
+                        shared,
+                        thread,
+                        waited: std::time::Duration::ZERO,
+                        held: std::time::Duration::ZERO,
+                    };
+                    let fed = {
+                        let mut streams = streams
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        crate::hle::zstd_stream_feed_checked(
+                            &mut streams,
+                            &mut memory,
+                            r[0],
+                            r[1],
+                            r[2] as i32,
+                            r[3],
+                        )
+                    };
+                    let asked_again = std::time::Instant::now();
+                    machine = shared.lock_machine();
+                    let acquired = std::time::Instant::now();
+                    if shared.stop.load(Ordering::Acquire) {
+                        return (self.core, None);
+                    }
+                    let input = (r[2] as i32).max(0) as u64;
+                    let wait = (acquired - asked_again + memory.waited).as_micros() as u64;
+                    machine.lock_stats[1] += wait;
+                    machine.thread_time.entry(thread).or_default()[1] += wait;
+                    decoder_memory_held = memory.held;
+                    released = Some((started, acquired));
+                    decoded = Some((*pc, fed, input, started));
+                }
                 let renderer_call = matches!(&result, Err(Trap::MissingBlock { pc })
                     if shared.cpu_hooks.binary_search(pc).is_err() && machine.nvn.has_entry(*pc));
                 // Host calls (a failed held call among them) swap the NVN
                 // state in for the boundary.
                 self.swap_in(&mut machine);
-                let outcome = if renderer_call {
+                let outcome = if let Some((site, fed, input, started)) = decoded {
+                    machine.note_zstd_call("stream", input, input, Some(started));
+                    machine
+                        .finish_zstd_stream_call(site, fed)
+                        .and_then(|()| machine.finish_host_call())
+                } else if renderer_call {
                     let mut nvn = shared.lock_nvn();
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
                     let outcome = machine.boundary(result);
@@ -5647,7 +5757,9 @@ impl Worker {
                     query.machine_lock_wait_ns += (held - waited).as_nanos() as u64;
                     query.machine_lock_held_ns += (finished - held).as_nanos() as u64;
                 }
-                let held_us = (finished - held).as_micros() as u64;
+                let released_time = released.map_or(std::time::Duration::ZERO, |(a, b)| b - a);
+                let held_us =
+                    (finished - held - released_time + decoder_memory_held).as_micros() as u64;
                 machine.lock_stats[2] += held_us;
                 machine.thread_time.entry(thread).or_default()[2] += held_us;
                 machine.boundary_held[kind] += held_us;
@@ -5659,7 +5771,13 @@ impl Worker {
                     } else {
                         boundary_kind_name(kind)
                     };
-                    crate::timeline::span(thread, &name, held, finished);
+                    if let Some((start, end)) = released {
+                        crate::timeline::span(thread, &name, held, start);
+                        crate::timeline::span(thread, "zstd-stream", start, end);
+                        crate::timeline::span(thread, &name, end, finished);
+                    } else {
+                        crate::timeline::span(thread, &name, held, finished);
+                    }
                 }
                 match outcome {
                     Ok(()) => {
@@ -6214,6 +6332,140 @@ mod tests {
             assert_eq!(machine.host_call_continue.take(), Some(destination));
             assert_eq!(machine.core.cpu.regs[8], register_value);
             assert_eq!(machine.core.cpu.regs[30], return_address);
+        }
+    }
+
+    #[test]
+    fn parallel_zstd_stream_matches_the_locked_host_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        let payload = b"streaming guest data".repeat(83_000);
+        let compressed = zstd::bulk::compress(&payload, 1).unwrap();
+        assert!(compressed.len() > 64);
+        for offlock in [false, true] {
+            let (site, stream, source, destination) = (0x1000, 0x4000, 0x10000, 0x200000);
+            let mut machine = thread_machine();
+            machine.layout.workers = 2;
+            machine.zstd_offlock = offlock;
+            machine.zstd_profile = Some(BTreeMap::new());
+            let guest_thread = machine.core.current_thread_id;
+            assert_ne!(guest_thread, 0);
+            machine
+                .nvn
+                .add_hook(site, crate::nvn::HostEntry::ZstdStreamCall);
+            machine
+                .memory
+                .map(site, PAGE_SIZE, READ | EXECUTE, STATE_CODE, "code")
+                .unwrap();
+            machine
+                .memory
+                .map(stream, PAGE_SIZE, READ | WRITE, STATE_CODE_DATA, "stream")
+                .unwrap();
+            machine
+                .memory
+                .map(
+                    source,
+                    (compressed.len() as u64).next_multiple_of(PAGE_SIZE),
+                    READ | WRITE,
+                    STATE_CODE_DATA,
+                    "input",
+                )
+                .unwrap();
+            machine
+                .memory
+                .map(
+                    destination,
+                    (payload.len() as u64).next_multiple_of(PAGE_SIZE),
+                    READ | WRITE,
+                    STATE_CODE_DATA,
+                    "output",
+                )
+                .unwrap();
+            machine.memory.write(source, &compressed).unwrap();
+            machine.memory.write_u8(stream, 1).unwrap();
+            machine.memory.write_u64(stream + 8, destination).unwrap();
+            machine
+                .memory
+                .write_u32(stream + 0x10, payload.len() as u32)
+                .unwrap();
+            machine.core.cpu.regs[..4].copy_from_slice(&[stream, source, 64, 0]);
+            let returns = AtomicUsize::new(0);
+            let result = machine.run_generated(|core| {
+                if core.cpu.pc == site {
+                    return Err(Trap::MissingBlock { pc: site });
+                }
+                assert_eq!(core.cpu.pc, site + 4);
+                assert_eq!(core.cpu.regs[30], site + 4);
+                if returns.fetch_add(1, Relaxed) == 0 {
+                    core.cpu.regs[..4].copy_from_slice(&[
+                        stream,
+                        source + 64,
+                        (compressed.len() - 64) as u64,
+                        0,
+                    ]);
+                    core.cpu.pc = site;
+                    Ok(())
+                } else {
+                    assert_eq!(core.cpu.regs[0], 0);
+                    Err(Trap::Exit { code: 0 })
+                }
+            });
+            assert!(matches!(result, Err(Trap::Exit { code: 0 })));
+            assert_eq!(returns.load(Relaxed), 2);
+            assert_eq!(machine.nvn.calls["hle:zstd_stream"], 2);
+            assert_eq!(machine.memory.read_u8(stream).unwrap(), 4);
+            assert_eq!(
+                machine.memory.read_u64(stream + 8).unwrap(),
+                destination + payload.len() as u64
+            );
+            assert!(machine.memory.equals(destination, &payload).unwrap());
+            let profiled_calls = machine
+                .zstd_profile
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|((decoder, thread, _), _)| *decoder == "stream" && *thread == guest_thread)
+                .map(|(_, timing)| timing.calls)
+                .sum::<u64>();
+            assert_eq!(profiled_calls, 2);
+        }
+    }
+
+    #[test]
+    fn parallel_zstd_stream_falls_back_to_the_guest_decoder() {
+        let (site, decoder, stream) = (0x1000, 0x1020, 0x4000);
+        for offlock in [false, true] {
+            let mut machine = thread_machine();
+            machine.layout.workers = 2;
+            machine.zstd_offlock = offlock;
+            machine
+                .nvn
+                .add_hook(site, crate::nvn::HostEntry::ZstdStreamCall);
+            machine
+                .memory
+                .map(site, PAGE_SIZE, READ | WRITE | EXECUTE, STATE_CODE, "code")
+                .unwrap();
+            machine.memory.write_u32(site, 0x9400_0008).unwrap();
+            machine
+                .memory
+                .map(stream, PAGE_SIZE, READ | WRITE, STATE_CODE_DATA, "stream")
+                .unwrap();
+            // A decoding stream with no host context was started by the guest.
+            machine.memory.write_u8(stream, 2).unwrap();
+            let args = [stream, 0, 0, 0];
+            machine.core.cpu.regs[..4].copy_from_slice(&args);
+            let result = machine.run_generated(|core| {
+                if core.cpu.pc == site {
+                    return Err(Trap::MissingBlock { pc: site });
+                }
+                assert_eq!(core.cpu.pc, decoder);
+                assert_eq!(core.cpu.regs[30], site + 4);
+                assert_eq!(&core.cpu.regs[..4], &args);
+                Err(Trap::Exit { code: 0 })
+            });
+            assert!(matches!(result, Err(Trap::Exit { code: 0 })));
+            assert_eq!(machine.nvn.calls["hle:zstd_stream (guest)"], 1);
+            assert_eq!(machine.memory.read_u8(stream).unwrap(), 2);
         }
     }
 
