@@ -180,6 +180,13 @@ synthetic fixtures and runs without the game files.
   the NVN lock fell from 28.64 to 24.59 seconds. Both runs exited cleanly
   and reached the outdoor title at the same checkpoints. This pair shows
   a small throughput difference across builds with several changes.
+  A private trial used the same executable for two guarded runs with
+  plain and losslessly filtered archives. At present 6,200 the filter
+  reduced retained payloads from 1,812 to 1,003 MiB. Peak process RSS
+  was 13,268 and 13,327 MiB respectively, with 21.67 and 23.03 seconds
+  of archive encoding CPU time. The filtered run averaged 7.83 FPS
+  outdoors compared with 8.60 FPS for the plain run. One 100-present
+  interval accounted for the slowdown. Both runs exited cleanly.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
