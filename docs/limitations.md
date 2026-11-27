@@ -106,12 +106,19 @@ automated test covers it).
 
 ## Performance
 
-- The console runs the game at 60 frames per second. A November 26 Radeon
-  run processed 9,600 opening movie pictures at 66.0 pictures/s. With
-  screenshots disabled, forest presents 10,500–10,700 took 12.5 seconds
-  (16.0 FPS). The run used the fixed-resolution opening, native render
-  scale and audio. It exited at the planned cutoff with zero backend draw
-  errors. A headless present measures throughput before window scanout.
+- The console runs the game at 60 frames per second. A Radeon run with
+  the candidate 12 translation and current renderer processed 9,660 movie
+  pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700
+  took 8.8 seconds (22.7 FPS). The archived renderer took 7.8 seconds
+  (25.6 FPS) with the same seven guest bundles and shared guest library.
+  Both runs used the same save, fixed resolution, native render scale,
+  audio and no screenshots. The current renderer logged zero skipped
+  draws over the opening. The archived renderer logged 35. The cost of
+  those draws within the measured window has not been isolated.
+- A separate graphics test stage used an older six-bundle translation
+  built without `target-cpu=native`. Its patched run reached 16.0 FPS
+  in the same forest window, and its archived runner reached 21.1 FPS.
+  These headless timings measure throughput before window scanout.
 - In an earlier translation benchmark of the first 3D scene
   (the Great Deku Tree, presents 10,500 to 10,700 of a scripted run from a
   new game, Ryzen 7 5800X3D, Radeon RX 9070 XT, Mesa 26.2.7), the default
