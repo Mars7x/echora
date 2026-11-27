@@ -9028,6 +9028,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opaque_integer_borders_use_integer_component_words() {
+        assert_eq!(
+            border_color([0, 0, 0, 1], true),
+            vk::BorderColor::INT_OPAQUE_BLACK
+        );
+        assert_eq!(
+            border_color([1; 4], true),
+            vk::BorderColor::INT_OPAQUE_WHITE
+        );
+        assert_eq!(
+            border_color([0; 4], true),
+            vk::BorderColor::INT_TRANSPARENT_BLACK
+        );
+        assert_eq!(
+            border_color([1; 4], false),
+            vk::BorderColor::FLOAT_TRANSPARENT_BLACK
+        );
+    }
+
+    #[test]
     fn host_import_falls_back_when_the_guest_span_is_too_small() {
         #[repr(align(4096))]
         struct HostPage([u8; 4096]);
@@ -11203,13 +11223,18 @@ impl ViewInfo {
     }
 }
 
-/// The built-in border colour nearest `rgba` (float bits): transparent
-/// black, opaque black or opaque white. Other colours (custom border
-/// colours are not enabled) take the nearest of these by alpha and
-/// brightness.
+/// Select a built-in border colour from the guest's four raw component words.
 fn border_color(rgba: [u32; 4], integer: bool) -> vk::BorderColor {
     use vk::BorderColor as Color;
     let [transparent_black, opaque_black, opaque_white] = if integer {
+        // Signed and unsigned integer textures both use the integer bit
+        // pattern for one. Interpreting these words as floats would turn an
+        // opaque border into a transparent one.
+        match rgba {
+            [0, 0, 0, 1] => return Color::INT_OPAQUE_BLACK,
+            [1, 1, 1, 1] => return Color::INT_OPAQUE_WHITE,
+            _ => {}
+        }
         [
             Color::INT_TRANSPARENT_BLACK,
             Color::INT_OPAQUE_BLACK,
@@ -11222,6 +11247,8 @@ fn border_color(rgba: [u32; 4], integer: bool) -> vk::BorderColor {
             Color::FLOAT_OPAQUE_WHITE,
         ]
     };
+    // Preserve the existing approximation for other colors until samplers
+    // can supply a custom border to every view they are paired with.
     let [r, g, b, a] = rgba.map(f32::from_bits);
     if a < 0.5 {
         transparent_black

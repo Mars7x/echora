@@ -544,15 +544,15 @@ mod tests {
                 mag_filter: vk::Filter::NEAREST,
                 ..Sampler::default()
             };
-            let border = Sampler {
-                address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
-                border: [1.0f32.to_bits(); 4],
-                ..sampler
-            };
             let expected_border = if crate::renderer::integer_format(view) {
                 1
             } else {
                 1.0f32.to_bits()
+            };
+            let border = Sampler {
+                address: [vk::SamplerAddressMode::CLAMP_TO_BORDER; 3],
+                border: [expected_border; 4],
+                ..sampler
             };
             for (code, sampler, expected) in [
                 (fetch_code.as_slice(), sampler, expected),

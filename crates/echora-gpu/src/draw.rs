@@ -496,7 +496,7 @@ pub struct Sampler {
     /// Depth comparison (a shadow-map sampler): the reference is compared
     /// with the texel by this function, giving 0 or 1.
     pub compare: Option<vk::CompareOp>,
-    /// Border colour for clamp-to-border addressing, as float bits (RGBA).
+    /// RGBA border words, interpreted according to the sampled numeric type.
     pub border: [u32; 4],
     /// Channel sources (a texture view's swizzle); not part of the
     /// Vulkan sampler.
