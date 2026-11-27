@@ -115,6 +115,13 @@ synthetic fixtures and runs without the game files.
   the same builds averaged 26.3 and 23.8 FPS. Both comparisons used the
   same translated guest libraries on Radeon. These single pairs do not
   isolate the effect of any one change.
+  Moving sampler-builder setters off the renderer mutex then reduced the
+  busiest guest thread's lock wait from 15.04 to 8.48 ms per frame in two
+  18-frame traces. A 3,000-present run with that change averaged 12.21 FPS.
+  The controls before and after it averaged 13.11 and 12.87 FPS, so the
+  default uses the original sampler path. A separate route with scripted
+  stick movement stayed inside Link's room through present 6,200, averaged
+  10.55 FPS over its final 3,000 presents and peaked at 13,015 MiB resident.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
