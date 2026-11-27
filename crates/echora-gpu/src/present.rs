@@ -9,6 +9,10 @@ use ash::vk;
 use crate::renderer::Renderer;
 use crate::vulkan::Gpu;
 
+/// Allow several refresh intervals for an image without relying on WSI
+/// forward progress while the surface is occluded.
+const ACQUIRE_TIMEOUT_NS: u64 = 50_000_000;
+
 /// The native window to present to.
 #[derive(Clone, Copy, Debug)]
 pub enum WindowHandle {
@@ -252,8 +256,7 @@ impl Presenter {
 
     /// (Re)create the swapchain for the surface's current size. `fallback`
     /// is used when the surface leaves the size to the swapchain (Wayland).
-    fn rebuild(&mut self, gpu: &Gpu, fallback: vk::Extent2D) -> Result<(), String> {
-        self.wait_for_presents(gpu)?;
+    fn rebuild(&mut self, gpu: &Gpu, fallback: vk::Extent2D) -> Result<bool, String> {
         // SAFETY: live physical device and surface.
         let (capabilities, formats, modes) = unsafe {
             (
@@ -285,8 +288,9 @@ impl Presenter {
             }
         };
         if extent.width == 0 || extent.height == 0 {
-            return Err("the window is minimized".into());
+            return Ok(false);
         }
+        self.wait_for_presents(gpu)?;
         let mut count = capabilities.min_image_count + 1;
         if capabilities.max_image_count != 0 {
             count = count.min(capabilities.max_image_count);
@@ -324,7 +328,7 @@ impl Presenter {
         self.extent = extent;
         self.format = format.format;
         self.stale = false;
-        Ok(())
+        Ok(true)
     }
 
     fn wait_for_presents(&mut self, gpu: &Gpu) -> Result<(), String> {
@@ -378,6 +382,9 @@ impl Renderer {
         key: u64,
         size: (u32, u32),
     ) -> Result<(), String> {
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(());
+        }
         let format = self.existing_target(key).ok_or("no such target")?.format;
         if crate::renderer::is_depth(format) {
             return Err("cannot present a depth target".into());
@@ -396,14 +403,16 @@ impl Renderer {
         }
         if presenter.stale || presenter.requested != size {
             self.flush()?;
-            presenter.rebuild(&self.gpu, fallback)?;
+            if !presenter.rebuild(&self.gpu, fallback)? {
+                return Ok(());
+            }
             presenter.requested = size;
         }
         // SAFETY: live swapchain; the fence is unsignaled.
         let acquired = unsafe {
             presenter.swapchain_loader.acquire_next_image(
                 presenter.swapchain,
-                u64::MAX,
+                ACQUIRE_TIMEOUT_NS,
                 vk::Semaphore::null(),
                 presenter.fence,
             )
@@ -415,6 +424,12 @@ impl Renderer {
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 presenter.stale = true;
+                return Ok(());
+            }
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
+                // No image was acquired and the fence is still unsignaled.
+                // The caller submits the guest's work even without a blit.
+                self.stat("stat: presents skipped waiting for a window image", 1);
                 return Ok(());
             }
             Err(error) => return Err(format!("vkAcquireNextImageKHR: {error}")),
