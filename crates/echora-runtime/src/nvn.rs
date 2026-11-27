@@ -2971,11 +2971,11 @@ impl Nvn {
     /// Tell lock-free sync waits (`Recorder::front`) whether GPU results
     /// wait to be stored, and where the completed serial is.
     fn publish_resolve_state(&self) {
-        let (pending, completed) = self.gpu_resolve_state();
+        let pending = self.gpu_resolve_pending();
         let current = read_shared(&self.registry);
         if current.resolve_pending == pending
             && current.replay_pending == self.replay_paused
-            && current.completed.is_some() == completed.is_some()
+            && current.completed.is_some() == self.gpu.is_some()
         {
             return;
         }
@@ -2983,8 +2983,10 @@ impl Nvn {
         let mut registry = write_shared(&self.registry);
         registry.resolve_pending = pending;
         registry.replay_pending = self.replay_paused;
-        if registry.completed.is_none() {
-            registry.completed = completed;
+        if registry.completed.is_none()
+            && let Some(backend) = &self.gpu
+        {
+            registry.completed = Some(backend.renderer.completed_handle());
         }
     }
 

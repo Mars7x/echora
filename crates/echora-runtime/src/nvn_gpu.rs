@@ -6076,19 +6076,16 @@ impl Nvn {
 
     /// Whether GPU results wait to be stored in guest memory at a CPU
     /// wait (`resolve_storage`), and the renderer's completed serial.
-    pub(super) fn gpu_resolve_state(
-        &self,
-    ) -> (bool, Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) {
+    pub(super) fn gpu_resolve_pending(&self) -> bool {
         let Some(backend) = self.gpu.as_ref() else {
-            return (false, None);
+            return false;
         };
-        let pending = !backend.pending_storage.is_empty()
+        !backend.pending_storage.is_empty()
             || !backend.in_place_writes.is_empty()
             || backend
                 .resident
                 .values()
-                .any(|pool| pool.uncached && !pool.gpu_dirty.is_empty());
-        (pending, Some(backend.renderer.completed_handle()))
+                .any(|pool| pool.uncached && !pool.gpu_dirty.is_empty())
     }
 
     /// Serial of the GPU submission holding everything recorded so far
