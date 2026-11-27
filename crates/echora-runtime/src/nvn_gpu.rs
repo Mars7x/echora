@@ -5300,9 +5300,14 @@ impl Nvn {
                     vk_format,
                     info.block_height,
                 );
-        let mut texels = Vec::new();
-        if !stream {
-            texels
+        // Whole-level copies already own tightly packed rows. Share them
+        // when the host transfer needs neither plane conversion nor padding.
+        let shared_rows = copied
+            .as_ref()
+            .filter(|rows| !combined_depth_stencil && rows.len() == upload_bytes);
+        let mut packed = Vec::new();
+        if !stream && shared_rows.is_none() {
+            packed
                 .try_reserve_exact(upload_bytes)
                 .map_err(|err| format!("texture upload: {err}"))?;
         }
@@ -5439,10 +5444,14 @@ impl Nvn {
                 offset: offset as u64,
             };
             if !stream {
-                texels.resize(offset + upload_stride * layers as usize, 0);
-                let output = &mut texels[offset..];
-                pack_layers((region, 0), output)?;
-                let upload = &output[..length];
+                let upload = if let Some(rows) = shared_rows {
+                    rows.as_slice()
+                } else {
+                    packed.resize(offset + upload_stride * layers as usize, 0);
+                    let output = &mut packed[offset..];
+                    pack_layers((region, 0), output)?;
+                    &output[..length]
+                };
                 // ECHORA_GPU_TEXTURE_DUMP=<dir> (debugging): the base level
                 // of large 4-byte 2D textures, as last uploaded.
                 if let Some(directory) = super::debug_var_os("ECHORA_GPU_TEXTURE_DUMP") {
@@ -5481,6 +5490,7 @@ impl Nvn {
             }));
             offset += upload_stride * layers as usize;
         }
+        let texels = shared_rows.cloned().unwrap_or_else(|| Arc::new(packed));
         // Content-keyed: guest writes that change the texels upload again.
         let generation = if stream {
             // The new image is generated from these storage bytes. Use
@@ -5542,7 +5552,7 @@ impl Nvn {
             height,
             shape,
             format: vk_format,
-            texels: Arc::new(texels),
+            texels,
             levels: levels.into(),
         };
         let backend = self.gpu.as_mut().unwrap();
@@ -14529,6 +14539,68 @@ mod target_tests {
                     .flatten()
                     .all(|pixel| (pixel - expected).abs() < 1e-6)
             );
+        }
+    }
+
+    #[test]
+    fn whole_level_copies_share_rows_when_the_upload_layout_matches() {
+        let Some((mut nvn, mut memory, base, template)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut props = nvn.objects[&template].builder.clone();
+        props.remove("Stride");
+        props.get_mut("Width").unwrap().x[0] = 1;
+        props.get_mut("Height").unwrap().x[0] = 1;
+        let source = base + (1 << 20);
+        for (format, input, expected) in [
+            (37, &[1, 2, 3, 4][..], &[1, 2, 3, 4][..]), // RGBA8
+            (50, &[5, 6], &[5, 6, 0, 0]),               // D16 with end padding
+            (
+                54,
+                &[0, 0, 128, 63, 9, 6, 7, 8],
+                &[0, 0, 128, 63, 9, 0, 0, 0],
+            ), // D32F+S8
+        ] {
+            let texture = template + format;
+            props.get_mut("Format").unwrap().x[0] = format;
+            nvn.initialize(texture, "Texture", props.clone()).unwrap();
+            guest.memory.write(source, input).unwrap();
+            let copied = nvn
+                .copy_texels(
+                    &mut guest,
+                    texture,
+                    crate::nvn::TexelTransfer {
+                        region: [0, 0, 0, 1, 1, 1],
+                        bases: [0; 2],
+                        strides: [0; 2],
+                    },
+                    source,
+                    true,
+                )
+                .ok()
+                .flatten()
+                .expect("whole-level rows");
+            nvn.record_copied_level(texture, Some(copied));
+            let super::TextureSource::Upload {
+                texels, generation, ..
+            } = nvn.guest_texture(&guest, texture).unwrap()
+            else {
+                panic!("expected a texture upload");
+            };
+            let rows = &nvn.gpu.as_ref().unwrap().copied_levels[&texture].1;
+            assert_eq!(texels.as_slice(), expected);
+            assert_eq!(generation, super::hash_bytes(expected));
+            assert_eq!(std::sync::Arc::ptr_eq(&texels, rows), format == 37);
+            let lifetime = std::sync::Arc::downgrade(rows);
+            nvn.gpu_forget_texture(texture);
+            drop(texels);
+            assert!(lifetime.upgrade().is_none());
         }
     }
 
