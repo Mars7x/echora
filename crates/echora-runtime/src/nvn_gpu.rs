@@ -16188,6 +16188,19 @@ mod target_tests {
         assert_eq!(key, retired_texture((0x10000, 52)));
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
         assert!(renderer.existing_target(2).is_none());
+        let stats = renderer.take_stats();
+        assert_eq!(stats["stat: target archives restored"], 1);
+        assert_eq!(
+            stats["stat: restored target archive image bytes"],
+            512 * 512 * 4
+        );
+        assert!(stats["stat: restored target archive compressed bytes"] < 512 * 512 * 4);
+        renderer.restore_archived_target(key).unwrap();
+        assert!(
+            !renderer
+                .take_stats()
+                .contains_key("stat: target archives restored")
+        );
         assert_eq!(
             renderer.read_target_bytes(key, 4).unwrap(),
             0.5_f32.to_le_bytes().repeat(512 * 512)

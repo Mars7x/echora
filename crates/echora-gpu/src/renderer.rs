@@ -5768,9 +5768,12 @@ impl Renderer {
         let Some(archived) = self.archived_targets.get(&key) else {
             return Ok(());
         };
+        let started = std::time::Instant::now();
         let info = archived.info;
+        let compressed_bytes = archived.compressed.len() as u64;
         let bytes = zstd::bulk::decompress(&archived.compressed, archived.decoded_bytes)
             .map_err(|error| error.to_string())?;
+        let decode_us = started.elapsed().as_micros() as u64;
         let target = self.create_target(
             info.width,
             info.height,
@@ -5790,6 +5793,20 @@ impl Renderer {
         self.remove_archive(key);
         self.target_changes += 1;
         self.changed_targets.push(key);
+        self.stat("stat: target archives restored", 1);
+        self.stat(
+            "stat: restored target archive compressed bytes",
+            compressed_bytes,
+        );
+        self.stat(
+            "stat: restored target archive image bytes",
+            bytes.len() as u64,
+        );
+        self.stat("stat: target archive decode us", decode_us);
+        self.stat(
+            "stat: target archive restore us",
+            started.elapsed().as_micros() as u64,
+        );
         Ok(())
     }
 
