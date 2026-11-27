@@ -7311,10 +7311,21 @@ impl Renderer {
     /// their guest texel grids.
     pub fn copy_target_level(
         &mut self,
+        from: (u64, u32, u32),
+        source: [i32; 4],
+        to: (u64, u32, u32),
+        destination: [i32; 4],
+    ) -> Result<(), String> {
+        self.blit_target_level(from, source, to, destination, None)
+    }
+
+    fn blit_target_level(
+        &mut self,
         (from, source_level, source_layer): (u64, u32, u32),
         source: [i32; 4],
         (to, destination_level, destination_layer): (u64, u32, u32),
         destination: [i32; 4],
+        output_filter: Option<vk::Filter>,
     ) -> Result<(), String> {
         if (from, source_level, source_layer) == (to, destination_level, destination_layer) {
             return Err("copy within one render target subresource".into());
@@ -7378,14 +7389,16 @@ impl Renderer {
                     .dst_offsets(corners(destination))
             })
             .collect();
-        let filter = if is_depth(source_target.format)
-            || integer_format(source_target.format)
-            || source[2..] == destination[2..]
-        {
-            vk::Filter::NEAREST
-        } else {
-            vk::Filter::LINEAR
-        };
+        let filter = output_filter.unwrap_or_else(|| {
+            if is_depth(source_target.format)
+                || integer_format(source_target.format)
+                || source[2..] == destination[2..]
+            {
+                vk::Filter::NEAREST
+            } else {
+                vk::Filter::LINEAR
+            }
+        });
         let barrier = |target: &Target, mip_level, layer, src, dst| {
             vk::ImageMemoryBarrier::default()
                 .src_access_mask(src)
@@ -7836,17 +7849,94 @@ impl Renderer {
         Ok(())
     }
 
-    /// Read a color target back as RGBA f32 texels (row-major).
-    /// Record a scaled blit of color target `key` into a swapchain image,
-    /// leaving that image ready to present.
+    /// Fill an acquired swapchain image and release it for presentation.
     pub(crate) fn blit_to_swapchain(
         &mut self,
         key: u64,
         image: vk::Image,
-        (width, height): (u32, u32),
+        format: vk::Format,
         extent: vk::Extent2D,
     ) -> Result<(), String> {
-        self.transition(key, vk::ImageLayout::GENERAL)?;
+        self.write_present_image(key, image, format, extent, *output_options())?;
+        let commands = self.commands()?;
+        let to_present = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .image(image)
+            .subresource_range(range(format));
+        // SAFETY: the acquired image is now in TRANSFER_DST_OPTIMAL.
+        unsafe {
+            *self
+                .stats
+                .entry("stat: barriers in blit_to_swapchain")
+                .or_default() += 1;
+            self.gpu.device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+        }
+        Ok(())
+    }
+
+    /// Write display texels with the chosen fit and filter. The destination can
+    /// discard its previous contents and finishes in TRANSFER_DST_OPTIMAL.
+    pub(crate) fn write_present_image(
+        &mut self,
+        key: u64,
+        image: vk::Image,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        (mode, filter): (ScalingMode, vk::Filter),
+    ) -> Result<(), String> {
+        let target = self.targets.get(&key).ok_or("no such present target")?;
+        let (width, height) = target.extent(0);
+        let source_format = target.format;
+        let fitted = present_rect(mode, (width, height), (extent.width, extent.height));
+        let (w, h) = (
+            (fitted[2] - fitted[0]) as u32,
+            (fitted[3] - fitted[1]) as u32,
+        );
+        // vkCmdBlitImage decodes an sRGB source and encodes an sRGB destination.
+        // With opposite 8-bit encodings, final transfer must copy display bytes.
+        let display_format = match format {
+            vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+                if is_srgb(source_format) != is_srgb(format) =>
+            {
+                srgb_twin(format)
+            }
+            _ => None,
+        };
+        let source_key = if let Some(display_format) = display_format
+            && w > 0
+            && h > 0
+            && ((w, h) != (width, height) || source_format != display_format)
+        {
+            // Blit into the destination's byte order with the source's transfer
+            // curve. The reusable staging target always has host-pixel dimensions.
+            let source = [0, 0, target.width as i32, target.height as i32];
+            self.target(STAGING_KEYS, w, h, display_format)?;
+            self.blit_target_level(
+                (key, 0, 0),
+                source,
+                (STAGING_KEYS, 0, 0),
+                [0, 0, w as i32, h as i32],
+                Some(filter),
+            )?;
+            STAGING_KEYS
+        } else {
+            key
+        };
+        self.transition(source_key, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
         let range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -7862,13 +7952,6 @@ impl Renderer {
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image)
             .subresource_range(range);
-        let to_present = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty())
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .image(image)
-            .subresource_range(range);
         let layers = vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: 0,
@@ -7878,8 +7961,6 @@ impl Renderer {
         // By default the frame keeps its aspect ratio: scaled to fit and
         // centred, with black bars filling the rest of the window
         // (ECHORA_SCALING_MODE chooses another fit).
-        let (mode, filter) = *output_options();
-        let fitted = present_rect(mode, (width, height), (extent.width, extent.height));
         let blit = vk::ImageBlit {
             src_subresource: layers,
             // Targets keep the console's row order: row 0 is the top.
@@ -7906,7 +7987,7 @@ impl Renderer {
             ],
         };
         let letterboxed = fitted != [0, 0, extent.width as i32, extent.height as i32];
-        let source = self.targets[&key].image;
+        let source = self.targets[&source_key].image;
         // SAFETY: recording; the target is in GENERAL layout and the
         // swapchain image was acquired.
         unsafe {
@@ -7952,32 +8033,42 @@ impl Renderer {
                     &[],
                 );
             }
-            device.cmd_blit_image(
-                commands,
-                source,
-                vk::ImageLayout::GENERAL,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[blit],
-                filter,
-            );
-            *self
-                .stats
-                .entry("stat: barriers in blit_to_swapchain")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
-                commands,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_present],
-            );
+            if w != 0 && h != 0 {
+                if display_format.is_some() {
+                    let region = vk::ImageCopy::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .dst_offset(blit.dst_offsets[0])
+                        .extent(vk::Extent3D {
+                            width: w,
+                            height: h,
+                            depth: 1,
+                        });
+                    device.cmd_copy_image(
+                        commands,
+                        source,
+                        vk::ImageLayout::GENERAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                } else {
+                    device.cmd_blit_image(
+                        commands,
+                        source,
+                        vk::ImageLayout::GENERAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        filter,
+                    );
+                }
+            }
         }
         Ok(())
     }
 
+    /// Read a color target back as RGBA f32 texels (row-major).
     pub fn read_target(&mut self, key: u64) -> Result<Vec<[f32; 4]>, String> {
         self.read_target_level(key, 0)
     }

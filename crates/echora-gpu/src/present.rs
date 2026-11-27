@@ -140,8 +140,9 @@ fn select_surface_format(
             let rank = match (srgb, format.format) {
                 (true, Format::B8G8R8A8_SRGB) | (false, Format::B8G8R8A8_UNORM) => 0,
                 (true, Format::R8G8B8A8_SRGB) | (false, Format::R8G8B8A8_UNORM) => 1,
-                (_, Format::B8G8R8A8_UNORM) => 2,
-                _ => 3,
+                (_, Format::B8G8R8A8_UNORM | Format::B8G8R8A8_SRGB) => 2,
+                (_, Format::R8G8B8A8_UNORM | Format::R8G8B8A8_SRGB) => 3,
+                _ => 4,
             };
             (other_color_space, rank)
         })
@@ -377,11 +378,7 @@ impl Renderer {
         key: u64,
         size: (u32, u32),
     ) -> Result<(), String> {
-        let (width, height, format) = {
-            let target = self.existing_target(key).ok_or("no such target")?;
-            let (width, height) = target.extent(0);
-            (width, height, target.format)
-        };
+        let format = self.existing_target(key).ok_or("no such target")?.format;
         if crate::renderer::is_depth(format) {
             return Err("cannot present a depth target".into());
         }
@@ -422,7 +419,7 @@ impl Renderer {
             }
             Err(error) => return Err(format!("vkAcquireNextImageKHR: {error}")),
         };
-        let shown = self.present_acquired(presenter, key, index, (width, height));
+        let shown = self.present_acquired(presenter, key, index);
         if shown.is_err() {
             self.abandon_present(presenter);
         }
@@ -436,7 +433,6 @@ impl Renderer {
         presenter: &mut Presenter,
         key: u64,
         index: u32,
-        size: (u32, u32),
     ) -> Result<(), String> {
         // SAFETY: the caller's acquire submitted the fence.
         unsafe {
@@ -452,7 +448,7 @@ impl Renderer {
         if let Some(ready) = &mut image.ready {
             ready.wait(&self.gpu.device)?;
         }
-        self.blit_to_swapchain(key, image.image, size, presenter.extent)?;
+        self.blit_to_swapchain(key, image.image, presenter.format, presenter.extent)?;
         let signal = if let Some(ready) = &image.ready {
             self.submit_for_present(ready.blitted)?;
             Some(ready.blitted)
@@ -584,52 +580,82 @@ mod tests {
     }
 
     #[test]
-    fn matching_surface_encoding_preserves_the_display_values_of_a_scaled_blit() {
-        let Ok(gpu) = Gpu::new() else {
-            return;
-        };
+    fn scanout_preserves_sdr_bytes_on_oppositely_encoded_surfaces() {
+        use crate::renderer::ScalingMode;
+        use vk::Format as F;
+
+        let Ok(gpu) = Gpu::new() else { return };
         let mut renderer = Renderer::new(gpu).unwrap();
-        let color_space = vk::ColorSpaceKHR::SRGB_NONLINEAR;
-        let source = vk::Format::R8G8B8A8_SRGB;
-        let formats = [
-            vk::SurfaceFormatKHR::default()
-                .format(vk::Format::B8G8R8A8_UNORM)
-                .color_space(color_space),
-            vk::SurfaceFormatKHR::default()
-                .format(source)
-                .color_space(color_space),
-        ];
-        let surface = select_surface_format(&formats, true).unwrap();
-        renderer.target(1, 2, 2, source).unwrap();
-        renderer.target(2, 3, 3, surface.format).unwrap();
-        renderer.target(3, 3, 3, formats[0].format).unwrap();
-        renderer
-            .clear_color(
-                1,
-                None,
-                vk::ClearColorValue {
-                    float32: [0.21586, 0.21586, 0.21586, 1.0],
-                },
-            )
-            .unwrap();
-        renderer
-            .copy_target(1, [0, 0, 2, 2], 2, [0, 0, 3, 3])
-            .unwrap();
-        renderer
-            .copy_target(1, [0, 0, 2, 2], 3, [0, 0, 3, 3])
-            .unwrap();
-        let encoded = renderer.read_target_bytes(2, 4).unwrap();
-        let linear = renderer.read_target_bytes(3, 4).unwrap();
-        let uniform = |bytes: &[u8], value: u8| {
-            bytes.len() == 36
-                && bytes.chunks_exact(4).all(|pixel| {
-                    pixel[3] == 255
-                        && pixel[..3]
-                            .iter()
-                            .all(|&channel| channel.abs_diff(value) <= 1)
-                })
-        };
-        assert!(uniform(&encoded, 128), "sRGB destination {encoded:?}");
-        assert!(uniform(&linear, 55), "UNORM destination {linear:?}");
+        for (source, same_order, swapped, srgb) in [
+            (F::R8G8B8A8_SRGB, F::R8G8B8A8_UNORM, F::B8G8R8A8_UNORM, true),
+            (F::R8G8B8A8_UNORM, F::R8G8B8A8_SRGB, F::B8G8R8A8_SRGB, false),
+            (F::B8G8R8A8_SRGB, F::B8G8R8A8_UNORM, F::R8G8B8A8_UNORM, true),
+            (F::B8G8R8A8_UNORM, F::B8G8R8A8_SRGB, F::R8G8B8A8_SRGB, false),
+        ] {
+            renderer.target(1, 2, 1, source).unwrap();
+            let green = if srgb { 128 } else { 55 };
+            for (x, rgba) in [[0.0, 0.21586, 1.0, 1.0], [1.0, 0.21586, 0.0, 0.5]]
+                .into_iter()
+                .enumerate()
+            {
+                renderer
+                    .clear_color(
+                        1,
+                        Some([x as i32, 0, 1, 1]),
+                        vk::ClearColorValue { float32: rgba },
+                    )
+                    .unwrap();
+            }
+
+            for format in [same_order, swapped, source] {
+                for (width, height, filter) in [
+                    (2, 1, vk::Filter::NEAREST),
+                    (5, 5, vk::Filter::NEAREST),
+                    (5, 5, vk::Filter::LINEAR),
+                ] {
+                    let extent = vk::Extent2D { width, height };
+                    let image = renderer.target(2, width, height, format).unwrap().image;
+                    // Mirror the final layout in this offscreen target's tracker.
+                    renderer
+                        .transition(2, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .unwrap();
+                    renderer
+                        .write_present_image(1, image, format, extent, (ScalingMode::Fit, filter))
+                        .unwrap();
+                    let bytes = renderer.read_target_bytes(2, 4).unwrap();
+                    let pixel = |x, y| {
+                        let at = ((y * width + x) * 4) as usize;
+                        let mut rgba: [u8; 4] = bytes[at..at + 4].try_into().unwrap();
+                        if matches!(format, F::B8G8R8A8_SRGB | F::B8G8R8A8_UNORM) {
+                            rgba.swap(0, 2);
+                        }
+                        rgba
+                    };
+                    let y = height / 2;
+                    assert_eq!(pixel(0, y), [0, green, 255, 255]);
+                    assert_eq!(pixel(width - 1, y), [255, green, 0, 128]);
+                    if height == 5 {
+                        for x in 0..width {
+                            assert_eq!(pixel(x, 0), [0, 0, 0, 255]);
+                            assert_eq!(pixel(x, 4), [0, 0, 0, 255]);
+                        }
+                        if filter == vk::Filter::NEAREST {
+                            assert_eq!(pixel(1, y), pixel(0, y));
+                            assert_eq!(pixel(3, y), pixel(width - 1, y));
+                        } else {
+                            let half = if srgb { 188 } else { 128 };
+                            let mid = pixel(2, y);
+                            for (actual, expected) in mid.into_iter().zip([half, green, half, 191])
+                            {
+                                assert!(
+                                    actual.abs_diff(expected) <= 1,
+                                    "{source:?} -> {format:?}: {mid:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
