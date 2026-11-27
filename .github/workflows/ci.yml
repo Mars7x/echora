@@ -28,9 +28,13 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - uses: ilammy/setup-nasm@v1
-      - name: System libraries
+      - name: Prepare Linux build
         if: runner.os == 'Linux'
         run: |
+          # Limit concurrent rustc and linker memory for the workspace test build.
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install -y libclang-dev libpipewire-0.3-dev libudev-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libx11-xcb-dev libvulkan-dev
       - name: Format
