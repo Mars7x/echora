@@ -74,7 +74,7 @@ struct ArchivedTarget {
     info: TargetInfo,
     decoded_bytes: usize,
     hash: u64,
-    compressed: std::sync::Arc<[u8]>,
+    compressed: std::sync::Arc<Box<[u8]>>,
 }
 
 struct PendingArchive {
@@ -686,7 +686,7 @@ pub struct Renderer {
     memory_types: vk::PhysicalDeviceMemoryProperties,
     targets: FastMap<u64, Target>,
     archived_targets: FastMap<u64, ArchivedTarget>,
-    archived_bytes: FastMap<u64, std::sync::Weak<[u8]>>,
+    archived_bytes: FastMap<u64, std::sync::Weak<Box<[u8]>>>,
     pending_archives: FastMap<u64, PendingArchive>,
     pending_archive_bytes: u64,
     archive_compressor: std::cell::OnceCell<Option<ArchiveCompressor>>,
@@ -5704,9 +5704,11 @@ impl Renderer {
             .get(&hash)
             .and_then(std::sync::Weak::upgrade)
         {
-            Some(shared) if shared.as_ref() == compressed => shared,
+            Some(shared) if shared.as_ref().as_ref() == compressed.as_slice() => shared,
             _ => {
-                let shared: std::sync::Arc<[u8]> = compressed.into_boxed_slice().into();
+                // Share the allocation already holding the compressed
+                // bytes. Arc<[u8]> would copy the entire boxed slice.
+                let shared = std::sync::Arc::new(compressed.into_boxed_slice());
                 self.archived_bytes
                     .insert(hash, std::sync::Arc::downgrade(&shared));
                 shared
@@ -5742,8 +5744,7 @@ impl Renderer {
         self.gpu.index_type_uint8
     }
 
-    /// Remove the archive and release its allocation when the last target
-    /// stops sharing it. A weak reference to an Arc<[u8]> holds its allocation.
+    /// Remove the archive. The last target sharing the payload frees its bytes.
     fn remove_archive(&mut self, key: u64) -> bool {
         let Some(archive) = self.archived_targets.remove(&key) else {
             return false;
