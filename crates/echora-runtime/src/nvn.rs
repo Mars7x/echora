@@ -7132,12 +7132,19 @@ impl Nvn {
                 (key.to_string(), serde_json::json!(elements))
             })
             .collect();
+        // Indexed instanced draws also use x6 and x7 for the first instance
+        // and the instance count.
+        let args = if command.name == "nvnCommandBufferDrawElementsInstanced" {
+            &command.x[1..8]
+        } else {
+            &command.x[1..6]
+        };
         let line = serde_json::json!({
             "present": self.presented_frames,
             "colors": self.render.colors.iter().map(|texture| format!("{texture:x}")).collect::<Vec<_>>(),
             "depth": format!("{:x}", self.render.depth),
             "draw": command.name,
-            "args": command.x[1..6],
+            "args": args,
             "stages": stages,
             "binds": binds,
             "states": states,
@@ -9210,6 +9217,41 @@ mod tests {
     use super::*;
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+    #[test]
+    fn indexed_draw_log_includes_the_instance_range() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let nvn = Nvn::default();
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("draw.jsonl");
+        let mut command = Command {
+            name: "nvnCommandBufferDrawElementsInstanced",
+            x: [0xa0, 4, 1, 36, 0x4000, 7, 53, 211],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        nvn.log_draw(&guest, &command, file.as_os_str());
+        command.name = "nvnCommandBufferDrawElementsBaseVertex";
+        nvn.log_draw(&guest, &command, file.as_os_str());
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let rows: Vec<serde_json::Value> = log
+            .lines()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(
+            rows[0]["args"],
+            serde_json::json!([4, 1, 36, 0x4000, 7, 53, 211])
+        );
+        assert_eq!(rows[1]["args"], serde_json::json!([4, 1, 36, 0x4000, 7]));
+    }
 
     fn numeric_texture_fixture(nvn: &mut Nvn, output: u64) {
         use echora_gpu::ash::vk;

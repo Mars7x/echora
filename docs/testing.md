@@ -40,6 +40,19 @@ The running game is checked from its run reports and from presented frames
 saved with `ECHORA_CAPTURE_EVERY` ([development](development.md)). These
 checks need the game and are not part of CI.
 
+To trace a color difference, choose a pixel in guest render-target coordinates
+and set `ECHORA_GPU_PIXEL_WATCH=first:end:key:x,y`. Use a hexadecimal target
+key, or join several same-size target keys with `+`. The watch records draws
+that change the pixel. Use `end = first + 1` to inspect one present. Longer
+ranges sample multiples of 60 and exclude the end. When the game renders at a
+different scale, the watch uses the same nearest-filter conversion as a full
+readback. A color sample transfers 16 bytes to the CPU.
+
+Set `ECHORA_DRAW_LOG` to a JSONL path and `ECHORA_DRAW_LOG_FROM` to the
+first present to log. Indexed instanced draws include the first instance and
+instance count as the final two elements of `args`. Older captures recorded
+only the first five arguments, so their instance ranges are unknown.
+
 ## Differential and semantic tests
 
 These need no game and run with `cargo test --workspace`. They compare the

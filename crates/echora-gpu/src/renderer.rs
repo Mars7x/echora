@@ -7878,7 +7878,7 @@ impl Renderer {
         let temporary = u64::MAX - 1;
         self.insert_target(temporary, target);
         let texels = self
-            .read_level(temporary, level, false, slice)
+            .read_level(temporary, level, false, slice, None)
             .map(|(texels, ..)| texels);
         let target = self.remove_target(temporary).unwrap();
         self.uploads.insert(key, (generation, target));
@@ -7888,8 +7888,19 @@ impl Renderer {
     /// Read mip level `level` of a color target back as RGBA f32 texels
     /// (at the guest's resolution).
     pub fn read_target_level(&mut self, key: u64, level: u32) -> Result<Vec<[f32; 4]>, String> {
-        self.read_level(key, level, false, 0)
+        self.read_level(key, level, false, 0, None)
             .map(|(texels, ..)| texels)
+    }
+
+    /// One level-zero texel in guest coordinates, decoded as in `read_target_level`.
+    pub fn read_target_pixel(
+        &mut self,
+        key: u64,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<[f32; 4]>, String> {
+        self.read_level(key, 0, false, 0, Some([x, y]))
+            .map(|(texels, ..)| texels.first().copied())
     }
 
     /// As `read_target_level`, slice `slice` of a 3D target (array layer
@@ -7900,14 +7911,14 @@ impl Renderer {
         level: u32,
         slice: u32,
     ) -> Result<Vec<[f32; 4]>, String> {
-        self.read_level(key, level, false, slice)
+        self.read_level(key, level, false, slice, None)
             .map(|(texels, ..)| texels)
     }
 
     /// Level 0 of a color target at the image's own (scaled) resolution,
     /// with that width and height: the frame as the window shows it.
     pub fn read_target_scaled(&mut self, key: u64) -> Result<(Vec<[f32; 4]>, u32, u32), String> {
-        self.read_level(key, 0, true, 0)
+        self.read_level(key, 0, true, 0, None)
     }
 
     /// Level `level` (slice `slice` of a 3D target) as RGBA f32 texels.
@@ -7917,6 +7928,7 @@ impl Renderer {
         level: u32,
         full: bool,
         slice: u32,
+        pixel: Option<[u32; 2]>,
     ) -> Result<(Vec<[f32; 4]>, u32, u32), String> {
         let (width, height, format, scaled) = {
             let target = self.targets.get(&key).ok_or("no such target")?;
@@ -7934,14 +7946,24 @@ impl Renderer {
             };
             (width, height, target.format, scaled)
         };
+        let [x, y, read_width, read_height] = match pixel {
+            Some([x, y]) if x < width && y < height => [x, y, 1, 1],
+            Some(_) => return Ok((Vec::new(), 0, 0)),
+            None => [0, 0, width, height],
+        };
         // Depth targets cannot be blitted to a color image: their depth
         // aspect is copied as it is and read as (depth, 0, 0, 1).
         if is_depth(format) {
             if full && !self.targets[&key].scale.is_one() {
                 return Err("depth readback uses the guest resolution".into());
             }
-            let bytes =
-                self.read_target_plane_bytes(key, level, slice, 4, [0, 0, width, height])?;
+            let bytes = self.read_target_plane_bytes(
+                key,
+                level,
+                slice,
+                4,
+                [x, y, read_width, read_height],
+            )?;
             let depth = |bytes: &[u8]| match format {
                 vk::Format::D16_UNORM => {
                     f32::from(u16::from_le_bytes([bytes[0], bytes[1]])) / 65535.0
@@ -7961,15 +7983,28 @@ impl Renderer {
                 .chunks_exact(size)
                 .map(|texel| [depth(texel), 0.0, 0.0, 1.0])
                 .collect();
-            return Ok((texels, width, height));
+            return Ok((texels, read_width, read_height));
         }
         // Blit to an RGBA32F image so every color format reads back alike.
+        // Keep the full blit transform when resampling so nearest filtering
+        // chooses precisely the same source texel as a full-level read.
+        let (origin, end, staging_extent, copy_origin) =
+            if pixel.is_some() && scaled == (width, height) {
+                ([x, y], [x + 1, y + 1], (1, 1), [0, 0])
+            } else {
+                ([0, 0], [scaled.0, scaled.1], (width, height), [x, y])
+            };
         let staging_key = u64::MAX;
-        self.target(staging_key, width, height, vk::Format::R32G32B32A32_SFLOAT)?;
+        self.target(
+            staging_key,
+            staging_extent.0,
+            staging_extent.1,
+            vk::Format::R32G32B32A32_SFLOAT,
+        )?;
         self.transition(key, vk::ImageLayout::GENERAL)?;
         self.order_target(key)?;
         self.transition(staging_key, vk::ImageLayout::GENERAL)?;
-        let size = u64::from(width) * u64::from(height) * 16;
+        let size = u64::from(read_width) * u64::from(read_height) * 16;
         let buffer = self.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let commands = self.commands()?;
         // `slice` is a depth slice of a volume, else an array layer.
@@ -7982,21 +8017,21 @@ impl Renderer {
             layer_count: 1,
         };
         let corner = vk::Offset3D {
-            x: width as i32,
-            y: height as i32,
+            x: staging_extent.0 as i32,
+            y: staging_extent.1 as i32,
             z: 1,
         };
         let blit = vk::ImageBlit {
             src_subresource: layers,
             src_offsets: [
                 vk::Offset3D {
-                    x: 0,
-                    y: 0,
+                    x: origin[0] as i32,
+                    y: origin[1] as i32,
                     z: slice as i32,
                 },
                 vk::Offset3D {
-                    x: scaled.0 as i32,
-                    y: scaled.1 as i32,
+                    x: end[0] as i32,
+                    y: end[1] as i32,
                     z: slice as i32 + 1,
                 },
             ],
@@ -8010,9 +8045,14 @@ impl Renderer {
         };
         let copy = vk::BufferImageCopy {
             image_subresource: blit.dst_subresource,
+            image_offset: vk::Offset3D {
+                x: copy_origin[0] as i32,
+                y: copy_origin[1] as i32,
+                z: 0,
+            },
             image_extent: vk::Extent3D {
-                width,
-                height,
+                width: read_width,
+                height: read_height,
                 depth: 1,
             },
             ..Default::default()
@@ -8055,9 +8095,9 @@ impl Renderer {
             );
         }
         self.flush()?;
-        let texels = buffer.read_f32x4((width * height) as usize);
+        let texels = buffer.read_f32x4((size / 16) as usize);
         buffer.destroy(self.device());
-        Ok((texels, width, height))
+        Ok((texels, read_width, read_height))
     }
 
     /// Readback layout for a single-level, single-layer target in its
@@ -8865,6 +8905,37 @@ mod tests {
     fn renderer() -> Option<Renderer> {
         // No device (CI): the GPU tests have nothing to run on.
         Gpu::new().ok().map(|gpu| Renderer::new(gpu).unwrap())
+    }
+
+    #[test]
+    fn watched_pixel_matches_the_guest_resolution_srgb_readback() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let (width, height) = (17, 9);
+        for (key, scale) in [(1, Scale::ONE), (2, Scale::new(3, 2).unwrap())] {
+            renderer.set_resolution_scale(scale);
+            let (w, h) = renderer
+                .target(key, width, height, vk::Format::R8G8B8A8_SRGB)
+                .unwrap()
+                .extent(0);
+            assert_eq!((w, h), (scale.apply(width), scale.apply(height)));
+            let bytes = (0..h)
+                .flat_map(|y| (0..w).flat_map(move |x| [x as u8 * 8, y as u8 * 8, 128, 255]))
+                .collect::<Vec<_>>();
+            renderer.restore_target_archive(key, &bytes).unwrap();
+            let full = renderer.read_target_level(key, 0).unwrap();
+            for (x, y) in [(0, 0), (3, 5), (width - 1, height - 1)] {
+                let reference = full[(y * width + x) as usize];
+                assert!((reference[2] - 0.216).abs() < 0.005);
+                assert_eq!(
+                    renderer.read_target_pixel(key, x, y).unwrap(),
+                    Some(reference)
+                );
+            }
+            assert_eq!(renderer.read_target_pixel(key, width, 0).unwrap(), None);
+            assert_eq!(renderer.read_target_pixel(key, 0, height).unwrap(), None);
+        }
     }
 
     #[test]

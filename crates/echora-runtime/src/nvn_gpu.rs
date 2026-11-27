@@ -12940,11 +12940,9 @@ impl Nvn {
             }
         }
         // ECHORA_GPU_PIXEL_WATCH=<first>:<end>:<target key>[+<key>...]:<x>,<y>:
-        // in every 60th present from first to end, each draw into a watched
-        // target that changes its pixel notes its program, instances and the
-        // new value (finds which draw left a wrong pixel; reads the target
-        // back after each draw). Watching several targets follows a pixel
-        // through a chain of passes of the same size.
+        // Watch one present, or every 60th present in a longer range. Each draw
+        // that changes the watched pixel records its program, instances and
+        // the new value. Multiple targets follow a pixel through successive passes.
         if let Ok(watch) = draw_var(switches, "ECHORA_GPU_PIXEL_WATCH") {
             let fields: Vec<&str> = watch.split([':', ',']).collect();
             if let [first, end, targets, x, y] = fields[..] {
@@ -12953,21 +12951,19 @@ impl Nvn {
                     .split('+')
                     .map(|target| u64::from_str_radix(target, 16))
                     .collect();
-                let (x, y) = (x.parse::<usize>(), y.parse::<usize>());
+                let (x, y) = (x.parse::<u32>(), y.parse::<u32>());
                 if let (Ok(first), Ok(end), Ok(targets), Ok(x), Ok(y)) = (first, end, targets, x, y)
                 {
                     let present = self.presented_frames;
                     let watched = targets
                         .into_iter()
                         .filter(|target| colors_written.contains(target));
-                    if (first..end).contains(&present) && present.is_multiple_of(60) {
+                    if (first..end).contains(&present)
+                        && (end - first == 1 || present.is_multiple_of(60))
+                    {
                         for target in watched {
-                            let width = backend
-                                .renderer
-                                .existing_target(target)
-                                .map_or(1, |target| target.width as usize);
-                            let texels = backend.renderer.read_target_level(target, 0)?;
-                            let Some(value) = texels.get(y * width + x).copied() else {
+                            let Some(value) = backend.renderer.read_target_pixel(target, x, y)?
+                            else {
                                 continue;
                             };
                             if backend.watched_pixel.insert(target, value) != Some(value) {

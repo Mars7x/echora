@@ -63,7 +63,8 @@ What doesn't work yet:
   frame, foreground water reflections have less color and a nearby leaf
   patch exposes more brown ground. Shader traces now
   wait for GPU writes and distinguish new texture samples from values
-  retained since an earlier report.
+  retained since an earlier report. The patched renderer reached present
+  10,700 on Radeon in a bounded run through the opening forest.
 - Gameplay past the opening scene. Around the flight through Kokiri Forest
   the graphics driver sometimes crashes, and memory use keeps growing after
   that point. The renderer now retires finalized uploads, releases shared
@@ -200,6 +201,9 @@ many bytes the renderer holds in targets, uploads and images awaiting release.
 Tests check that finalized images stay alive until the GPU finishes and that
 flushing an idle renderer releases them without submitting another batch.
 Texture view registration validates and copies the view under the same lock.
+To trace the missing ground cover, the draw log records the first instance
+and instance count of indexed instanced draws. A pixel watch can follow one
+texel through a single frame while transferring only that texel to the CPU.
 Speed work continues after that.
 
 ## Building
