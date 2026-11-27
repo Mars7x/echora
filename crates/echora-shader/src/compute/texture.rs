@@ -1146,10 +1146,14 @@ impl Emitter {
         };
         let query = |e: &mut Self, image| {
             let size = e.value(op::IMAGE_QUERY_SIZE_LOD, size_type, &[image, level]);
+            let levels = e.value(op::IMAGE_QUERY_LEVELS, e.u32, &[image]);
+            // TXQ.DIMENSION pads missing axes of a live image with one. A
+            // null texture has zero levels and returns zero on every axis.
             let one = e.constant(1);
+            let implicit_axis = e.glsl(e.u32, glsl::U_MIN, &[levels, one]);
             std::array::from_fn(|n| match (n == 3, n < count as usize, count) {
-                (true, _, _) => e.value(op::IMAGE_QUERY_LEVELS, e.u32, &[image]),
-                (false, false, _) => one,
+                (true, _, _) => levels,
+                (false, false, _) => implicit_axis,
                 (false, true, 1) => size,
                 (false, true, _) => e.value(op::COMPOSITE_EXTRACT, e.u32, &[size, n as u32]),
             })

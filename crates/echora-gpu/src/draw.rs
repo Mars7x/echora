@@ -334,6 +334,8 @@ pub struct StencilFace {
 /// What a texture binding samples.
 #[derive(Clone, Debug)]
 pub enum TextureSource {
+    /// The null image in reserved guest texture-pool slot zero.
+    Null,
     /// A render target, by its key.
     Target(u64),
     /// Mip levels `base_level`.. (`level_count` of them, 0: the rest) of a
@@ -367,6 +369,7 @@ impl TextureSource {
     /// generation (its texels are cached under them and never compared).
     pub(crate) fn same_as(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Null, Self::Null) => true,
             (Self::Target(a), Self::Target(b)) => a == b,
             (
                 Self::TargetView {
@@ -1608,7 +1611,7 @@ impl Renderer {
                 TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                     self.existing_target(*key).map(|target| target.image)
                 }
-                TextureSource::Upload { .. } => None,
+                TextureSource::Null | TextureSource::Upload { .. } => None,
             });
         if self.rendering_pending(sampled) {
             self.memory_barrier()?;

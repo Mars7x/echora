@@ -3614,6 +3614,7 @@ impl Nvn {
             .collect();
         let mut keys: Vec<String> = sources
             .map(|source| match source {
+                TextureSource::Null => "null".to_string(),
                 TextureSource::Target(key) => {
                     format!("t{key:x}@{:x}", self.texture_storage(*key).unwrap_or(0))
                 }
@@ -3879,6 +3880,9 @@ impl Nvn {
                     .iter()
                     .zip(cached.entries.iter())
                     .all(|(&handle, entry)| {
+                        if matches!(entry.source, TextureSource::Null) {
+                            return self.is_default_null_texture(handle);
+                        }
                         self.with_memoized_binding(handle, |binding| {
                             entry.matches_binding(&binding.source, &binding.sampler)
                         }) == Some(true)
@@ -3920,6 +3924,16 @@ impl Nvn {
         let stage = u64::from(nvn);
         let mut handles: Vec<u64> = self.render.bound_textures.handles(stage).collect();
         handles.extend_from_slice(additional);
+        // A dynamically indexed shader can read slot zero even if no stage
+        // binding listed it. Preserve an explicit registration over the default.
+        if self
+            .render
+            .state
+            .get("SetTexturePool")
+            .is_some_and(|bind| self.render_texture_descriptor(bind.x[1], 0).is_some())
+        {
+            handles.push(0);
+        }
         handles.sort_unstable();
         handles.dedup();
         // Resolved handles are kept for the present as the draw path's
@@ -3944,6 +3958,16 @@ impl Nvn {
         let mut entries = Vec::with_capacity(handles.len());
         let mut resolved_handles = Vec::with_capacity(handles.len());
         for handle in handles {
+            if self.is_default_null_texture(handle) {
+                resolved_handles.push(handle);
+                entries.push(echora_gpu::pool::PoolEntry {
+                    texture: 0,
+                    sampler: (handle >> echora_shader_abi::SAMPLER_INDEX_SHIFT & 0xfff) as u32,
+                    source: TextureSource::Null,
+                    sampler_state: Sampler::default(),
+                });
+                continue;
+            }
             if let Some((source, sampler_state, _)) = self.memoized_binding(handle) {
                 resolved_handles.push(handle);
                 entries.push(echora_gpu::pool::PoolEntry {
@@ -4130,7 +4154,7 @@ impl Nvn {
                 level_count,
                 ..
             } => (key, base_level, level_count),
-            TextureSource::Upload { .. } => return source,
+            TextureSource::Null | TextureSource::Upload { .. } => return source,
         };
         let (mut base_level, mut level_count) = if super::mip_targets() {
             self.handle_view_levels(handle).unwrap_or((0, 0))
@@ -5639,6 +5663,17 @@ impl Nvn {
         Ok(source)
     }
 
+    /// The native pool initializer writes an invalid-format, all-zero-channel
+    /// descriptor at slot zero. Explicit registrations still take precedence.
+    fn is_default_null_texture(&self, handle: u64) -> bool {
+        handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK) == 0
+            && self.render.state.get("SetTexturePool").is_some_and(|bind| {
+                let pool = bind.x[1];
+                self.object(pool, "TexturePool").is_ok()
+                    && self.render_texture_descriptor(pool, 0).is_none()
+            })
+    }
+
     /// The texture object a bound handle names through the bound pool.
     fn handle_texture(&self, handle: u64) -> Result<u64, String> {
         let pool = self
@@ -6812,6 +6847,13 @@ impl Nvn {
                             format!("texture 5/{slot} is not bound: {}", layout(self))
                         })?;
                     c0[entry..entry + 8].copy_from_slice(&handle.to_le_bytes());
+                    if self.is_default_null_texture(handle) {
+                        textures.insert(
+                            descriptor.binding,
+                            (TextureSource::Null, Sampler::default()),
+                        );
+                        continue;
+                    }
                     let texture = self.handle_texture(handle)?;
                     let started = std::time::Instant::now();
                     let (source, _) = self.resolve_sampled_texture(core, texture)?;
@@ -9311,6 +9353,7 @@ impl Nvn {
             // Every slice of a volume and every layer of an array (the
             // simulator reads them all), slice or layer after slice.
             let (texels, width, height, depth, layers) = match source {
+                TextureSource::Null => continue,
                 TextureSource::Upload {
                     key,
                     width,
@@ -9367,33 +9410,33 @@ impl Nvn {
                 // Every slice of a volume and every layer of an array (the
                 // simulator reads them all).
                 let (depth, layers);
-                let texels = match source {
-                    TextureSource::Upload { key, shape, .. } => {
+                let (texels, width, height) = match source {
+                    TextureSource::Null => return Ok(()),
+                    TextureSource::Upload {
+                        key,
+                        width,
+                        height,
+                        shape,
+                        ..
+                    } => {
                         renderer.texture_view_for(source)?;
                         (depth, layers) = (shape.depth(), shape.layers());
                         let mut texels = Vec::new();
                         for slice in 0..depth.max(layers) {
                             texels.extend(renderer.read_upload_slice(*key, 0, slice)?);
                         }
-                        texels
+                        (texels, *width, *height)
                     }
                     TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
-                        (depth, layers) = renderer.existing_target(*key).map_or((1, 1), |target| {
-                            (target.shape.depth(), target.shape.layers())
-                        });
+                        let target = renderer.existing_target(*key).ok_or("no such target")?;
+                        let (width, height) = (target.width, target.height);
+                        (depth, layers) = (target.shape.depth(), target.shape.layers());
                         let mut texels = Vec::new();
                         for slice in 0..depth.max(layers) {
                             texels.extend(renderer.read_target_slice(*key, 0, slice)?);
                         }
-                        texels
+                        (texels, width, height)
                     }
-                };
-                let (width, height) = match source {
-                    TextureSource::Upload { width, height, .. } => (*width, *height),
-                    TextureSource::Target(key) | TextureSource::TargetView { key, .. } => renderer
-                        .existing_target(*key)
-                        .map(|target| (target.width, target.height))
-                        .ok_or("no such target")?,
                 };
                 let count = (width * height * depth.max(layers)) as usize;
                 let bytes: Vec<u8> = texels
@@ -11292,6 +11335,13 @@ impl Nvn {
                             .bound_textures
                             .get(u64::from(nvn), u64::from(slot))
                             .ok_or_else(|| format!("texture {nvn}/{slot} is not bound"))?;
+                        if self.is_default_null_texture(handle) {
+                            textures.insert(
+                                (index, descriptor.binding),
+                                (TextureSource::Null, Sampler::default()),
+                            );
+                            continue;
+                        }
                         // Valid within a present (textures are revalidated
                         // once per present); registrations evict their ids.
                         let stamp = (
@@ -13625,6 +13675,7 @@ fn constant_pointer(descriptor: &shader::Descriptor, c0: &[u8]) -> Option<(u64, 
 fn label_sources<'a>(sources: impl Iterator<Item = &'a TextureSource>) -> String {
     sources
         .map(|source| match source {
+            TextureSource::Null => "null".into(),
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                 format!("t{key:x}")
             }
@@ -16231,6 +16282,54 @@ mod pool_tests {
     use crate::nvn::{Args, Command, Guest, GuestMemory};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn default_null_texture_requires_a_bound_pool_and_unregistered_zero_slot() {
+        let mut nvn = Nvn::default();
+        let pool = 5;
+        assert!(!nvn.is_default_null_texture(0));
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        assert!(!nvn.is_default_null_texture(0));
+        nvn.initialize(pool, "TexturePool", BTreeMap::new())
+            .unwrap();
+        assert!(nvn.is_default_null_texture(0));
+        assert!(nvn.is_default_null_texture(258 << 20));
+        assert!(!nvn.is_default_null_texture(1));
+        assert!(nvn.handle_texture(1).is_err());
+        let epoch = nvn.descriptor_epoch;
+        nvn.frame_capture = Some(Box::new(crate::nvn::FrameCapture {
+            commands: Vec::new(),
+            render: nvn.render.clone(),
+            queue_render: nvn.queue_render.clone(),
+            render_queue: nvn.render_queue,
+            oldest_descriptor_epoch: epoch,
+        }));
+        nvn.apply_registration(crate::nvn::Registration {
+            pool,
+            id: 0,
+            sampler: None,
+            view: Some(None),
+            entry: Args {
+                x: [7, 0, 0, 0],
+                ..Default::default()
+            },
+        });
+        assert!(!nvn.is_default_null_texture(0));
+        nvn.select_descriptors(epoch);
+        assert!(nvn.is_default_null_texture(0));
+        assert!(nvn.render_texture_view(pool, 0).is_none());
+        nvn.select_descriptors(nvn.descriptor_epoch);
+        assert_eq!(nvn.handle_texture(0).unwrap(), 7);
+    }
 
     #[test]
     fn rendered_mip_alias_uses_its_own_virtual_mapping() {

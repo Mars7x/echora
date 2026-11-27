@@ -384,6 +384,11 @@ impl Renderer {
                 self.stat("stat: texture pool entries past capacity", 1);
                 continue;
             }
+            if matches!(entry.source, TextureSource::Null) {
+                // Clear every old view when a new pool restores its null slot.
+                kinds.push((entry.texture, 0, 0));
+                continue;
+            }
             // An upload resolved before with the same source and sampler
             // names the same sampler and views (render targets resolve
             // every time: sampling them transitions and refreshes copies).
@@ -448,6 +453,13 @@ impl Renderer {
             }
         }
         let pool = self.texture_pool.as_ref().unwrap();
+        // An indirect lookup may read the reserved zero slot even when it
+        // was absent from the handles inferred from the shader's inputs.
+        if pool.view_masks.get(&0).is_some_and(|&mask| mask != 0)
+            && !kinds.iter().any(|&(index, _, _)| index == 0)
+        {
+            kinds.push((0, 0, 0));
+        }
         // A guest descriptor replaces the entire texture, including views of
         // the previous shape or numeric class that the new image cannot supply.
         for &(index, _, view_mask) in &kinds {
@@ -504,6 +516,7 @@ impl Renderer {
                             })
                             .map(|entry| {
                                 let source = match &entry.source {
+                                    TextureSource::Null => "null".to_string(),
                                     TextureSource::Upload {
                                         key,
                                         generation,
@@ -593,6 +606,7 @@ impl Renderer {
     /// A source's shape and format.
     fn source_shape(&self, source: &TextureSource) -> Result<(ImageShape, vk::Format), String> {
         match source {
+            TextureSource::Null => Err("null texture has no shape".into()),
             TextureSource::Upload { shape, format, .. } => Ok((*shape, *format)),
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => self
                 .existing_target(*key)
@@ -871,6 +885,50 @@ mod tests {
         let pool = renderer.texture_pool.as_ref().unwrap();
         assert!(!pool.written.contains_key(&(binding::UINT_2D, 1)));
         assert!(pool.written.contains_key(&(binding::SAMPLED_2D, 1)));
+    }
+
+    #[test]
+    fn new_pool_null_slot_clears_previous_views_of_slot_zero() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        renderer
+            .target(7, 4, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let entry = |texture, source| PoolEntry {
+            texture,
+            sampler: 0,
+            source,
+            sampler_state: Sampler::default(),
+        };
+        renderer
+            .bind_pool(
+                &vec![
+                    entry(0, TextureSource::Target(7)),
+                    entry(1, TextureSource::Target(7)),
+                ]
+                .into(),
+            )
+            .unwrap();
+        assert!(
+            renderer
+                .texture_pool
+                .as_ref()
+                .unwrap()
+                .written
+                .contains_key(&(binding::SAMPLED_2D, 0))
+        );
+        renderer
+            .bind_pool(&vec![entry(0, TextureSource::Null)].into())
+            .unwrap();
+        let written = &renderer.texture_pool.as_ref().unwrap().written;
+        assert!(!written.contains_key(&(binding::SAMPLED_2D, 0)));
+        assert!(!written.contains_key(&(binding::SAMPLED_2D_ARRAY, 0)));
+        assert!(written.contains_key(&(binding::SAMPLED_2D, 1)));
     }
 
     #[test]

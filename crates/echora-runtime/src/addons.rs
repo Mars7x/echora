@@ -128,7 +128,7 @@ impl GraphicsAddons {
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                 *key = NEUTRAL_WEIGHTS_TARGET;
             }
-            TextureSource::Upload { .. } => unreachable!(),
+            TextureSource::Null | TextureSource::Upload { .. } => unreachable!(),
         }
         Ok(())
     }

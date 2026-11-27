@@ -41,6 +41,7 @@ pub struct Gpu {
     /// The device enables the Vulkan mirror clamp-to-edge address mode.
     pub(crate) sampler_mirror_clamp_to_edge: bool,
     pub(crate) sampler_filter_minmax: bool,
+    pub(crate) null_descriptor: bool,
     pub(crate) filter_minmax_image_component_mapping: bool,
     pub(crate) texture_compression_astc_ldr: bool,
     /// Compute shaders can require 32-lane subgroups (the guest's warp
@@ -335,8 +336,9 @@ impl Gpu {
         // Guest shaders index buffers the way the console allows; reads out
         // of bounds must return zeros, not fault the GPU (a fault hangs the
         // ring and loses the device).
-        let robustness2 =
-            supported_robust.robust_buffer_access2 != 0 && has(ash::ext::robustness2::NAME);
+        let robustness2 = has(ash::ext::robustness2::NAME)
+            && (supported_robust.robust_buffer_access2 != 0
+                || supported_robust.null_descriptor != 0);
         if robustness2 {
             enabled_extensions.push(ash::ext::robustness2::NAME.as_ptr());
         }
@@ -548,7 +550,7 @@ impl Gpu {
             device_info = device_info.push_next(&mut enable_clip);
         }
         let mut enable_robust = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
-            .robust_buffer_access2(true)
+            .robust_buffer_access2(supported_robust.robust_buffer_access2 != 0)
             .robust_image_access2(supported_robust.robust_image_access2 != 0)
             .null_descriptor(supported_robust.null_descriptor != 0);
         if robustness2 {
@@ -630,6 +632,7 @@ impl Gpu {
             && s12.descriptor_binding_uniform_texel_buffer_update_after_bind != 0
             && s12.shader_sampled_image_array_non_uniform_indexing != 0
             && robustness2
+            && supported_robust.robust_buffer_access2 != 0
             && supported_robust.null_descriptor != 0)
             .then(|| texture_pool_layout(&device))
             .transpose()?;
@@ -678,6 +681,7 @@ impl Gpu {
             max_sampler_lod_bias: properties.limits.max_sampler_lod_bias,
             sampler_mirror_clamp_to_edge,
             sampler_filter_minmax: s12.sampler_filter_minmax != 0,
+            null_descriptor: robustness2 && supported_robust.null_descriptor != 0,
             filter_minmax_image_component_mapping: properties12
                 .filter_minmax_image_component_mapping
                 != 0,

@@ -2820,22 +2820,22 @@ impl Renderer {
             self.volume_as_layers(*key, alias, width, height, depth, format)?;
             return self.texture_view(&TextureSource::Target(alias), texture_type);
         }
-        let key = match source {
+        let (key, target, kind) = match source {
+            TextureSource::Null => return self.null_view(),
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                 self.transition(*key, vk::ImageLayout::GENERAL)?;
-                if !self.targets.contains_key(key) {
-                    return Err("sampled target does not exist".into());
-                }
-                *key
+                (
+                    *key,
+                    self.targets
+                        .get(key)
+                        .ok_or("sampled target does not exist")?,
+                    "render target",
+                )
             }
             TextureSource::Upload { key, .. } => {
                 self.upload(source)?;
-                *key
+                (*key, &self.uploads[key].1, "upload")
             }
-        };
-        let target = match source {
-            TextureSource::Target(_) | TextureSource::TargetView { .. } => &self.targets[&key],
-            TextureSource::Upload { .. } => &self.uploads[&key].1,
         };
         let wanted = match texture_type {
             0 => vk::ImageViewType::TYPE_1D,
@@ -2875,12 +2875,8 @@ impl Renderer {
                 selected
             }
             _ => {
-                let what = match source {
-                    TextureSource::Target(_) | TextureSource::TargetView { .. } => "render target",
-                    TextureSource::Upload { .. } => "upload",
-                };
                 return Err(format!(
-                    "a {wanted:?} binding samples {what} {key:x}, a {:?} image",
+                    "a {wanted:?} binding samples {kind} {key:x}, a {:?} image",
                     target.shape
                 ));
             }
@@ -4213,6 +4209,13 @@ impl Renderer {
         }
     }
 
+    fn null_view<T: vk::Handle>(&self) -> Result<T, String> {
+        self.gpu
+            .null_descriptor
+            .then(|| T::from_raw(0))
+            .ok_or_else(|| "null texture requires Vulkan nullDescriptor".to_string())
+    }
+
     /// The texel-buffer view of guest buffer texture `source`: its level-0
     /// texels copied into a buffer once per generation. Buffer textures
     /// can be far longer than the largest 1D image (light lists a million
@@ -4221,6 +4224,9 @@ impl Renderer {
         &mut self,
         source: &crate::draw::TextureSource,
     ) -> Result<vk::BufferView, String> {
+        if matches!(source, crate::draw::TextureSource::Null) {
+            return self.null_view();
+        }
         let crate::draw::TextureSource::Upload {
             key,
             generation,
@@ -6046,6 +6052,7 @@ impl Renderer {
             TextureSource::Target(key) | TextureSource::TargetView { key, .. } => {
                 self.targets.get(key).map(|target| target.format)
             }
+            TextureSource::Null => None,
             TextureSource::Upload { format, .. } => Some(*format),
         }
     }
@@ -6057,7 +6064,7 @@ impl Renderer {
                 .targets
                 .get(key)
                 .is_some_and(|target| !target.scale.is_one()),
-            TextureSource::Upload { .. } => false,
+            TextureSource::Null | TextureSource::Upload { .. } => false,
         }
     }
 

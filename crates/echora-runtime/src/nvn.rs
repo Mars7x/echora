@@ -291,6 +291,7 @@ struct PreviousDescriptor {
 
 #[derive(Debug)]
 enum ReplacedRegistration {
+    DefaultNullTexture,
     Texture { entry: Args, view: Option<Bag> },
     Sampler(echora_gpu::draw::Sampler),
 }
@@ -2465,7 +2466,11 @@ fn registry_call(
             if texture >= 1 << 20 || sampler >= 1 << 12 {
                 return Ok(false);
             }
-            core.cpu.regs[0] = u64::from(texture) | (u64::from(sampler) << 20);
+            core.cpu.regs[0] = if name == "nvnDeviceGetSeparateSamplerHandle" {
+                u64::from(sampler) << 20
+            } else {
+                combined_texture_handle(texture, sampler)
+            };
             Ok(true)
         }
         "nvnDeviceGetInteger" => {
@@ -2615,6 +2620,15 @@ fn registry_call(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// Native NVN ignores the sampler when forming a combined handle for slot zero.
+fn combined_texture_handle(texture: u32, sampler: u32) -> u64 {
+    if texture == 0 {
+        0
+    } else {
+        u64::from(texture) | (u64::from(sampler) << 20)
     }
 }
 
@@ -3818,7 +3832,7 @@ impl Nvn {
                 if texture >= 1 << 20 || sampler >= 1 << 12 {
                     return Err(invalid(format!("handle for {texture}/{sampler}")));
                 }
-                core.cpu.regs[0] = u64::from(texture) | (u64::from(sampler) << 20);
+                core.cpu.regs[0] = combined_texture_handle(texture,sampler);
                 return Ok(true);
             }
             "nvnDeviceGetTexelFetchHandle"
@@ -3932,11 +3946,10 @@ impl Nvn {
             // descriptor table lives in the memory pool at offset (each entry
             // is the descriptor size from GetInteger 15/16).
             "nvnTexturePoolInitialize" | "nvnSamplerPoolInitialize" => {
-                let pool_size =
-                    self.object(x[1], "MemoryPool").map_err(invalid)?.builder["Storage"].x[1];
+                let storage = self.object(x[1], "MemoryPool").map_err(invalid)?.builder["Storage"];
                 let count = x[3] as u32;
                 let end = x[2].checked_add(u64::from(count) * 32);
-                if count == 0 || end.is_none_or(|end| end > pool_size) {
+                if count == 0 || end.is_none_or(|end| end > storage.x[1]) {
                     return Err(invalid(format!(
                         "{count} descriptors at {:#x} outside the pool",
                         x[2]
@@ -3946,7 +3959,19 @@ impl Nvn {
                     .trim_end_matches("Initialize");
                 let mut builder = BTreeMap::new();
                 builder.insert("Storage".to_string(), args);
+                let null_slot = if kind == "TexturePool" && storage.x[0] != 0 {
+                    Some(storage.x[0].checked_add(x[2]).ok_or_else(|| invalid("texture pool address overflows".into()))?)
+                } else { None };
                 self.initialize(this, kind, builder).map_err(invalid)?;
+                if let Some(address) = null_slot {
+                    // The guest SDK initializes only the first 32-byte TIC:
+                    // invalid format, four ZERO sources, block-linear header.
+                    let words = [0x0002_4900u32, 0, 0x0060_0000, 0, 0, 0, 0, 0];
+                    if let Err(error) = core.memory.write(address, words.map(u32::to_le_bytes).as_flattened()) {
+                        self.forget_object(this);
+                        return Err(error);
+                    }
+                }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -4826,6 +4851,7 @@ impl Nvn {
     fn render_texture_descriptor(&self, pool: u64, id: u32) -> Option<&Args> {
         match self.previous_descriptor(pool, id) {
             Some(ReplacedRegistration::Texture { entry, .. }) => Some(entry),
+            Some(ReplacedRegistration::DefaultNullTexture) => None,
             _ => self.texture_descriptor(pool, id),
         }
     }
@@ -4833,6 +4859,7 @@ impl Nvn {
     fn render_texture_view(&self, pool: u64, id: u32) -> Option<&Bag> {
         match self.previous_descriptor(pool, id) {
             Some(ReplacedRegistration::Texture { view, .. }) => view.as_ref(),
+            Some(ReplacedRegistration::DefaultNullTexture) => None,
             _ => self.views.get(&(pool, id)),
         }
     }
@@ -4935,6 +4962,11 @@ impl Nvn {
             .or_default()
             .insert(id, entry);
         let Some(previous) = previous else {
+            // The native pool initializer already populated slot zero. Older
+            // submissions must still see it after the first explicit write.
+            if id == 0 {
+                self.replace_descriptor(pool, id, |_| ReplacedRegistration::DefaultNullTexture);
+            }
             return;
         };
         let current_view = self.views.get(&(pool, id));
@@ -10881,6 +10913,70 @@ mod tests {
         assert!(first.record(command, &mut guest).unwrap());
         assert_eq!(lock_shared(&replacement).commands.len(), 1);
         assert_eq!(lock_shared(&original).commands.len(), 2);
+    }
+
+    #[test]
+    fn texture_pool_initializes_only_zero_and_combined_handles_preserve_it() {
+        let mut nvn = Nvn::default();
+        let (device, pool, table, backing) = (0x111, 0x222, 0x333, 0x1000);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        nvn.initialize(
+            pool,
+            "MemoryPool",
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x: [backing, 128, 0, 0],
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(backing, 4096, READ | WRITE, STATE_NORMAL, "texture table")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        guest.memory.write(backing, &[0xcc; 128]).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnTexturePoolInitialize",
+            &[table, pool, 32, 2],
+        );
+        let mut observed = [0; 128];
+        guest.memory.read(backing, &mut observed).unwrap();
+        let mut expected = [0xcc; 128];
+        expected[32..64].fill(0);
+        expected[32..36].copy_from_slice(&0x24900u32.to_le_bytes());
+        expected[40..44].copy_from_slice(&0x600000u32.to_le_bytes());
+        assert_eq!(observed, expected);
+        // Exercise the locked fallback, then the shared registry fast path.
+        for shared in [false, true] {
+            if shared {
+                write_shared(&nvn.registry).devices.insert(device);
+            }
+            for (name, args, expected) in [
+                ("nvnDeviceGetTextureHandle", vec![device, 0, 258], 0),
+                (
+                    "nvnDeviceGetTextureHandle",
+                    vec![device, 1, 258],
+                    0x10200001,
+                ),
+                (
+                    "nvnDeviceGetSeparateSamplerHandle",
+                    vec![device, 258],
+                    0x10200000,
+                ),
+            ] {
+                assert_eq!(call(&mut nvn, &mut guest, name, &args), expected);
+            }
+        }
     }
 
     #[test]

@@ -605,6 +605,102 @@ mod tests {
     }
 
     #[test]
+    fn reserved_null_texture_samples_and_queries_four_zero_words() {
+        use echora_shader::compute::{Layout, translate};
+        use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
+        use std::sync::Arc;
+        let Ok(gpu) = Gpu::new() else { return };
+        if gpu.shader_objects().is_err() || !gpu.buffer_device_address || !gpu.null_descriptor {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let word = |fields: &[(u32, u128)]| {
+            echora_shader::decode(
+                fields
+                    .iter()
+                    .fold(7 << 12, |w, &(shift, value)| w | value << shift),
+            )
+        };
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let guest = 0x1_0000u32;
+        let key = 1;
+        let (output, _) = renderer.resident_buffer(key, PAGE_SIZE).unwrap();
+        let address = renderer.buffer_address(output).unwrap();
+        let (table, _) = renderer
+            .set_page_table(guest >> PAGE_SHIFT, &[address])
+            .unwrap();
+        for bindless in [false, true] {
+            if bindless && renderer.gpu.texture_pool_layout.is_none() {
+                continue;
+            }
+            let mut code = vec![mov(0, 0), mov(1, 0), mov(2, 0), mov(5, 0)];
+            // TEX.LZ RGBA and TXQ.DIMENSION through the same 2D image.
+            code.push(word(&[
+                (0, if bindless { 0x361 } else { 0xb60 }),
+                (16, 8),
+                (32, if bindless { 2 } else { 1 }),
+                (40, if bindless { 0 } else { 0x10 }),
+                (59, u128::from(bindless)),
+                (61, 1),
+                (64, 10),
+                (72, 15),
+                (81, 7),
+                (87, 1),
+            ]));
+            code.push(word(&[
+                (0, if bindless { 0x370 } else { 0xb6f }),
+                (16, 12),
+                (32, if bindless { 0 } else { 255 }),
+                (40, if bindless { 0 } else { 0x10 }),
+                (59, u128::from(bindless)),
+                (64, 255),
+                (72, 15),
+            ]));
+            for index in 0..8 {
+                code.push(mov(4, u128::from(guest) + index * 4));
+                code.push(word(&[
+                    (0, 0x386),
+                    (24, 4),
+                    (32, 8 + index),
+                    (72, 1),
+                    (73, 4),
+                ]));
+            }
+            code.push(word(&[(0, 0x94d), (87, 7)]));
+            let stage = Arc::new(translate(&code, &Layout::workgroup([1, 1, 1])).unwrap());
+            assert_eq!(stage.texture_pool_bindings != 0, bindless);
+            let textures = stage
+                .descriptors
+                .iter()
+                .filter(|d| d.kind() == DescriptorKind::Texture)
+                .map(|d| (d.binding, (TextureSource::Null, Sampler::default())))
+                .collect();
+            let program = renderer.create_program(vec![stage]).unwrap();
+            // A skipped store or a normalized RGB descriptor with alpha=1 must fail.
+            renderer.upload_resident(key, 0, &[0xff; 32]).unwrap();
+            renderer
+                .dispatch(&Dispatch {
+                    program: &program,
+                    groups: [1, 1, 1],
+                    uniforms: HashMap::new(),
+                    storage: HashMap::new(),
+                    storage_in_place: HashMap::new(),
+                    textures,
+                    images: HashMap::new(),
+                    image_formats: HashMap::new(),
+                    indirect: None,
+                    page_table: table,
+                    pool: Default::default(),
+                })
+                .unwrap();
+            let token = renderer.read_resident(key, 0, 32).unwrap();
+            renderer.flush().unwrap();
+            assert_eq!(renderer.take_reads(&[token])[&token], [0; 32]);
+            renderer.destroy_program(program).unwrap();
+        }
+    }
+
+    #[test]
     fn sampling_respects_mirror_clamp_base_levels_and_reduction() {
         use crate::draw::{ImageShape, UploadRegion};
         use echora_shader::compute::{Layout, translate};
