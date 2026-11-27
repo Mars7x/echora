@@ -132,11 +132,11 @@ synthetic fixtures and runs without the game files.
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
   averaged 11.62 FPS over presents 3,200–6,200 and peaked at 12,511 MiB.
-  After the multisample-state and page-table changes the same route averaged
-  12.00 FPS and peaked at 12,258 MiB. The renderer allocated 1,397 page-table
-  buffers across the run, down from 1,592. The opening forest averaged
-  25.6 and 26.3 FPS respectively over presents 10,400–10,500. These runs
-  reached the same saved room and exited at the intended stops.
+  A repeat with the same executable averaged 12.00 FPS and peaked at
+  12,258 MiB. In the two runs the renderer allocated 1,592 and 1,397
+  page-table buffers. Opening forest throughput ranged from 25.6 to 26.3
+  FPS over presents 10,400–10,500. The hardware effect of reusing page-table
+  buffers across extent changes still needs a matched build comparison.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the

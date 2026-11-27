@@ -40,6 +40,13 @@ The running game is checked from its run reports and from presented frames
 saved with `ECHORA_CAPTURE_EVERY` ([development](development.md)). These
 checks need the game and are not part of CI.
 
+For a renderer comparison, record the commit and SHA-256 of each runner
+alongside the guest library hashes, save checkpoint and timed present range.
+When different source snapshots mount at the same path and share a Cargo
+target directory, older source timestamps can leave a previous runner in
+place. Use separate build outputs or force the changed host crates and
+runner to recompile and verify the compiler log before measuring.
+
 To trace a color difference, set `ECHORA_GPU_PIXEL_WATCH=first:end:key:x,y`
 with decimal pixel coordinates in the guest render target. Use a hexadecimal
 target key or `@storage` with a hexadecimal guest storage address. Join
