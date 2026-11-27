@@ -12,6 +12,10 @@ synthetic fixtures and runs without the game files.
   2160p show fog and scenery across the frame after fixes to render-target
   scaling. With Dynamic resolution disabled, a 1440p test used 2560×1440
   scene targets. The adaptive path used 854×480 targets in the sampled scene.
+  In Link's room at present 3,500, the fixed NDSR resolve read a 2560×1440
+  image and wrote a 2560×1440 image with a sharpening strength of 2.5.
+  All 815 logged graphics draws had multisampling disabled. The guest also
+  used smaller viewports for intermediate passes.
   A traced water pixel in the opening forest retained more than 99.99% of
   its base color at the blend before the volume passes in twelve live
   samples. In another live capture the same pixel chose the positive Z
@@ -34,7 +38,9 @@ synthetic fixtures and runs without the game files.
   adjacent rock aligned in both comparisons. In one capture the paired
   foliage depth and material draws each emitted 48,415 triangles. Both
   covered nearby leaves, but none of their triangles covered the center
-  of the missing clump. Other vegetation draws remain under investigation.
+  of the missing clump. A separate trace of 33 indexed, alpha-tested
+  depth draws recovered all 934 triangles. None intersected the 96×64
+  patch around that clump before face culling. Its source is still unknown.
   The missing floor has yet to be reproduced in these frames. Unimplemented
   operations can stop the run and produce a report.
 - The reserved zero texture in a guest texture pool samples as transparent
@@ -122,6 +128,15 @@ synthetic fixtures and runs without the game files.
   default uses the original sampler path. A separate route with scripted
   stick movement stayed inside Link's room through present 6,200, averaged
   10.55 FPS over its final 3,000 presents and peaked at 13,015 MiB resident.
+- Releasing CPU copies after their texture uploads reached the GPU reduced
+  retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
+  6,100. With native blend state and corrected primitive restart, the room
+  averaged 11.62 FPS over presents 3,200–6,200 and peaked at 12,511 MiB.
+  After the multisample-state and page-table changes the same route averaged
+  12.00 FPS and peaked at 12,258 MiB. The renderer allocated 1,397 page-table
+  buffers across the run, down from 1,592. The opening forest averaged
+  25.6 and 26.3 FPS respectively over presents 10,400–10,500. These runs
+  reached the same saved room and exited at the intended stops.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
