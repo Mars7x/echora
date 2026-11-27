@@ -209,6 +209,17 @@ const SPIN_BACKOFF_INSTRUCTIONS: u64 = 200_000;
 /// Polls at least this dense (one per this many instructions) mark a spin.
 const SPIN_DENSITY_INSTRUCTIONS: u64 = 64;
 
+#[derive(Default, Serialize)]
+struct ProcessorQueryProfile {
+    queries: u64,
+    requested_preemptions: u64,
+    switched_threads: u64,
+    switches_without_request: u64,
+    parked_worker: u64,
+    machine_lock_wait_ns: u64,
+    machine_lock_held_ns: u64,
+}
+
 pub struct Machine {
     /// CPU, memory and per-instruction accounting used by generated code.
     pub core: Core,
@@ -364,6 +375,9 @@ pub struct Machine {
     nvn_lock_stats: [u64; 2],
     /// Microseconds each guest thread's NVN calls waited for that lock.
     nvn_thread_wait: BTreeMap<u64, u64>,
+    /// ECHORA_PROFILE_CORE_QUERY: scheduling at GetCurrentProcessorNumber
+    /// boundaries, attributed to the guest thread that made the query.
+    processor_queries: Option<BTreeMap<u64, ProcessorQueryProfile>>,
     /// Parallel runs: host microseconds per guest thread running guest
     /// code, waiting for the machine lock and holding it (for finding the
     /// thread that bounds the frame rate).
@@ -472,6 +486,9 @@ impl Machine {
             recorded_nvn_calls: 0,
             nvn_lock_stats: [0; 2],
             nvn_thread_wait: BTreeMap::new(),
+            processor_queries: crate::nvn::debug_var_os("ECHORA_PROFILE_CORE_QUERY")
+                .is_some()
+                .then(BTreeMap::new),
             thread_time: BTreeMap::new(),
             profile_instructions: BTreeMap::new(),
             stop_check_tick: 0,
@@ -3177,6 +3194,9 @@ impl Machine {
                     self.recorded_nvn_calls = 0;
                     self.nvn_lock_stats = [0; 2];
                     self.nvn_thread_wait.clear();
+                    if let Some(queries) = &mut self.processor_queries {
+                        queries.clear();
+                    }
                     self.boundary_kinds.fill(0);
                     self.boundary_held.fill(0);
                     self.thread_time.clear();
@@ -4766,6 +4786,9 @@ impl Machine {
             "pending_mutex_wait":self.pending_mutex_wait,
             "pending_synchronization_wait":self.pending_synchronization_wait,
         });
+        if let Some(queries) = &self.processor_queries {
+            model["scheduler"]["processor_queries"] = serde_json::json!(queries);
+        }
         model
     }
 
@@ -5510,6 +5533,8 @@ impl Worker {
                     time[1] += (held - waited).as_micros() as u64;
                 }
                 let kind = boundary_kind(&result);
+                let query_preemption = (kind == 0x10 && machine.processor_queries.is_some())
+                    .then(|| self.core.preempt.load(Ordering::Relaxed));
                 let yielded =
                     kind == 0x0b && (-2..=QUIET_SLEEP_NS).contains(&(self.core.cpu.regs[0] as i64));
                 let sleep_ns = self.core.cpu.regs[0] as i64;
@@ -5544,6 +5569,21 @@ impl Worker {
                     machine.boundary(result)
                 };
                 let finished = std::time::Instant::now();
+                let next_thread = machine.core.current_thread_id;
+                if let (Some(requested), Some(queries)) =
+                    (query_preemption, machine.processor_queries.as_mut())
+                {
+                    let switched = outcome.is_ok() && next_thread != thread;
+                    let parked = matches!(outcome, Err(Trap::NoRunnableThreads { .. }));
+                    let query = queries.entry(thread).or_default();
+                    query.queries += 1;
+                    query.requested_preemptions += u64::from(requested);
+                    query.switched_threads += u64::from(switched);
+                    query.switches_without_request += u64::from(switched && !requested);
+                    query.parked_worker += u64::from(parked);
+                    query.machine_lock_wait_ns += (held - waited).as_nanos() as u64;
+                    query.machine_lock_held_ns += (finished - held).as_nanos() as u64;
+                }
                 let held_us = (finished - held).as_micros() as u64;
                 machine.lock_stats[2] += held_us;
                 machine.thread_time.entry(thread).or_default()[2] += held_us;
@@ -6266,6 +6306,66 @@ mod tests {
             priority,
             core,
         ]);
+    }
+
+    #[test]
+    fn processor_queries_preserve_equal_priority_handoffs_and_report_the_request_flag() {
+        for profile in [false, true] {
+            let mut m = thread_machine();
+            m.layout.workers = 2;
+            m.processor_queries = profile.then(BTreeMap::new);
+            m.core.max_steps = 100;
+            m.memory
+                .map(0x1000, PAGE_SIZE, READ | EXECUTE, STATE_CODE, "guest code")
+                .unwrap();
+            let main_id = m.layout.main_thread_id;
+            let priority = u64::from(m.layout.main_thread_priority);
+            create_thread_args(&mut m, priority, 0);
+            m.core.cpu.regs[1] = 0x1100;
+            m.svc(8).unwrap();
+            let handle = m.core.cpu.regs[1] as u32;
+            let child_id = m.thread_id_for_handle(handle).unwrap();
+            m.core.cpu.regs[0] = u64::from(handle);
+            m.svc(9).unwrap();
+
+            let result = m.run_generated(|core| match core.cpu.pc {
+                0x1000 => Err(Trap::SupervisorCall { number: 0x10 }),
+                0x1100 => {
+                    core.preempt
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Err(Trap::SupervisorCall { number: 0x10 })
+                }
+                0x1004 => {
+                    assert_eq!(core.current_thread_id, main_id);
+                    assert_eq!(core.cpu.regs[0], 0);
+                    Err(Trap::Exit { code: 0 })
+                }
+                pc => panic!("unexpected guest PC {pc:#x}"),
+            });
+            assert!(matches!(result, Err(Trap::Exit { code: 0 })));
+            let queries: Vec<_> = m
+                .svc_trace
+                .iter()
+                .filter(|event| event.number == 0x10)
+                .map(|event| (event.thread_id, event.pc))
+                .collect();
+            assert_eq!(queries, [(main_id, 0x1000), (child_id, 0x1100)]);
+            let report = m.thread_model_report();
+            let counts = report["scheduler"].get("processor_queries");
+            if profile {
+                let counts = counts.unwrap();
+                for (id, requested) in [(main_id, 0), (child_id, 1)] {
+                    let row = &counts[id.to_string()];
+                    assert_eq!(row["queries"], 1);
+                    assert_eq!(row["requested_preemptions"], requested);
+                    assert_eq!(row["switched_threads"], 1);
+                    assert_eq!(row["switches_without_request"], 1 - requested);
+                    assert_eq!(row["parked_worker"], 0);
+                }
+            } else {
+                assert!(counts.is_none());
+            }
+        }
     }
 
     fn mutex_test_machine() -> Machine {

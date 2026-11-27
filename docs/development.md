@@ -135,6 +135,7 @@ moving scene with image capture disabled.
 | `ECHORA_GPU_TIME=1` | Compare time covered by GPU submission intervals with wall time and CPU fence waits. Include per-phase draw recording timings in the run report. |
 | `ECHORA_GPU_TIME=items` | Also rank draw and dispatch timestamp intervals. Intervals can overlap and include waits for earlier commands. |
 | `ECHORA_PROFILE_FROM=N` | Reset runtime and GPU statistics at present N to measure a specific part of a run. |
+| `ECHORA_PROFILE_CORE_QUERY=1` | In parallel runs, report each guest thread’s GetCurrentProcessorNumber calls, preemption requests pending at entry, scheduler handoffs, worker parks and machine-lock time in nanoseconds under `thread_model.scheduler.processor_queries`. `ECHORA_PROFILE_FROM` restarts these counts. |
 | `ECHORA_HOST_PROFILE=file` | Sample the host instruction pointer of every runtime thread and write the samples with the process's memory map, for offline symbolization (no `perf` needed). |
 | `ECHORA_PC_STACKS=LO-HI` | Record the guest return chain of samples whose PC is in that range (`pc_stacks` in the report). |
 | `ECHORA_PC_SAMPLES_FROM=N` | Sample guest PCs only from presented frame N on. |
