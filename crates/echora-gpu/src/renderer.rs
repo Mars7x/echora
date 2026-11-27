@@ -695,10 +695,12 @@ pub struct Renderer {
     uploads: FastMap<u64, (u64, Target)>,
     /// Byte length and subresource layout for reconstructing CPU uploads.
     upload_layouts: FastMap<u64, (u64, std::sync::Arc<[crate::draw::UploadRegion]>)>,
+    /// The original source layout used to derive each dimensional alias.
+    alias_sources: FastMap<u64, crate::draw::TextureRevision>,
     /// Texel buffers made from guest buffer textures (shaders read them as
     /// samplerBuffer), by upload key: the generation copied, the buffer and
     /// its view.
-    texel_buffers: FastMap<u64, (u64, HostBuffer, vk::BufferView)>,
+    texel_buffers: FastMap<u64, (crate::draw::TextureRevision, HostBuffer, vk::BufferView)>,
     /// Debugging (ECHORA_LAST_SUBMIT / ECHORA_SLOW_SUBMITS files): what
     /// the current submission records, to find work that stalls the GPU.
     labels: Vec<String>,
@@ -1369,6 +1371,7 @@ impl Renderer {
             guest_target_keys: Vec::new(),
             uploads: FastMap::default(),
             upload_layouts: FastMap::default(),
+            alias_sources: FastMap::default(),
             texel_buffers: FastMap::default(),
             labels: Vec::new(),
             work_items: 0,
@@ -2656,8 +2659,6 @@ impl Renderer {
         // level 0 of a volume as 2D array layers.
         if let TextureSource::Upload {
             key,
-            generation,
-            width,
             height,
             shape,
             format,
@@ -2685,11 +2686,11 @@ impl Renderer {
                 _ => None,
             };
             if let Some((alias, alias_height, alias_shape)) = alias {
-                let current = self.uploads.get(&alias).is_some_and(|(uploaded, target)| {
-                    uploaded == generation
-                        && (target.width, target.height, target.format, target.shape)
-                            == (*width, alias_height, *format, alias_shape)
-                });
+                let revision = source.revision();
+                let current = self
+                    .alias_sources
+                    .get(&alias)
+                    .is_some_and(|cached| cached.matches(revision));
                 // The alias already holds this generation. The source's
                 // texels may have been released after its own upload.
                 let mut source = if current {
@@ -2711,7 +2712,9 @@ impl Renderer {
                 *key = alias;
                 *height = alias_height;
                 *shape = alias_shape;
-                if !current {
+                if current {
+                    *levels = self.upload_layouts[&alias].1.clone();
+                } else {
                     match alias_shape {
                         ImageShape::D1 { .. } => {
                             *levels = levels
@@ -2747,7 +2750,11 @@ impl Renderer {
                         _ => {}
                     }
                 }
-                return self.texture_view_with_layers(&source, texture_type, layer_range);
+                let view = self.texture_view_with_layers(&source, texture_type, layer_range)?;
+                if !current {
+                    self.alias_sources.insert(alias, revision.retained());
+                }
+                return Ok(view);
             }
         }
         // A view of some mip levels and/or array layers (cube faces) of a
@@ -3088,13 +3095,8 @@ impl Renderer {
         else {
             return Ok(());
         };
-        if let Some((uploaded, target)) = self.uploads.get(key) {
-            if uploaded == generation
-                && (target.width, target.height, target.format, target.shape)
-                    == (*width, *height, *format, *shape)
-            {
-                return Ok(());
-            }
+        if self.has_upload_source(source) {
+            return Ok(());
         }
         if generated.is_some() && (self.uploads.contains_key(key) || levels.is_empty()) {
             return Err("a generated upload needs an unused key and subresource layout".into());
@@ -3222,6 +3224,7 @@ impl Renderer {
         // changes, it can also remain available while the new image is filled.
         let mut target = if reusing {
             self.texture_epoch += 1;
+            self.alias_sources.remove(key);
             self.uploads.remove(key).expect("matching image above").1
         } else {
             self.create_shaped_image(
@@ -3375,6 +3378,7 @@ impl Renderer {
         }
         if let Some((_, previous)) = self.uploads.insert(*key, (*generation, target)) {
             self.texture_epoch += 1;
+            self.alias_sources.remove(key);
             self.slot.retired_uploads.push(previous);
         }
         self.upload_layouts
@@ -3441,6 +3445,9 @@ impl Renderer {
         let length = self
             .resident_upload_length(source)
             .ok_or_else(|| format!("upload {key:#x}: texels released and no current image"))?;
+        if length == 0 {
+            return Ok(source.clone());
+        }
         let (image, image_levels, image_layers, format) = {
             let (_, target) = &self.uploads[key];
             (
@@ -4320,7 +4327,6 @@ impl Renderer {
         }
         let crate::draw::TextureSource::Upload {
             key,
-            generation,
             format,
             texels,
             levels,
@@ -4338,15 +4344,22 @@ impl Renderer {
             ));
         }
         if let Some((cached, _, view)) = self.texel_buffers.get(key) {
-            if cached == generation {
+            if cached.matches(source.revision()) {
                 return Ok(*view);
             }
         }
-        // Released texels come back from the upload's image.
-        if texels.is_empty() {
-            let filled = self.with_texels(source)?;
-            return self.texel_buffer_view(&filled);
-        }
+        // Released texels come back from the upload's image. Use the
+        // recovered bytes directly, including when the image is empty.
+        let filled;
+        let texels = if texels.is_empty() {
+            filled = self.with_texels(source)?;
+            let crate::draw::TextureSource::Upload { texels, .. } = &filled else {
+                unreachable!("with_texels preserves an upload source");
+            };
+            texels
+        } else {
+            texels
+        };
         let start = levels.first().map_or(0, |region| region.offset as usize);
         let end = levels
             .get(1)
@@ -4358,16 +4371,18 @@ impl Renderer {
         }
         let bytes = &texels[start.min(end)..end];
         let length = bytes.len() / texel_size * texel_size;
-        let buffer = self.host_buffer(
-            length.max(texel_size) as u64,
-            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
-        )?;
+        if length == 0 {
+            return Err(format!(
+                "buffer texture {key:#x} has no complete {format:?} texel"
+            ));
+        }
+        let buffer = self.host_buffer(length as u64, vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER)?;
         buffer.write(0, &bytes[..length]);
         let info = vk::BufferViewCreateInfo::default()
             .buffer(buffer.buffer)
             .format(view_format)
             .offset(0)
-            .range(length.max(texel_size) as u64);
+            .range(length as u64);
         // SAFETY: the buffer is live; the view is destroyed with it.
         let view = match unsafe { self.device().create_buffer_view(&info, None) } {
             Ok(view) => view,
@@ -4376,8 +4391,9 @@ impl Renderer {
                 return Err(format!("vkCreateBufferView {format:?}: {error}"));
             }
         };
-        if let Some((_, old, old_view)) =
-            self.texel_buffers.insert(*key, (*generation, buffer, view))
+        if let Some((_, old, old_view)) = self
+            .texel_buffers
+            .insert(*key, (source.revision().retained(), buffer, view))
         {
             self.slot.retired_texel_buffers.push((old, old_view));
         }
@@ -8188,6 +8204,7 @@ impl Renderer {
                 self.slot.retired_uploads.push(target);
             }
             self.upload_layouts.remove(&key);
+            self.alias_sources.remove(&key);
         }
     }
 
@@ -10531,6 +10548,15 @@ mod tests {
         (regions[0].layer, regions[1].layer) = (1, 0);
         assert!(!renderer.has_upload_source(&remapped));
         assert!(renderer.has_upload_source(&source));
+        // Both an ordinary 2D-array binding and its 1D-row alias must
+        // follow the layer remap when the byte-content hash stays the same.
+        for (input, first) in [(&source, 0), (&remapped, 1), (&source, 0)] {
+            for (kind, key) in [(3, 19), (1, 19 ^ super::ROW_UPLOAD_BIT)] {
+                renderer.texture_view(input, kind).unwrap();
+                let pixel = renderer.read_upload_slice(key, 0, 0).unwrap()[0];
+                assert_eq!((pixel[0] * 255.0).round() as u8, first);
+            }
+        }
     }
 
     #[test]
@@ -11052,6 +11078,57 @@ mod tests {
         renderer.flush().unwrap();
         assert!(renderer.slot.retired_texel_buffers.is_empty());
         assert_eq!(renderer.flushes, submissions);
+    }
+
+    #[test]
+    fn buffer_view_uses_the_first_mip_of_the_current_layout() {
+        use crate::draw::{TextureSource, UploadRegion};
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let bytes = std::sync::Arc::new((0_u8..16).collect::<Vec<_>>());
+        for offset in [0, 8, 0] {
+            let source = TextureSource::Upload {
+                key: 47,
+                generation: 1,
+                width: 2,
+                height: 1,
+                shape: ImageShape::D1 { layers: 1 },
+                format: vk::Format::R32_SFLOAT,
+                texels: bytes.clone(),
+                levels: [UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 2,
+                    height: 1,
+                    depth: 1,
+                    offset,
+                }]
+                .into(),
+            };
+            renderer.texel_buffer_view(&source).unwrap();
+            let offset = offset as usize;
+            assert_eq!(
+                renderer.texel_buffers[&47].1.read_bytes(8),
+                bytes[offset..offset + 8]
+            );
+        }
+        let incomplete = TextureSource::Upload {
+            key: 47,
+            generation: 2,
+            width: 1,
+            height: 1,
+            shape: ImageShape::D1 { layers: 1 },
+            format: vk::Format::R32_SFLOAT,
+            texels: std::sync::Arc::new(vec![1, 2]),
+            levels: Default::default(),
+        };
+        assert!(
+            renderer
+                .texel_buffer_view(&incomplete)
+                .unwrap_err()
+                .contains("no complete")
+        );
     }
 
     #[test]

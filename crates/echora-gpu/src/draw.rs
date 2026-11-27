@@ -50,7 +50,7 @@ pub struct Program {
 /// generation is unchanged).
 struct TextureMemo {
     epoch: u64,
-    upload: UploadIdentity,
+    upload: TextureRevision,
     sampler: Sampler,
     info: vk::DescriptorImageInfo,
 }
@@ -347,10 +347,10 @@ pub enum TextureSource {
     },
 }
 
-pub(crate) type UploadIdentity = (u64, u64, u32, u32, ImageShape, vk::Format);
+type UploadIdentity = (u64, u64, u32, u32, ImageShape, vk::Format);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TextureIdentity {
+enum TextureIdentity {
     Null,
     Target(u64),
     TargetView {
@@ -363,11 +363,34 @@ pub(crate) enum TextureIdentity {
     Upload(UploadIdentity),
 }
 
+/// Cache the subresource layout alongside the image revision. Reading a
+/// binding borrows the layout; only a newly cached binding increments its Arc.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextureRevision<L = Arc<[UploadRegion]>> {
+    image: TextureIdentity,
+    levels: Option<L>,
+}
+
+impl TextureRevision<&Arc<[UploadRegion]>> {
+    pub(crate) fn retained(self) -> TextureRevision {
+        TextureRevision {
+            image: self.image,
+            levels: self.levels.cloned(),
+        }
+    }
+}
+
+impl TextureRevision {
+    pub(crate) fn matches(&self, revision: TextureRevision<&Arc<[UploadRegion]>>) -> bool {
+        self.image == revision.image && self.levels.as_ref() == revision.levels
+    }
+}
+
 impl TextureSource {
     /// The image revision or subresource a descriptor names, without its
     /// CPU-side upload bytes.
-    pub(crate) fn identity(&self) -> TextureIdentity {
-        match *self {
+    pub(crate) fn revision(&self) -> TextureRevision<&Arc<[UploadRegion]>> {
+        let image = match *self {
             Self::Null => TextureIdentity::Null,
             Self::Target(key) => TextureIdentity::Target(key),
             Self::TargetView {
@@ -392,18 +415,20 @@ impl TextureSource {
                 format,
                 ..
             } => TextureIdentity::Upload((key, generation, width, height, shape, format)),
-        }
+        };
+        let levels = match self {
+            Self::Upload { levels, .. } => Some(levels),
+            _ => None,
+        };
+        TextureRevision { image, levels }
     }
 
-    pub(crate) fn upload_identity(&self) -> Option<UploadIdentity> {
-        match self.identity() {
-            TextureIdentity::Upload(upload) => Some(upload),
-            _ => None,
-        }
+    pub(crate) fn upload_revision(&self) -> Option<TextureRevision<&Arc<[UploadRegion]>>> {
+        matches!(self, Self::Upload { .. }).then(|| self.revision())
     }
 
     pub(crate) fn same_as(&self, other: &Self) -> bool {
-        self.identity() == other.identity()
+        self.revision() == other.revision()
     }
 }
 
@@ -1288,14 +1313,14 @@ impl Renderer {
                             ));
                         };
                         let slot = scratch.textures.len();
-                        let upload = source.upload_identity();
+                        let upload = source.upload_revision();
                         let memoized = upload.and_then(|upload| {
                             let memo = program.texture_memo.lock().unwrap();
                             memo.get(slot)?
                                 .as_ref()
                                 .filter(|memo| {
                                     memo.epoch == self.texture_epoch
-                                        && memo.upload == upload
+                                        && memo.upload.matches(upload)
                                         && memo.sampler == *sampler
                                 })
                                 .map(|memo| memo.info)
@@ -1324,7 +1349,7 @@ impl Renderer {
                                     }
                                     memo[slot] = Some(TextureMemo {
                                         epoch: self.texture_epoch,
-                                        upload,
+                                        upload: upload.retained(),
                                         sampler: *sampler,
                                         info,
                                     });
