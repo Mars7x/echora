@@ -309,6 +309,28 @@ struct VertexTraceReport {
     texture_counts: Vec<[u32; 16]>,
 }
 
+#[derive(Clone, Copy)]
+enum PixelWatchTarget {
+    Key(u64),
+    Storage(u64),
+}
+
+impl PixelWatchTarget {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().strip_prefix('@') {
+            Some(hex) => u64::from_str_radix(hex, 16).ok().map(Self::Storage),
+            None => u64::from_str_radix(text.trim(), 16).ok().map(Self::Key),
+        }
+    }
+
+    fn matches(self, target: u64, storage: Option<u64>) -> bool {
+        match self {
+            Self::Key(key) => target == key,
+            Self::Storage(address) => storage == Some(address),
+        }
+    }
+}
+
 impl VertexTraceReport {
     fn begin_report(&mut self, present: u64, records: usize) -> Option<u64> {
         let previous = (!self.texture_counts.is_empty()).then_some(self.reported);
@@ -388,7 +410,7 @@ pub struct Backend {
     /// Draws probed (ECHORA_GPU_PROBE).
     probed: u32,
     /// The watched pixel's last value in each watched target (ECHORA_GPU_PIXEL_WATCH).
-    watched_pixel: HashMap<u64, [f32; 4]>,
+    watched_pixel: HashMap<(u64, u32, u32), [f32; 4]>,
     /// The window swapchain (ECHORA_WINDOW), once created; None after a
     /// failure, which is noted and not retried.
     presenter: Option<Result<Presenter, ()>>,
@@ -11843,17 +11865,9 @@ impl Nvn {
                 .get(bind_key("BindVertexBuffer", None, index as u64))
             {
                 Some(bind) if bind.x[3] > skip => {
-                    let divisor = props.divisor;
-                    let reach = if stride == 0 {
-                        element.min(bind.x[3])
-                    } else if divisor != 0 {
-                        // Per-instance data: the instances drawn.
-                        let elements = (u64::from(first_instance) + u64::from(instances.max(1)))
-                            .div_ceil(divisor);
-                        (elements * stride).min(bind.x[3])
-                    } else {
-                        (vertex_end * stride).min(bind.x[3])
-                    };
+                    let reach = props
+                        .byte_end(vertex_end, first_instance, instances, element)
+                        .min(bind.x[3]);
                     let (address, size) = (bind.x[2] + skip, reach.saturating_sub(skip));
                     let guest = self.gpu_to_guest(address, size)?;
                     self.resolve_draw_input_of(core, "vertices", guest, size)?;
@@ -12939,7 +12953,7 @@ impl Nvn {
                 ));
             }
         }
-        // ECHORA_GPU_PIXEL_WATCH=<first>:<end>:<target key>[+<key>...]:<x>,<y>:
+        // ECHORA_GPU_PIXEL_WATCH=<first>:<end>:<key or @storage>[+...]:<x>,<y>:
         // Watch one present, or every 60th present in a longer range. Each draw
         // that changes the watched pixel records its program, instances and
         // the new value. Multiple targets follow a pixel through successive passes.
@@ -12947,28 +12961,36 @@ impl Nvn {
             let fields: Vec<&str> = watch.split([':', ',']).collect();
             if let [first, end, targets, x, y] = fields[..] {
                 let (first, end) = (first.parse::<u64>(), end.parse::<u64>());
-                let targets: Result<Vec<u64>, _> = targets
-                    .split('+')
-                    .map(|target| u64::from_str_radix(target, 16))
-                    .collect();
+                let targets: Option<Vec<_>> =
+                    targets.split('+').map(PixelWatchTarget::parse).collect();
                 let (x, y) = (x.parse::<u32>(), y.parse::<u32>());
-                if let (Ok(first), Ok(end), Ok(targets), Ok(x), Ok(y)) = (first, end, targets, x, y)
+                if let (Ok(first), Ok(end), Some(targets), Ok(x), Ok(y)) =
+                    (first, end, targets, x, y)
                 {
                     let present = self.presented_frames;
-                    let watched = targets
-                        .into_iter()
-                        .filter(|target| colors_written.contains(target));
                     if (first..end).contains(&present)
                         && (end - first == 1 || present.is_multiple_of(60))
                     {
-                        for target in watched {
-                            let Some(value) = backend.renderer.read_target_pixel(target, x, y)?
+                        for (&target, &(level, layer)) in colors_written.iter().zip(&color_places) {
+                            let storage = self.texture_storage(target);
+                            if !targets
+                                .iter()
+                                .any(|selector| selector.matches(target, storage))
+                            {
+                                continue;
+                            }
+                            let backend = self.gpu.as_mut().unwrap();
+                            let Some(value) = backend
+                                .renderer
+                                .read_target_plane_pixel(target, level, layer, x, y)?
                             else {
                                 continue;
                             };
-                            if backend.watched_pixel.insert(target, value) != Some(value) {
+                            if backend.watched_pixel.insert((target, level, layer), value)
+                                != Some(value)
+                            {
                                 let line = format!(
-                                    "pixel watch present {present} {target:x} ({x},{y}) after {:016x}/{:016x} count {} instances {}: {value:?}",
+                                    "pixel watch present {present} {target:x} ({x},{y}) after {:016x}/{:016x} count {} instances {}: {value:?} level {level} layer {layer} storage {storage:x?}",
                                     keys.0, keys.1, draw_count, draw_instances
                                 );
                                 backend.note(line);
@@ -13784,6 +13806,64 @@ pub(super) struct ParsedAttribute {
 pub(super) struct ParsedStream {
     stride: u64,
     divisor: u64,
+}
+
+impl ParsedStream {
+    /// Exclusive byte end of the last attribute fetched from this binding.
+    fn byte_end(
+        self,
+        vertex_end: u64,
+        first_instance: u32,
+        instances: u32,
+        attribute_end: u64,
+    ) -> u64 {
+        if instances == 0 {
+            return 0;
+        }
+        let last = match u64::from(instances - 1).checked_div(self.divisor) {
+            // The hardware adds the base instance after dividing the draw-relative index.
+            Some(step) => u64::from(first_instance) + step,
+            None => match vertex_end.checked_sub(1) {
+                Some(vertex) => vertex,
+                None => return 0,
+            },
+        };
+        last.saturating_mul(self.stride)
+            .saturating_add(attribute_end)
+    }
+}
+
+#[cfg(test)]
+mod vertex_stream_range_tests {
+    use super::ParsedStream;
+
+    #[test]
+    fn instance_divisor_advances_from_the_first_instance() {
+        let stream = ParsedStream {
+            stride: 16,
+            divisor: 3,
+        };
+        // Four instances starting at seven fetch elements 7, 7, 7 and 8.
+        assert_eq!(stream.byte_end(100, 7, 4, 12), 8 * 16 + 12);
+    }
+
+    #[test]
+    fn vertex_range_includes_attributes_that_cross_a_stride() {
+        let stream = ParsedStream {
+            stride: 8,
+            divisor: 0,
+        };
+        assert_eq!(stream.byte_end(4, 0, 1, 20), 3 * 8 + 20);
+        assert_eq!(stream.byte_end(0, 0, 1, 20), 0);
+        assert_eq!(
+            ParsedStream {
+                stride: 0,
+                ..stream
+            }
+            .byte_end(4, 0, 1, 20),
+            20
+        );
+    }
 }
 
 /// The vertex attribute and stream snapshots' props a draw reads.
@@ -18465,7 +18545,21 @@ const ARCHIVES_PER_SUBMIT: usize = 6;
 
 #[cfg(test)]
 mod vertex_trace_report_tests {
-    use super::VertexTraceReport;
+    use super::{PixelWatchTarget, VertexTraceReport};
+
+    #[test]
+    fn pixel_watch_distinguishes_texture_keys_and_storage_addresses() {
+        let targets: Vec<_> = "12+@ab"
+            .split('+')
+            .map(|s| PixelWatchTarget::parse(s).unwrap())
+            .collect();
+        assert!(targets[0].matches(0x12, None));
+        assert!(!targets[0].matches(0xab, Some(0x12)));
+        assert!(targets[1].matches(0x34, Some(0xab)));
+        assert!(targets[1].matches(0x56, Some(0xab)));
+        assert!(!targets[1].matches(0xab, None));
+        assert!(PixelWatchTarget::parse("@").is_none());
+    }
 
     #[test]
     fn reports_texture_execution_changes_since_each_observation() {

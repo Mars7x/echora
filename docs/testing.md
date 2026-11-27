@@ -42,7 +42,8 @@ checks need the game and are not part of CI.
 
 To trace a color difference, choose a pixel in guest render-target coordinates
 and set `ECHORA_GPU_PIXEL_WATCH=first:end:key:x,y`. Use a hexadecimal target
-key, or join several same-size target keys with `+`. The watch records draws
+key or `@storage` with a hexadecimal guest storage address. Join several
+same-size targets with `+`. The watch reads the bound mip and layer and records draws
 that change the pixel. Use `end = first + 1` to inspect one present. Longer
 ranges sample multiples of 60 and exclude the end. When the game renders at a
 different scale, the watch uses the same nearest-filter conversion as a full
@@ -52,6 +53,12 @@ Set `ECHORA_DRAW_LOG` to a JSONL path and `ECHORA_DRAW_LOG_FROM` to the
 first present to log. Indexed instanced draws include the first instance and
 instance count as the final two elements of `args`. Older captures recorded
 only the first five arguments, so their instance ranges are unknown.
+
+The vertex stream range tests cover the fixed-function input path. One draw
+starts at instance 7 with a divisor of 3, so its first four instances use
+stream elements 7, 7, 7 and 8. A second draw has an attribute that extends
+beyond one stride. Both tests check the exclusive end of the bytes supplied
+to Vulkan. [Vulkan vertex input address calculation](https://docs.vulkan.org/spec/latest/chapters/fxvertex.html#fxvertex-input-extraction)
 
 ## Differential and semantic tests
 

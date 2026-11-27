@@ -69,8 +69,11 @@ What doesn't work yet:
   the graphics driver sometimes crashes, and memory use keeps growing after
   that point. The renderer now retires finalized uploads, releases shared
   image archives after their last use, and preserves untouched blocks when
-  drawing or clearing part of a compressed texture. The long-run impact
-  still needs measurement.
+  drawing or clearing part of a compressed texture. Large packed color
+  textures can upload in bands through the existing staging ring. This
+  path avoids a separate staging allocation for the 192 MiB texture seen
+  in the early forest. The change in peak memory during gameplay still
+  needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
   about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.

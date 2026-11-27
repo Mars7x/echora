@@ -1194,6 +1194,49 @@ fn upload_copies(
     })
 }
 
+/// Split tightly packed 2D color planes into ring-sized bands. Each tuple
+/// retains the destination row as well as the source region's byte offset.
+fn split_large_upload_rows(
+    regions: &mut Vec<(crate::draw::UploadRegion, u32)>,
+    size: u64,
+    format: vk::Format,
+) {
+    let texel_bytes = u64::from(format_bytes(format));
+    if !texel_bytes.is_power_of_two() {
+        return;
+    }
+    for index in (0..regions.len()).rev() {
+        let (region, _) = regions[index];
+        let end = regions.get(index + 1).map_or(size, |(next, _)| next.offset);
+        let row_bytes = u64::from(region.width) * texel_bytes;
+        if region.depth != 1
+            || row_bytes == 0
+            || end.saturating_sub(region.offset) <= RING_SIZE
+            || row_bytes.checked_mul(u64::from(region.height)) != end.checked_sub(region.offset)
+        {
+            continue;
+        }
+        // Preserve the 16-byte staging alignment of subsequent region offsets.
+        let rows_per_band = ((RING_SIZE / row_bytes) & !15) as u32;
+        if rows_per_band == 0 {
+            continue;
+        }
+        regions.splice(
+            index..=index,
+            (0..region.height).step_by(rows_per_band as usize).map(|y| {
+                (
+                    crate::draw::UploadRegion {
+                        height: rows_per_band.min(region.height - y),
+                        offset: region.offset + u64::from(y) * row_bytes,
+                        ..region
+                    },
+                    y,
+                )
+            }),
+        );
+    }
+}
+
 impl Renderer {
     pub fn new(gpu: Gpu) -> Result<Self, String> {
         let gpu = std::sync::Arc::new(gpu);
@@ -2964,24 +3007,29 @@ impl Renderer {
         }
         // Each region's bytes: up to the next region's offset, the last to
         // the end.
-        let mut by_offset: Vec<&crate::draw::UploadRegion> = levels.iter().collect();
-        by_offset.sort_by_key(|region| region.offset);
+        let mut by_offset: Vec<_> = levels.iter().map(|region| (*region, 0)).collect();
+        by_offset.sort_by_key(|(region, _)| region.offset);
+        if generated.is_none() && size as u64 > RING_SIZE {
+            split_large_upload_rows(&mut by_offset, size as u64, *format);
+        }
         if generated.is_some()
-            && (by_offset.first().is_none_or(|region| region.offset != 0)
+            && (by_offset
+                .first()
+                .is_none_or(|(region, _)| region.offset != 0)
                 || by_offset
                     .last()
-                    .is_none_or(|region| region.offset >= size as u64)
+                    .is_none_or(|(region, _)| region.offset >= size as u64)
                 || by_offset
                     .windows(2)
-                    .any(|pair| pair[0].offset == pair[1].offset))
+                    .any(|pair| pair[0].0.offset == pair[1].0.offset))
         {
             return Err("invalid offsets for generated texture upload".into());
         }
         let region_bytes = |index: usize| {
             by_offset
                 .get(index + 1)
-                .map_or(size as u64, |next| next.offset)
-                - by_offset[index].offset
+                .map_or(size as u64, |(next, _)| next.offset)
+                - by_offset[index].0.offset
         };
         // An upload larger than the ring (a big ASTC array decoded to
         // RGBA8) whose regions each fit goes through the ring a batch of
@@ -3070,10 +3118,18 @@ impl Renderer {
         };
         // Levels the image cannot hold (create_shaped_image clamps) are
         // not copied.
-        let copies: Vec<vk::BufferImageCopy> = levels
+        let copies: Vec<vk::BufferImageCopy> = by_offset
             .iter()
-            .filter(|region| region.level < target.levels && region.layer < shape.layers())
-            .flat_map(|region| upload_copies(region, *format, offset))
+            .filter(|(region, _)| region.level < target.levels && region.layer < shape.layers())
+            .flat_map(|(region, y)| {
+                upload_copies(region, *format, offset).map(|copy| vk::BufferImageCopy {
+                    image_offset: vk::Offset3D {
+                        y: *y as i32,
+                        ..Default::default()
+                    },
+                    ..copy
+                })
+            })
             .collect();
         // SAFETY: recording; the image and ring are live.
         unsafe {
@@ -3116,7 +3172,7 @@ impl Renderer {
                         bytes += region_bytes(end);
                         end += 1;
                     }
-                    let first = by_offset[start].offset;
+                    let first = by_offset[start].0.offset;
                     let (ring, at) = if let Some(generated) = generated.as_mut() {
                         self.ring_upload_with(bytes, 16, |output| (generated.fill)(first, output))?
                     } else {
@@ -7899,7 +7955,19 @@ impl Renderer {
         x: u32,
         y: u32,
     ) -> Result<Option<[f32; 4]>, String> {
-        self.read_level(key, 0, false, 0, Some([x, y]))
+        self.read_target_plane_pixel(key, 0, 0, x, y)
+    }
+
+    /// One guest-resolution texel from the selected mip and layer or volume slice.
+    pub fn read_target_plane_pixel(
+        &mut self,
+        key: u64,
+        level: u32,
+        slice: u32,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<[f32; 4]>, String> {
+        self.read_level(key, level, false, slice, Some([x, y]))
             .map(|(texels, ..)| texels.first().copied())
     }
 
@@ -8939,6 +9007,48 @@ mod tests {
     }
 
     #[test]
+    fn watched_pixel_reads_the_bound_mip_and_layer() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer
+            .shaped_target(
+                1,
+                8,
+                4,
+                crate::draw::ImageShape::D2 { layers: 2 },
+                vk::Format::R8G8B8A8_UNORM,
+                2,
+            )
+            .unwrap();
+        for (level, layer, color) in [
+            (0, 1, [1.0, 0.0, 0.0, 1.0]),
+            (1, 0, [0.0, 1.0, 0.0, 1.0]),
+            (1, 1, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            renderer
+                .clear_color_level(
+                    1,
+                    level,
+                    layer,
+                    None,
+                    vk::ClearColorValue { float32: color },
+                )
+                .unwrap();
+        }
+        let expected = renderer.read_target_slice(1, 1, 1).unwrap();
+        assert_eq!(expected[7], [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            renderer.read_target_plane_pixel(1, 1, 1, 3, 1).unwrap(),
+            Some(expected[7])
+        );
+        assert_eq!(
+            renderer.read_target_plane_pixel(1, 1, 1, 4, 1).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn reads_an_upload_before_separate_submission() {
         use crate::draw::{ImageShape, TextureSource, UploadRegion};
 
@@ -9859,6 +9969,60 @@ mod tests {
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (1, 1));
             assert_eq!((range.base_array_layer, range.layer_count), selected);
+        }
+    }
+
+    #[test]
+    fn oversized_color_mip_uses_the_ring_and_preserves_its_rows() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let (width, height) = (4096, 4097);
+        let mip_offset = (width * height * 4) as usize;
+        let mip_bytes = ((width / 2) * (height / 2) * 4) as usize;
+        let mut bytes = vec![0; mip_offset + mip_bytes];
+        let colors = [[15, 31, 63, 127], [3, 5, 7, 9], [19, 23, 27, 33]];
+        let locations = [(0, 3, 4095), (0, 5, 4096), (1, 7, 0)];
+        for ((level, x, y), color) in locations.into_iter().zip(colors) {
+            let start = if level == 0 { 0 } else { mip_offset };
+            let offset = start + ((y * (width >> level) + x) * 4) as usize;
+            bytes[offset..offset + 4].copy_from_slice(&color);
+        }
+        let source = TextureSource::Upload {
+            key: 7,
+            generation: 1,
+            width,
+            height,
+            shape: ImageShape::D2 { layers: 1 },
+            format: vk::Format::R8G8B8A8_UNORM,
+            texels: std::sync::Arc::new(bytes),
+            levels: [0, 1]
+                .map(|level| UploadRegion {
+                    level,
+                    layer: 0,
+                    width: width >> level,
+                    height: height >> level,
+                    depth: 1,
+                    offset: if level == 0 { 0 } else { mip_offset as u64 },
+                })
+                .into(),
+        };
+        renderer.texture_view_for(&source).unwrap();
+        assert!(
+            renderer.slot.retired_texel_buffers.is_empty(),
+            "dedicated staging buffer retained"
+        );
+        let (_, target) = renderer.uploads.remove(&7).unwrap();
+        renderer.insert_target(7, target);
+        for ((level, x, y), color) in locations.into_iter().zip(colors) {
+            assert_eq!(
+                renderer
+                    .read_target_plane_bytes(7, level, 0, 4, [x, y, 1, 1])
+                    .unwrap(),
+                color
+            );
         }
     }
 
