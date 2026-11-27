@@ -9,10 +9,12 @@
 //! out of range). It also gives every invocation's final variables, which
 //! the tests use as the registers.
 //!
-//! Invocations run one at a time until each reaches a barrier or a
-//! subgroup operation; a subgroup operation completes when every running
-//! invocation of its subgroup is at it, a barrier when every running
-//! invocation of its scope is. Global memory is the dumped regions of
+//! Invocations that share workgroup memory advance one instruction per
+//! round. Other invocations can run through to the next collective. A
+//! subgroup operation completes when every running invocation of its
+//! subgroup is at it, a barrier when every running invocation of its
+//! scope is. Programs with unsynchronized accesses can depend on the
+//! chosen instruction order. Global memory is the dumped regions of
 //! device memory, addressed through physical pointers as the program
 //! computes them (its page table is in those regions too).
 
@@ -2213,31 +2215,43 @@ impl Machine {
             })
             .collect();
         let mut barriers = Vec::new();
+        let interleave = count > 1
+            && self.globals.iter().any(|&(_, _, class)| {
+                matches!(
+                    class,
+                    storage::WORKGROUP | storage::TASK_PAYLOAD_WORKGROUP_EXT
+                ) || (class == storage::OUTPUT && self.model == execution::MESH_EXT)
+            });
         loop {
-            for invocation in invocations.iter_mut() {
-                if !invocation.done {
-                    self.advance(invocation, &mut shared);
+            let mut progress = false;
+            for invocation in invocations.iter_mut().filter(|lane| !lane.done) {
+                if interleave {
+                    if Self::collective(self.body[invocation.at].opcode) {
+                        continue;
+                    }
+                    progress = true;
                 }
+                self.advance(invocation, &mut shared, interleave);
             }
             if invocations.iter().all(|invocation| invocation.done) {
                 break;
             }
-            let mut progress = false;
             // Subgroup operations: every running invocation of the
             // subgroup at the same one.
             for first in (0..count).step_by(subgroup) {
-                let members: Vec<usize> = (first..(first + subgroup).min(count))
-                    .filter(|&n| !invocations[n].done)
-                    .collect();
-                let Some(&lead) = members.first() else {
+                let mut members =
+                    (first..(first + subgroup).min(count)).filter(|&n| !invocations[n].done);
+                let Some(lead) = members.next() else {
                     continue;
                 };
                 let at = invocations[lead].at;
                 if self.body[at].opcode == op::CONTROL_BARRIER
-                    || members.iter().any(|&n| invocations[n].at != at)
+                    || !Self::collective(self.body[at].opcode)
+                    || members.clone().any(|n| invocations[n].at != at)
                 {
                     continue;
                 }
+                let members: Vec<_> = std::iter::once(lead).chain(members).collect();
                 self.subgroup_operation(&mut invocations, first, &members, &mut shared);
                 progress = true;
             }
@@ -2250,19 +2264,18 @@ impl Machine {
                 self.constants.get(&scope_id).map_or(2, |value| value[0])
             };
             for first in (0..count).step_by(subgroup) {
-                let members: Vec<usize> = (first..(first + subgroup).min(count))
-                    .filter(|&n| !invocations[n].done)
-                    .collect();
-                let Some(&lead) = members.first() else {
+                let end = (first + subgroup).min(count);
+                let mut members = (first..end).filter(|&n| !invocations[n].done);
+                let Some(lead) = members.next() else {
                     continue;
                 };
                 let at = invocations[lead].at;
                 if self.body[at].opcode == op::CONTROL_BARRIER
                     && scope_of(at) == 3
-                    && members.iter().all(|&n| invocations[n].at == at)
+                    && members.all(|n| invocations[n].at == at)
                 {
-                    for &n in &members {
-                        invocations[n].at += 1;
+                    for lane in invocations[first..end].iter_mut().filter(|lane| !lane.done) {
+                        lane.at += 1;
                     }
                     progress = true;
                 }
@@ -3296,10 +3309,14 @@ impl Machine {
         pointer
     }
 
-    /// Runs `invocation` until it ends or reaches a barrier or subgroup
-    /// operation (left at it).
-    fn advance(&self, invocation: &mut Invocation, shared: &mut Shared) {
+    /// Runs one ordinary instruction when interleaving, otherwise runs
+    /// until the invocation ends or reaches a collective.
+    fn advance(&self, invocation: &mut Invocation, shared: &mut Shared, interleave: bool) {
+        let start = invocation.steps;
         loop {
+            if interleave && invocation.steps != start {
+                return;
+            }
             invocation.steps += 1;
             if invocation.steps > 1 << 28 {
                 shared.problem("an invocation ran 2^28 instructions".to_string());
@@ -5263,6 +5280,43 @@ mod tests {
         assert!(barriers.iter().all(|&(_, running)| running == 32));
         assert_eq!(registers[31][&2], 2);
         assert_eq!(registers[32][&2], 0);
+    }
+
+    #[test]
+    fn shared_memory_replay_interleaves_lanes_at_each_instruction() {
+        // Four lanes write their lane numbers plus 100 and then read from
+        // their partner. On the simulator's instruction-interleaved
+        // schedule, every store runs before the first load.
+        let lane = word(&[(0, 12, 0x919), (16, 8, 0), (72, 8, 0x21)]);
+        let address = word(&[
+            (0, 12, 0x824),
+            (16, 8, 1),
+            (24, 8, 0),
+            (32, 32, 4),
+            (64, 8, 255),
+        ]);
+        let partner = word(&[
+            (0, 12, 0x812),
+            (16, 8, 3),
+            (24, 8, 1),
+            (32, 32, 4),
+            (64, 8, 255),
+            (72, 8, 0x3c),
+            (81, 3, 7),
+        ]);
+        let store = word(&[(0, 12, 0x388), (24, 8, 1), (32, 8, 2), (73, 3, 4)]);
+        let load = word(&[(0, 12, 0x984), (16, 8, 4), (24, 8, 3), (73, 3, 4)]);
+        let (registers, _, problems) = run_group_with_shared(
+            4,
+            Some(16),
+            &[],
+            &[lane, address, add(2, 0, 100), partner, store, load],
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            registers.iter().map(|r| r[&4]).collect::<Vec<_>>(),
+            [101, 100, 103, 102]
+        );
     }
 
     #[test]

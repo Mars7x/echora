@@ -304,6 +304,13 @@ counts the pointer's elements, as Mesa's lowering reads the extension); a
 half C and D go as A does. A simulator test checks it gives the same D
 bits as `Cooperative`, and the movie's pictures came out identical on the
 GPU.
+
+CPU replays with workgroup memory advance lanes one instruction per round
+between collectives. On 6,400 samples from a captured 1440p forest resolve,
+this reduced mean absolute RGB error against the Radeon outputs from
+7.89 to 0.17 display levels with stock sharpening and from 7.42 to 0.14
+with sharpening disabled, on an 8-bit scale. This affects offline replay.
+
 With `MatrixPath::Exact` (`Parameters::matrix_mode` `MatrixMode::Exact`)
 the subgroup path sums like the A100's tensor cores as published (Fasi,
 Higham, Mikaitis and Pranesh, 2021; Khattak and Mikaitis, 2025): each
