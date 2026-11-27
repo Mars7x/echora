@@ -220,6 +220,13 @@ struct ProcessorQueryProfile {
     machine_lock_held_ns: u64,
 }
 
+#[derive(Default, serde::Serialize)]
+struct ZstdCallProfile {
+    calls: u64,
+    input_bytes: u64,
+    elapsed_us: u64,
+}
+
 pub struct Machine {
     /// CPU, memory and per-instruction accounting used by generated code.
     pub core: Core,
@@ -378,6 +385,8 @@ pub struct Machine {
     /// ECHORA_PROFILE_CORE_QUERY: scheduling at GetCurrentProcessorNumber
     /// boundaries, attributed to the guest thread that made the query.
     processor_queries: Option<BTreeMap<u64, ProcessorQueryProfile>>,
+    /// Opt-in decoder profile by entry, guest thread, and request size.
+    zstd_profile: Option<BTreeMap<(&'static str, u64, u64), ZstdCallProfile>>,
     /// Parallel runs: host microseconds per guest thread running guest
     /// code, waiting for the machine lock and holding it (for finding the
     /// thread that bounds the frame rate).
@@ -487,6 +496,9 @@ impl Machine {
             nvn_lock_stats: [0; 2],
             nvn_thread_wait: BTreeMap::new(),
             processor_queries: crate::nvn::debug_var_os("ECHORA_PROFILE_CORE_QUERY")
+                .is_some()
+                .then(BTreeMap::new),
+            zstd_profile: crate::nvn::debug_var_os("ECHORA_PROFILE_ZSTD")
                 .is_some()
                 .then(BTreeMap::new),
             thread_time: BTreeMap::new(),
@@ -2991,6 +3003,24 @@ impl Machine {
         .min()
     }
 
+    fn note_zstd_call(
+        &mut self,
+        decoder: &'static str,
+        input: u64,
+        size: u64,
+        started: Option<std::time::Instant>,
+    ) {
+        if let Some((profile, started)) = self.zstd_profile.as_mut().zip(started) {
+            let bucket = size.checked_next_power_of_two().unwrap_or(u64::MAX);
+            let info = profile
+                .entry((decoder, self.core.current_thread_id, bucket))
+                .or_default();
+            info.calls += 1;
+            info.input_bytes = info.input_bytes.saturating_add(input);
+            info.elapsed_us += started.elapsed().as_micros() as u64;
+        }
+    }
+
     /// One high-level NVN call. Arguments are in X0..X7 (and V0..V7); the
     /// result goes to X0.
     fn call_nvn(&mut self, entry: crate::nvn::HostEntry) -> Result<(), Trap> {
@@ -3021,7 +3051,11 @@ impl Machine {
         if entry == HostEntry::ZstdFrames {
             *self.nvn.calls.entry(name).or_default() += 1;
             let r = self.core.cpu.regs;
-            self.core.cpu.regs[0] = crate::hle::zstd_decompress_frames(
+            let started = self
+                .zstd_profile
+                .as_ref()
+                .map(|_| std::time::Instant::now());
+            let decoded = crate::hle::zstd_decompress_frames(
                 &mut self.memory,
                 r[1],
                 r[2],
@@ -3030,7 +3064,9 @@ impl Machine {
                 r[5],
                 r[6],
                 r[7],
-            )?;
+            );
+            self.note_zstd_call("frames", r[4], r[2], started);
+            self.core.cpu.regs[0] = decoded?;
             return Ok(());
         }
         if entry == HostEntry::ZstdStreamCall {
@@ -3040,6 +3076,10 @@ impl Machine {
             let site = self.core.cpu.pc;
             self.core.cpu.regs[30] = site + 4;
             let regs = self.core.cpu.regs;
+            let started = self
+                .zstd_profile
+                .as_ref()
+                .map(|_| std::time::Instant::now());
             let fed = crate::hle::zstd_stream_feed(
                 &mut self.zstd_streams,
                 &mut self.memory,
@@ -3047,8 +3087,10 @@ impl Machine {
                 regs[1],
                 regs[2] as i32,
                 regs[3],
-            )?;
-            match fed {
+            );
+            let input = (regs[2] as i32).max(0) as u64;
+            self.note_zstd_call("stream", input, input, started);
+            match fed? {
                 Some(result) => {
                     *self.nvn.calls.entry(name).or_default() += 1;
                     self.core.cpu.regs[0] = u64::from(result);
@@ -3089,10 +3131,14 @@ impl Machine {
         }
         if entry == HostEntry::ZstdDecompress {
             *self.nvn.calls.entry(name).or_default() += 1;
-            let regs = &self.core.cpu.regs;
+            let regs = self.core.cpu.regs;
             let (destination, capacity, source, size, workspace, ddict) =
                 (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
-            self.core.cpu.regs[0] = crate::hle::zstd_decompress(
+            let started = self
+                .zstd_profile
+                .as_ref()
+                .map(|_| std::time::Instant::now());
+            let decoded = crate::hle::zstd_decompress(
                 &mut self.memory,
                 destination,
                 capacity,
@@ -3100,7 +3146,14 @@ impl Machine {
                 size,
                 workspace,
                 ddict,
-            )?;
+            );
+            self.note_zstd_call(
+                "wrapper",
+                size & 0xffff_ffff,
+                capacity & 0xffff_ffff,
+                started,
+            );
+            self.core.cpu.regs[0] = decoded?;
             return Ok(());
         }
         match self.nvn.calls.get_mut(&name) {
@@ -3196,6 +3249,9 @@ impl Machine {
                     self.nvn_thread_wait.clear();
                     if let Some(queries) = &mut self.processor_queries {
                         queries.clear();
+                    }
+                    if let Some(profile) = &mut self.zstd_profile {
+                        profile.clear();
                     }
                     self.boundary_kinds.fill(0);
                     self.boundary_held.fill(0);
@@ -4753,6 +4809,9 @@ impl Machine {
             "parallel_lock":{"audio_thread_frames":self.audio_thread_frames,"boundaries":self.lock_stats[0],"wait_us":self.lock_stats[1],"held_us":self.lock_stats[2],"lock_free_nvn_calls":self.lock_free_nvn_calls,"lock_free_yields":self.lock_free_yields,"recorded_nvn_calls":self.recorded_nvn_calls,"nvn_wait_us":self.nvn_lock_stats[0],"nvn_held_us":self.nvn_lock_stats[1],"nvn_thread_wait_us":self.nvn_thread_wait.iter().map(|(thread, wait)| (thread.to_string(), *wait)).collect::<BTreeMap<_, _>>()},
             "thread_window_instructions":self.thread_instructions().into_iter().map(|(thread, count)| (thread.to_string(), count - self.profile_instructions.get(&thread).copied().unwrap_or(0))).collect::<BTreeMap<_, _>>(),
             "thread_time_us":self.thread_time.iter().map(|(thread, [run, wait, held])| (thread.to_string(), serde_json::json!({"guest": run, "lock_wait": wait, "lock_held": held}))).collect::<BTreeMap<_, _>>(),
+            "zstd_profile":self.zstd_profile.as_ref().map(|profile| profile.iter().map(|(&(decoder, thread, size), stats)| {
+                serde_json::json!({"decoder": decoder, "thread": thread, "size_bucket_bytes": size, "timing": stats})
+            }).collect::<Vec<_>>()),
             "boundary_kinds":self.boundary_kinds.iter().enumerate().filter(|(_, count)| **count != 0).map(|(kind, count)| {
                 (boundary_kind_name(kind), *count)
             }).collect::<BTreeMap<_, _>>(),
@@ -6156,6 +6215,28 @@ mod tests {
             assert_eq!(machine.core.cpu.regs[8], register_value);
             assert_eq!(machine.core.cpu.regs[30], return_address);
         }
+    }
+
+    #[test]
+    fn decoder_profile_counts_host_calls_by_guest_thread_and_capacity() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+        let mut machine = Machine::new(Layout::default(), 100);
+        machine.zstd_profile = Some(BTreeMap::new());
+        machine.core.current_thread_id = 7;
+        let (source, destination) = (0x11000, 0x12000);
+        machine
+            .memory
+            .map(source, 0x2000, READ | WRITE, STATE_NORMAL, "decode")
+            .unwrap();
+        let frame = zstd::bulk::compress(b"profile", 1).unwrap();
+        machine.memory.write(source, &frame).unwrap();
+        machine.core.cpu.regs[1..5].copy_from_slice(&[destination, 73, source, frame.len() as u64]);
+        machine.call_nvn(crate::nvn::HostEntry::ZstdFrames).unwrap();
+        assert_eq!(machine.core.cpu.regs[0], 7);
+        assert!(machine.memory.equals(destination, b"profile").unwrap());
+        let stats = &machine.zstd_profile.as_ref().unwrap()[&("frames", 7, 128)];
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.input_bytes, frame.len() as u64);
     }
 
     #[test]
