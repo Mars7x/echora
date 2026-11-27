@@ -10958,27 +10958,26 @@ impl Nvn {
                 }
                 specialization.push(values);
             }
-            // ECHORA_VERTEX_TRACE_BASE=N: the program traces nothing; draws
-            // with base vertex N use a variant that does (`traced_variant`),
-            // so each program's records come from the same patch.
-            let untraced: Vec<Vec<(u32, u32)>> = specialization
-                .iter()
-                .map(|values| values.iter().map(|&(id, _)| (id, 0)).collect())
-                .collect();
-            let base_filter = super::debug_var_os("ECHORA_VERTEX_TRACE_BASE").is_some();
+            // Only draws with the selected base get vertex trace addresses. Both
+            // variants keep the program's vertex formats and other specialization.
+            let untraced = super::debug_var_os("ECHORA_VERTEX_TRACE_BASE").map(|_| {
+                stages
+                    .iter()
+                    .zip(&specialization)
+                    .map(|(stage, values)| {
+                        without_vertex_trace_addresses(&stage.spec_constants, values)
+                    })
+                    .collect::<Vec<_>>()
+            });
             if super::debug_var_os("ECHORA_SHADER_STATS").is_some() {
                 eprintln!("shader stats: draw {:016x}/{:016x}", keys.0, keys.1);
             }
             let program = backend.renderer.create_program_specialized(
                 stages.to_vec(),
-                if base_filter {
-                    &untraced
-                } else {
-                    &specialization
-                },
+                untraced.as_deref().unwrap_or(&specialization),
             )?;
             backend.programs.insert(built, program);
-            if base_filter {
+            if untraced.is_some() {
                 eprintln!(
                     "vertex trace program {:016x}/{:016x} trace constants per stage {:?}",
                     keys.0,
@@ -10986,7 +10985,7 @@ impl Nvn {
                     specialization.iter().map(Vec::len).collect::<Vec<_>>()
                 );
             }
-            if base_filter && specialization.iter().any(|values| !values.is_empty()) {
+            if untraced.is_some() && specialization.iter().any(|values| !values.is_empty()) {
                 let traced = backend
                     .renderer
                     .create_program_specialized(stages.to_vec(), &specialization)?;
@@ -14069,6 +14068,23 @@ mod vertex_stream_range_tests {
 pub(super) struct ParsedVertexState {
     attributes: Vec<ParsedAttribute>,
     streams: Vec<ParsedStream>,
+}
+
+/// Disable vertex tracing without changing another specialization in the same stage.
+fn without_vertex_trace_addresses(
+    constants: &[echora_shader_abi::SpecConstant],
+    values: &[(u32, u32)],
+) -> Vec<(u32, u32)> {
+    use echora_shader_abi::SpecMeaning::{VertexTraceHigh, VertexTraceLow};
+    let mut untraced = values.to_vec();
+    for constant in constants {
+        if matches!(constant.meaning, VertexTraceLow | VertexTraceHigh)
+            && let Some((_, value)) = untraced.iter_mut().find(|(id, _)| *id == constant.id)
+        {
+            *value = 0;
+        }
+    }
+    untraced
 }
 
 /// ECHORA_LOOP_TRACE: the `loop_traces` key of a draw program's stage
@@ -19441,6 +19457,39 @@ const ARCHIVES_PER_SUBMIT: usize = 6;
 #[cfg(test)]
 mod vertex_trace_report_tests {
     use super::{PixelWatchHistory, PixelWatchSelection, PixelWatchTarget, VertexTraceReport};
+
+    #[test]
+    fn base_filter_only_disables_the_vertex_trace_address() {
+        use echora_shader_abi::{SpecConstant, SpecMeaning::*};
+        let meanings = [
+            VertexFormat(2),
+            LoopTraceLow,
+            FragmentTracePixel,
+            VertexTraceHigh,
+            LoopTraceHigh,
+            VertexTraceLow,
+        ];
+        let constants = meanings
+            .into_iter()
+            .enumerate()
+            .map(|(i, meaning)| SpecConstant {
+                id: i as u32,
+                meaning,
+            })
+            .collect::<Vec<_>>();
+        let values = [
+            (1, 100),
+            (0, 516),
+            (5, 91),
+            (2, 0x03560578),
+            (4, 12),
+            (3, 3),
+        ];
+        assert_eq!(
+            super::without_vertex_trace_addresses(&constants, &values),
+            [(1, 100), (0, 516), (5, 0), (2, 0x03560578), (4, 12), (3, 0)]
+        );
+    }
 
     #[test]
     fn pixel_watch_distinguishes_texture_keys_and_storage_addresses() {
