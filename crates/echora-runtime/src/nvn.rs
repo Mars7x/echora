@@ -696,6 +696,8 @@ pub struct Nvn {
     /// or made again, instead of emptying the whole memo.
     #[serde(skip)]
     binding_evictions: Vec<(u64, [u64; 2])>,
+    #[serde(skip)]
+    binding_eviction_scratch: gpu::BindingEvictionScratch,
     /// Changes the binding memo cannot evict by texture (a texture made
     /// again over a live one, a window going): the memo starts empty.
     #[serde(skip)]

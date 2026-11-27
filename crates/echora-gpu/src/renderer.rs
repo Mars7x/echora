@@ -6435,9 +6435,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// The keys of targets made, remade or moved since the last call.
-    pub fn take_changed_targets(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.changed_targets)
+    /// Mark the pending target changes as consumed by binding invalidation.
+    pub fn clear_changed_targets(&mut self) {
+        self.changed_targets.clear();
     }
 
     /// Target changes that have not been consumed by binding invalidation.

@@ -43,6 +43,12 @@ pub(super) struct DrawBindings {
     storage_entries: Vec<(usize, u32, u64, u64)>,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct BindingEvictionScratch {
+    keys: super::FastSet<u64>,
+    bases: Vec<u64>,
+}
+
 /// A statistic's name, hashed and compared by its address: a static
 /// string's bytes are not read per count. The same name held at two
 /// addresses makes two counters, added together in the report.
@@ -7937,34 +7943,40 @@ impl Nvn {
     fn evict_bindings(&mut self) {
         let targets = self
             .gpu
-            .as_mut()
-            .map(|backend| {
-                let targets = backend.renderer.take_changed_targets();
-                if backend
-                    .target_index
-                    .stamp
-                    .is_some_and(|stamp| stamp != backend.renderer.target_changes)
-                {
-                    backend.target_index.changed.extend(targets.iter().copied());
-                }
-                targets
-            })
+            .as_ref()
+            .map(|backend| backend.renderer.changed_targets())
             .unwrap_or_default();
         if targets.is_empty() && self.binding_evictions.is_empty() {
             return;
         }
-        let mut keys: super::FastSet<u64> = super::FastSet::default();
-        let mut bases: super::FastSet<u64> = super::FastSet::default();
-        for key in targets {
+        let mut scratch = std::mem::take(&mut self.binding_eviction_scratch);
+        let BindingEvictionScratch { keys, bases } = &mut scratch;
+        for &key in targets {
             keys.insert(key);
             if let Some(base) = self.texture_storage(key) {
-                bases.insert(base);
+                bases.push(base);
             }
         }
-        for (texture, storages) in std::mem::take(&mut self.binding_evictions) {
+        for &(texture, storages) in &self.binding_evictions {
             keys.insert(texture);
             bases.extend(storages.into_iter().filter(|base| *base != 0));
         }
+        self.binding_evictions.clear();
+        if let Some(backend) = self.gpu.as_mut() {
+            if backend
+                .target_index
+                .stamp
+                .is_some_and(|stamp| stamp != backend.renderer.target_changes)
+            {
+                backend
+                    .target_index
+                    .changed
+                    .extend(backend.renderer.changed_targets().iter().copied());
+            }
+            backend.renderer.clear_changed_targets();
+        }
+        bases.sort_unstable();
+        bases.dedup();
         let stale = |entry: &super::ResolvedBinding| {
             let source_key = match &entry.source {
                 TextureSource::Target(key) | TextureSource::TargetView { key, .. } => Some(key),
@@ -7973,13 +7985,16 @@ impl Nvn {
             source_key.is_some_and(|key| keys.contains(&key))
                 || keys.contains(&entry.texture)
                 || entry.backing.as_ref().is_some_and(|backing| {
-                    backing
-                        .pieces()
-                        .iter()
-                        .any(|(_, range)| bases.iter().any(|base| range.contains(base)))
+                    backing.pieces().iter().any(|(_, range)| {
+                        let first = bases.partition_point(|base| *base < range.start);
+                        bases.get(first).is_some_and(|base| *base < range.end)
+                    })
                 })
         };
         self.evict_memoized_bindings(stale);
+        keys.clear();
+        bases.clear();
+        self.binding_eviction_scratch = scratch;
     }
 
     /// Drop the memoized bindings (every queue's) that `stale` selects;
@@ -18476,6 +18491,31 @@ mod pool_tests {
             present: 0,
             texture,
         }
+    }
+
+    #[test]
+    fn binding_evictions_do_not_carry_over_to_the_next_batch() {
+        let mut nvn = Nvn::default();
+        let base = 0x20_0000;
+        let binding_over = |start| {
+            memo_binding(
+                1,
+                TextureSource::Target(2),
+                Some(TextureBacking::linear(start, 4)),
+            )
+        };
+        nvn.binding_memo.1.insert(1, binding_over(base));
+        nvn.binding_memo.1.insert(2, binding_over(base - 4));
+        nvn.binding_evictions.push((9, [base, base]));
+        nvn.evict_bindings();
+        assert!(!nvn.binding_memo.1.contains_key(&1));
+        assert!(nvn.binding_memo.1.contains_key(&2));
+
+        nvn.binding_memo.1.insert(1, binding_over(base));
+        nvn.binding_evictions.push((10, [base - 4, 0]));
+        nvn.evict_bindings();
+        assert!(nvn.binding_memo.1.contains_key(&1));
+        assert!(!nvn.binding_memo.1.contains_key(&2));
     }
 
     /// A pool at guest `base` (0x1000 bytes) and a 2x1 texture over its
