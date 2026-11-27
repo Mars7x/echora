@@ -448,14 +448,15 @@ pub fn zstd_decompress(
         memory.read(content, &mut bytes)?;
         Some(bytes)
     };
-    let mut input = vec![0u8; size as usize];
-    memory.read(source, &mut input)?;
-    let mut output = Vec::with_capacity(capacity as usize);
-    match zstd_decode(&input, &mut output, dictionary.as_deref()) {
-        Ok(_) => {
-            memory.write(destination, &output)?;
-            Ok(output.len() as u64)
-        }
+    match decode_guest_zstd(
+        memory,
+        destination,
+        capacity,
+        source,
+        size,
+        dictionary.as_deref(),
+    )? {
+        Ok(written) => Ok(written as u64),
         Err(code) if code.wrapping_neg() == ZSTD_DST_SIZE_TOO_SMALL => Ok(TOO_SMALL),
         Err(_) => Ok(FAILED),
     }
@@ -514,24 +515,66 @@ pub fn zstd_decompress_frames(
     } else {
         None
     };
-    let mut input = vec![0u8; size as usize];
-    memory.read(source, &mut input)?;
-    let mut output = Vec::with_capacity(capacity as usize);
-    match zstd_decode(&input, &mut output, dictionary.as_deref()) {
-        Ok(_) => {
-            memory.write(destination, &output)?;
-            Ok(output.len() as u64)
-        }
+    match decode_guest_zstd(
+        memory,
+        destination,
+        capacity,
+        source,
+        size,
+        dictionary.as_deref(),
+    )? {
+        Ok(written) => Ok(written as u64),
         Err(code) => Ok(code as u64),
     }
+}
+
+/// Keep input and output separate from guest mappings until decoding succeeds.
+/// Reuse bounded scratch for small frames, with larger buffers released on return.
+fn decode_guest_zstd(
+    memory: &mut Memory,
+    destination: u64,
+    capacity: u64,
+    source: u64,
+    size: u64,
+    dictionary: Option<&[u8]>,
+) -> Result<Result<usize, usize>, Trap> {
+    const SCRATCH_LIMIT: u64 = 1 << 20;
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+
+    if size <= SCRATCH_LIMIT && capacity <= SCRATCH_LIMIT {
+        return SCRATCH.with_borrow_mut(|(input, output)| {
+            input.resize(input.len().max(size as usize), 0);
+            let input = &mut input[..size as usize];
+            memory.read(source, input)?;
+            output.resize(output.len().max(capacity as usize), 0);
+            let output = &mut output[..capacity as usize];
+            let decoded = zstd_decode(input, output, dictionary);
+            if let Ok(written) = decoded {
+                memory.write(destination, &output[..written])?;
+            }
+            Ok(decoded)
+        });
+    }
+
+    let mut input = vec![0; size as usize];
+    memory.read(source, &mut input)?;
+    let mut output = Vec::with_capacity(capacity as usize);
+    let decoded = zstd_decode(&input, &mut output, dictionary);
+    if decoded.is_ok() {
+        memory.write(destination, &output)?;
+    }
+    Ok(decoded)
 }
 
 /// Every frame of `input` into `output`'s capacity, through this thread's
 /// decompression context and the digested form of `dictionary` (kept for
 /// the few most recent dictionaries, by content).
-fn zstd_decode(
+fn zstd_decode<C: zstd::zstd_safe::WriteBuf + ?Sized>(
     input: &[u8],
-    output: &mut Vec<u8>,
+    output: &mut C,
     dictionary: Option<&[u8]>,
 ) -> Result<usize, usize> {
     use std::cell::RefCell;
@@ -683,8 +726,29 @@ mod tests {
         assert_eq!(&out[..text.len()], &text[..]);
         assert_eq!(&out[text.len()..], b"tail");
         // Too little room, corrupt input and a misaligned workspace.
+        memory.write(0x14000, &vec![0xa5; total as usize]).unwrap();
         let small = zstd_decompress(&mut memory, 0x14000, total - 1, 0x11000, size, 0x10000, 0);
         assert_eq!(small.unwrap(), 0xffff_fffe);
+        memory.read(0x14000, &mut out).unwrap();
+        assert!(out.iter().all(|&byte| byte == 0xa5));
+        // Larger requests use temporary buffers and only write decoded bytes.
+        let large = zstd_decompress(
+            &mut memory,
+            0x14000,
+            (1 << 20) + 1,
+            0x11000,
+            size,
+            0x10000,
+            0,
+        );
+        assert_eq!(large.unwrap(), total);
+        // The compressed input remains available until output production ends.
+        let overlapping = zstd_decompress(&mut memory, 0x11001, total, 0x11000, size, 0x10000, 0);
+        assert_eq!(overlapping.unwrap(), total);
+        memory.read(0x11001, &mut out).unwrap();
+        assert_eq!(&out[..text.len()], &text[..]);
+        assert_eq!(&out[text.len()..], b"tail");
+        memory.write(0x11000, &frames).unwrap();
         memory.write(0x11000, b"nope").unwrap();
         let corrupt = zstd_decompress(&mut memory, 0x14000, total, 0x11000, size, 0x10000, 0);
         assert_eq!(corrupt.unwrap(), 0xffff_ffff);
