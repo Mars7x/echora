@@ -2842,7 +2842,7 @@ impl Machine {
         let placeholder = self.nvn.entries_only();
         let recorder = self.nvn.recorder();
         let thunks = std::sync::RwLock::new(self.nvn.thunk_names());
-        let nvn = std::sync::Mutex::new(std::mem::replace(&mut self.nvn, placeholder));
+        let nvn = parking_lot::Mutex::new(std::mem::replace(&mut self.nvn, placeholder));
         let shared = Shared {
             machine: std::sync::Mutex::new(&mut *self),
             wake: (0..workers).map(|_| std::sync::Condvar::new()).collect(),
@@ -2935,10 +2935,7 @@ impl Machine {
             shared.wake_replay();
             finished
         });
-        let mut renderer = shared
-            .nvn
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut renderer = shared.nvn.into_inner();
         merge_cpu_hook_counts(&mut self.nvn, &mut renderer);
         self.nvn = renderer;
         self.parallel = false;
@@ -4960,7 +4957,7 @@ struct Shared<'a> {
     /// machine lock (present and lookups) swaps it into the
     /// machine, whose `nvn` holds only the entry points meanwhile. Taken
     /// after the machine lock, never before it.
-    nvn: std::sync::Mutex<crate::nvn::Nvn>,
+    nvn: parking_lot::Mutex<crate::nvn::Nvn>,
     /// Threads waiting for `nvn` (a replay in pieces hands it over to them
     /// between pieces; the mutex alone gives it straight back).
     nvn_waiters: &'static std::sync::atomic::AtomicUsize,
@@ -5025,29 +5022,14 @@ impl<'a> Shared<'a> {
         wake.notify_one();
     }
 
-    /// After letting the NVN state go between replay pieces: waiting threads
-    /// take it first (the mutex would hand it straight back to this one),
-    /// for up to a fraction of a millisecond.
-    fn hand_nvn_over(&self) {
-        let waiting = self.nvn_waiters.load(std::sync::atomic::Ordering::Acquire);
-        if waiting > 0 {
-            let handed = std::time::Instant::now();
-            while self.nvn_waiters.load(std::sync::atomic::Ordering::Acquire) >= waiting
-                && handed.elapsed() < std::time::Duration::from_micros(200)
-            {
-                std::thread::yield_now();
-            }
-        }
-    }
-
     /// The NVN state, counted among its waiters until it is held.
-    fn lock_nvn(&self) -> std::sync::MutexGuard<'_, crate::nvn::Nvn> {
+    fn lock_nvn(&self) -> parking_lot::MutexGuard<'_, crate::nvn::Nvn> {
+        if let Some(nvn) = self.nvn.try_lock() {
+            return nvn;
+        }
         self.nvn_waiters
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let nvn = self
-            .nvn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nvn = self.nvn.lock();
         self.nvn_waiters
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         nvn
@@ -5216,7 +5198,6 @@ fn replay_thread(shared: &Shared, mut core: Core) {
     }
     let _watch = crate::fault::watch(&core);
     crate::fault::precise_timers();
-    let mut handed = std::time::Duration::ZERO;
     while !shared.stop.load(Ordering::Acquire) {
         let asked = std::time::Instant::now();
         let mut nvn = shared.lock_nvn();
@@ -5226,7 +5207,7 @@ fn replay_thread(shared: &Shared, mut core: Core) {
             asked,
             std::time::Instant::now(),
         );
-        nvn.note_replay_thread_wait(asked.elapsed() + std::mem::take(&mut handed));
+        nvn.note_replay_thread_wait(asked.elapsed());
         let failed = shared
             .replay_failed
             .lock()
@@ -5250,7 +5231,8 @@ fn replay_thread(shared: &Shared, mut core: Core) {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trap);
             }
-            drop(nvn);
+            // Hand the next replay piece to an already queued caller.
+            parking_lot::MutexGuard::unlock_fair(nvn);
             if let Some(wait) = waiting_on_inputs
                 && let Err(message) = wait_for_replay_inputs(wait, u64::MAX)
             {
@@ -5260,9 +5242,6 @@ fn replay_thread(shared: &Shared, mut core: Core) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(Trap::InvalidState { message });
             }
-            let handing = std::time::Instant::now();
-            shared.hand_nvn_over();
-            handed += handing.elapsed();
             continue;
         }
         drop(nvn);
@@ -5863,15 +5842,18 @@ impl Worker {
                 break;
             }
             let waiting_on_inputs = nvn.replay_waiting_on_inputs();
-            drop(nvn);
+            let let_go = std::time::Instant::now();
+            parking_lot::MutexGuard::unlock_fair(nvn);
             if let Some(wait) = waiting_on_inputs
                 && let Err(message) = wait_for_replay_inputs(wait, self.core.current_thread_id)
             {
                 self.held_failed = Some(Some(Trap::InvalidState { message }));
                 return false;
             }
-            shared.hand_nvn_over();
+            let asked_again = std::time::Instant::now();
             nvn = shared.lock_nvn();
+            released += asked_again - let_go;
+            rewaited += asked_again.elapsed();
         }
         // A thunk name is immutable once published. If it was missing,
         // it may have been published while the lock was released.
@@ -5948,20 +5930,16 @@ impl Worker {
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
         while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
             let waiting_on_inputs = nvn.replay_waiting_on_inputs();
-            drop(nvn);
+            let let_go = std::time::Instant::now();
+            parking_lot::MutexGuard::unlock_fair(nvn);
             if let Some(wait) = waiting_on_inputs
                 && let Err(message) = wait_for_replay_inputs(wait, self.core.current_thread_id)
             {
                 self.held_failed = Some(Some(Trap::InvalidState { message }));
                 return false;
             }
-            let let_go = std::time::Instant::now();
-            shared.hand_nvn_over();
             let asked_again = std::time::Instant::now();
-            nvn = shared
-                .nvn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            nvn = shared.lock_nvn();
             released += asked_again - let_go;
             rewaited += asked_again.elapsed();
             let counter = self.core.physical_counter_ticks();

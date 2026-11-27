@@ -24,6 +24,7 @@ echora-nup.workspace = true
 getrandom = { version = "0.4", features = ["std"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 miniz_oxide = "0.8"
+parking_lot = "0.12"
 # "asm": rav1d's hand-written SIMD (nasm on x86-64 at build time); with it
 # rav1d links the 16-bit kernels too, so bitdepth_16 must be on.
 unsafe-libopus = "0.2"

@@ -2023,6 +2023,7 @@ dependencies = [
  "jiff",
  "libc",
  "miniz_oxide 0.8.9",
+ "parking_lot",
  "rav1d",
  "raw-window-handle",
  "serde",
