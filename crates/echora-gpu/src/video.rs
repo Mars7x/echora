@@ -10,6 +10,7 @@
 //! decode queue and a copy queue, so it never shares a queue with the
 //! renderer and runs on whichever thread decodes the movie.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -36,6 +37,7 @@ pub struct VideoDevice {
     video: ash::khr::video_queue::Device,
     decode: ash::khr::video_decode_queue::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
+    unavailable: AtomicBool,
 }
 
 const EXTENSIONS: [&std::ffi::CStr; 3] = [
@@ -210,7 +212,14 @@ impl VideoDevice {
             transfer_family,
             transfer_queue: Mutex::new(transfer_queue),
             memory,
+            unavailable: AtomicBool::new(false),
         }))
+    }
+
+    /// A device whose decode or transfer failed to finish stays out of use
+    /// for later movie sessions.
+    pub fn is_available(&self) -> bool {
+        !self.unavailable.load(Ordering::Acquire)
     }
 
     fn memory_type(&self, bits: u32, wanted: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -247,6 +256,9 @@ impl VideoDevice {
         command: vk::CommandBuffer,
         sync: &mut VideoSync,
     ) -> Result<(), String> {
+        if !self.is_available() || sync.pending {
+            return Err("Vulkan video device cannot accept another submission".into());
+        }
         // Both queues access the decoded output. A fence waits on the host;
         // the timeline makes writes and layout transitions visible to the
         // next submit, including when it uses a different queue.
@@ -268,24 +280,34 @@ impl VideoDevice {
         // SAFETY: the queue is held; the command buffer is recorded and the
         // fence unsignaled.
         unsafe {
-            self.device
-                .reset_fences(&[sync.fence])
-                .map_err(vk_error("vkResetFences"))?;
-            self.device
-                .queue_submit2(*queue, &submit, sync.fence)
-                .map_err(vk_error("vkQueueSubmit2 (video)"))?;
+            self.submission_result(self.device.reset_fences(&[sync.fence]), "vkResetFences")?;
+            self.submission_result(
+                self.device.queue_submit2(*queue, &submit, sync.fence),
+                "vkQueueSubmit2 (video)",
+            )?;
         }
         sync.value = next;
         sync.pending = true;
         drop(queue);
         // SAFETY: the fence belongs to this device.
-        unsafe {
+        let waited = unsafe {
             self.device
                 .wait_for_fences(&[sync.fence], true, 5_000_000_000)
+        };
+        // Device loss also ends the use of objects referenced by this
+        // submission, so those resources can be destroyed.
+        sync.pending = !matches!(waited, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST));
+        if waited.is_err() {
+            self.unavailable.store(true, Ordering::Release);
         }
-        .map_err(vk_error("vkWaitForFences (video)"))?;
-        sync.pending = false;
-        Ok(())
+        waited.map_err(vk_error("vkWaitForFences (video)"))
+    }
+
+    fn submission_result(&self, result: Result<(), vk::Result>, call: &str) -> Result<(), String> {
+        if result == Err(vk::Result::ERROR_DEVICE_LOST) {
+            self.unavailable.store(true, Ordering::Release);
+        }
+        result.map_err(|error| format!("{call}: {error}"))
     }
 }
 
@@ -619,6 +641,9 @@ unsafe impl Send for Av1Decoder {}
 impl Av1Decoder {
     /// A session for pictures up to `width` x `height`.
     pub fn new(video: Arc<VideoDevice>, width: u32, height: u32) -> Result<Self, String> {
+        if !video.is_available() {
+            return Err("Vulkan video device is unavailable".into());
+        }
         let capabilities = av1_capabilities(&video)?;
         if capabilities.max_dpb_slots < SLOTS || capabilities.max_active_references < 7 {
             return Err(format!(
@@ -667,15 +692,23 @@ impl Av1Decoder {
             }
             None => return Err("no readable NV12 format for AV1 output in the DPB".into()),
         };
-        let mut decoder = Self {
-            extent,
+        let mut decoder = Self::empty(video);
+        decoder.extent = extent;
+        decoder.size_alignment = capabilities.bitstream_size_alignment.max(1);
+        decoder.create(format, output, &capabilities)?;
+        Ok(decoder)
+    }
+
+    fn empty(video: Arc<VideoDevice>) -> Self {
+        Self {
+            extent: vk::Extent2D::default(),
             session: vk::VideoSessionKHR::null(),
             session_memory: Vec::new(),
             parameters: vk::VideoSessionParametersKHR::null(),
             pictures: Vec::new(),
             outputs: Vec::new(),
             bitstream: Mapped::NONE,
-            size_alignment: capabilities.bitstream_size_alignment.max(1),
+            size_alignment: 1,
             readback: Mapped::NONE,
             decode_pool: vk::CommandPool::null(),
             transfer_pool: vk::CommandPool::null(),
@@ -685,9 +718,7 @@ impl Av1Decoder {
             fresh: true,
             decoded: [None; SLOTS as usize],
             video,
-        };
-        decoder.create(format, output, &capabilities)?;
-        Ok(decoder)
+        }
     }
 
     /// Creates the session and its resources (`Drop` releases whatever was
@@ -904,8 +935,8 @@ impl Av1Decoder {
     /// the session parameters for the frames that follow. Pointers inside
     /// `header` need only be valid for the call.
     pub fn set_sequence(&mut self, header: &StdVideoAV1SequenceHeader) -> Result<(), String> {
-        if self.sync.pending {
-            return Err("previous video submission did not complete".into());
+        if self.sync.pending || !self.video.is_available() {
+            return Err("Vulkan video session cannot record commands".into());
         }
         let device = &self.video.device;
         let functions = self.video.video.fp();
@@ -952,8 +983,8 @@ impl Av1Decoder {
 
     /// Decodes `frame` into its slot and waits for it.
     pub fn decode(&mut self, frame: &Av1Frame) -> Result<(), String> {
-        if self.sync.pending {
-            return Err("previous video submission did not complete".into());
+        if self.sync.pending || !self.video.is_available() {
+            return Err("Vulkan video session cannot record commands".into());
         }
         if self.parameters == vk::VideoSessionParametersKHR::null() {
             return Err("AV1 frame before a sequence header".into());
@@ -1175,8 +1206,8 @@ impl Av1Decoder {
     /// Copies the picture in `slot` into `out` as NV12 with rows `pitch`
     /// bytes apart (`nv12_size(height, pitch)` bytes).
     pub fn read_nv12(&mut self, slot: u32, pitch: u32, out: &mut [u8]) -> Result<(), String> {
-        if self.sync.pending {
-            return Err("previous video submission did not complete".into());
+        if self.sync.pending || !self.video.is_available() {
+            return Err("Vulkan video session cannot record commands".into());
         }
         let extent = self
             .decoded
@@ -1336,19 +1367,51 @@ fn color_layers(base: u32, count: u32) -> vk::ImageSubresourceRange {
 
 impl Drop for Av1Decoder {
     fn drop(&mut self) {
+        if self.sync.pending {
+            // The submission timed out. Leave its objects with a worker
+            // until the fence completes so software decoding can take over.
+            let empty = Self::empty(self.video.clone());
+            let retired = Arc::new(Mutex::new(Some(std::mem::replace(self, empty))));
+            let worker = retired.clone();
+            let started = std::thread::Builder::new()
+                .name("video-retire".into())
+                .spawn(move || {
+                    let mut decoder = worker
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .unwrap();
+                    loop {
+                        // SAFETY: this decoder owns the live fence and keeps
+                        // the device and submitted resources alive.
+                        let result = unsafe {
+                            decoder.video.device.wait_for_fences(
+                                &[decoder.sync.fence],
+                                true,
+                                5_000_000_000,
+                            )
+                        };
+                        match result {
+                            Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+                                decoder.sync.pending = false;
+                                break;
+                            }
+                            Err(vk::Result::TIMEOUT) => {}
+                            Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+                        }
+                    }
+                });
+            if let Err(error) = started {
+                // Keep the device and its in-flight children alive even
+                // when the host cannot create the cleanup worker.
+                eprintln!("video: could not start Vulkan cleanup ({error})");
+                std::mem::forget(retired);
+            }
+            return;
+        }
         let video = self.video.clone();
         let device = &video.device;
         let functions = video.video.fp();
-        if self.sync.pending {
-            // SAFETY: this fence still belongs to a submission. A GPU that
-            // never finishes it (a hung or lost device) gets 5 s; then the
-            // decoder's objects are leaked, as destroying them while the
-            // submission may still use them is not allowed.
-            let waited = unsafe { device.wait_for_fences(&[self.sync.fence], true, 5_000_000_000) };
-            if waited.is_err() {
-                return;
-            }
-        }
         self.bitstream.destroy(&video);
         self.readback.destroy(&video);
         // SAFETY: every submission was waited for, so nothing below is in
@@ -1392,5 +1455,82 @@ impl Drop for Av1Decoder {
                 device.free_memory(memory, None);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn stalled_video_submission_retires_after_its_fence_completes() {
+        let video = match VideoDevice::new() {
+            Ok(video) => video,
+            Err(error) => {
+                eprintln!("skipped Vulkan AV1 fence exercise: {error}");
+                return;
+            }
+        };
+        let device = &video.device;
+        let mut decoder = Av1Decoder::empty(video.clone());
+        let mut timeline =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        // SAFETY: valid creation parameters on a live device.
+        let gate = unsafe {
+            decoder.sync.fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                    None,
+                )
+                .unwrap()
+        };
+        let waits = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(gate)
+            .value(1)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        // SAFETY: the queue is held, and the submission owns no commands.
+        unsafe {
+            device
+                .queue_submit2(
+                    *video.transfer_queue.lock().unwrap(),
+                    &[vk::SubmitInfo2::default().wait_semaphore_infos(&waits)],
+                    decoder.sync.fence,
+                )
+                .unwrap();
+        }
+        video.unavailable.store(true, Ordering::Release);
+        decoder.sync.pending = true;
+        let started = Instant::now();
+        drop(decoder);
+        let elapsed = started.elapsed();
+        let retained = Arc::strong_count(&video) > 1;
+
+        // SAFETY: the signal satisfies the test's only queued wait.
+        unsafe {
+            device.signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+        }
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(&video) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&video),
+            1,
+            "decoder resources were retained after completion"
+        );
+        // SAFETY: the reaper has dropped the decoder after the fence completed.
+        unsafe { device.destroy_semaphore(gate, None) };
+        assert!(retained, "pending work lost ownership of its device");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "dropping the decoder blocked on its work"
+        );
+        assert!(!video.is_available());
+        eprintln!("verified AV1 fence retirement on {}", video.name);
     }
 }

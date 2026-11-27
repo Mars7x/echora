@@ -1944,7 +1944,8 @@ impl HostDecoder {
                         None
                     }
                 })
-                .clone()?;
+                .clone()
+                .filter(|device| device.is_available())?;
             self.gpu_movie = Some(echora_gpu::video_av1::MovieDecoder::new(device));
         }
         let movie = self.gpu_movie.as_mut()?;
