@@ -1494,6 +1494,20 @@ impl Emitter {
         Ok(value)
     }
 
+    /// Flush an f32 subnormal to zero of the same sign, leaving all other
+    /// bit patterns (including NaN payloads) intact.
+    fn flush_subnormal(&mut self, value: u32) -> u32 {
+        let bits = self.value(op::BITCAST, self.u32, &[value]);
+        let exponent_mask = self.constant(0x7f80_0000);
+        let exponent = self.value(op::BITWISE_AND, self.u32, &[bits, exponent_mask]);
+        let zero = self.constant(0);
+        let tiny = self.value(op::I_EQUAL, self.bool, &[exponent, zero]);
+        let sign_mask = self.constant(0x8000_0000);
+        let sign = self.value(op::BITWISE_AND, self.u32, &[bits, sign_mask]);
+        let result = self.value(op::SELECT, self.u32, &[tiny, sign, bits]);
+        self.value(op::BITCAST, self.f32, &[result])
+    }
+
     /// `.SAT`: `value` (of type `ty`, a float or a vector of them, with
     /// `bool_type` its comparison type) clamped to [`zero`, `one`], a NaN
     /// (and -0) giving +0 as the hardware does (FClamp leaves NaN
@@ -2025,11 +2039,16 @@ impl Emitter {
                 a,
                 b,
                 compare,
+                flush_to_zero,
                 combine,
                 accumulate,
-                ..
             } => {
                 let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+                let (a, b) = if flush_to_zero {
+                    (self.flush_subnormal(a), self.flush_subnormal(b))
+                } else {
+                    (a, b)
+                };
                 let result = self.float_compare(compare, a, b);
                 self.set_predicates(p, q, result, combine, accumulate);
             }
@@ -2707,17 +2726,7 @@ impl Emitter {
                         }
                     }
                 };
-                // MUFU flushes a subnormal input to a zero of its sign.
-                let x = {
-                    let magnitude = self.glsl(self.f32, glsl::F_ABS, &[x]);
-                    let smallest = self.float_constant(f32::MIN_POSITIVE);
-                    let tiny = self.value(op::F_ORD_LESS_THAN, self.bool, &[magnitude, smallest]);
-                    let bits = self.value(op::BITCAST, self.u32, &[x]);
-                    let sign = self.constant(0x8000_0000);
-                    let signed_zero = self.value(op::BITWISE_AND, self.u32, &[bits, sign]);
-                    let signed_zero = self.value(op::BITCAST, self.f32, &[signed_zero]);
-                    self.value(op::SELECT, self.f32, &[tiny, signed_zero, x])
-                };
+                let x = self.flush_subnormal(x);
                 // Handle the guest's edge cases explicitly and keep the
                 // host operations inside their defined input domains.
                 let zero = self.float_constant(0.0);

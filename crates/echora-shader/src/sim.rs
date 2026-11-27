@@ -8659,7 +8659,7 @@ mod tests {
     }
 
     #[test]
-    fn float_compares_follow_all_sixteen_codes_with_nan() {
+    fn float_compares_follow_all_sixteen_codes_with_nan_and_ftz() {
         let specials = [
             0.0f32,
             -0.0,
@@ -8669,40 +8669,57 @@ mod tests {
             f32::NEG_INFINITY,
             f32::NAN,
             f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            -f32::from_bits(1),
         ];
-        for &a in &specials {
-            for &b in &specials {
-                for code in 0..16u32 {
-                    // FSETP.code.AND P0, PT, R0, R1, PT.
-                    let fsetp = word(&[
-                        (0, 12, 0x20b),
-                        (24, 8, 0),
-                        (32, 8, 1),
-                        (76, 4, u128::from(code)),
-                        (81, 3, 0),
-                        (84, 3, 7),
-                        (87, 3, 7),
-                    ]);
-                    let unordered = a.is_nan() || b.is_nan();
-                    let relation = match code & 7 {
-                        0 => false,
-                        1 => a < b,
-                        2 => a == b,
-                        3 => a <= b,
-                        4 => a > b,
-                        5 => a != b && !unordered,
-                        6 => a >= b,
-                        _ => !unordered,
-                    };
-                    // Codes 8-15: the unordered forms (NAN, LTU .. GEU, T).
-                    let expected = match code {
-                        0..=7 => relation,
-                        8 => unordered,
-                        15 => true,
-                        _ => unordered || relation,
-                    };
-                    let (_, p) = run(&[a.to_bits(), b.to_bits()], &[fsetp]);
-                    assert_eq!(p[&0], expected, "FSETP code {code}: {a} vs {b}");
+        for flush in [false, true] {
+            let operand = |x: f32| {
+                if flush && x.is_subnormal() {
+                    0.0f32.copysign(x)
+                } else {
+                    x
+                }
+            };
+            for &left in &specials {
+                for &right in &specials {
+                    let (a, b) = (operand(left), operand(right));
+                    for code in 0..16u32 {
+                        // FSETP.code.AND P0, PT, R0, R1, PT.
+                        let fsetp = word(&[
+                            (0, 12, 0x20b),
+                            (24, 8, 0),
+                            (32, 8, 1),
+                            (76, 4, u128::from(code)),
+                            (80, 1, u128::from(flush)),
+                            (81, 3, 0),
+                            (84, 3, 7),
+                            (87, 3, 7),
+                        ]);
+                        let unordered = a.is_nan() || b.is_nan();
+                        let relation = match code & 7 {
+                            0 => false,
+                            1 => a < b,
+                            2 => a == b,
+                            3 => a <= b,
+                            4 => a > b,
+                            5 => a != b && !unordered,
+                            6 => a >= b,
+                            _ => !unordered,
+                        };
+                        // Codes 8-15: the unordered forms (NAN, LTU .. GEU, T).
+                        let expected = match code {
+                            0..=7 => relation,
+                            8 => unordered,
+                            15 => true,
+                            _ => unordered || relation,
+                        };
+                        let (_, p) = run(&[left.to_bits(), right.to_bits()], &[fsetp]);
+                        assert_eq!(
+                            p[&0], expected,
+                            "FSETP code {code}, FTZ={flush}: {left} vs {right}"
+                        );
+                    }
                 }
             }
         }
