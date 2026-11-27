@@ -115,6 +115,13 @@ synthetic fixtures and runs without the game files.
   frames had no whole-frame black flash. Their camera poses did not
   match the previous comparison, so they do not establish a visual
   improvement or regression in the forest.
+  CPU-uncached texture uploads now revalidate at each draw or dispatch;
+  the direct handle cache and bindless lists cannot retain such a source
+  across uses without checking its backing. GPU-enabled regressions
+  change both small and large uploads without a flush during the same
+  present and check the new texels, including a bindless texture list.
+  The corrected saved route reached present 6,032 normally at native
+  1440p and averaged 11.36 FPS over presents 3,200–6,000.
 - Min/max filtering uses the host's Vulkan sampler reduction support. On
   Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
   levels at LOD 0.5 returned 0.4375 for both minimum and maximum reduction.

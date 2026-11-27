@@ -4227,6 +4227,7 @@ impl Nvn {
         let started = self.pool_list_stamp(nvn);
         let mut entries = Vec::with_capacity(handles.len());
         let mut resolved_handles = Vec::with_capacity(handles.len());
+        let mut cacheable = true;
         for handle in handles {
             if self.is_default_null_texture(handle) {
                 resolved_handles.push(handle);
@@ -4258,7 +4259,9 @@ impl Nvn {
             let (source, storage) = self.resolve_sampled_texture(core, texture)?;
             let source = self.through_view(source, handle);
             let sampler_state = self.binding_sampler(handle, texture, &source);
-            self.remember_binding(handle, texture, source.clone(), sampler_state, storage);
+            let (_, memoized) =
+                self.remember_binding(handle, texture, source.clone(), sampler_state, storage);
+            cacheable &= memoized;
             resolved_handles.push(handle);
             entries.push(echora_gpu::pool::PoolEntry {
                 texture: (handle & u64::from(echora_shader_abi::TEXTURE_INDEX_MASK)) as u32,
@@ -4274,15 +4277,17 @@ impl Nvn {
                 .unwrap()
                 .stat("stat: pool entry lists changed while made", 1);
         }
-        self.pool_entry_cache.insert(
-            nvn,
-            super::CachedPoolEntries {
-                stamp: started,
-                entries: list.clone(),
-                handles: resolved_handles,
-                additional: additional.to_vec(),
-            },
-        );
+        if cacheable {
+            self.pool_entry_cache.insert(
+                nvn,
+                super::CachedPoolEntries {
+                    stamp: started,
+                    entries: list.clone(),
+                    handles: resolved_handles,
+                    additional: additional.to_vec(),
+                },
+            );
+        }
         Ok(list)
     }
 
@@ -5489,7 +5494,11 @@ impl Nvn {
                 let backend = self.gpu.as_mut().unwrap();
                 backend.release_upload_texels(texture);
                 let source = backend.textures[&texture].1.clone();
-                backend.texture_checked.insert(texture, frame);
+                if !uncached {
+                    backend.texture_checked.insert(texture, frame);
+                } else {
+                    backend.texture_checked.remove(&texture);
+                }
                 backend.stat("stat: texture checks", 1);
                 backend.stat("stat: texture check microseconds", check_micros);
                 if shadowed {
@@ -6022,11 +6031,11 @@ impl Nvn {
             "stat: texture upload microseconds",
             upload_start.elapsed().as_micros() as u64,
         );
-        self.gpu
-            .as_mut()
-            .unwrap()
-            .texture_checked
-            .insert(texture, frame);
+        if !uncached {
+            backend.texture_checked.insert(texture, frame);
+        } else {
+            backend.texture_checked.remove(&texture);
+        }
         Ok(source)
     }
 
@@ -7881,7 +7890,7 @@ impl Nvn {
         source: TextureSource,
         sampler: Sampler,
         backing: Option<TextureBacking>,
-    ) -> shader::SampleType {
+    ) -> (shader::SampleType, bool) {
         let sample_type = self
             .gpu
             .as_ref()
@@ -7892,6 +7901,13 @@ impl Nvn {
                 shader::SampleType::Float,
                 echora_gpu::renderer::sampled_texture_type,
             );
+        // Coherent CPU-uncached uploads must be checked at each use,
+        // not just once per present. In particular, a bindless list
+        // containing one cannot be retained across draws.
+        if matches!(source, TextureSource::Upload { .. }) && self.texture_cpu_uncached(texture) {
+            self.binding_memo.1.remove(&handle);
+            return (sample_type, false);
+        }
         self.binding_memo.1.insert(
             handle,
             super::ResolvedBinding {
@@ -7904,7 +7920,16 @@ impl Nvn {
                 texture,
             },
         );
-        sample_type
+        (sample_type, true)
+    }
+
+    fn texture_cpu_uncached(&self, texture: u64) -> bool {
+        self.objects
+            .get(&texture)
+            .and_then(|object| object.builder.get("Storage"))
+            .and_then(|storage| self.objects.get(&storage.x[0]))
+            .and_then(|pool| pool.builder.get("Flags"))
+            .is_some_and(|flags| flags.x[0] & 6 == 2)
     }
 
     fn with_memoized_binding<T>(
@@ -11829,7 +11854,7 @@ impl Nvn {
                                 ));
                             }
                             let sampler = self.binding_sampler(handle, texture, &source);
-                            let sample_type = self.remember_binding(
+                            let (sample_type, _) = self.remember_binding(
                                 handle,
                                 texture,
                                 source.clone(),
@@ -15787,6 +15812,77 @@ mod target_tests {
     }
 
     #[test]
+    fn an_uncached_texture_observes_cpu_writes_between_draws_in_the_same_present() {
+        use echora_gpu::draw::TextureSource;
+
+        let Some((mut nvn, mut memory, base, texture)) =
+            texture_cache_fixture_of_size(0x22, 32, 32)
+        else {
+            return;
+        };
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let (source, backing) = nvn.resolve_sampled_texture(&mut guest, texture).unwrap();
+        let TextureSource::Upload { generation, .. } = source else {
+            panic!("initial upload expected");
+        };
+        nvn.remember_binding(1, texture, source, super::Sampler::default(), backing);
+        // CPU-uncached storage is coherent without a pool flush.
+        let offset = 256;
+        let rgba = [32, 64, 128, 255];
+        guest.memory.write(base + offset, &rgba).unwrap();
+        let TextureSource::Upload {
+            generation: updated,
+            texels,
+            ..
+        } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("updated upload expected");
+        };
+        assert_ne!(updated, generation);
+        assert_eq!(texels[offset as usize..][..4], rgba);
+        assert!(
+            nvn.memoized_binding(1).is_none(),
+            "stale uncached handle was retained"
+        );
+        let (pool, index) = (4, 256_u32);
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        nvn.texture_descriptors.entry(pool).or_default().insert(
+            index,
+            Args {
+                x: [texture, 0, 0, 0],
+                ..Default::default()
+            },
+        );
+        let first = nvn
+            .pool_entries(&mut guest, 0, &[u64::from(index)])
+            .unwrap();
+        let new = [8, 16, 32, 255];
+        guest.memory.write(base + offset, &new).unwrap();
+        let second = nvn
+            .pool_entries(&mut guest, 0, &[u64::from(index)])
+            .unwrap();
+        let TextureSource::Upload { texels, .. } = &second[0].source else {
+            panic!("updated bindless upload expected");
+        };
+        assert_eq!(texels[offset as usize..][..4], new);
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn an_uncached_texture_sees_a_write_after_many_unchanged_frames() {
         use echora_gpu::draw::TextureSource;
 
@@ -15860,7 +15956,7 @@ mod target_tests {
                 .stat_value("stat: texture uploads"),
             1
         );
-        nvn.presented_frames += 1;
+        // The large upload must also see the change before another present.
         let rgba = [32, 64, 128, 255];
         let offset = 256;
         guest.memory.write(base + offset, &rgba).unwrap();
