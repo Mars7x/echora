@@ -740,6 +740,12 @@ impl GuestFileIndex {
     }
 }
 
+/// Shared Vulkan binding, or the producer serial to wait for before a CPU copy.
+enum UniformSource {
+    Shared(vk::Buffer, u64),
+    Copy(Option<u64>),
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
         if let Some(Ok(presenter)) = self.presenter.take() {
@@ -7893,17 +7899,15 @@ impl Nvn {
             .max()
     }
 
-    /// Whether a draw's uniform buffer at guest `range` is read by the GPU
-    /// in place rather than copied when the draw is recorded: GPU work
-    /// recorded before it may still store there through the page table, and
-    /// in place the GPU reads those stores in queue order, as the console
-    /// does, while a copy would wait for that work first. Only guest memory
-    /// shared with the GPU qualifies (`shared_binding`), with no other GPU
-    /// results waiting to be copied into it (`gpu_writes_pending`).
-    /// ECHORA_UNIFORMS_IN_PLACE=0 copies them all, waiting; =all reads
-    /// every shared uniform buffer in place, GPU-written or not.
-    /// (`serial`: the range's `draw_input_write_serial`.)
-    fn uniform_in_place(&self, range: std::ops::Range<u64>, serial: Option<u64>) -> bool {
+    /// Select a uniform source for replay preflight and draw submission.
+    /// An in-place GPU binding sees previous writes in queue order. A CPU
+    /// copy must wait for the submission that wrote the backing bytes.
+    /// ECHORA_UNIFORMS_IN_PLACE=0 always copies. With =all, GPU-written
+    /// and CPU-written uniforms are both eligible for in-place binding.
+    fn draw_uniform_source(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> Result<UniformSource, String> {
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| {
             match super::debug_var_os("ECHORA_UNIFORMS_IN_PLACE")
@@ -7915,23 +7919,34 @@ impl Nvn {
                 _ => 1,
             }
         });
+        let serial = self.draw_input_write_serial(range.clone());
         let Some(backend) = self.gpu.as_ref() else {
-            return false;
+            return Ok(UniformSource::Copy(serial));
         };
-        mode != 0
-            && (mode == 2
-                || serial.is_some_and(|serial| serial > backend.renderer.completed_serial()))
-            && !self.gpu_writes_pending(&range)
-            && self
-                .shared_guest_range(range.start, range.end - range.start)
-                .is_some()
+        let pending = serial.is_some_and(|serial| serial > backend.renderer.completed_serial());
+        if mode == 0 || (mode != 2 && !pending) || self.gpu_writes_pending(&range) {
+            return Ok(UniformSource::Copy(serial));
+        }
+        let alignment = backend.renderer.uniform_offset_alignment();
+        // A guest/file mapping alone does not guarantee a usable Vulkan buffer.
+        let Some((buffer, offset)) = self.shared_binding(range.start, range.end - range.start)?
+        else {
+            return Ok(UniformSource::Copy(serial));
+        };
+        if offset.is_multiple_of(alignment) {
+            Ok(UniformSource::Shared(buffer, offset))
+        } else {
+            // The import succeeded, but the draw will copy. Check the current
+            // backing after the import even if there was no writer beforehand.
+            Ok(UniformSource::Copy(self.draw_input_write_serial(range)))
+        }
     }
 
     /// The shared buffer and offset to read a draw's `length` bytes of
     /// guest indices at `guest` (`size` bytes each) from in place: when GPU
     /// work not yet finished may write them (else they are copied, as
     /// before) and they lie in a span the GPU shares, as for uniforms
-    /// (`uniform_in_place`). ECHORA_INDICES_IN_PLACE=0 (debugging): copied
+    /// (`draw_uniform_source`). ECHORA_INDICES_IN_PLACE=0 (debugging): copied
     /// after that work, as before.
     fn indices_in_place(
         &mut self,
@@ -7963,7 +7978,7 @@ impl Nvn {
             .filter(|&(_, offset)| offset.is_multiple_of(size)))
     }
 
-    fn uniform_write_serial(&self, stages: &[Arc<Translated>]) -> u64 {
+    fn uniform_write_serial(&mut self, stages: &[Arc<Translated>]) -> Result<u64, String> {
         let mut serial = 0;
         for stage in stages {
             let nvn = u64::from(nvn_stage(stage.stage));
@@ -7982,15 +7997,14 @@ impl Nvn {
                 }
                 if let Ok(guest) = self.gpu_to_guest(bind.x[3], size)
                     && let Some(end) = guest.checked_add(size)
-                    && let writes = self.draw_input_write_serial(guest..end)
-                    && !self.uniform_in_place(guest..end, writes)
-                    && let Some(writes) = writes
+                    && let UniformSource::Copy(Some(writes)) =
+                        self.draw_uniform_source(guest..end)?
                 {
                     serial = serial.max(writes);
                 }
             }
         }
-        serial
+        Ok(serial)
     }
 
     /// Let replay release the lock while an input the command will read
@@ -8034,7 +8048,7 @@ impl Nvn {
                 return Ok(None);
             };
             (
-                self.uniform_write_serial(&program.stages),
+                self.uniform_write_serial(&program.stages)?,
                 "stat: replay deferred mapped uniform reads",
             )
         };
@@ -11336,29 +11350,24 @@ impl Nvn {
                         if let Some(started) = started {
                             uniform_time += started.elapsed();
                         }
-                        // Computed once for both (it walks the pending
-                        // shared writes).
-                        let mut writes = None;
-                        if let Some(end) = guest.checked_add(size) {
-                            let serial = self.draw_input_write_serial(guest..end);
-                            writes = Some(serial);
-                            if self.uniform_in_place(guest..end, serial)
-                                && let Some((buffer, offset)) = self.shared_binding(guest, size)?
-                            {
-                                let backend = self.gpu.as_mut().unwrap();
-                                if offset % backend.renderer.uniform_offset_alignment() == 0 {
+                        let writes = if let Some(end) = guest.checked_add(size) {
+                            match self.draw_uniform_source(guest..end)? {
+                                UniformSource::Shared(buffer, offset) => {
                                     uniforms_in_place.insert(
                                         (index, descriptor.binding),
                                         (buffer, offset, size),
                                     );
-                                    backend.stat("stat: draw uniforms read in place", 1);
+                                    self.gpu
+                                        .as_mut()
+                                        .unwrap()
+                                        .stat("stat: draw uniforms read in place", 1);
                                     continue;
                                 }
-                                // Importing the span may have changed what
-                                // the serial walked.
-                                writes = None;
+                                UniformSource::Copy(serial) => Some(serial),
                             }
-                        }
+                        } else {
+                            None
+                        };
                         self.resolve_draw_input_after(core, "uniforms", guest, size, writes)?;
                         uniform_bytes += size;
                         guest_uniforms.insert((index, descriptor.binding), (guest, size as usize));
@@ -17771,8 +17780,15 @@ mod pool_tests {
         assert!(!index.storage.contains_key(&0x10_2000));
         assert_eq!(index.storage[&0x10_3000], [0x3000]);
 
-        nvn.objects.remove(&0x1000);
-        nvn.object_changed(0x1000, "MemoryPool");
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        guest.cpu.regs[0] = 0x1000;
+        assert!(nvn.call("nvnMemoryPoolFinalize", &mut guest).unwrap());
         assert!(!nvn.target_index_current());
         nvn.refresh_target_index();
         assert!(nvn.gpu.as_ref().unwrap().target_index.storage.is_empty());
@@ -19269,6 +19285,7 @@ mod replay_input_wait_tests {
         let mut bind = |address, size| {
             bind_uniform(&mut nvn, address, size);
             nvn.uniform_write_serial(std::slice::from_ref(&stage))
+                .unwrap()
         };
         assert_eq!(bind(gpu, 8), 0);
         assert_eq!(bind(gpu + 6, 3), 0);
