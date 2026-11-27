@@ -646,9 +646,10 @@ pub struct Nvn {
     /// between copies.
     #[serde(skip)]
     tiled_scratch: std::cell::RefCell<Vec<u8>>,
-    /// The memory pools among `objects` (the page table walks them).
+    /// Live pool handles and their fixed allocation parameters. A pool
+    /// without a published allocation still resolves through its object.
     #[serde(skip)]
-    memory_pools: std::collections::BTreeSet<u64>,
+    memory_pools: BTreeMap<u64, Option<PoolAllocation>>,
     /// Memory pools made since the last present's `share_new_pools` (the
     /// only ones it can find unshared; thousands are live).
     #[serde(skip)]
@@ -956,6 +957,14 @@ struct PoolRanges {
     epoch: Option<u64>,
     entries: Vec<PoolRange>,
     page_pools: Vec<PagePool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoolAllocation {
+    storage: u64,
+    size: u64,
+    gpu: Option<u64>,
+    flags: u64,
 }
 
 /// One GPU address range backed by a physical allocation. Virtual pools
@@ -3320,6 +3329,15 @@ impl Nvn {
                         buffers: 0,
                     },
                 );
+                self.memory_pools.insert(
+                    this,
+                    Some(PoolAllocation {
+                        storage: memory,
+                        size,
+                        gpu: Some(gpu),
+                        flags: flags.map_or(0x21, |args| args.x[0]),
+                    }),
+                );
                 self.pool_epoch += 1;
                 // The GPU reaches the pool from now on, as on the console:
                 // shared into the page table here, not at the next present.
@@ -4461,13 +4479,11 @@ impl Nvn {
                     let others: Vec<u64> = self
                         .memory_pools
                         .iter()
-                        .copied()
-                        .filter(|&other| {
-                            other != this
-                                && self.objects.get(&other).is_some_and(|pool| {
-                                    pool.builder.get("Storage").map(|storage| storage.x[0])
-                                        == Some(base)
-                                })
+                        .filter_map(|(&other, &known)| {
+                            (other != this
+                                && self.pool_allocation(other, known)
+                                    .is_some_and(|pool| pool.storage == base))
+                            .then_some(other)
                         })
                         .collect();
                     if base != 0 && !others.is_empty() {
@@ -7694,6 +7710,26 @@ impl Nvn {
         index
     }
 
+    fn pool_allocation(
+        &self,
+        address: u64,
+        known: Option<PoolAllocation>,
+    ) -> Option<PoolAllocation> {
+        known.or_else(|| {
+            let pool = self
+                .objects
+                .get(&address)
+                .filter(|pool| pool.kind == "MemoryPool")?;
+            let storage = pool.builder.get("Storage")?;
+            Some(PoolAllocation {
+                storage: storage.x[0],
+                size: storage.x[1],
+                gpu: pool.state.get("GpuAddress").map(|args| args.x[0]),
+                flags: pool.builder.get("Flags").map_or(0x21, |args| args.x[0]),
+            })
+        })
+    }
+
     fn index_pool_ranges(&self, index: &mut PoolRanges) {
         use echora_shader_abi::PAGE_SIZE;
 
@@ -7708,21 +7744,19 @@ impl Nvn {
                 furthest_end: 0,
             });
         };
-        for address in &self.memory_pools {
-            let Some(pool) = self.objects.get(address) else {
+        for (&address, &known) in &self.memory_pools {
+            let Some(PoolAllocation {
+                storage: base,
+                size,
+                gpu: Some(gpu),
+                flags,
+            }) = self.pool_allocation(address, known)
+            else {
                 continue;
             };
-            let (Some(storage), Some(gpu)) = (
-                pool.builder.get("Storage"),
-                pool.state.get("GpuAddress").map(|args| args.x[0]),
-            ) else {
-                continue;
-            };
-            let [base, size, ..] = storage.x;
             let gpu_visible = gpu != 0 && size != 0;
             if base != 0 {
                 add(gpu, size, base);
-                let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
                 // GPU_NO_ACCESS exposes the allocation only through aliases.
                 if gpu_visible && flags & 8 == 0 {
                     index.page_pools.push(PagePool {
@@ -7736,7 +7770,7 @@ impl Nvn {
                 }
                 continue;
             }
-            for (name, mapping) in &pool.state {
+            for (name, mapping) in &self.objects[&address].state {
                 let Some(offset) = name
                     .strip_prefix(VIRTUAL_MAPPING)
                     .and_then(|hex| u64::from_str_radix(hex, 16).ok())
@@ -7755,15 +7789,12 @@ impl Nvn {
                     && gpu.is_multiple_of(PAGE_SIZE)
                 {
                     index.page_pools.push(PagePool {
-                        base: range.start - physical_offset,
-                        backing_size: backing.builder["Storage"].x[1],
+                        base: backing.storage,
+                        backing_size: backing.size,
                         offset: physical_offset,
                         gpu,
                         size,
-                        flags: backing
-                            .builder
-                            .get("Flags")
-                            .map_or(0x21, |flags| flags.x[0]),
+                        flags: backing.flags,
                     });
                 }
             }
@@ -7781,13 +7812,18 @@ impl Nvn {
             .map(|(_, range)| range)
     }
 
-    fn virtual_mapping_backing(&self, mapping: &Args) -> Option<(&Object, std::ops::Range<u64>)> {
+    fn virtual_mapping_backing(
+        &self,
+        mapping: &Args,
+    ) -> Option<(PoolAllocation, std::ops::Range<u64>)> {
         let [physical, offset, size, _] = mapping.x;
-        let backing = self.object(physical, "MemoryPool").ok()?;
-        let storage = backing.builder.get("Storage")?;
+        let backing = self.pool_allocation(
+            physical,
+            self.memory_pools.get(&physical).copied().flatten(),
+        )?;
         let end = offset.checked_add(size)?;
-        let base = storage.x[0];
-        if base == 0 || end > storage.x[1] {
+        let base = backing.storage;
+        if base == 0 || end > backing.size {
             return None;
         }
         Some((backing, base.checked_add(offset)?..base.checked_add(end)?))
@@ -7994,7 +8030,7 @@ impl Nvn {
         }
         self.object_changed(address, kind);
         if kind == "MemoryPool" {
-            self.memory_pools.insert(address);
+            self.memory_pools.insert(address, None);
             self.new_pools.push(address);
             if debug_var_os("ECHORA_TASK_DUMP").is_some() {
                 self.pool_made_at.insert(address, self.presented_frames);
@@ -13948,7 +13984,7 @@ mod tests {
             );
             call(nvn, core, "nvnMemoryPoolGetBufferAddress", &[object])
         };
-        pool(&mut nvn, &mut core, 0x10_2000, 0x10_3000, 0x10_8000, 0x4000);
+        let physical_gpu = pool(&mut nvn, &mut core, 0x10_2000, 0x10_3000, 0x10_8000, 0x4000);
         let virtual_gpu = pool(&mut nvn, &mut core, 0x10_2000, 0x10_3100, 0, 0x8000);
         let texture = 0x10_3200;
         let props = BTreeMap::from([
@@ -14006,6 +14042,55 @@ mod tests {
             1
         );
         assert!(nvn.gpu_to_guest(virtual_gpu + 0x2010, 0x10).is_err());
+        // Reuse the physical object's handle with new storage and GPU_NO_ACCESS.
+        // Only its virtual alias contributes pages, using the new allocation.
+        let builder = 0x10_2000;
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetStorage",
+            &[builder, 0x10_d000, 0x2000],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnMemoryPoolBuilderSetFlags",
+            &[builder, 8],
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnMemoryPoolInitialize",
+                &[0x10_3000, builder]
+            ),
+            1
+        );
+        core.memory
+            .write(request, &0x10_3000u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnMemoryPoolMapVirtual", &map),
+            1
+        );
+        assert!(nvn.gpu_to_guest(physical_gpu, 4).is_err());
+        assert_eq!(nvn.texture_storage(texture), Some(0x10_d010));
+        let expected = [PagePool {
+            base: 0x10_d000,
+            backing_size: 0x2000,
+            offset: 0,
+            gpu: virtual_gpu + 0x2000,
+            size: 0x2000,
+            flags: 8,
+        }];
+        assert_eq!(nvn.indexed_pool_ranges().page_pools, expected);
+        // Partially constructed pools can still resolve from the object maps.
+        nvn.memory_pools
+            .values_mut()
+            .for_each(|allocation| *allocation = None);
+        let mut ranges = PoolRanges::default();
+        nvn.index_pool_ranges(&mut ranges);
+        assert_eq!(ranges.page_pools, expected);
     }
 
     #[test]

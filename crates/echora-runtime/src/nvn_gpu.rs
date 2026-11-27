@@ -8634,18 +8634,13 @@ impl Nvn {
             .map(|backend| {
                 self.memory_pools
                     .iter()
-                    .copied()
-                    .filter(|address| {
-                        self.objects.get(address).is_some_and(|pool| {
-                            let flags = pool.builder.get("Flags").map_or(0x21, |flags| flags.x[0]);
-                            pool.kind == "MemoryPool"
-                                && flags & 6 != 0
-                                && pool.builder.get("Storage").is_some_and(|storage| {
-                                    storage.x[0] != 0
-                                        && !backend.shared_pools.contains_key(&storage.x[0])
-                                        && !backend.shared_pieces.contains_key(&storage.x[0])
-                                })
-                        })
+                    .filter_map(|(&address, &known)| {
+                        let pool = self.pool_allocation(address, known)?;
+                        (pool.flags & 6 != 0
+                            && pool.storage != 0
+                            && !backend.shared_pools.contains_key(&pool.storage)
+                            && !backend.shared_pieces.contains_key(&pool.storage))
+                        .then_some(address)
                     })
                     .filter(|address| !self.new_pools.contains(address))
                     .collect()
@@ -9207,12 +9202,10 @@ impl Nvn {
         let pools: Vec<(u64, u64)> = self
             .memory_pools
             .iter()
-            .filter_map(|address| self.objects.get(address))
-            .filter(|object| object.kind == "MemoryPool")
-            .filter_map(|pool| {
-                let size = pool.builder.get("Storage")?.x[1];
-                let gpu = pool.state.get("GpuAddress")?.x[0];
-                (gpu != 0 && size != 0).then_some((gpu, size))
+            .filter_map(|(&address, &known)| {
+                let pool = self.pool_allocation(address, known)?;
+                let gpu = pool.gpu?;
+                (gpu != 0 && pool.size != 0).then_some((gpu, pool.size))
             })
             .collect();
         let mut named: Vec<(u64, u64)> = Vec::new();
@@ -10314,12 +10307,9 @@ impl Nvn {
         let Some((base, size, flags)) = known.or_else(|| {
             self.memory_pools
                 .iter()
-                .filter_map(|address| self.objects.get(address))
-                .filter(|object| object.kind == "MemoryPool")
-                .filter_map(|pool| {
-                    let storage = pool.builder.get("Storage")?;
-                    let flags = pool.builder.get("Flags").map_or(0, |flags| flags.x[0]);
-                    Some((storage.x[0], storage.x[1], flags))
+                .filter_map(|(&address, &known)| {
+                    let pool = self.pool_allocation(address, known)?;
+                    Some((pool.storage, pool.size, pool.flags))
                 })
                 .find(|&(base, size, _)| {
                     base != 0 && base <= guest && guest + length <= base + size
