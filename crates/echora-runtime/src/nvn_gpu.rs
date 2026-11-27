@@ -11978,25 +11978,21 @@ impl Nvn {
             Some(min) => (min as i64 + i64::from(base_vertex)).max(0) as u64,
         }
         .min(vertex_end);
+        let needed = fixed_stream_extents(parsed.streams.len(), &attributes);
         let per_vertex = |props: &ParsedStream| props.divisor == 0 && props.stride != 0;
-        let shifted = !pulling && vertex_start > 0 && parsed.streams.iter().any(per_vertex);
-        // Each stream's bytes per vertex the loaded attributes reach (past
-        // the furthest attribute's offset and size): a stream no attribute
-        // reads is not read, and a stride-0 one (the same element for every
-        // vertex) only that far, not its whole buffer (full-screen passes
-        // bound megabytes for three vertices).
-        let mut needed: HashMap<u32, u64> = HashMap::default();
-        for attribute in &attributes {
-            let size = attribute_format_size(attribute.format);
-            let end = u64::from(attribute.offset) + size;
-            let entry = needed.entry(attribute.stream).or_default();
-            *entry = (*entry).max(end);
-        }
+        // An unrelated bound stream must not change a procedural draw's
+        // first vertex or base vertex. Pulled inputs use the guest fetch table.
+        let shifted = vertex_start > 0
+            && parsed
+                .streams
+                .iter()
+                .zip(&needed)
+                .any(|(props, &end)| end != 0 && per_vertex(props));
         let mut streams = Vec::new();
-        for (index, props) in parsed.streams.iter().enumerate() {
+        for (index, (props, element)) in parsed.streams.iter().zip(needed).enumerate() {
             // Only the vertices this draw can reach are read.
             let stride = props.stride;
-            let Some(&element) = needed.get(&(index as u32)) else {
+            if element == 0 {
                 streams.push(VertexStream {
                     stride: stride as u32,
                     divisor: props.divisor as u32,
@@ -12004,7 +12000,7 @@ impl Nvn {
                     guest: None,
                 });
                 continue;
-            };
+            }
             let skip = if shifted && per_vertex(props) {
                 vertex_start * stride
             } else {
@@ -13947,6 +13943,24 @@ pub(super) struct ParsedStream {
     divisor: u64,
 }
 
+/// Exclusive byte end per Vulkan vertex binding. Keep holes below the last
+/// consumed binding so that attributes retain their original binding numbers.
+fn fixed_stream_extents(count: usize, attributes: &[VertexAttribute]) -> Vec<u64> {
+    let mut extents = Vec::new();
+    for attribute in attributes {
+        let index = attribute.stream as usize;
+        if index >= count {
+            continue;
+        }
+        if index >= extents.len() {
+            extents.resize(index + 1, 0);
+        }
+        let end = u64::from(attribute.offset) + attribute_format_size(attribute.format);
+        extents[index] = extents[index].max(end);
+    }
+    extents
+}
+
 impl ParsedStream {
     /// Exclusive byte end of the last attribute fetched from this binding.
     fn byte_end(
@@ -13974,7 +13988,25 @@ impl ParsedStream {
 
 #[cfg(test)]
 mod vertex_stream_range_tests {
-    use super::ParsedStream;
+    use super::{ParsedStream, VertexAttribute, fixed_stream_extents, vk};
+
+    #[test]
+    fn fixed_fetch_only_binds_streams_reached_by_attributes() {
+        let attribute = |stream, offset| VertexAttribute {
+            location: 0,
+            stream,
+            offset,
+            format: vk::Format::R32G32_SFLOAT,
+        };
+        // A procedural shader or a shader that pulls every input through the
+        // page table uses no fixed bindings, even if the guest bound eight.
+        assert!(fixed_stream_extents(8, &[]).is_empty());
+        assert_eq!(
+            fixed_stream_extents(8, &[attribute(2, 12), attribute(2, 4), attribute(0, 0)]),
+            [8, 0, 20]
+        );
+        assert!(fixed_stream_extents(2, &[attribute(u32::MAX, 0)]).is_empty());
+    }
 
     #[test]
     fn instance_divisor_advances_from_the_first_instance() {
@@ -15938,7 +15970,7 @@ mod target_tests {
             captured: Vec::new(),
             states: Default::default(),
         };
-        snapshot_states(&nvn.bags, &guest, &mut bind);
+        snapshot_states(&nvn.bags, &guest, &mut bind).unwrap();
         // The queued bind keeps its snapshot after the guest reuses the state.
         guest.cpu.regs[0] = state;
         assert!(

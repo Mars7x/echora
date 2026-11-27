@@ -2237,9 +2237,8 @@ fn front_bag(kind: &str, rest: &str) -> bool {
         || (matches!(kind, "TextureBuilder" | "TextureView") && rest.starts_with("Set"))
 }
 
-/// Kinds whose calls are only the generic property bags (no call on them
-/// has an arm of its own in `Nvn::call`): workers make them without the
-/// NVN state (`Recorder::front`).
+/// Kinds handled entirely by `bag_call`, including the vertex states
+/// stored in guest memory. Workers can make these calls without locking NVN.
 const FRONT_KINDS: &[&str] = &[
     "BlendState",
     "ChannelMaskState",
@@ -2247,6 +2246,8 @@ const FRONT_KINDS: &[&str] = &[
     "DepthStencilState",
     "MultisampleState",
     "PolygonState",
+    "VertexAttribState",
+    "VertexStreamState",
     "BufferBuilder",
 ];
 
@@ -8232,10 +8233,6 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
     Ok(region)
 }
 
-/// Fill `command.states` for the Bind*State commands. Single states are
-/// passed by pointer (X1); vertex attribute and stream states as
-/// (count X1, array X2). Array elements are the bags of that kind at or
-/// above the array, in address order (the element size is NVN-private).
 /// Fixed-function state structures a Bind reads from memory: their
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
@@ -8400,20 +8397,73 @@ fn state_transition(
     after
 }
 
-fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
+// The SDK's four-byte attribute and eight-byte stream travel with guest
+// memory, including ordinary memcpy and prebuilt arrays. Bind captures the
+// decoded values in the same format as previously recorded commands.
+fn snapshot_vertex_states(
+    core: &Guest,
+    command: &mut Command,
+    attribute: bool,
+) -> Result<(), Trap> {
+    let count = command.x[1] as u32 as usize;
+    let stride = if attribute { 4 } else { 8 };
+    let mut bytes = [0; 32 * 8];
+    if count > 32 {
+        return Err(Trap::InvalidState {
+            message: format!("{}: invalid vertex state count {count}", command.name),
+        });
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let bytes = &mut bytes[..count * stride];
+    core.memory.read(command.x[2], bytes)?;
+    let args = |first: u32, second: u32| Args {
+        x: [u64::from(first), u64::from(second), 0, 0],
+        ..Args::default()
+    };
+    command.states = bytes
+        .chunks_exact(stride)
+        .enumerate()
+        .map(|(index, element)| {
+            let word = u32::from_le_bytes(element[..4].try_into().unwrap());
+            let mut props = BTreeMap::from([("@Offset".into(), args((index * stride) as u32, 0))]);
+            if attribute {
+                if word & 0x40 != 0 {
+                    props.insert(
+                        "Format".into(),
+                        args(attrib_format(word), attrib_offset(word)),
+                    );
+                    props.insert("StreamIndex".into(), args(word & 31, 0));
+                }
+            } else {
+                let divisor = u32::from_le_bytes(element[4..].try_into().unwrap());
+                // BindVertexStreamState emits the low twelve stride bits;
+                // the in-memory stride and its getter retain the whole word.
+                props.insert("Stride".into(), args(word & 0xfff, 0));
+                props.insert("Divisor".into(), args(divisor, 0));
+            }
+            props
+        })
+        .collect::<Vec<_>>()
+        .into();
+    Ok(())
+}
+
+fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(), Trap> {
     let Some(kind) = command
         .name
         .strip_prefix("nvnCommandBufferBind")
         .filter(|kind| kind.ends_with("State"))
     else {
-        return;
+        return Ok(());
     };
-    let (count, base) = match kind {
-        "VertexAttribState" | "VertexStreamState" => (command.x[1] as usize, command.x[2]),
-        _ => (1, command.x[1]),
-    };
-    if count > 32 || base == 0 {
-        return;
+    if matches!(kind, "VertexAttribState" | "VertexStreamState") {
+        return snapshot_vertex_states(core, command, kind == "VertexAttribState");
+    }
+    let base = command.x[1];
+    if base == 0 {
+        return Ok(());
     }
     // A single tagged state: what the bound structure's bytes hold; an
     // untagged one (never set through NVN) is the defaults, not another
@@ -8426,7 +8476,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
             .and_then(|tag| tagged_state(kind, tag));
         if let Some(snapshot) = tagged {
             command.states = snapshot;
-            return;
+            return Ok(());
         }
         let mut props = read_shared(bags.at(base))
             .get(&base)
@@ -8441,10 +8491,10 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
             },
         );
         command.states = vec![props].into();
-        return;
+        return Ok(());
     }
     command.states = bags
-        .kind_from(base, kind, count)
+        .kind_from(base, kind, 1)
         .into_iter()
         .map(|(address, bag)| {
             let mut props = bag.props;
@@ -8460,6 +8510,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) {
         })
         .collect::<Vec<_>>()
         .into();
+    Ok(())
 }
 
 /// Record NVN call `name` (`nvnCommandBuffer` + `rest`) on a recording
@@ -8566,6 +8617,55 @@ fn stencil_face_property<'a>(
     })
 }
 
+fn attrib_format(word: u32) -> u32 {
+    (word >> 21) & 0x3ff
+}
+
+fn attrib_offset(word: u32) -> u32 {
+    (word >> 7) & 0x3fff
+}
+
+/// SDK vertex setters operate on W-registers. Preserve their exact masks
+/// and writes, including bits outside a setter's normal input range.
+fn vertex_state_call(core: &mut Guest, kind: &str, rest: &str) -> Result<bool, Trap> {
+    let [state, x1, x2, ..] = core.cpu.regs;
+    match (kind, rest) {
+        ("VertexAttribState", "SetDefaults") => core.memory.write_u32(state, 0)?,
+        ("VertexAttribState", "SetFormat") => {
+            let old = core.memory.read_u32(state)?;
+            let word = (old & 0x8000_003f) | ((x1 as u32) << 21) | ((x2 as u32) << 7) | 0x40;
+            core.memory.write_u32(state, word)?;
+        }
+        ("VertexAttribState", "SetStreamIndex") => {
+            let old = core.memory.read_u32(state)?;
+            core.memory.write_u32(state, (old & !31) | x1 as u32)?;
+        }
+        ("VertexAttribState", "GetStreamIndex") => {
+            core.cpu.regs[0] = u64::from(core.memory.read_u32(state)? & 31)
+        }
+        ("VertexAttribState", "GetFormat") => {
+            let format = attrib_format(core.memory.read_u32(state)?);
+            core.memory.write_u32(x1, format)?;
+            // The native getter reads the word again after the first store.
+            let offset = attrib_offset(core.memory.read_u32(state)?);
+            core.memory.write_u64(x2, u64::from(offset))?;
+        }
+        ("VertexStreamState", "SetDefaults") => core.memory.write_u64(state, 0)?,
+        ("VertexStreamState", "SetStride") => core.memory.write_u32(state, x1 as u32)?,
+        ("VertexStreamState", "SetDivisor") => {
+            core.memory.write_u32(state.wrapping_add(4), x1 as u32)?
+        }
+        ("VertexStreamState", "GetStride") => {
+            core.cpu.regs[0] = u64::from(core.memory.read_u32(state)?)
+        }
+        ("VertexStreamState", "GetDivisor") => {
+            core.cpu.regs[0] = u64::from(core.memory.read_u32(state.wrapping_add(4))?)
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// The generic property bags (SetDefaults / Set<Prop> / Get<Prop> on
 /// builders, fixed-function state structures and texture views): Ok(true)
 /// when `kind`/`rest` is one of those calls and it was made. They touch
@@ -8582,6 +8682,14 @@ fn bag_call(
     args: Args,
     x: [u64; 31],
 ) -> Result<bool, Trap> {
+    if matches!(kind, "VertexAttribState" | "VertexStreamState") {
+        let handled = vertex_state_call(core, kind, rest)?;
+        if handled && rest.starts_with("Set") {
+            // This address may previously have held a different kind of builder.
+            write_shared(bags.at(this)).remove(&this);
+        }
+        return Ok(handled);
+    }
     let invalid = |message: String| Trap::InvalidState {
         message: format!("{name}: {message}"),
     };
@@ -8859,7 +8967,7 @@ fn record_command(
                 .push(core.memory.read_u64(x[2] + index * 8)?);
         }
     }
-    snapshot_states(bags, core, &mut command);
+    snapshot_states(bags, core, &mut command)?;
     let copy_view = match command.name {
         "nvnCommandBufferCopyBufferToTexture" => Some(command.x[3]),
         "nvnCommandBufferCopyTextureToBuffer" => Some(command.x[2]),
@@ -10233,6 +10341,251 @@ mod tests {
     }
 
     #[test]
+    fn native_vertex_state_setters_and_getters_follow_the_guest_bytes() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "vertex states")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let recorder = nvn.recorder();
+        let front = |guest: &mut Guest, name: &'static str, args: &[u64]| {
+            guest.cpu.regs[..args.len()].copy_from_slice(args);
+            assert!(
+                recorder
+                    .call(name, RecordedCall::classify(name).unwrap(), guest)
+                    .unwrap()
+            );
+        };
+        let (state, copy, format, offset) = (0x1100, 0x11c0, 0x1200, 0x1220);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferBuilderSetDefaults",
+            &[state],
+        );
+        guest.memory.write_u64(state, u64::MAX).unwrap();
+        front(&mut guest, "nvnVertexAttribStateSetDefaults", &[state]);
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0xffff_ffff_0000_0000);
+        assert_eq!(nvn.bags.len(), 0);
+        guest.memory.write_u32(state, 0x8000_0020).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnVertexAttribStateSetFormat",
+            &[state, 0x143, 0x1234],
+        );
+        front(
+            &mut guest,
+            "nvnVertexAttribStateSetStreamIndex",
+            &[state, 7],
+        );
+        let word = 0x8000_0067 | (0x143 << 21) | (0x1234 << 7);
+        assert_eq!(guest.memory.read_u32(state).unwrap(), word);
+        guest.memory.write_u32(copy, word).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnVertexAttribStateSetDefaults",
+            &[state],
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnVertexAttribStateGetStreamIndex",
+                &[copy]
+            ),
+            7
+        );
+        guest.memory.write_u64(format, u64::MAX).unwrap();
+        guest.memory.write_u64(offset, u64::MAX).unwrap();
+        front(
+            &mut guest,
+            "nvnVertexAttribStateGetFormat",
+            &[copy, format, offset],
+        );
+        assert_eq!(
+            guest.memory.read_u64(format).unwrap(),
+            0xffff_ffff_0000_0143
+        );
+        assert_eq!(guest.memory.read_u64(offset).unwrap(), 0x1234);
+        // The first output aliases the state, so the SDK's second load sees 0x143.
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnVertexAttribStateGetFormat",
+            &[copy, copy, offset],
+        );
+        assert_eq!(guest.memory.read_u64(offset).unwrap(), 2);
+
+        // The setters do not pre-mask their arguments. Excess format and
+        // offset bits reach bits 31 and 21 respectively.
+        front(
+            &mut guest,
+            "nvnVertexAttribStateSetFormat",
+            &[state, 0x400, 0x4000],
+        );
+        assert_eq!(guest.memory.read_u32(state).unwrap(), 0x8020_0040);
+        front(&mut guest, "nvnVertexAttribStateSetDefaults", &[state]);
+        front(
+            &mut guest,
+            "nvnVertexAttribStateSetStreamIndex",
+            &[state, 0x8000_0061],
+        );
+        assert_eq!(guest.memory.read_u32(state).unwrap(), 0x8000_0061);
+        front(&mut guest, "nvnVertexStreamStateSetDefaults", &[state]);
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnVertexStreamStateSetStride",
+            &[state, 0x1234_abcd],
+        );
+        front(
+            &mut guest,
+            "nvnVertexStreamStateSetDivisor",
+            &[state, 0xabcdef12],
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnVertexStreamStateGetStride",
+                &[state]
+            ),
+            0x1234_abcd
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnVertexStreamStateGetDivisor",
+                &[state]
+            ),
+            0xabcdef12
+        );
+        assert_eq!(nvn.bags.len(), 0);
+    }
+
+    #[test]
+    fn native_vertex_state_arrays_bind_exactly_the_recorded_elements() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "vertex arrays")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let (buffer, attributes, streams) = (0x1010, 0x1ff4, 0x1808);
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        let recorder = nvn.recorder();
+        // All three elements come directly from memory. The middle one has
+        // plausible format bits but its enable bit is clear.
+        for (i, word) in [
+            (9 << 21) | (47 << 7) | 0x43,
+            (3 << 21) | 9,
+            (5 << 21) | 0x44,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            guest
+                .memory
+                .write_u32(attributes + i as u64 * 4, word)
+                .unwrap();
+        }
+        guest.cpu.regs[..3].copy_from_slice(&[buffer, 0x1_0000_0003, attributes]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindVertexAttribState", &mut guest)
+                .unwrap()
+        );
+        // An additional element crosses the mapped boundary; it must fault
+        // without appending a partially recorded command.
+        guest.cpu.regs[1] = 4;
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindVertexAttribState", &mut guest)
+                .is_err()
+        );
+        guest.cpu.regs[..3].copy_from_slice(&[buffer, 0, 0]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindVertexAttribState", &mut guest)
+                .unwrap()
+        );
+        guest
+            .memory
+            .write_u64(streams, (7u64 << 32) | 0xabcd)
+            .unwrap();
+        guest
+            .memory
+            .write_u64(streams + 8, (9u64 << 32) | 32)
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBindVertexStreamState",
+            &[buffer, 2, streams],
+        );
+        guest.memory.write_u32(attributes, 0).unwrap();
+        guest.memory.write_u64(streams, 0).unwrap();
+        let handle = call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let recorded = nvn.use_command_list(handle).unwrap();
+        let archived = ArchivedList::pack(&recorded).unpack();
+        assert_eq!(archived.len(), 3);
+        let attrs = &archived[0].states;
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs[0]["Format"].x, [9, 47, 0, 0]);
+        assert_eq!(attrs[0]["StreamIndex"].x[0], 3);
+        assert!(!attrs[1].contains_key("Format"));
+        assert_eq!(attrs[1]["@Offset"].x[0], 4);
+        assert_eq!(attrs[2]["Format"].x[0], 5);
+        assert!(archived[1].states.is_empty());
+        assert_eq!(archived[2].states[0]["Stride"].x[0], 0xbcd);
+        assert_eq!(archived[2].states[0]["Divisor"].x[0], 7);
+        assert_eq!(archived[2].states[1]["@Offset"].x[0], 8);
+        assert_eq!(archived[2].states[1]["Stride"].x[0], 32);
+
+        // Archives written before native state storage contain setter
+        // properties, including unused argument registers, and no enable bit.
+        let mut legacy = archived[0].clone();
+        legacy.x[2] = 0x3000; // Original guest storage is no longer mapped.
+        let format = Args {
+            x: [17, 4, 93, 71],
+            ..Args::default()
+        };
+        legacy.states = vec![BTreeMap::from([("Format".into(), format)])].into();
+        nvn.execute(&legacy, &mut guest).unwrap();
+        assert_eq!(
+            nvn.render.state["BindVertexAttribState"].states[0]["Format"],
+            format
+        );
+    }
+
+    #[test]
     fn remembered_state_transitions_give_the_tags_of_the_properties() {
         let mut memory = Memory::new(1 << 39);
         memory
@@ -10336,7 +10689,7 @@ mod tests {
             states: StateSnapshots::default(),
         };
         bind.x[1] = destination;
-        snapshot_states(&nvn.bags, &guest, &mut bind);
+        snapshot_states(&nvn.bags, &guest, &mut bind).unwrap();
         assert_eq!(bind.states[0]["DepthFunc"].x[0], 3);
         assert_eq!(bind.states[0]["DepthWriteEnable"].x[0], 1);
         assert_eq!(guest.memory.read_u32(source).unwrap(), original);
