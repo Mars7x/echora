@@ -7168,7 +7168,7 @@ impl Nvn {
         {
             let words: Vec<u32> = backend
                 .renderer
-                .read_debug_buffer(index)
+                .read_debug_buffer(index)?
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                 .collect();
@@ -10826,7 +10826,7 @@ impl Nvn {
             }
             let words: Vec<u32> = backend
                 .renderer
-                .read_debug_buffer(buffer)
+                .read_debug_buffer(buffer)?
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                 .collect();
@@ -10874,7 +10874,7 @@ impl Nvn {
                 }
                 let words: Vec<u32> = backend
                     .renderer
-                    .read_debug_buffer(report.buffer)
+                    .read_debug_buffer(report.buffer)?
                     .chunks_exact(4)
                     .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                     .collect();

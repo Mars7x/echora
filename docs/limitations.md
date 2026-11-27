@@ -17,7 +17,9 @@ automated test covers it).
 - Finalizing a texture removes its texel buffer and alternate 1D, 3D and
   array images from the lookup caches. Pending GPU commands retain their
   resources until completion. Vulkan tests cover both retirement and a
-  reused handle reading new buffer contents. Rendering into a compressed
+  reused handle reading new buffer contents. After a full flush, resources
+  retired between submissions are freed even if no further work was recorded.
+  Rendering into a compressed
   texture through an integer view loads and writes back the selected mip and
   layer. Color clears through a block view also preserve the scissor and
   channel mask. A Vulkan test checks that partial writes preserve neighboring

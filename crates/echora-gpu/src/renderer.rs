@@ -677,7 +677,7 @@ pub struct Renderer {
     debug_buffers: Vec<HostBuffer>,
     /// ECHORA_LOOP_TRACE buffers (index, the program it counts), reported
     /// when a wait stalls or the device is lost (`report_loop_traces`).
-    loop_trace_buffers: Vec<(usize, String)>,
+    loop_trace_buffers: Vec<LoopTraceBuffer>,
     recording: bool,
     /// No draws, dispatches or copies follow the last full barrier in the
     /// current command buffer.
@@ -3380,7 +3380,14 @@ impl Renderer {
                 finished?;
             }
         }
-        self.finish_current(false)
+        if self.slot.in_flight {
+            self.finish_current(false)?;
+        } else {
+            // Finalization between submissions retires into the idle recording
+            // slot. Every earlier batch that could use its resources is done.
+            self.release_retired_resources();
+        }
+        Ok(())
     }
 
     /// The highest completed submission serial, shared (see `wait_for`).
@@ -3664,9 +3671,9 @@ impl Renderer {
         self.end_pass();
         self.end_condition();
         self.occlusion_before_submit(self.slot.commands);
-        // Ring bytes the host reads back (storage a draw wrote) are made
-        // visible to it once the submission completes.
-        if !self.slot.pending_reads.is_empty() {
+        // Make pending ring reads and shader writes to mapped trace buffers
+        // visible to the host once this submission completes.
+        if !self.slot.pending_reads.is_empty() || !self.debug_buffers.is_empty() {
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -3887,9 +3894,6 @@ impl Renderer {
         // SAFETY: the fence has signaled and this slot is no longer in use.
         unsafe {
             device
-                .reset_fences(&[self.slot.fence])
-                .map_err(vk_error("vkResetFences"))?;
-            device
                 .reset_command_pool(self.slot.command_pool, vk::CommandPoolResetFlags::empty())
                 .map_err(vk_error("vkResetCommandPool"))?;
             device
@@ -3898,6 +3902,11 @@ impl Renderer {
                     vk::DescriptorPoolResetFlags::empty(),
                 )
                 .map_err(vk_error("vkResetDescriptorPool"))?;
+            // Keep the completed fence signaled if a pool reset fails,
+            // so a retry can observe completion without another submission.
+            device
+                .reset_fences(&[self.slot.fence])
+                .map_err(vk_error("vkResetFences"))?;
         }
         self.slot.in_flight = false;
         // Its markers are passed: their events are reset for reuse.
@@ -3943,7 +3952,24 @@ impl Renderer {
                 }
             }
         }
-        // The work has completed: forgotten uploads can go.
+        self.release_retired_resources();
+        // Deferred results leave the ring before its next use overwrites
+        // them.
+        let mut pending_reads = std::mem::take(&mut self.slot.pending_reads);
+        for (token, offset, length) in pending_reads.drain(..) {
+            let bytes = self.ring_read(offset, length);
+            self.completed_reads.push((token, bytes));
+        }
+        self.slot.pending_reads = pending_reads;
+        self.slot.ring_used = 0;
+        self.slot.sets_used = 0;
+        self.slot.descriptors_used = [0; 4];
+        Ok(())
+    }
+
+    /// Release this slot's retired resources after every batch that could
+    /// reference them has finished.
+    fn release_retired_resources(&mut self) {
         for target in std::mem::take(&mut self.slot.retired_uploads) {
             self.destroy_target(target);
         }
@@ -3969,18 +3995,6 @@ impl Renderer {
                 self.gpu.device.free_memory(memory, None);
             }
         }
-        // Deferred results leave the ring before its next use overwrites
-        // them.
-        let mut pending_reads = std::mem::take(&mut self.slot.pending_reads);
-        for (token, offset, length) in pending_reads.drain(..) {
-            let bytes = self.ring_read(offset, length);
-            self.completed_reads.push((token, bytes));
-        }
-        self.slot.pending_reads = pending_reads;
-        self.slot.ring_used = 0;
-        self.slot.sets_used = 0;
-        self.slot.descriptors_used = [0; 4];
-        Ok(())
     }
 
     /// The texel-buffer view of guest buffer texture `source`: its level-0
@@ -7777,45 +7791,65 @@ impl Renderer {
         Ok((self.debug_buffers.len() - 1, address))
     }
 
-    /// Debugging: a `debug_buffer`'s bytes as they are now.
     /// Name debug buffer `index` as a loop trace of `program`.
     pub fn mark_loop_trace(&mut self, index: usize, program: String) {
-        self.loop_trace_buffers.push((index, program));
+        self.loop_trace_buffers.push(LoopTraceBuffer {
+            index,
+            program,
+            completed: None,
+            long_or_stopped: Vec::new(),
+        });
     }
 
-    /// Each loop trace's loops with invocations the budget stopped, and
-    /// each loop's most iterations (when a wait stalls or fails: the trace
-    /// otherwise reports every 60 presents, after a hang never).
+    /// A failed or stalled fence cannot synchronize a host read. Use only
+    /// loop counters saved by the most recent completed report.
     fn report_loop_traces(&self, why: &str) {
-        for (index, program) in &self.loop_trace_buffers {
-            let Some(buffer) = self.debug_buffers.get(*index) else {
+        for trace in &self.loop_trace_buffers {
+            let program = &trace.program;
+            let Some(serial) = trace.completed else {
+                eprintln!("loop trace ({why}) {program}: no completed snapshot");
                 continue;
             };
-            let words: Vec<u32> = buffer
-                .read_bytes(64 << 10)
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| u32::from_le_bytes(*word))
-                .collect();
-            for (number, entry) in words.chunks_exact(4).enumerate() {
-                if entry[0] != 0 && (entry[2] != 0 || entry[1] >= 256) {
-                    eprintln!(
-                        "loop trace ({why}) {program} loop {number} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
-                        entry[3].wrapping_sub(1),
-                        entry[0],
-                        entry[1],
-                        entry[2]
-                    );
-                }
+            eprintln!(
+                "loop trace ({why}) {program}: last completed snapshot at submission {serial}"
+            );
+            for (number, entry) in &trace.long_or_stopped {
+                eprintln!(
+                    "loop trace {program} loop {number} at {:#x}: {} iterations, at most {} per invocation, {} stopped by the budget",
+                    entry[3].wrapping_sub(1),
+                    entry[0],
+                    entry[1],
+                    entry[2]
+                );
             }
         }
     }
 
-    pub fn read_debug_buffer(&self, index: usize) -> Vec<u8> {
-        self.debug_buffers
+    /// Submit recorded writes and wait for all trace writers before reading
+    /// their coherent mapping. Earlier asynchronous submissions also carry
+    /// the host-read barrier in `submit_current`.
+    pub fn read_debug_buffer(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        self.flush()?;
+        let bytes = self
+            .debug_buffers
             .get(index)
-            .map_or_else(Vec::new, |buffer| buffer.read_bytes(buffer.size as usize))
+            .map_or_else(Vec::new, |buffer| buffer.read_bytes(buffer.size as usize));
+        if let Some(trace) = self
+            .loop_trace_buffers
+            .iter_mut()
+            .find(|t| t.index == index)
+        {
+            trace.completed = Some(self.completed_serial);
+            trace.long_or_stopped.clear();
+            for (number, data) in bytes.as_chunks::<16>().0.iter().enumerate() {
+                let words: &[[u8; 4]; 4] = data.as_chunks::<4>().0.try_into().unwrap();
+                let entry = words.map(u32::from_le_bytes);
+                if entry[0] != 0 && (entry[2] != 0 || entry[1] >= 256) {
+                    trace.long_or_stopped.push((number, entry));
+                }
+            }
+        }
+        Ok(bytes)
     }
 
     /// Make sure a guest texture is uploaded (debugging reads).
@@ -8457,6 +8491,13 @@ struct PageTableBuffer {
     submitted_read: u64,
 }
 
+struct LoopTraceBuffer {
+    index: usize,
+    program: String,
+    completed: Option<u64>,
+    long_or_stopped: Vec<(usize, [u32; 4])>,
+}
+
 /// A mapped host-visible buffer.
 pub(crate) struct HostBuffer {
     pub buffer: vk::Buffer,
@@ -8882,6 +8923,43 @@ mod tests {
         let reads = renderer.take_reads(&[first, second]);
         assert_eq!(reads[&first], [0x11; 4]);
         assert_eq!(reads[&second], [0x22; 4]);
+    }
+
+    #[test]
+    fn debug_snapshots_observe_submitted_and_recorded_gpu_writes() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        // Use the transfer engine to write two loop records into the same
+        // kind of coherent mapping the shader instrumentation uses.
+        let buffer = renderer
+            .host_buffer(32, vk::BufferUsageFlags::TRANSFER_DST)
+            .unwrap();
+        let handle = buffer.buffer;
+        let index = renderer.debug_buffers.len();
+        renderer.debug_buffers.push(buffer);
+        renderer.mark_loop_trace(index, "test".into());
+        assert_eq!(renderer.loop_trace_buffers[0].completed, None);
+        for (already_submitted, iterations) in [(true, 300u32), (false, 400)] {
+            let words = [7, 4, 0, 17, iterations, 256, 0, 33];
+            let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let commands = renderer.commands().unwrap();
+            // SAFETY: outside rendering, destination live, aligned and in bounds.
+            unsafe {
+                renderer
+                    .device()
+                    .cmd_update_buffer(commands, handle, 0, &bytes);
+            }
+            let serial = renderer.recorded_serial();
+            if already_submitted {
+                renderer.flush_async().unwrap();
+            }
+            assert_eq!(renderer.read_debug_buffer(index).unwrap(), bytes);
+            assert!(renderer.completed_serial() >= serial);
+            let emergency = &renderer.loop_trace_buffers[0];
+            assert_eq!(emergency.completed, Some(serial));
+            assert_eq!(emergency.long_or_stopped, [(1, [iterations, 256, 0, 33])]);
+        }
     }
 
     #[test]
@@ -10036,6 +10114,8 @@ mod tests {
             for &binding in bindings {
                 renderer.texture_view(&source, binding).unwrap();
             }
+            renderer.submit_frame().unwrap();
+            assert!(!renderer.recording && renderer.spares.iter().any(|slot| slot.in_flight));
             assert_eq!(renderer.uploads.len(), bindings.len());
             let retired = renderer.slot.retired_uploads.len();
             let [_, (_, upload_bytes), (_, retired_bytes)] = renderer.image_allocation_bytes();
@@ -10050,6 +10130,12 @@ mod tests {
                 renderer.slot.retired_uploads.len() - retired,
                 bindings.len()
             );
+            renderer.poll_completed_fences(|_, _| Ok(false)).unwrap();
+            assert_eq!(renderer.image_allocation_bytes()[2].1, after);
+            let submissions = renderer.flushes;
+            renderer.flush().unwrap();
+            assert_eq!(renderer.image_allocation_bytes()[2].1, 0);
+            assert_eq!(renderer.flushes, submissions);
         }
     }
 
@@ -10078,6 +10164,11 @@ mod tests {
         }
         assert!(renderer.texel_buffers.is_empty());
         assert_eq!(renderer.slot.retired_texel_buffers.len(), 2);
+        assert!(!renderer.recording);
+        let submissions = renderer.flushes;
+        renderer.flush().unwrap();
+        assert!(renderer.slot.retired_texel_buffers.is_empty());
+        assert_eq!(renderer.flushes, submissions);
     }
 
     #[test]

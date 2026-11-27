@@ -331,6 +331,12 @@ invocation, the times the loop budget ran out there, and its header's
 byte offset plus one (four words per loop, in emission order; nothing
 while the address is 0).
 
+Routine loop and vertex trace reports wait for pending GPU writes before
+reading their counters. If a fence stalls or fails, the emergency loop report
+uses the last completed snapshot and names its submission. It records loops
+that reached 256 iterations in one invocation or hit the loop budget. A
+stall before the first snapshot is reported explicitly.
+
 **Vertex tracing.** With ECHORA_VERTEX_TRACE set at translation
 (debugging only, as loop tracing), vertex and mesh programs record what
 their first invocations computed in a buffer at the device address the
