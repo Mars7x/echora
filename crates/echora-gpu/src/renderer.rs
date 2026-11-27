@@ -1483,6 +1483,9 @@ impl Renderer {
     pub(crate) fn commands(&mut self) -> Result<vk::CommandBuffer, String> {
         let commands = self.recording_commands()?;
         self.end_pass();
+        if let Some(error) = &self.fatal {
+            return Err(error.clone());
+        }
         Ok(commands)
     }
 
@@ -5850,6 +5853,7 @@ impl Renderer {
         if self.work_items >= limit {
             self.flush_async()?;
         }
+        self.reserve_occlusion_space()?;
         self.work_items += 1;
         Ok(())
     }
@@ -7729,6 +7733,7 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
+        self.reserve_occlusion_space()?;
         if mask != vk::ColorComponentFlags::RGBA {
             self.stat("stat: masked color clears", 1);
             // SAFETY: the union contains four initialized 32-bit words.
@@ -7843,6 +7848,7 @@ impl Renderer {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
+        self.reserve_occlusion_space()?;
         self.prepare_condition()?;
         self.begin_rendering(&[], &[], &[], &[], Some((key, level, layer)), [0; 4])?;
         self.apply_condition()?;

@@ -478,6 +478,24 @@ impl Occlusion {
 }
 
 impl Renderer {
+    /// Rotate submissions before an operation that can open or close passes
+    /// or add a report. Resolved plans stay mapped until their fence signals.
+    pub(crate) fn reserve_occlusion_space(&mut self) -> Result<(), String> {
+        // A draw can end a pass, resolve reports for its condition, then
+        // open another pass. Each of those can start a new segment.
+        const HEADROOM: usize = 8;
+        if let Some(occlusion) = &self.occlusion {
+            let slot = occlusion.slot(self.current_fence());
+            if occlusion.next[slot] as usize + HEADROOM >= QUERIES as usize
+                || occlusion.plan_next[slot] as usize + occlusion.pending.len() + HEADROOM
+                    >= PLANS as usize
+            {
+                self.flush_async()?;
+            }
+        }
+        Ok(())
+    }
+
     fn occlusion(&mut self) -> Result<&mut Occlusion, String> {
         if self.occlusion.is_none() {
             let fences = self.slot_fences();
@@ -489,8 +507,7 @@ impl Renderer {
         Ok(self.occlusion.as_mut().expect("made above"))
     }
 
-    /// End the active segment and begin the next, resolving the batch
-    /// first when the slot has no room for it.
+    /// End the active segment and begin the next within the reserved slot.
     fn next_segment(&mut self, begin: bool) -> Result<(), String> {
         // Inside a rendering pass when the active segment began in it and
         // the next can (no resolve, its query reset ahead).
@@ -514,46 +531,29 @@ impl Renderer {
         }
         let commands = self.commands()?;
         self.occlusion()?;
-        self.next_segment_outside(commands, begin);
-        Ok(())
+        self.next_segment_outside(commands, begin)
     }
 
     /// `next_segment` outside a rendering pass (the occlusion state made).
-    fn next_segment_outside(&mut self, commands: vk::CommandBuffer, begin: bool) {
+    fn next_segment_outside(
+        &mut self,
+        commands: vk::CommandBuffer,
+        begin: bool,
+    ) -> Result<(), String> {
         let fence = self.current_fence();
         // SAFETY: `self.gpu` stays in place for this call.
         let gpu = unsafe { self.detached_gpu() };
         let device = &gpu.device;
         let occlusion = self.occlusion.as_mut().expect("made by the caller");
         occlusion.end(&device, commands);
-        if begin && !occlusion.has_room(fence) {
-            self.end_condition();
-            let occlusion = self.occlusion.as_mut().expect("made above");
-            occlusion.resolve(&device, commands, fence);
-            // The slot's queries are all resolved: they start over (each
-            // is reset before it begins, after the copy in command order).
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            // SAFETY: recording, outside rendering.
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    commands,
-                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[barrier],
-                    &[],
-                    &[],
-                )
-            };
-            occlusion.slot_reused(fence);
-        }
         if begin {
-            let occlusion = self.occlusion.as_mut().expect("made above");
+            if !occlusion.has_room(fence) {
+                return Err("occlusion slot exhausted while recording".into());
+            }
             occlusion.resume = false;
             occlusion.begin(&device, commands, fence, false);
         }
+        Ok(())
     }
 
     /// Before a rendering pass begins (outside it): queries are reset
@@ -603,10 +603,11 @@ impl Renderer {
         }
     }
 
-    /// After a rendering pass ended a segment: counting goes on outside,
-    /// resolving the batch first when the slot has no room.
+    /// After a rendering pass ended a segment, counting goes on outside.
     pub(crate) fn occlusion_pass_ended(&mut self, commands: vk::CommandBuffer) {
-        self.next_segment_outside(commands, true);
+        if let Err(error) = self.next_segment_outside(commands, true) {
+            self.fatal.get_or_insert(error);
+        }
     }
 
     /// Internal raster operations implementing attachment clears are
@@ -622,6 +623,7 @@ impl Renderer {
         if !counting {
             return record(self);
         }
+        self.reserve_occlusion_space()?;
         self.next_segment(false)?;
         self.occlusion.as_mut().expect("counting").resume = false;
         let result = record(self);
@@ -631,6 +633,7 @@ impl Renderer {
 
     /// ResetCounter(SAMPLES_PASSED): the count restarts from 0 here.
     pub fn samples_reset(&mut self) -> Result<(), String> {
+        self.reserve_occlusion_space()?;
         self.next_segment(false)?;
         let occlusion = self.occlusion.as_mut().expect("made by next_segment");
         occlusion.reset_from = Some(occlusion.ended);
@@ -653,14 +656,7 @@ impl Renderer {
         if !offset.is_multiple_of(4) {
             return Err("a samples-passed report must be four-byte aligned".into());
         }
-        let fence = self.current_fence();
-        let occlusion = self.occlusion()?;
-        let slot = occlusion.slot(fence);
-        // Leave room for the new report, the batch total and a change of
-        // segment. Reports can fill the plan even with no query counting.
-        if occlusion.plan_next[slot] as usize + occlusion.pending.len() + 3 >= PLANS as usize {
-            self.flush_async()?;
-        }
+        self.reserve_occlusion_space()?;
         let counting = self.occlusion()?.active.is_some();
         let resume = self.occlusion()?.resume;
         self.next_segment(false)?;
@@ -880,6 +876,37 @@ fn sum_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_rollover_keeps_recorded_resolve_plans() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address {
+            return;
+        }
+        let mut renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        let (buffer, _) = renderer.resident_buffer(1, 32).unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.samples_report(buffer, 0, 0x62).unwrap();
+        renderer.mark().unwrap();
+        let first = renderer.occlusion.as_ref().unwrap().plans.read_bytes(16);
+
+        for _ in 0..super::QUERIES + 5 {
+            renderer.samples_reset().unwrap();
+        }
+        renderer.samples_report(buffer, 16, 0x97).unwrap();
+        renderer.mark().unwrap();
+
+        let occlusion = renderer.occlusion.as_ref().unwrap();
+        assert_eq!(occlusion.plans.read_bytes(16), first);
+        let token = renderer.read_resident(1, 0, 32).unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            [0_u64, 0x62, 0, 0x97].map(u64::to_le_bytes).concat()
+        );
+    }
+
     #[test]
     fn reports_without_a_reset_can_span_multiple_plan_buffers() {
         let Ok(gpu) = crate::vulkan::Gpu::new() else {
