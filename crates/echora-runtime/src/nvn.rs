@@ -2230,11 +2230,12 @@ impl<'a> RecordedCall<'a> {
 }
 
 /// A property-bag call workers make without the NVN state: any on a kind
-/// in `FRONT_KINDS`, and the setters of texture builders and views (their
-/// getters include storage queries `Nvn::call` answers itself).
+/// in `FRONT_KINDS`, and setters on texture builders, texture views and
+/// sampler builders. Their getters use type-specific logic in `Nvn::call`.
 fn front_bag(kind: &str, rest: &str) -> bool {
     FRONT_KINDS.contains(&kind)
-        || (matches!(kind, "TextureBuilder" | "TextureView") && rest.starts_with("Set"))
+        || (matches!(kind, "TextureBuilder" | "TextureView" | "SamplerBuilder")
+            && rest.starts_with("Set"))
 }
 
 /// Kinds handled entirely by `bag_call`, including the vertex states
@@ -4464,35 +4465,6 @@ impl Nvn {
         // int* t, int* r) and GetCompare(s, int* mode, int* function). They
         // return what the matching setter stored (floats in V0/V1).
         if matches!(kind, "Sampler" | "SamplerBuilder") {
-            // The SDK's float, signed and unsigned border setters overwrite
-            // the same four words. Snapshot them before the guest reuses X1.
-            if kind == "SamplerBuilder"
-                && matches!(
-                    rest,
-                    "SetBorderColor" | "SetBorderColori" | "SetBorderColorui"
-                )
-            {
-                let mut words = [0u64; 4];
-                for (index, word) in words.iter_mut().enumerate() {
-                    *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
-                }
-                let mut bags = write_shared(self.bags.at(this));
-                let bag = bags.entry(this).or_insert_with(|| Bag {
-                    kind: kind.into(),
-                    ..Bag::default()
-                });
-                if bag.kind != kind {
-                    return Err(invalid(format!("no SamplerBuilder at {this:#x}")));
-                }
-                bag.props.insert(
-                    "BorderColor".into(),
-                    Args {
-                        x: words,
-                        v: [0; 2],
-                    },
-                );
-                return Ok(true);
-            }
             if matches!(
                 rest,
                 "GetBorderColor" | "GetBorderColori" | "GetBorderColorui"
@@ -8919,11 +8891,41 @@ fn bag_call(
         command_id: None,
         message: format!("{name}: {message}"),
     };
+    // The SDK's float, signed and unsigned border setters overwrite
+    // the same four words. Snapshot them before the guest reuses X1.
+    if kind == "SamplerBuilder"
+        && matches!(
+            rest,
+            "SetBorderColor" | "SetBorderColori" | "SetBorderColorui"
+        )
+    {
+        let mut words = [0u64; 4];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
+        }
+        let mut bags = write_shared(bags.at(this));
+        let bag = bags.entry(this).or_insert_with(|| Bag {
+            kind: kind.into(),
+            ..Bag::default()
+        });
+        if bag.kind != kind {
+            return Err(invalid(format!("no SamplerBuilder at {this:#x}")));
+        }
+        bag.props.insert(
+            "BorderColor".into(),
+            Args {
+                x: words,
+                v: [0; 2],
+            },
+        );
+        return Ok(true);
+    }
     let bag_like = kind.ends_with("Builder") || kind == "TextureView" || kind.ends_with("State");
     if bag_like && rest == "SetDefaults" {
         // Builders keep their device across SetDefaults: the application
         // sets the device first for some kinds (QueueBuilder).
-        let device = read_shared(bags.at(this))
+        let mut shard = write_shared(bags.at(this));
+        let device = shard
             .get(&this)
             .and_then(|bag| bag.props.get("Device").copied());
         let mut bag = Bag {
@@ -8937,7 +8939,7 @@ fn bag_call(
         if let Some(tag) = bag.tag {
             core.memory.write_u32(this, tag)?;
         }
-        write_shared(bags.at(this)).insert(this, bag);
+        shard.insert(this, bag);
         return Ok(true);
     }
     if bag_like {
@@ -11340,6 +11342,84 @@ mod tests {
     }
 
     #[test]
+    fn recorder_sampler_setters_share_builder_state_with_initialization_and_getters() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "sampler")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let (device, builder, sampler, min, max) = (0x1000, 0x1100, 0x1180, 0x1200, 0x1204);
+        let mut nvn = Nvn::default();
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        let recorder = nvn.recorder();
+        let set = |guest: &mut Guest, name: &'static str, args: &[u64]| {
+            guest.cpu.regs[..args.len()].copy_from_slice(args);
+            assert!(
+                recorder
+                    .call(name, RecordedCall::classify(name).unwrap(), guest)
+                    .unwrap()
+            );
+        };
+
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetDevice",
+            &[builder, device],
+        );
+        set(&mut guest, "nvnSamplerBuilderSetDefaults", &[builder]);
+        let lod = [0.5_f32.to_bits(), 4.25_f32.to_bits()];
+        guest.cpu.vectors[..2].copy_from_slice(&lod.map(u128::from));
+        set(&mut guest, "nvnSamplerBuilderSetLodClamp", &[builder]);
+        set(&mut guest, "nvnSamplerBuilderSetCompare", &[builder, 1, 3]);
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnSamplerInitialize",
+                &[sampler, builder]
+            ),
+            1
+        );
+
+        // Reset the shared builder. The initialized sampler retains the previous values.
+        set(&mut guest, "nvnSamplerBuilderSetDefaults", &[builder]);
+        for (object, name, expected) in [
+            (
+                builder,
+                "nvnSamplerBuilderGetLodClamp",
+                [0, 1000.0_f32.to_bits()],
+            ),
+            (sampler, "nvnSamplerGetLodClamp", lod),
+            (builder, "nvnSamplerBuilderGetCompare", [0, 2]),
+            (sampler, "nvnSamplerGetCompare", [1, 3]),
+        ] {
+            guest.cpu.regs[..3].copy_from_slice(&[object, min, max]);
+            assert!(!recorder.front(name, &mut guest).unwrap());
+            call(&mut nvn, &mut guest, name, &[object, min, max]);
+            assert_eq!(
+                [min, max].map(|at| guest.memory.read_u32(at).unwrap()),
+                expected
+            );
+        }
+        guest.cpu.regs[0] = 0;
+        assert!(
+            !recorder
+                .front("nvnSamplerBuilderSetDefaults", &mut guest)
+                .unwrap()
+        );
+        assert!(
+            nvn.call("nvnSamplerBuilderSetDefaults", &mut guest)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn sampler_border_queries_share_the_last_four_words() {
         let mut memory = Memory::new(1 << 39);
         memory
@@ -11352,6 +11432,7 @@ mod tests {
             counter: None,
         };
         let mut nvn = Nvn::default();
+        let recorder = nvn.recorder();
         let (device, builder, sampler, input, out) = (0x1000, 0x1100, 0x1180, 0x1200, 0x1210);
         nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
         call(
@@ -11373,12 +11454,10 @@ mod tests {
                     .write_u32(input + 4 * index as u64, *word)
                     .unwrap();
             }
-            call(
-                &mut nvn,
-                &mut core,
-                &format!("nvnSamplerBuilderSetBorderColor{suffix}"),
-                &[builder, input],
-            );
+            let setter = format!("nvnSamplerBuilderSetBorderColor{suffix}");
+            core.cpu.regs[..2].copy_from_slice(&[builder, input]);
+            assert!(recorder.front(&setter, &mut core).unwrap());
+            core.memory.write(input, &[0; 16]).unwrap();
             call(
                 &mut nvn,
                 &mut core,
