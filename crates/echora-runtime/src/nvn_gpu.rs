@@ -303,6 +303,43 @@ impl PagePool {
 #[path = "nvn_write_ranges.rs"]
 mod writer_ranges;
 
+struct VertexTraceReport {
+    buffer: usize,
+    reported: u64,
+    texture_counts: Vec<[u32; 16]>,
+}
+
+impl VertexTraceReport {
+    fn begin_report(&mut self, present: u64, records: usize) -> Option<u64> {
+        let previous = (!self.texture_counts.is_empty()).then_some(self.reported);
+        self.texture_counts.resize(records, [0; 16]);
+        self.reported = present;
+        previous
+    }
+
+    // Each texture instruction has its own cumulative execution counter.
+    // Its last sample may predate other instructions in the same record.
+    fn sample_interval(
+        &mut self,
+        record: usize,
+        slot: usize,
+        count: u32,
+        previous_report: Option<u64>,
+    ) -> String {
+        let previous_count = std::mem::replace(&mut self.texture_counts[record][slot], count);
+        match previous_report {
+            None => " [first observation]".into(),
+            Some(present) if count == previous_count => {
+                format!(" [count unchanged since report at present {present}]")
+            }
+            Some(present) => format!(
+                " [+{} since report at present {present}]",
+                count.wrapping_sub(previous_count)
+            ),
+        }
+    }
+}
+
 pub struct Backend {
     pub renderer: Renderer,
     /// Translations by stage key and the parameters that shape them.
@@ -333,10 +370,8 @@ pub struct Backend {
     /// present it was last reported at.
     loop_traces: HashMap<u64, (usize, u64, u64)>,
     /// ECHORA_VERTEX_TRACE (debugging): each traced graphics stage's record
-    /// buffer, by (vertex key, fragment key, stage index): its
-    /// `Renderer::debug_buffer` index and the present it was last reported
-    /// at.
-    vertex_traces: HashMap<(u64, u64, usize), (usize, u64)>,
+    /// buffer and reporting history by (vertex key, fragment key, stage index).
+    vertex_traces: HashMap<(u64, u64, usize), VertexTraceReport>,
     /// Each debug buffer's device address, by its index.
     vertex_trace_addresses: Vec<u64>,
     /// Linked graphics programs by translation identities and trace mode.
@@ -10616,12 +10651,17 @@ impl Nvn {
                     };
                     let trace = (keys.0, keys.1, index);
                     let address = match backend.vertex_traces.get(&trace) {
-                        Some(&(buffer, _)) => backend.vertex_trace_addresses[buffer],
+                        Some(report) => backend.vertex_trace_addresses[report.buffer],
                         None => {
                             let (buffer, address) = backend.renderer.debug_buffer(32 << 10)?;
-                            backend
-                                .vertex_traces
-                                .insert(trace, (buffer, self.presented_frames));
+                            backend.vertex_traces.insert(
+                                trace,
+                                VertexTraceReport {
+                                    buffer,
+                                    reported: self.presented_frames,
+                                    texture_counts: Vec::new(),
+                                },
+                            );
                             if backend.vertex_trace_addresses.len() <= buffer {
                                 backend.vertex_trace_addresses.resize(buffer + 1, 0);
                             }
@@ -10816,7 +10856,7 @@ impl Nvn {
         {
             for index in 0..stages.len() {
                 let trace = (keys.0, keys.1, index);
-                let Some(&(buffer, reported)) = backend.vertex_traces.get(&trace) else {
+                let Some(report) = backend.vertex_traces.get_mut(&trace) else {
                     continue;
                 };
                 // ECHORA_VERTEX_TRACE_REPORT_EVERY=N presents (60).
@@ -10824,15 +10864,16 @@ impl Nvn {
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(60);
-                if self.presented_frames < reported + every {
+                if self.presented_frames < report.reported.saturating_add(every) {
                     continue;
                 }
                 let words: Vec<u32> = backend
                     .renderer
-                    .read_debug_buffer(buffer)
+                    .read_debug_buffer(report.buffer)
                     .chunks_exact(4)
                     .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                     .collect();
+                let previous_report = report.begin_report(self.presented_frames, words.len() / 128);
                 for (record, entry) in words.chunks_exact(128).enumerate() {
                     // Any record written (an invocation that left by an
                     // early exit has no "reached its end" bit).
@@ -10881,13 +10922,12 @@ impl Nvn {
                                     entry[echora_shader_abi::VERTEX_TRACE_HANDLE_WORD + index];
                                 line += &format!(" handle {handle:#010x}");
                             }
+                            line +=
+                                &report.sample_interval(record, index, texture[1], previous_report);
                         }
                     }
                     eprintln!("{line}");
                 }
-                backend
-                    .vertex_traces
-                    .insert(trace, (buffer, self.presented_frames));
             }
         }
 
@@ -18404,6 +18444,47 @@ const ARCHIVE_AFTER_PRESENTS: u64 = 24;
 /// Archives queued per submission, largest first, so one submission does
 /// not hand the compressing thread a whole scene's targets at once.
 const ARCHIVES_PER_SUBMIT: usize = 6;
+
+#[cfg(test)]
+mod vertex_trace_report_tests {
+    use super::VertexTraceReport;
+
+    #[test]
+    fn reports_texture_execution_changes_since_each_observation() {
+        let mut report = VertexTraceReport {
+            buffer: 0,
+            reported: 13_000,
+            texture_counts: Vec::new(),
+        };
+        let previous = report.begin_report(13_600, 2);
+        assert_eq!(previous, None);
+        assert_eq!(
+            report.sample_interval(0, 0, 446, previous),
+            " [first observation]"
+        );
+        report.sample_interval(0, 1, 256, previous);
+        report.sample_interval(1, 0, u32::MAX, previous);
+
+        let previous = report.begin_report(13_660, 2);
+        assert_eq!(
+            report.sample_interval(0, 0, 446, previous),
+            " [count unchanged since report at present 13600]"
+        );
+        assert_eq!(
+            report.sample_interval(0, 1, 261, previous),
+            " [+5 since report at present 13600]"
+        );
+        assert_eq!(
+            report.sample_interval(1, 0, 1, previous),
+            " [+2 since report at present 13600]"
+        );
+        let previous = report.begin_report(13_720, 2);
+        assert_eq!(
+            report.sample_interval(0, 1, 261, previous),
+            " [count unchanged since report at present 13660]"
+        );
+    }
+}
 
 #[cfg(test)]
 mod translation_key_tests {

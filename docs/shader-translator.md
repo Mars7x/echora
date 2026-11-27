@@ -340,6 +340,9 @@ Launch the runtime with `ECHORA_VERTEX_TRACE_PROGRAMS=<key>[,...]` to trace
 only the listed hexadecimal stage keys. This overrides `ECHORA_VERTEX_TRACE`
 in the runtime. With `ECHORA_VERTEX_TRACE_REPORT` set, use
 `ECHORA_VERTEX_TRACE_REPORT_FROM=N` to print records starting at present N.
+Each texture instruction retains its last sample across draws and presents.
+The first report establishes a baseline. Later reports show how many times
+the instruction ran since the previous report, or that its count is unchanged.
 The buffer is 64 records of 128 u32 words (32 KiB), zeroed by the
 runtime. A vertex program writes record `VertexIndex - BaseVertex` (the
 index the draw read; an index of 64 or more is not traced) from the

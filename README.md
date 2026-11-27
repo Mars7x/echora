@@ -59,7 +59,8 @@ What works today:
 What doesn't work yet:
 
 - Water and fog don't match the console yet. They are being compared
-  against real-hardware footage of the same scenes.
+  against real-hardware footage of the same scenes. Shader traces now
+  distinguish new texture samples from values retained since an earlier report.
 - Gameplay past the opening scene. Around the flight through Kokiri Forest
   the graphics driver sometimes crashes, and memory use keeps growing after
   that point. The renderer now retires finalized uploads, releases shared
