@@ -174,6 +174,12 @@ synthetic fixtures and runs without the game files.
   All 2,210 retained archives at present 6,200 had storage addresses
   inside the live guest heap. Their 1,928 distinct compressed payloads
   occupied 2,004 MiB.
+  A profiling run at `caea754` averaged 8.39 FPS over presents
+  3,800–4,700, compared with 8.32 at `d405cfa`. Replay-worker pieces
+  fell from 854,018 to 799,988, and the worker's cumulative wait for
+  the NVN lock fell from 28.64 to 24.59 seconds. Both runs exited cleanly
+  and reached the outdoor title at the same checkpoints. This pair shows
+  a small throughput difference across builds with several changes.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
