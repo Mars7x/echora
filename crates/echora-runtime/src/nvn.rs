@@ -4388,13 +4388,13 @@ impl Nvn {
         // int* t, int* r) and GetCompare(s, int* mode, int* function). They
         // return what the matching setter stored (floats in V0/V1).
         if matches!(kind, "Sampler" | "SamplerBuilder") {
-            // SetBorderColor[i|ui](builder, const T rgba[4]): the four words
-            // are captured, since the application may reuse the array.
-            // Get* writes them to the array at X1 (default transparent
-            // black, OpenGL's).
-            if let Some(suffix) = rest
-                .strip_prefix("SetBorderColor")
-                .filter(|_| kind == "SamplerBuilder")
+            // The SDK's float, signed and unsigned border setters overwrite
+            // the same four words. Snapshot them before the guest reuses X1.
+            if kind == "SamplerBuilder"
+                && matches!(
+                    rest,
+                    "SetBorderColor" | "SetBorderColori" | "SetBorderColorui"
+                )
             {
                 let mut words = [0u64; 4];
                 for (index, word) in words.iter_mut().enumerate() {
@@ -4409,7 +4409,7 @@ impl Nvn {
                     return Err(invalid(format!("no SamplerBuilder at {this:#x}")));
                 }
                 bag.props.insert(
-                    format!("BorderColor{suffix}"),
+                    "BorderColor".into(),
                     Args {
                         x: words,
                         v: [0; 2],
@@ -4417,7 +4417,10 @@ impl Nvn {
                 );
                 return Ok(true);
             }
-            if let Some(suffix) = rest.strip_prefix("GetBorderColor") {
+            if matches!(
+                rest,
+                "GetBorderColor" | "GetBorderColori" | "GetBorderColorui"
+            ) {
                 let props = if kind == "Sampler" {
                     self.object(this, "Sampler")
                         .map_err(invalid)?
@@ -4426,9 +4429,7 @@ impl Nvn {
                 } else {
                     self.bag(this, "SamplerBuilder").map_err(invalid)?
                 };
-                let words = props
-                    .get(&format!("BorderColor{suffix}"))
-                    .map_or([0; 4], |value| value.x);
+                let words = props.get("BorderColor").map_or([0; 4], |value| value.x);
                 for (index, word) in words.iter().enumerate() {
                     core.memory
                         .write_u32(x[1] + index as u64 * 4, *word as u32)?;
@@ -10174,6 +10175,75 @@ mod tests {
                 expected,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn sampler_border_queries_share_the_last_four_words() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "sampler")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let (device, builder, sampler, input, out) = (0x1000, 0x1100, 0x1180, 0x1200, 0x1210);
+        nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnSamplerBuilderSetDefaults",
+            &[builder],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnSamplerBuilderSetDevice",
+            &[builder, device],
+        );
+        for (generation, suffix) in ["", "i", "ui"].into_iter().enumerate() {
+            let words = [0x7fa1_2345, 0x8000_0000, u32::MAX, generation as u32];
+            for (index, word) in words.iter().enumerate() {
+                core.memory
+                    .write_u32(input + 4 * index as u64, *word)
+                    .unwrap();
+            }
+            call(
+                &mut nvn,
+                &mut core,
+                &format!("nvnSamplerBuilderSetBorderColor{suffix}"),
+                &[builder, input],
+            );
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnSamplerInitialize",
+                &[sampler, builder],
+            );
+            for (kind, object) in [("SamplerBuilder", builder), ("Sampler", sampler)] {
+                for getter in ["", "i", "ui"] {
+                    core.memory.write(out, &[0; 16]).unwrap();
+                    call(
+                        &mut nvn,
+                        &mut core,
+                        &format!("nvn{kind}GetBorderColor{getter}"),
+                        &[object, out],
+                    );
+                    assert_eq!(
+                        std::array::from_fn(|i| core.memory.read_u32(out + 4 * i as u64).unwrap()),
+                        words
+                    );
+                }
+            }
+            assert_eq!(
+                Nvn::sampler_from_properties(&nvn.bag(builder, "SamplerBuilder").unwrap()).border,
+                words
+            );
+            call(&mut nvn, &mut core, "nvnSamplerFinalize", &[sampler]);
         }
     }
 
