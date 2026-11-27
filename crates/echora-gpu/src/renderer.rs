@@ -5562,12 +5562,24 @@ impl Renderer {
     /// Retire an allocation that has no texels to keep under another key.
     pub fn discard_undefined_target(&mut self, key: u64) {
         if self.target_is_undefined(key) {
-            let target = self.remove_target(key).unwrap();
-            self.slot.retired_uploads.push(target);
-            self.fresh_targets.retain(|fresh| *fresh != key);
-            self.target_changes += 1;
-            self.changed_targets.push(key);
+            self.discard_target(key);
         }
+    }
+
+    /// The guest has replaced all of this image's storage. Recorded commands
+    /// still own the live allocation until their submission completes.
+    pub fn discard_target(&mut self, key: u64) {
+        if let Some(target) = self.remove_target(key) {
+            self.slot.retired_uploads.push(target);
+        } else if self.remove_archive(key) {
+            let index = self.guest_target_keys.binary_search(&key).unwrap();
+            self.guest_target_keys.remove(index);
+        } else {
+            return;
+        }
+        self.fresh_targets.retain(|fresh| *fresh != key);
+        self.target_changes += 1;
+        self.changed_targets.push(key);
     }
 
     /// Schedule one lossless snapshot while the target is inactive. Leave

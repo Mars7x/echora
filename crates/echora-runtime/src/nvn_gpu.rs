@@ -2050,6 +2050,62 @@ impl Nvn {
         }
     }
 
+    /// A buffer fill writes every byte in its range. An initialized target can
+    /// override guest RAM on sampling, including through a finalized texture's
+    /// storage alias. Discard it only when the fill replaces its entire image.
+    fn discard_targets_overwritten_by_buffer(&mut self, written: &std::ops::Range<u64>) {
+        if self.gpu.is_none() || written.is_empty() {
+            return;
+        }
+        self.refresh_target_index();
+        let backend = self.gpu.as_ref().unwrap();
+        let mut discarded = Vec::new();
+        for (&base, keys) in &backend.target_index.storage {
+            if !written.contains(&base) {
+                continue;
+            }
+            for &key in keys {
+                let Some(target) = backend.renderer.target_info(key) else {
+                    continue;
+                };
+                let Some(object) = self.objects.get(&key) else {
+                    continue;
+                };
+                let value =
+                    |name: &str, default| object.builder.get(name).map_or(default, |v| v.x[0]);
+                // The footprint of a single 2D subresource is known in both
+                // pitch-linear and block-linear storage. Multisample layouts,
+                // partial virtual mappings and other shapes need their own proof.
+                if target.levels != 1
+                    || target.shape != (ImageShape::D2 { layers: 1 })
+                    || value("Target", 1) != 1
+                    || value("Depth", 1) > 1
+                    || value("Levels", 1) > 1
+                    || value("Samples", 1) > 1
+                    || self.target_shape(key).ok()
+                        != Some((target.width, target.height, target.format))
+                {
+                    continue;
+                }
+                if let Some(TextureBacking::Linear((0, range))) = self.texture_object_backing(key)
+                    && range.start == base
+                    && range.start < range.end
+                    && range.end <= written.end
+                {
+                    discarded.push(key);
+                }
+            }
+        }
+        if !discarded.is_empty() {
+            let backend = self.gpu.as_mut().unwrap();
+            for key in discarded {
+                backend.renderer.discard_target(key);
+                backend.retired_since.remove(&key);
+            }
+            self.evict_bindings_over(std::slice::from_ref(written));
+        }
+    }
+
     /// ClearBuffer over guest `range` (already written in guest memory):
     /// cached textures over it are dropped as for a flush, and resident
     /// copies are filled with `value` on the GPU instead of uploaded.
@@ -2058,6 +2114,7 @@ impl Nvn {
         range: std::ops::Range<u64>,
         value: u32,
     ) -> Result<(), String> {
+        self.discard_targets_overwritten_by_buffer(&range);
         self.gpu_invalidate(range.clone(), None);
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
@@ -15916,6 +15973,144 @@ mod target_tests {
         expected[4..8].copy_from_slice(&0.25_f32.to_le_bytes());
         assert_eq!(readback.as_slice(), expected);
         assert_eq!(nvn.prepare_compute_image(linear).unwrap().0, linear);
+    }
+
+    #[test]
+    fn clear_buffer_overwrites_rendered_storage_visible_through_texture_aliases() {
+        use super::TextureSource;
+
+        let Some((mut nvn, mut memory, base, texture)) =
+            texture_cache_fixture_of_size(0x24, 512, 1024)
+        else {
+            return;
+        };
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .set_resolution_scale(echora_gpu::renderer::Scale::ONE);
+        nvn.objects
+            .get_mut(&texture)
+            .unwrap()
+            .builder
+            .get_mut("Height")
+            .unwrap()
+            .x[0] = 512;
+        let size = 512 * 512 * 4;
+        let gpu = 0x400_0000;
+        let alias = 3;
+        nvn.objects.get_mut(&1).unwrap().state.insert(
+            "GpuAddress".into(),
+            Args {
+                x: [gpu, 0, 0, 0],
+                ..Default::default()
+            },
+        );
+        nvn.memory_pools.insert(1, None);
+        nvn.initialize(alias, "Texture", nvn.objects[&texture].builder.clone())
+            .unwrap();
+        // This two-texel image straddles the end of the fill.
+        let neighbor = 4;
+        let mut desc = nvn.objects[&texture].builder.clone();
+        desc.get_mut("Width").unwrap().x[0] = 2;
+        desc.get_mut("Height").unwrap().x[0] = 1;
+        desc.get_mut("Stride").unwrap().x[0] = 8;
+        desc.get_mut("Storage").unwrap().x[1] = size - 4;
+        nvn.initialize(neighbor, "Texture", desc).unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let clear = |nvn: &mut Nvn, core: &mut Guest, address, bytes, value| {
+            nvn.execute_command(
+                &Command {
+                    name: "nvnCommandBufferClearBuffer",
+                    x: [0, address, bytes, value, 0, 0, 0, 0],
+                    v: [0; 8],
+                    captured: Vec::new(),
+                    states: Default::default(),
+                },
+                core,
+            )
+            .unwrap();
+        };
+        let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (neighbor, 0, 0), red, None, 15, 0)
+            .unwrap();
+        for archive in [false, true] {
+            nvn.gpu_clear_color(&core, (texture, 0, 0), red, None, 15, 0)
+                .unwrap();
+            let key = if archive {
+                core.cpu.regs[0] = texture;
+                assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+                let key = crate::nvn::retired_texture((base, 37));
+                let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+                assert_eq!(
+                    renderer.queue_target_archive(key).unwrap(),
+                    echora_gpu::renderer::ArchiveRequest::Queued
+                );
+                renderer.flush().unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while renderer.existing_target(key).is_some() {
+                    assert!(std::time::Instant::now() < deadline);
+                    renderer.finish_target_archives().unwrap();
+                    std::thread::yield_now();
+                }
+                key
+            } else {
+                texture
+            };
+            // An offset fill omits the first texel, so the image still owns data.
+            clear(&mut nvn, &mut core, gpu + 4, size - 4, 0);
+            assert!(
+                nvn.gpu
+                    .as_ref()
+                    .unwrap()
+                    .renderer
+                    .target_info(key)
+                    .is_some()
+            );
+            // Queue a read of the original live attachment before its last guest
+            // byte is replaced. Its Vulkan resources survive until that read ends.
+            let read = (!archive).then(|| {
+                nvn.gpu
+                    .as_mut()
+                    .unwrap()
+                    .renderer
+                    .queue_target_archive_read(key)
+                    .unwrap()
+            });
+            clear(&mut nvn, &mut core, gpu, size, 0xdeadbeef);
+            assert!(
+                nvn.gpu
+                    .as_ref()
+                    .unwrap()
+                    .renderer
+                    .target_info(key)
+                    .is_none(),
+                "overwritten image persisted (archived={archive})"
+            );
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            assert_eq!(
+                &renderer.read_target_bytes(neighbor, 4).unwrap()[4..8],
+                &[255, 0, 0, 255]
+            );
+            let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, alias).unwrap()
+            else {
+                panic!("alias still sees earlier rendering");
+            };
+            assert_eq!(
+                &**texels,
+                &0xdeadbeef_u32.to_le_bytes().repeat(size as usize / 4)
+            );
+            if let Some(read) = read {
+                let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+                renderer.flush().unwrap();
+                assert_eq!(&renderer.take_reads(&[read])[&read][..4], &[255, 0, 0, 255]);
+            }
+        }
     }
 
     #[test]
