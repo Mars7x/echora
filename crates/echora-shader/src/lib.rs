@@ -150,6 +150,15 @@ fn translate_with_constants(
             )));
         }
         let code = program_code(&program[GRAPHICS_HEADER_SIZE.min(program.len())..])?;
+        let traced = options.vertex_trace.unwrap_or_else(vertex_trace);
+        let fragment_register_trace = if traced && header.stage == Stage::Fragment {
+            std::env::var("ECHORA_FRAGMENT_TRACE_REGISTER")
+                .ok()
+                .map(|value| fragment_register_watch(&value))
+                .transpose()?
+        } else {
+            None
+        };
         let layout = compute::Layout {
             sampled_textures,
             storage_images: &[],
@@ -165,7 +174,8 @@ fn translate_with_constants(
                 ..mesh
             }),
             loop_trace: loop_trace(),
-            vertex_trace: options.vertex_trace.unwrap_or_else(vertex_trace),
+            vertex_trace: traced,
+            fragment_register_trace,
             previous_stores: options.previous_stores,
             fragment_output_types: options.fragment_output_types,
             float64: options.float64,
@@ -216,6 +226,7 @@ fn translate_with_constants(
         mesh: None,
         loop_trace: loop_trace(),
         vertex_trace: false,
+        fragment_register_trace: None,
         previous_stores: None,
         fragment_output_types: [0; 8],
         float64: options.float64,
@@ -315,6 +326,19 @@ fn loop_trace() -> bool {
 /// `compute::Layout::vertex_trace`). As `loop_trace`, for debugging only.
 fn vertex_trace() -> bool {
     std::env::var_os("ECHORA_VERTEX_TRACE").is_some()
+}
+
+/// A hex guest instruction byte offset and decimal general register, e.g.
+/// ECHORA_FRAGMENT_TRACE_REGISTER=0xacc0:r14. Set before game launch.
+fn fragment_register_watch(value: &str) -> Result<(u32, u8), Unsupported> {
+    let parsed = value.split_once(':').and_then(|(pc, register)| {
+        let pc = u32::from_str_radix(pc.trim().trim_start_matches("0x"), 16).ok()?;
+        let register = register.trim().strip_prefix('r')?.parse().ok()?;
+        (pc.is_multiple_of(16) && pc <= 0x0fff_fff0).then_some((pc, register))
+    });
+    parsed.ok_or_else(|| whole(format!(
+        "invalid fragment register watch {value:?}, expected an aligned hex byte offset and r0..r255, e.g. 0xacc0:r14"
+    )))
 }
 
 /// The translation of HMMA a mode asks for.

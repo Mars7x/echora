@@ -10955,6 +10955,7 @@ impl Nvn {
                                 &report.sample_interval(record, index, texture[1], previous_report);
                         }
                     }
+                    echora_shader_abi::append_fragment_register_trace(&mut line, entry);
                     eprintln!("{line}");
                 }
             }

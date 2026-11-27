@@ -550,6 +550,9 @@ pub struct Layout<'a> {
     /// `SpecMeaning::VertexTraceLow` and `VertexTraceHigh` give; see
     /// `vertex_trace` for the layout.
     pub vertex_trace: bool,
+    /// For a traced fragment, record a general register immediately before
+    /// the instruction at this byte offset executes.
+    pub fragment_register_trace: Option<(u32, u8)>,
     /// The device runs 64-bit floats (shaderFloat64): non-`.FTZ` FADD,
     /// FMUL and FFMA keep denormals exactly through f64 (see `denormal`),
     /// whatever the host does with 32-bit denormals.
@@ -622,6 +625,7 @@ impl Layout<'_> {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            fragment_register_trace: None,
             float64: false,
             denorm_flush_32: false,
             subgroup_uniform_control_flow: false,
@@ -1054,6 +1058,10 @@ impl Emitter {
         if self.uniform {
             return self.read_uniform(n.min(63));
         }
+        self.read_general_register(n)
+    }
+
+    fn read_general_register(&mut self, n: u8) -> u32 {
         if n == 255 {
             return self.constant(0);
         }
@@ -1793,7 +1801,14 @@ impl Emitter {
         let op = instruction.op;
         self.uniform = instruction.uniform;
         self.module.site = Some(u32::try_from(index * 16).unwrap_or(u32::MAX));
-        let result = self.guarded(instruction.guard, |e| e.operation(index, op));
+        let result = self.guarded(instruction.guard, |e| {
+            if let Some((pc, register)) = e.layout.fragment_register_trace
+                && pc as usize == index * 16
+            {
+                e.trace_fragment_register(pc, register);
+            }
+            e.operation(index, op)
+        });
         self.module.site = None;
         self.uniform = false;
         result
@@ -4396,6 +4411,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            fragment_register_trace: None,
             float64: false,
             denorm_flush_32: false,
             subgroup_uniform_control_flow: false,
@@ -4691,6 +4707,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            fragment_register_trace: None,
             float64: false,
             denorm_flush_32: false,
             subgroup_uniform_control_flow: false,
@@ -5594,6 +5611,7 @@ mod tests {
             mesh: None,
             loop_trace: false,
             vertex_trace: false,
+            fragment_register_trace: None,
             float64: false,
             denorm_flush_32: false,
             subgroup_uniform_control_flow: false,

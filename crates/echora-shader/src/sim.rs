@@ -953,6 +953,7 @@ pub fn trace_lines(bytes: &[u8]) -> Vec<String> {
                 }
             }
         }
+        echora_shader_abi::append_fragment_register_trace(&mut line, entry);
         lines.push(line);
     }
     lines
@@ -5746,6 +5747,7 @@ mod tests {
         let layout = Layout {
             loop_trace: true,
             vertex_trace: false,
+            fragment_register_trace: None,
             float64: false,
             dual_source_blend: false,
             ..Layout::workgroup([32, 1, 1])
@@ -9877,6 +9879,7 @@ mod tests {
                 outputs_beyond: false,
             }),
             vertex_trace: true,
+            fragment_register_trace: Some((0x30, 0)),
             ..Layout::workgroup([1, 1, 1])
         };
         let translated = crate::compute::translate(&code, &layout).unwrap();
@@ -9898,7 +9901,7 @@ mod tests {
             layers: 1,
             texels: texels.into(),
         };
-        let report = machine.simulate(&Inputs {
+        let mut inputs = Inputs {
             workgroup_count: [1, 1, 1],
             builtins: HashMap::from([(
                 15,
@@ -9918,7 +9921,8 @@ mod tests {
                 (FRAGMENT_TRACE_PIXEL_SPEC_ID, 10 | 20 << 16),
             ]),
             ..Inputs::default()
-        });
+        };
+        let report = machine.simulate(&inputs);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         let lines = trace_lines(&report.memory[&buffer]);
         // Texel (2, 1), number 6: 6, 12, 18 and 1.0; the TEX at 0x20.
@@ -9927,11 +9931,30 @@ mod tests {
             lines[0].ends_with(concat!(
                 " | out [8e-45, 1.7e-44, 2.5e-44, 1.0] | tex at 0x20 x1 00000006 0000000c 00000012 3f800000",
                 " | tex at 0xa0 x1 00000006 0000000c 00000012 3f800000 handle 0x00300005",
+                " | before 0x30 r0 x1 3f200000",
             )),
             "{}",
             lines[0]
         );
         assert!(lines[0].starts_with("record 0: done 0x1 "), "{}", lines[0]);
+        // A predicated-off instruction never observed the register, even
+        // though the rest of the fragment wrote its texture trace.
+        let mut skipped = code;
+        skipped[3].guard = crate::decode::Pred {
+            index: 7,
+            negated: true,
+        };
+        let skipped = crate::compute::translate(&skipped, &layout).unwrap();
+        let skipped = Machine::new(&skipped.spirv).simulate(&inputs);
+        let skipped_lines = trace_lines(&skipped.memory[&buffer]);
+        assert_eq!(skipped_lines.len(), 1);
+        assert!(!skipped_lines[0].contains(" | before "));
+        // Moving the watch to a different pixel excludes this invocation.
+        inputs
+            .specialization
+            .insert(FRAGMENT_TRACE_PIXEL_SPEC_ID, 11 | 20 << 16);
+        let missed = machine.simulate(&inputs);
+        assert!(trace_lines(&missed.memory[&buffer]).is_empty());
     }
 
     #[test]

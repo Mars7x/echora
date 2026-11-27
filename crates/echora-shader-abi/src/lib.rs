@@ -411,6 +411,23 @@ pub const VERTEX_TRACE_HIGH_SPEC_ID: u32 = 28;
 pub const VERTEX_TRACE_HANDLE_WORD: usize = 108;
 /// Record word whose bit k marks a handle for texture trace entry k.
 pub const VERTEX_TRACE_HANDLE_MASK: usize = 124;
+/// Last three fragment trace words: instruction index and register (low
+/// byte), execution count and raw register value before that instruction.
+pub const FRAGMENT_REGISTER_TRACE_WORD: usize = 125;
+
+/// Append a register watch to the GPU or simulator report when it executed.
+pub fn append_fragment_register_trace(line: &mut String, record: &[u32]) {
+    use std::fmt::Write as _;
+    if let Some(&[site, count, value]) = record
+        .get(FRAGMENT_REGISTER_TRACE_WORD..)
+        .and_then(<[u32]>::first_chunk::<3>)
+        && count != 0
+    {
+        let pc = (site >> 8) * 16;
+        let register = site & 0xff;
+        let _ = write!(line, " | before {pc:#x} r{register} x{count} {value:08x}");
+    }
+}
 /// The specialization constant ids of `SpecMeaning::LoopTraceLow` and
 /// `LoopTraceHigh`.
 pub const LOOP_TRACE_LOW_SPEC_ID: u32 = 29;

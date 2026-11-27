@@ -31,8 +31,9 @@
 //! end words 104..108 hold registers r0..r3 (target 0's colour when the
 //! header enables it).
 //!
-//! Words 108..128 are unused. Nothing is written while the address is 0;
-//! the runtime zeroes the buffer before the draw it traces.
+//! Words 108..124 and mask 124 hold bindless texture handles. Optional
+//! fragment register watches use 125..128; see the shader ABI. Nothing
+//! is written while the address is 0.
 
 use echora_shader_abi::{
     FRAGMENT_TRACE_PIXEL_SPEC_ID, SpecConstant, SpecMeaning, VERTEX_TRACE_HANDLE_MASK,
@@ -63,6 +64,24 @@ const BUILTIN_FRAG_COORD: u32 = 15;
 const FRAGMENT_OUTPUT_START: u32 = 104;
 
 impl Emitter {
+    /// A watched instruction's guard has passed. Record the incoming GPR
+    /// even for a uniform instruction, which uses a separate register file.
+    pub(super) fn trace_fragment_register(&mut self, pc: u32, register: u8) {
+        let Some(record) = self.vertex_trace_record else {
+            return;
+        };
+        if self.stage != Stage::Fragment {
+            return;
+        }
+        let start = echora_shader_abi::FRAGMENT_REGISTER_TRACE_WORD as u32;
+        let site = self.constant((pc / 16) << 8 | u32::from(register));
+        let one = self.constant(1);
+        let value = self.read_general_register(register);
+        self.trace_atomic(record, start, op::ATOMIC_EXCHANGE, site);
+        self.trace_atomic(record, start + 1, op::ATOMIC_I_ADD, one);
+        self.trace_atomic(record, start + 2, op::ATOMIC_EXCHANGE, value);
+    }
+
     /// Whether this program records a vertex trace.
     fn vertex_traced(&self) -> bool {
         self.layout.vertex_trace

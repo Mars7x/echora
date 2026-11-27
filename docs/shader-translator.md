@@ -372,6 +372,15 @@ writes record n from invocation n of workgroup (0, 0, 0). Record words:
 | 8 + 6k .. 14 + 6k | texture entry k (k < 16): the instruction's byte offset in the code (after the 128-byte program header) plus one (0: no entry), the times the invocation ran it, and the four result words of its last run (before the mask picks the written components; integer bits) |
 | 108..124 | Raw handle of the last sample for each bindless texture entry |
 | 124 | Bit k says entry k used a bindless handle |
+| 125..128 | Fragment register watch site (instruction index shifted left eight bits, with the register in the low byte), cumulative execution count, and last raw register word |
+
+To watch a fragment's incoming general register, launch with
+`ECHORA_FRAGMENT_TRACE_PIXEL=X,Y` and `ECHORA_FRAGMENT_TRACE_REGISTER=0xacc0:r14`
+alongside the stage selection and reporting options above. The byte offset
+starts after the program header. The register is sampled before the selected
+data instruction executes and only when its predicate passes. The report
+prints the offset, register, execution count and raw hexadecimal value. An
+unchanged execution count means the value is from an earlier draw.
 
 Entries are numbered by texture instruction (TEX, TLD, TLD4, TXD, TXQ,
 TMML) in the order the translation emits them, which is the same for
