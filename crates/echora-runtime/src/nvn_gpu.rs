@@ -2507,7 +2507,6 @@ impl Nvn {
         let target = self.gpu.as_ref()?.renderer.target_info(key)?;
         if base != 0
             || level >= target.levels
-            || !target.scale.is_one()
             || echora_gpu::renderer::is_depth(target.format)
             || self.target_shape(texture).ok() != Some((target.width, target.height, target.format))
             || !self.texture_alias_layout_matches(texture, key, target)
@@ -16310,12 +16309,16 @@ mod target_tests {
 
     #[test]
     fn partial_texel_write_updates_rendered_pixels_through_an_alias() {
-        for pitch_linear in [true, false] {
-            check_partial_texel_write_through_an_alias(pitch_linear);
+        for (pitch_linear, scale) in [
+            (true, super::Scale::ONE),
+            (false, super::Scale::ONE),
+            (false, super::Scale::new(2, 1).unwrap()),
+        ] {
+            check_partial_texel_write_through_an_alias(pitch_linear, scale);
         }
     }
 
-    fn check_partial_texel_write_through_an_alias(pitch_linear: bool) {
+    fn check_partial_texel_write_through_an_alias(pitch_linear: bool, scale: super::Scale) {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
         let Some((mut nvn, mut memory, _, texture)) = texture_cache_fixture_of_size(0x24, 64, 16)
@@ -16348,7 +16351,7 @@ mod target_tests {
             .as_mut()
             .unwrap()
             .renderer
-            .set_resolution_scale(super::Scale::ONE);
+            .set_resolution_scale(scale);
         let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
         nvn.gpu_clear_color(&core, (texture, 0, 0), red, None, 15, 0)
             .unwrap();

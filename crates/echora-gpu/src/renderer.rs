@@ -8714,13 +8714,13 @@ impl Renderer {
         self.read_target_plane_bytes(key, 0, 0, texel_bytes, [x, y, width, height])
     }
 
-    /// Replace a rectangle of an unscaled color target with tightly packed
-    /// texels. The other pixels in the target keep their rendered contents.
+    /// Replace a rectangle of a color target with tightly packed guest
+    /// texels. The other pixels keep their rendered contents.
     pub fn write_target_plane_bytes(
         &mut self,
         key: u64,
         (level, plane): (u32, u32),
-        [x, y, width, height]: [u32; 4],
+        [guest_x, guest_y, guest_width, guest_height]: [u32; 4],
         texels: &[u8],
     ) -> Result<(), String> {
         let target = self.targets.get(&key).ok_or("no such target")?;
@@ -8731,24 +8731,66 @@ impl Renderer {
             }
             shape => (plane, 0, shape.layers()),
         };
-        if !target.scale.is_one()
-            || texel_bytes == 0
-            || level >= target.levels
-            || plane >= planes
-            || x.checked_add(width)
-                .is_none_or(|end| end > (target.width >> level).max(1))
-            || y.checked_add(height)
-                .is_none_or(|end| end > (target.height >> level).max(1))
-        {
+        if texel_bytes == 0 || level >= target.levels || plane >= planes {
             return Err("unsupported target texel write".into());
         }
-        let row_bytes = width as usize * texel_bytes as usize;
-        if texels.len() != row_bytes * height as usize {
+        let guest_extent = [
+            (target.width >> level).max(1),
+            (target.height >> level).max(1),
+        ];
+        if guest_x
+            .checked_add(guest_width)
+            .is_none_or(|end| end > guest_extent[0])
+            || guest_y
+                .checked_add(guest_height)
+                .is_none_or(|end| end > guest_extent[1])
+        {
+            return Err("target texel write extends past the mip level".into());
+        }
+        let source_row_bytes = guest_width as usize * texel_bytes as usize;
+        if texels.len() != source_row_bytes * guest_height as usize {
             return Err("target texel write does not contain the complete rectangle".into());
         }
         if texels.is_empty() {
             return Ok(());
         }
+        let scale = target.scale;
+        let (target_width, target_height) = target.extent(level);
+        let mut rect = target.scaled([
+            guest_x as i32,
+            guest_y as i32,
+            guest_width as i32,
+            guest_height as i32,
+        ]);
+        // Rounding a scaled base extent before halving it can give a mip
+        // one additional pixel. Include that pixel at the logical edge.
+        if guest_x + guest_width == guest_extent[0] {
+            rect[2] = target_width as i32 - rect[0];
+        }
+        if guest_y + guest_height == guest_extent[1] {
+            rect[3] = target_height as i32 - rect[1];
+        }
+        let [x, y, width, height] = clip(rect, [0, 0, target_width as i32, target_height as i32]);
+        if width <= 0 || height <= 0 {
+            return Ok(());
+        }
+        let [x, y, width, height] = [x as u32, y as u32, width as u32, height as u32];
+        let (numerator, denominator) = scale.terms();
+        let sample = |image: u32, start: u32, length: u32| -> usize {
+            // A guest texel owns the half-open interval between its scaled
+            // edges. Using absolute coordinates keeps adjacent writes aligned.
+            let guest =
+                ((u64::from(image) + 1) * u64::from(denominator) - 1) / u64::from(numerator);
+            (guest.clamp(u64::from(start), u64::from(start + length - 1)) - u64::from(start))
+                as usize
+        };
+        let columns: Vec<_> = if scale.is_one() {
+            Vec::new()
+        } else {
+            (x..x + width)
+                .map(|column| sample(column, guest_x, guest_width) * texel_bytes as usize)
+                .collect()
+        };
         self.transition(key, vk::ImageLayout::GENERAL)?;
         let image = self.targets[&key].image;
         let aspect_mask = vk::ImageAspectFlags::COLOR;
@@ -8793,18 +8835,39 @@ impl Renderer {
                 &[barrier(read_write, transfer_write)],
             );
         }
+        let row_bytes = width as usize * texel_bytes as usize;
         let rows_per_copy = (RING_SIZE as usize / row_bytes).max(1);
-        let mut row = y;
-        for bytes in texels.chunks(rows_per_copy * row_bytes) {
-            let rows = (bytes.len() / row_bytes) as u32;
-            let (ring, offset) = self.ring_upload(bytes, u64::from(texel_bytes) * 4)?;
+        let alignment = u64::from(texel_bytes) * 4;
+        for row in (0..height).step_by(rows_per_copy) {
+            let rows = (height - row).min(rows_per_copy as u32);
+            let bytes = rows as usize * row_bytes;
+            let (ring, offset) = if scale.is_one() {
+                let first = row as usize * source_row_bytes;
+                self.ring_upload(&texels[first..first + bytes], alignment)?
+            } else {
+                self.ring_upload_with(bytes as u64, alignment, |output| {
+                    let texel_bytes = texel_bytes as usize;
+                    for (line, destination) in output.chunks_exact_mut(row_bytes).enumerate() {
+                        let source =
+                            sample(y + row + line as u32, guest_y, guest_height) * source_row_bytes;
+                        for (&column, pixel) in columns
+                            .iter()
+                            .zip(destination.chunks_exact_mut(texel_bytes))
+                        {
+                            let offset = source + column;
+                            pixel.copy_from_slice(&texels[offset..offset + texel_bytes]);
+                        }
+                    }
+                    Ok(())
+                })?
+            };
             let commands = self.commands()?;
             let copy = vk::BufferImageCopy::default()
                 .buffer_offset(offset)
                 .image_subresource(subresource)
                 .image_offset(vk::Offset3D {
                     x: x as i32,
-                    y: row as i32,
+                    y: (y + row) as i32,
                     z: slice as i32,
                 })
                 .image_extent(vk::Extent3D {
@@ -8823,7 +8886,6 @@ impl Renderer {
                     &[copy],
                 );
             }
-            row += rows;
         }
         let commands = self.commands()?;
         // SAFETY: publish the transferred region before later image uses.
@@ -12538,6 +12600,57 @@ mod rescaling_tests {
         assert_eq!(renderer.target(10, 8, 8, format).unwrap().extent(0), (8, 8));
         renderer.keep_unscaled(10).unwrap();
         assert!(!renderer.unscaled.iter().any(|(key, _)| *key == 10));
+    }
+
+    #[test]
+    fn partial_writes_follow_fractional_scaled_texel_boundaries() {
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        renderer.set_resolution_scale(Scale::new(3, 2).unwrap());
+        renderer
+            .target(1, 16, 8, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let background = [1., 0., 0., 1.];
+        renderer
+            .clear_color(
+                1,
+                None,
+                vk::ClearColorValue {
+                    float32: background,
+                },
+            )
+            .unwrap();
+        let patch = [
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [0, 255, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        // Write separate row bands, as large guest writes do.
+        for (row, slice) in patch.as_flattened().chunks_exact(8).enumerate() {
+            renderer
+                .write_target_plane_bytes(1, (0, 0), [1, 1 + row as u32, 2, 1], slice)
+                .unwrap();
+        }
+        let (pixels, width, height) = renderer.read_target_scaled(1).unwrap();
+        assert_eq!((width, height), (24, 12));
+        for y in 0..height {
+            for x in 0..width {
+                let expected = if (1..4).contains(&x) && (1..4).contains(&y) {
+                    let texel = usize::from(y == 3) * 2 + usize::from(x == 3);
+                    patch[texel].map(|value| f32::from(value) / 255.)
+                } else {
+                    background
+                };
+                assert_eq!(
+                    pixels[(y * width + x) as usize],
+                    expected,
+                    "texel ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
