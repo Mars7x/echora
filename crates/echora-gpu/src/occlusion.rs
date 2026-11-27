@@ -94,56 +94,8 @@ impl Occlusion {
         renderer: &Renderer,
         fences: [vk::Fence; crate::renderer::SLOTS],
     ) -> Result<Self, String> {
-        let device = renderer.device();
-        let info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::OCCLUSION)
-            .query_count(SLOTS * QUERIES);
-        // SAFETY: a valid create info on a live device; destroyed in `destroy`.
-        let pool = unsafe { device.create_query_pool(&info, None) }
-            .map_err(vk_error("vkCreateQueryPool"))?;
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST;
-        let accumulator = renderer.host_buffer_with(16, usage, true)?;
-        accumulator.write(0, &[0; 16]);
-        let results = renderer.host_buffer_with(u64::from(SLOTS * QUERIES) * 8, usage, true)?;
-        let plans = renderer.host_buffer_with(u64::from(SLOTS * PLANS) * 16, usage, true)?;
-        let sums = renderer.host_buffer_with(u64::from(SLOTS * PLANS) * 8, usage, true)?;
-        let address = |buffer: &HostBuffer| {
-            renderer
-                .buffer_address(buffer.buffer)
-                .ok_or("occlusion counts need buffer device addresses")
-        };
-        let range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(40);
-        let ranges = [range];
-        let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
-        // SAFETY: as above.
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
-            .map_err(vk_error("vkCreatePipelineLayout"))?;
-        let words = sum_program();
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
-        let module = unsafe { device.create_shader_module(&module_info, None) }
-            .map_err(vk_error("vkCreateShaderModule"))?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main");
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(layout);
-        // SAFETY: as above.
-        let pipelines = unsafe {
-            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        // SAFETY: the pipeline (made or not) no longer needs the module.
-        unsafe { device.destroy_shader_module(module, None) };
-        let pipeline =
-            pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0];
-        Ok(Self {
-            pool,
+        let mut counts = Self {
+            pool: vk::QueryPool::null(),
             fences,
             next: [0; crate::renderer::SLOTS],
             active: None,
@@ -155,22 +107,59 @@ impl Occlusion {
             pending: Vec::new(),
             ended: 0,
             plan_next: [0; crate::renderer::SLOTS],
-            accumulator_address: address(&accumulator)?,
-            results_address: address(&results)?,
-            plans_address: address(&plans)?,
-            sums_address: address(&sums)?,
-            accumulator,
-            results,
-            plans,
-            sums,
-            layout,
-            pipeline,
+            accumulator: HostBuffer::empty(),
+            results: HostBuffer::empty(),
+            plans: HostBuffer::empty(),
+            sums: HostBuffer::empty(),
+            accumulator_address: 0,
+            results_address: 0,
+            plans_address: 0,
+            sums_address: 0,
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
             control: if renderer.gpu.occlusion_query_precise {
                 vk::QueryControlFlags::PRECISE
             } else {
                 vk::QueryControlFlags::empty()
             },
-        })
+        };
+        if let Err(error) = counts.initialize(renderer) {
+            counts.destroy(renderer.device());
+            return Err(error);
+        }
+        Ok(counts)
+    }
+
+    fn initialize(&mut self, renderer: &Renderer) -> Result<(), String> {
+        let device = renderer.device();
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::OCCLUSION)
+            .query_count(SLOTS * QUERIES);
+        // SAFETY: a valid create info on a live device; cleaned up by destroy.
+        self.pool = unsafe { device.create_query_pool(&info, None) }
+            .map_err(vk_error("vkCreateQueryPool"))?;
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        (self.accumulator, self.accumulator_address) =
+            renderer.addressable_host_buffer(16, usage)?;
+        self.accumulator.write(0, &[0; 16]);
+        (self.results, self.results_address) =
+            renderer.addressable_host_buffer(u64::from(SLOTS * QUERIES) * 8, usage)?;
+        (self.plans, self.plans_address) =
+            renderer.addressable_host_buffer(u64::from(SLOTS * PLANS) * 16, usage)?;
+        (self.sums, self.sums_address) =
+            renderer.addressable_host_buffer(u64::from(SLOTS * PLANS) * 8, usage)?;
+        let range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(40);
+        let ranges = [range];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
+        // SAFETY: a valid device and create info; cleaned up by destroy.
+        self.layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+            .map_err(vk_error("vkCreatePipelineLayout"))?;
+        self.pipeline = crate::compute::internal_pipeline(device, self.layout, &sum_program())?;
+        Ok(())
     }
 
     /// The slot of the command buffer recorded under `fence`.
@@ -883,6 +872,19 @@ fn sum_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn occlusion_setup_can_fail_before_creating_pipelines() {
+        let Ok(mut gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address {
+            return;
+        }
+        gpu.buffer_device_address = false;
+        let renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        assert!(super::Occlusion::new(&renderer, renderer.slot_fences()).is_err());
+    }
+
     #[test]
     fn the_sum_program_is_valid_spirv() {
         let words = super::sum_program();

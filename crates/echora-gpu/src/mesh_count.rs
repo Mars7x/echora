@@ -65,82 +65,47 @@ pub(crate) struct MeshCount {
 
 impl MeshCount {
     fn new(renderer: &Renderer) -> Result<Self, String> {
+        let mut count = Self {
+            pipelines: [vk::Pipeline::null(); 2],
+            layout: vk::PipelineLayout::null(),
+            log: HostBuffer::empty(),
+            log_address: 0,
+            next: 0,
+            reported: 0,
+            probes: HostBuffer::empty(),
+            probes_address: 0,
+            probed: 0,
+        };
+        if let Err(error) = count.initialize(renderer) {
+            count.destroy(renderer.device());
+            return Err(error);
+        }
+        Ok(count)
+    }
+
+    fn initialize(&mut self, renderer: &Renderer) -> Result<(), String> {
         let device = renderer.device();
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
-        let log = renderer.host_buffer_with(u64::from(LOGGED) * 4, usage, true)?;
+        (self.log, self.log_address) =
+            renderer.addressable_host_buffer(u64::from(LOGGED) * 4, usage)?;
         // Unwritten entries read u32::MAX: work the GPU never reached.
-        log.write(0, &vec![0xff; LOGGED as usize * 4]);
-        let log_address = renderer
-            .buffer_address(log.buffer)
-            .ok_or("bounded mesh counts need buffer device addresses")?;
-        let probes = renderer.host_buffer_with(u64::from(PROBES) * 4, usage, true)?;
-        probes.write(0, &vec![0xff; PROBES as usize * 4]);
-        let probes_address = renderer
-            .buffer_address(probes.buffer)
-            .ok_or("bounded mesh counts need buffer device addresses")?;
+        self.log.write(0, &vec![0xff; LOGGED as usize * 4]);
+        (self.probes, self.probes_address) =
+            renderer.addressable_host_buffer(u64::from(PROBES) * 4, usage)?;
+        self.probes.write(0, &vec![0xff; PROBES as usize * 4]);
         let range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .size(PUSH_BYTES as u32);
         let ranges = [range];
         let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
-        // SAFETY: a valid device and create info; destroyed in `destroy`.
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+        // SAFETY: a valid device and create info; cleaned up by destroy.
+        self.layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
             .map_err(vk_error("vkCreatePipelineLayout"))?;
-        let mut pipelines = [vk::Pipeline::null(); 2];
         for kind in [IndirectCounts::Mesh, IndirectCounts::Dispatch] {
-            match Self::create_pipeline(device, layout, kind) {
-                Ok(pipeline) => pipelines[kind as usize] = pipeline,
-                Err(error) => {
-                    // SAFETY: neither pipeline has been used.
-                    unsafe {
-                        for pipeline in pipelines {
-                            device.destroy_pipeline(pipeline, None);
-                        }
-                        device.destroy_pipeline_layout(layout, None);
-                    }
-                    log.destroy(device);
-                    probes.destroy(device);
-                    return Err(error);
-                }
-            }
+            self.pipelines[kind as usize] =
+                crate::compute::internal_pipeline(device, self.layout, &bound_program(kind))?;
         }
-        Ok(Self {
-            pipelines,
-            layout,
-            log,
-            log_address,
-            next: 0,
-            reported: 0,
-            probes,
-            probes_address,
-            probed: 0,
-        })
-    }
-
-    fn create_pipeline(
-        device: &ash::Device,
-        layout: vk::PipelineLayout,
-        kind: IndirectCounts,
-    ) -> Result<vk::Pipeline, String> {
-        let words = bound_program(kind);
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
-        let module = unsafe { device.create_shader_module(&module_info, None) }
-            .map_err(vk_error("vkCreateShaderModule"))?;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main");
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(layout);
-        // SAFETY: as above.
-        let pipelines = unsafe {
-            device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        };
-        // SAFETY: the pipeline (made or not) no longer needs the module.
-        unsafe { device.destroy_shader_module(module, None) };
-        Ok(pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0])
+        Ok(())
     }
 
     /// The counts read since the last report: each past the bound, then
@@ -500,6 +465,19 @@ fn bound_program(kind: IndirectCounts) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::IndirectCounts;
+
+    #[test]
+    fn mesh_count_setup_can_fail_before_creating_pipelines() {
+        let Ok(mut gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address {
+            return;
+        }
+        gpu.buffer_device_address = false;
+        let renderer = super::Renderer::new(gpu).unwrap();
+        assert!(super::MeshCount::new(&renderer).is_err());
+    }
 
     /// The bound program run once in the simulator: the three target words
     /// and the logged word, for `source` words, a per-word `bound`, the

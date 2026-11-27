@@ -39,47 +39,42 @@ pub(crate) struct WordConditions {
 
 impl WordConditions {
     fn new(renderer: &Renderer) -> Result<Self, String> {
-        let device = renderer.device();
-        let outcomes = renderer.host_buffer_with(
+        let mut conditions = Self {
+            pipelines: [vk::Pipeline::null(); 2],
+            layout: vk::PipelineLayout::null(),
+            outcomes: HostBuffer::empty(),
+            outcomes_address: 0,
+            next: 0,
+        };
+        if let Err(error) = conditions.initialize(renderer) {
+            conditions.destroy(renderer.device());
+            return Err(error);
+        }
+        Ok(conditions)
+    }
+
+    fn initialize(&mut self, renderer: &Renderer) -> Result<(), String> {
+        (self.outcomes, self.outcomes_address) = renderer.addressable_host_buffer(
             SLOTS * 4,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT,
-            true,
         )?;
-        let outcomes_address = renderer
-            .buffer_address(outcomes.buffer)
-            .ok_or("word conditions need buffer device addresses")?;
+        let device = renderer.device();
         let range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .size(PUSH_BYTES as u32);
         let ranges = [range];
         let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
-        // SAFETY: a valid device and create info; destroyed in `destroy`.
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
+        // SAFETY: a valid device and create info; cleaned up by destroy.
+        self.layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
             .map_err(vk_error("vkCreatePipelineLayout"))?;
-        let mut pipelines = [vk::Pipeline::null(); 2];
         for (index, second_word) in [false, true].into_iter().enumerate() {
-            match create_pipeline(device, layout, second_word) {
-                Ok(pipeline) => pipelines[index] = pipeline,
-                Err(error) => {
-                    // SAFETY: none has been used.
-                    unsafe {
-                        for pipeline in pipelines {
-                            device.destroy_pipeline(pipeline, None);
-                        }
-                        device.destroy_pipeline_layout(layout, None);
-                    }
-                    outcomes.destroy(device);
-                    return Err(error);
-                }
-            }
+            self.pipelines[index] = crate::compute::internal_pipeline(
+                device,
+                self.layout,
+                &compare_program(second_word),
+            )?;
         }
-        Ok(Self {
-            pipelines,
-            layout,
-            outcomes,
-            outcomes_address,
-            next: 0,
-        })
+        Ok(())
     }
 
     pub(crate) fn destroy(self, device: &ash::Device) {
@@ -92,32 +87,6 @@ impl WordConditions {
         }
         self.outcomes.destroy(device);
     }
-}
-
-fn create_pipeline(
-    device: &ash::Device,
-    layout: vk::PipelineLayout,
-    second_word: bool,
-) -> Result<vk::Pipeline, String> {
-    let words = compare_program(second_word);
-    let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-    // SAFETY: valid SPIR-V; destroyed once the pipeline holds it.
-    let module = unsafe { device.create_shader_module(&module_info, None) }
-        .map_err(vk_error("vkCreateShaderModule"))?;
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(module)
-        .name(c"main");
-    let pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage)
-        .layout(layout);
-    // SAFETY: as above.
-    let pipelines = unsafe {
-        device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-    };
-    // SAFETY: the pipeline (made or not) no longer needs the module.
-    unsafe { device.destroy_shader_module(module, None) };
-    Ok(pipelines.map_err(|(_, error)| vk_error("vkCreateComputePipelines")(error))?[0])
 }
 
 impl Renderer {
@@ -334,6 +303,18 @@ fn compare_program(second_word: bool) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn word_condition_setup_can_fail_before_creating_pipelines() {
+        let Ok(mut gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address || gpu.conditional_rendering.is_none() {
+            return;
+        }
+        gpu.buffer_device_address = false;
+        let renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        assert!(super::WordConditions::new(&renderer).is_err());
+    }
     /// The program run once in the simulator: the outcome word for the
     /// 64-bit `word`, the pushed `value` and `render_when_equal`.
     fn outcome(word: u64, value: u64, render_when_equal: bool) -> u32 {

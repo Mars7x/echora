@@ -8,8 +8,41 @@ use std::collections::HashMap;
 use ash::vk;
 
 use crate::draw::{Program, Sampler, TextureSource};
-use crate::renderer::{Renderer, descriptor_buffer_range};
+use crate::renderer::{Renderer, descriptor_buffer_range, vk_error};
 use crate::shader::DescriptorKind;
+
+/// Create an internal compute pipeline whose entry point is main.
+pub(crate) fn internal_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    words: &[u32],
+) -> Result<vk::Pipeline, String> {
+    let module_info = vk::ShaderModuleCreateInfo::default().code(words);
+    // SAFETY: valid SPIR-V on a live device.
+    let module = unsafe { device.create_shader_module(&module_info, None) }
+        .map_err(vk_error("vkCreateShaderModule"))?;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(c"main");
+    let info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(layout);
+    // SAFETY: the module and layout are live; no returned pipeline has been used.
+    unsafe {
+        let created = device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None);
+        device.destroy_shader_module(module, None);
+        match created {
+            Ok(pipelines) => Ok(pipelines[0]),
+            Err((pipelines, error)) => {
+                for pipeline in pipelines {
+                    device.destroy_pipeline(pipeline, None);
+                }
+                Err(vk_error("vkCreateComputePipelines")(error))
+            }
+        }
+    }
+}
 
 /// A compute binding to one mip and a range of a target's array layers.
 #[derive(Clone, Copy, Debug, Default)]

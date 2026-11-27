@@ -9164,6 +9164,25 @@ impl Renderer {
         Ok(memory)
     }
 
+    pub(crate) fn addressable_host_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(HostBuffer, u64), String> {
+        if !self.gpu.buffer_device_address {
+            return Err("buffer device addresses are unavailable".into());
+        }
+        let buffer = self.host_buffer_with(size, usage, true)?;
+        if let Some(address) = self
+            .buffer_address(buffer.buffer)
+            .filter(|address| *address != 0)
+        {
+            return Ok((buffer, address));
+        }
+        buffer.destroy(self.device());
+        Err("the new host buffer has no device address".into())
+    }
+
     /// `host_buffer`, with a device address when `addressable`.
     #[track_caller]
     pub(crate) fn host_buffer_with(
@@ -9277,7 +9296,7 @@ unsafe impl Send for HostBuffer {}
 
 impl HostBuffer {
     /// A placeholder owning nothing.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
