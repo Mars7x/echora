@@ -3131,17 +3131,10 @@ impl Renderer {
         // old, ordered after the work that read them, with no flush and no
         // new allocation. Another shape retires the old image, freed once
         // the work submitted so far has completed.
-        let mut reused = None;
-        if let Some((_, old)) = self.uploads.remove(key) {
-            self.texture_epoch += 1;
-            if (old.width, old.height, old.format, old.shape) == (*width, *height, *format, *shape)
+        let reusing = self.uploads.get(key).is_some_and(|(_, old)| {
+            (old.width, old.height, old.format, old.shape) == (*width, *height, *format, *shape)
                 && old.levels == level_count
-            {
-                reused = Some(old);
-            } else {
-                self.slot.retired_uploads.push(old);
-            }
-        }
+        });
         // A guest texture's upload never needs more than this: a larger one
         // means a misread size, shape or format, which stops the run with
         // the texture's description instead of exhausting memory.
@@ -3197,8 +3190,7 @@ impl Renderer {
         if big || Self::labelling() {
             let text = format!(
                 "present - upload {key:#x} {width}x{height} {shape:?} {format:?} levels {level_count} bytes {} chunked {chunked} reused {}",
-                size,
-                reused.is_some()
+                size, reusing
             );
             if big {
                 eprintln!("gpu: {}", &text[10..]);
@@ -3225,10 +3217,14 @@ impl Renderer {
         } else {
             self.ring_upload(texels, 16)?
         };
-        let reusing = reused.is_some();
-        let mut target = match reused {
-            Some(target) => target,
-            None => self.create_shaped_image(
+        let commands = self.commands()?;
+        // Keep the old image available until staging succeeds. If the shape
+        // changes, it can also remain available while the new image is filled.
+        let mut target = if reusing {
+            self.texture_epoch += 1;
+            self.uploads.remove(key).expect("matching image above").1
+        } else {
+            self.create_shaped_image(
                 *width,
                 *height,
                 *shape,
@@ -3237,14 +3233,7 @@ impl Renderer {
                     | vk::ImageUsageFlags::TRANSFER_DST
                     | vk::ImageUsageFlags::TRANSFER_SRC,
                 level_count,
-            )?,
-        };
-        let commands = match self.commands() {
-            Ok(commands) => commands,
-            Err(error) => {
-                self.slot.retired_uploads.push(target);
-                return Err(error);
-            }
+            )?
         };
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(if reusing {
@@ -3384,7 +3373,10 @@ impl Renderer {
         if !reusing {
             self.register_views(&target);
         }
-        self.uploads.insert(*key, (*generation, target));
+        if let Some((_, previous)) = self.uploads.insert(*key, (*generation, target)) {
+            self.texture_epoch += 1;
+            self.slot.retired_uploads.push(previous);
+        }
         self.upload_layouts
             .insert(*key, (size as u64, levels.clone()));
         Ok(())
@@ -11323,6 +11315,52 @@ mod tests {
         assert_eq!(
             renderer.read_target_level(1, 1).unwrap(),
             vec![green; 8 * 2]
+        );
+    }
+
+    #[test]
+    fn failed_replacement_keeps_the_previous_upload_available_for_sampling() {
+        use crate::draw::{TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let make = |width: u32, red: u8| TextureSource::Upload {
+            key: 71,
+            generation: u64::from(red),
+            width,
+            height: 1,
+            shape: ImageShape::D2 { layers: 1 },
+            format: vk::Format::R8G8B8A8_UNORM,
+            texels: std::sync::Arc::new([red, 0, 0, 255].repeat(width as usize)),
+            levels: [UploadRegion {
+                level: 0,
+                layer: 0,
+                width,
+                height: 1,
+                depth: 1,
+                offset: 0,
+            }]
+            .into(),
+        };
+        let original = make(1, 255);
+        let replacement = make(2, 0);
+        renderer.upload(&original).unwrap();
+        renderer.submit_frame().unwrap();
+        let memories = renderer.memory_types.memory_type_count;
+        renderer.memory_types.memory_type_count = 0;
+        let failure = renderer.upload(&replacement);
+        renderer.memory_types.memory_type_count = memories;
+        assert_eq!(failure.unwrap_err(), "no memory type with DEVICE_LOCAL");
+        assert!(renderer.has_upload_source(&original));
+        assert_eq!(
+            renderer.read_upload_level(71, 0).unwrap(),
+            [[1.0, 0.0, 0.0, 1.0]]
+        );
+        renderer.upload(&replacement).unwrap();
+        assert_eq!(
+            renderer.read_upload_level(71, 0).unwrap(),
+            [[0.0, 0.0, 0.0, 1.0]; 2]
         );
     }
 
