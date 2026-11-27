@@ -169,6 +169,15 @@ impl Renderer {
         let commands = self.commands()?;
         // A condition left active would gate the comparison as well.
         self.end_condition();
+        if self.occlusion.as_ref().is_some_and(|occlusion| {
+            let pending = |buffer, offset| {
+                occlusion.pending_at(buffer, offset) || occlusion.pending_at(buffer, offset + 4)
+            };
+            pending(word.0, word.1)
+                || matches!(other, Comparand::Word(buffer, offset) if pending(buffer, offset))
+        }) {
+            self.occlusion_resolve(commands);
+        }
         let conditions = self.word_conditions.as_mut().expect("made above");
         let slot = conditions.next % SLOTS;
         conditions.next += 1;
@@ -428,6 +437,31 @@ mod tests {
         word.destroy(renderer.device());
         second.destroy(renderer.device());
         same.destroy(renderer.device());
+    }
+
+    #[test]
+    fn a_word_condition_observes_pending_sample_reports() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        let mut renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        if !renderer.supports_conditions() || !renderer.gpu.buffer_device_address {
+            return;
+        }
+        let (buffer, _) = renderer.resident_buffer(1, 32).unwrap();
+        renderer
+            .upload_resident(1, 0, &[1_u64, 0, 0, 0].map(u64::to_le_bytes).concat())
+            .unwrap();
+        renderer.samples_reset().unwrap();
+        renderer.samples_report(buffer, 0, 5).unwrap();
+        renderer
+            .condition_on_word((buffer, 0), super::Comparand::Word(buffer, 16), true)
+            .unwrap()
+            .unwrap();
+
+        renderer.flush().unwrap();
+        let held = renderer.word_conditions.as_ref().unwrap();
+        assert_eq!(held.outcomes.read_bytes(4), 1_u32.to_le_bytes());
     }
 
     #[test]
