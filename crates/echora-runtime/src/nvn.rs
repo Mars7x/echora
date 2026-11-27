@@ -2355,12 +2355,11 @@ impl<'a> RecordedCall<'a> {
 }
 
 /// A property-bag call workers make without the NVN state: any on a kind
-/// in `FRONT_KINDS`, and setters on texture builders, texture views and
-/// sampler builders. Their getters use type-specific logic in `Nvn::call`.
+/// in `FRONT_KINDS`, and setters on texture builders and texture views.
+/// Their getters use type-specific logic in `Nvn::call`.
 fn front_bag(kind: &str, rest: &str) -> bool {
     FRONT_KINDS.contains(&kind)
-        || (matches!(kind, "TextureBuilder" | "TextureView" | "SamplerBuilder")
-            && rest.starts_with("Set"))
+        || (matches!(kind, "TextureBuilder" | "TextureView") && rest.starts_with("Set"))
 }
 
 /// Kinds handled entirely by `bag_call`, including the vertex states
@@ -12053,7 +12052,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_sampler_setters_share_builder_state_with_initialization_and_getters() {
+    fn sampler_initialization_captures_builder_state_before_reset() {
         let mut memory = Memory::new(1 << 39);
         memory
             .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "sampler")
@@ -12068,26 +12067,32 @@ mod tests {
         let mut nvn = Nvn::default();
         nvn.initialize(device, "Device", BTreeMap::new()).unwrap();
         let recorder = nvn.recorder();
-        let set = |guest: &mut Guest, name: &'static str, args: &[u64]| {
-            guest.cpu.regs[..args.len()].copy_from_slice(args);
-            assert!(
-                recorder
-                    .call(name, RecordedCall::classify(name).unwrap(), guest)
-                    .unwrap()
-            );
-        };
-
         call(
             &mut nvn,
             &mut guest,
             "nvnSamplerBuilderSetDevice",
             &[builder, device],
         );
-        set(&mut guest, "nvnSamplerBuilderSetDefaults", &[builder]);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetDefaults",
+            &[builder],
+        );
         let lod = [0.5_f32.to_bits(), 4.25_f32.to_bits()];
         guest.cpu.vectors[..2].copy_from_slice(&lod.map(u128::from));
-        set(&mut guest, "nvnSamplerBuilderSetLodClamp", &[builder]);
-        set(&mut guest, "nvnSamplerBuilderSetCompare", &[builder, 1, 3]);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetLodClamp",
+            &[builder],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetCompare",
+            &[builder, 1, 3],
+        );
         assert_eq!(
             call(
                 &mut nvn,
@@ -12099,7 +12104,12 @@ mod tests {
         );
 
         // Reset the shared builder. The initialized sampler retains the previous values.
-        set(&mut guest, "nvnSamplerBuilderSetDefaults", &[builder]);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetDefaults",
+            &[builder],
+        );
         for (object, name, expected) in [
             (
                 builder,
@@ -12167,7 +12177,8 @@ mod tests {
             }
             let setter = format!("nvnSamplerBuilderSetBorderColor{suffix}");
             core.cpu.regs[..2].copy_from_slice(&[builder, input]);
-            assert!(recorder.front(&setter, &mut core).unwrap());
+            assert!(!recorder.front(&setter, &mut core).unwrap());
+            assert!(nvn.call(&setter, &mut core).unwrap());
             core.memory.write(input, &[0; 16]).unwrap();
             call(
                 &mut nvn,
