@@ -26,6 +26,9 @@ use echora_gpu::present::Presenter;
 use echora_gpu::renderer::{Renderer, Scale, TargetInfo};
 use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage, Translated};
 
+#[path = "nvn_indices.rs"]
+mod index_assembly;
+
 use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, StateSnapshots};
 
 /// Reuse the allocation of the binding tables filled for each draw.
@@ -11816,7 +11819,7 @@ impl Nvn {
         let mode = if mesh_draw { 4 } else { command.x[1] };
         // Quads (mode 7, GL order): drawn as two triangles each.
         let quads = mode == 7;
-        let topology = if quads {
+        let mut topology = if quads {
             vk::PrimitiveTopology::TRIANGLE_LIST
         } else {
             topology(mode).ok_or_else(|| format!("primitive mode {mode}"))?
@@ -11871,21 +11874,22 @@ impl Nvn {
             }
         }
         // SetPrimitiveRestart(cmd, enable, index): in a strip or fan, an
-        // index equal to `index` starts a new primitive. Vulkan restarts
-        // at the index type's all-ones value only, so matching indices are
-        // rewritten to it (8-bit indices were widened to 16 bits).
+        // An index equal to the supplied marker starts a new primitive.
         let restart = self
             .render
             .state
             .get("SetPrimitiveRestart")
             .filter(|command| command.x[1] & 0xff != 0)
             .map(|command| command.x[2] as u32);
-        let strip = matches!(
-            topology,
-            vk::PrimitiveTopology::LINE_STRIP
-                | vk::PrimitiveTopology::TRIANGLE_STRIP
-                | vk::PrimitiveTopology::TRIANGLE_FAN
-        );
+        // A draw this large can only come from misread state; it would hold
+        // the GPU for seconds (the kernel resets it past 10 s).
+        let requested_count = command.x[3] as u32;
+        if !mesh_draw && u64::from(requested_count) * u64::from(instances) > 1 << 24 {
+            return Err(format!(
+                "{requested_count} vertices x {instances} instances"
+            ));
+        }
+        let mut index_restart = None;
         let (mut indices, mut count, mut first, mut base_vertex) = match command.name {
             // DrawArrays(cmd, mode, first, count).
             "nvnCommandBufferDrawArrays" | "nvnCommandBufferDrawArraysInstanced" => {
@@ -11893,8 +11897,8 @@ impl Nvn {
             }
             // DrawElementsBaseVertex(cmd, mode, type, count, indexBuffer,
             // baseVertex); type 0 = 8-bit, 1 = 16-bit, 2 = 32-bit (NVN1's
-            // NVNindexType order). 8-bit indices widen to 16-bit, which the
-            // renderer takes.
+            // NVNindexType order). Widen unsigned bytes if the device or
+            // the guest restart marker requires it.
             "nvnCommandBufferDrawElementsBaseVertex"
             | "nvnCommandBufferDrawElements"
             | "nvnCommandBufferDrawElementsInstanced" => {
@@ -11917,19 +11921,12 @@ impl Nvn {
                 let guest = self.gpu_to_guest(address, length)?;
                 // Vertex pulling needs the indices only on the GPU. Upload
                 // them as-is when the CPU does not widen or rewrite them.
-                // A restart value that is exactly the type's all-ones
-                // value (Vulkan's) needs no rewriting (0x1ffff with 16-bit
-                // indices, say, still goes through the rewrite).
-                let all_ones = if size == 2 { 0xffff } else { u32::MAX };
-                // 8-bit indices are widened on the CPU unless the device
-                // takes them as they are (and no restart value applies:
-                // that compares against the widened indices).
-                let native_bytes = size == 1
-                    && !(strip && restart.is_some())
-                    && self.gpu.as_ref().unwrap().renderer.supports_uint8_indices();
-                let rewrites_indices = size == 1 && !native_bytes
-                    || quads
-                    || strip && restart.is_some_and(|value| value != all_ones);
+                index_restart = index_assembly::restart_marker(topology, restart, size);
+                let custom =
+                    index_restart.is_some_and(|marker| marker != index_assembly::index_max(size));
+                let native_bytes =
+                    size == 1 && self.gpu.as_ref().unwrap().renderer.supports_uint8_indices();
+                let rewrites_indices = size == 1 && !native_bytes || quads || custom;
                 let kind = match size {
                     1 => vk::IndexType::UINT8_KHR,
                     2 => vk::IndexType::UINT16,
@@ -11994,11 +11991,11 @@ impl Nvn {
             _ if mesh_draw => (Indices::None, 0, 0, 0),
             other => return Err(format!("{other} is not modeled on the GPU")),
         };
-        // A draw this large can only come from misread state; it would hold
-        // the GPU for seconds (the kernel resets it past 10 s).
-        if u64::from(count) * u64::from(instances) > 1 << 24 {
-            return Err(format!("{count} vertices x {instances} instances"));
-        }
+        let primitive_restart = if let Some(marker) = index_restart {
+            index_assembly::prepare_restart(&mut indices, marker, &mut topology, &mut count)?
+        } else {
+            false
+        };
         if quads {
             let corners: Vec<u32> = match &indices {
                 Indices::None => (first..first + count).collect(),
@@ -12035,54 +12032,23 @@ impl Nvn {
 
         // One past the highest vertex the draw references, for CPU-selected
         // vertex stream ranges. Guest indices need no CPU-selected range.
-        let vertex_end = match &indices {
-            Indices::None => u64::from(first) + u64::from(count),
-            Indices::U16(bytes) => bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|index| u64::from(u16::from_le_bytes(*index)))
-                .max()
-                .map_or(0, |max| {
-                    (max as i64 + i64::from(base_vertex) + 1).max(0) as u64
-                }),
-            Indices::U32(bytes) => bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|index| u64::from(u32::from_le_bytes(*index)))
-                .max()
-                .map_or(0, |max| {
-                    (max as i64 + i64::from(base_vertex) + 1).max(0) as u64
-                }),
-            Indices::Guest { .. } | Indices::Shared { .. } => 0,
-        };
-        // The lowest vertex it references: meshes that share one large
-        // vertex buffer read their own range only (the draw's first or base
-        // vertex moves down by as much).
-        let lowest_index = |indices: &Indices| -> Option<u64> {
-            match indices {
-                Indices::None | Indices::Guest { .. } | Indices::Shared { .. } => None,
-                Indices::U16(bytes) => bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|index| u64::from(u16::from_le_bytes(*index)))
-                    .min(),
-                Indices::U32(bytes) => bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|index| u64::from(u32::from_le_bytes(*index)))
-                    .min(),
+        let (vertex_start, vertex_end) = if matches!(&indices, Indices::None) {
+            (u64::from(first), u64::from(first) + u64::from(count))
+        } else if let Some((low, high)) = index_assembly::bounds(&indices, primitive_restart) {
+            let max_index = self.gpu.as_ref().unwrap().renderer.gpu.max_index_value;
+            if high > max_index {
+                return Err(format!(
+                    "draw index {high:#x} exceeds the device limit {max_index:#x}"
+                ));
             }
+            let base = i64::from(base_vertex);
+            (
+                (i64::from(low) + base).max(0) as u64,
+                (i64::from(high) + base + 1).max(0) as u64,
+            )
+        } else {
+            (0, 0)
         };
-        let vertex_start = match lowest_index(&indices) {
-            None if matches!(indices, Indices::None) => u64::from(first),
-            None => 0,
-            Some(min) => (min as i64 + i64::from(base_vertex)).max(0) as u64,
-        }
-        .min(vertex_end);
         let needed = fixed_stream_extents(parsed.streams.len(), &attributes);
         let per_vertex = |props: &ParsedStream| props.divisor == 0 && props.stride != 0;
         // An unrelated bound stream must not change a procedural draw's
@@ -12370,27 +12336,6 @@ impl Nvn {
         let depth_state = self.render.properties("BindDepthStencilState");
         let color_state = self.render.properties("BindColorState");
         let mask_state = self.render.properties("BindChannelMaskState");
-        let primitive_restart = match (restart, &mut indices) {
-            (Some(value), Indices::U16(bytes)) if strip => {
-                for index in bytes.as_chunks_mut::<2>().0 {
-                    if u32::from(u16::from_le_bytes(*index)) == value & 0xffff {
-                        *index = [0xff; 2];
-                    }
-                }
-                true
-            }
-            (Some(value), Indices::U32(bytes)) if strip => {
-                for index in bytes.as_chunks_mut::<4>().0 {
-                    if u32::from_le_bytes(*index) == value {
-                        *index = [0xff; 4];
-                    }
-                }
-                true
-            }
-            // Kept as they are: the restart value is already all ones.
-            (Some(_), Indices::Guest { .. } | Indices::Shared { .. }) if strip => true,
-            _ => false,
-        };
         let fixed = Fixed {
             topology,
             primitive_restart,

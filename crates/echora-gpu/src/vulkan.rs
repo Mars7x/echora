@@ -78,6 +78,8 @@ pub struct Gpu {
     /// VK_KHR_index_type_uint8 (or the EXT): draws bind 8-bit index
     /// buffers as they are.
     pub index_type_uint8: bool,
+    /// Largest regular vertex index accepted by indexed draws (restart values are exempt).
+    pub max_index_value: u32,
     /// VK_EXT_depth_bias_control with the forced UNORM representation: a
     /// D24 depth target held as D32F takes polygon offset units in D24
     /// steps (2^-24), as the console's D24 does, not in the float format's
@@ -446,6 +448,7 @@ impl Gpu {
             .sampler_anisotropy(core.sampler_anisotropy != 0)
             .texture_compression_astc_ldr(core.texture_compression_astc_ldr != 0)
             .robust_buffer_access(core.robust_buffer_access != 0)
+            .full_draw_index_uint32(core.full_draw_index_uint32 != 0)
             .occlusion_query_precise(core.occlusion_query_precise != 0)
             .fill_mode_non_solid(core.fill_mode_non_solid != 0)
             .shader_int64(core.shader_int64 != 0)
@@ -707,6 +710,7 @@ impl Gpu {
             mesh_shader,
             conditional_rendering,
             index_type_uint8,
+            max_index_value: properties.limits.max_draw_indexed_index_value,
             depth_bias_control,
             shader_binary_version,
             name,
