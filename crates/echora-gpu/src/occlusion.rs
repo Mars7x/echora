@@ -653,6 +653,14 @@ impl Renderer {
         if !offset.is_multiple_of(4) {
             return Err("a samples-passed report must be four-byte aligned".into());
         }
+        let fence = self.current_fence();
+        let occlusion = self.occlusion()?;
+        let slot = occlusion.slot(fence);
+        // Leave room for the new report, the batch total and a change of
+        // segment. Reports can fill the plan even with no query counting.
+        if occlusion.plan_next[slot] as usize + occlusion.pending.len() + 3 >= PLANS as usize {
+            self.flush_async()?;
+        }
         let counting = self.occlusion()?.active.is_some();
         let resume = self.occlusion()?.resume;
         self.next_segment(false)?;
@@ -872,6 +880,42 @@ fn sum_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reports_without_a_reset_can_span_multiple_plan_buffers() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if !gpu.buffer_device_address {
+            return;
+        }
+        let mut renderer = crate::renderer::Renderer::new(gpu).unwrap();
+        let reports = u64::from(super::PLANS) + 2;
+        let (buffer, _) = renderer.resident_buffer(1, reports * 16).unwrap();
+        let timestamp = |index| 0x1122_3344_5600_0000_u64 + index;
+        for index in 0..reports {
+            renderer
+                .samples_report(buffer, index * 16, timestamp(index))
+                .unwrap();
+            if index == reports / 2 {
+                renderer.mark().unwrap();
+            }
+        }
+        let occlusion = renderer.occlusion.as_ref().unwrap();
+        let slot = occlusion.slot(renderer.current_fence());
+        assert!(
+            occlusion.plan_next[slot] as usize + occlusion.pending.len() < super::PLANS as usize
+        );
+        renderer.mark().unwrap();
+        let token = renderer.read_resident(1, 0, reports * 16).unwrap();
+        renderer.flush().unwrap();
+        let reads = renderer.take_reads(&[token]);
+        assert_eq!(reads[&token].len() as u64, reports * 16);
+        for (index, bytes) in reads[&token].chunks_exact(16).enumerate() {
+            assert_eq!(bytes[..8], [0; 8]);
+            assert_eq!(bytes[8..], timestamp(index as u64).to_le_bytes());
+        }
+    }
+
     #[test]
     fn occlusion_setup_can_fail_before_creating_pipelines() {
         let Ok(mut gpu) = crate::vulkan::Gpu::new() else {
