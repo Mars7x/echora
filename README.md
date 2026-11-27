@@ -62,8 +62,9 @@ What doesn't work yet:
   against real-hardware footage of the same scenes.
 - Gameplay past the opening scene. Around the flight through Kokiri Forest
   the graphics driver sometimes crashes, and memory use keeps growing after
-  that point. Finalizing a streamed texture now retires its texel buffer
-  and alternate upload images. The long-run impact still needs measurement.
+  that point. The renderer now retires finalized uploads, releases shared
+  image archives after their last use, and writes compressed texture blocks
+  back to the selected mip and layer. The long-run impact still needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
   about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.
@@ -187,7 +188,10 @@ they win clearly in the game ([lifter redesign](docs/lifter-redesign.md),
 Right now the focus is on accuracy and on getting into gameplay: making
 water and fog match real-hardware footage of the same scenes, and fixing the
 driver crash and the memory growth that stop runs past the opening scene.
-The current comparisons use the forest water and the fog along Navi’s flight.
+The current comparisons match camera poses in the forest footage. A repeated
+replay can change the water reflection even with the camera held still, so
+water color comparisons use live frames. The memory trace now reports how
+many bytes the renderer holds in targets, uploads and images awaiting release.
 Speed work continues after that.
 
 ## Building

@@ -17,8 +17,15 @@ automated test covers it).
 - Finalizing a texture removes its texel buffer and alternate 1D, 3D and
   array images from the lookup caches. Pending GPU commands retain their
   resources until completion. Vulkan tests cover both retirement and a
-  reused handle reading new buffer contents. The effect on memory growth
-  during the flight through Kokiri Forest still needs measurement.
+  reused handle reading new buffer contents. Rendering into a compressed
+  texture through an integer view loads and writes back the selected mip and
+  layer. A Vulkan test checks that partial writes preserve neighboring blocks
+  and that recycling the scratch attachment preserves each texture's contents.
+- Inactive targets can share a compressed host archive. Restoring or replacing
+  the final target using one releases its backing allocation immediately.
+  `ECHORA_CACHE_SIZES` reports Vulkan allocation bytes for render targets,
+  uploads and images still held by command buffers. The effect on memory
+  growth during the flight through Kokiri Forest still needs measurement.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the

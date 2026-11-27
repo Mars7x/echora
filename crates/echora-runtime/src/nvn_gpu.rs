@@ -2464,6 +2464,9 @@ impl Nvn {
             for (name, size) in backend.renderer.cache_sizes() {
                 line += &format!(" {name} {size}");
             }
+            for (name, bytes) in backend.renderer.image_allocation_bytes() {
+                line += &format!(" {name} {bytes}");
+            }
         }
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -4664,18 +4667,16 @@ impl Nvn {
             .flatten()
     }
 
-    /// The alias target (and its size) a draw renders the blocks of
-    /// block-compressed texture `texture` into through a color view of
-    /// format `view`, when each of the view's texels is one block (an
-    /// RGBA16UI view of BC4: a pixel shader compressing, one pixel per 4x4
-    /// block). The texture's own image takes them before it is sampled
-    /// (`texture_source`), as on the console both name one memory.
+    /// Load the selected compressed plane into an integer attachment. The
+    /// draw writes blocks there, then copies that plane back to guest storage.
     fn block_alias_target(
         &mut self,
-        texture: u64,
+        core: &Guest,
+        slot: usize,
+        (texture, level, layer): (u64, u32, u32),
         view: vk::Format,
     ) -> Result<Option<(u64, (u32, u32))>, String> {
-        let Ok((width, height, format)) = self.target_shape(texture) else {
+        let Ok((_, _, format)) = self.target_shape(texture) else {
             return Ok(None);
         };
         let Some(bytes) = echora_gpu::renderer::bc_block_bytes(format) else {
@@ -4690,16 +4691,29 @@ impl Nvn {
             return Ok(None);
         }
         self.ensure_render_target(texture)?;
-        let alias = 1 << 62 | texture;
-        let shape = self.render_shape(texture);
-        let levels = self.texture_levels(texture);
-        let size = (width.div_ceil(4), height.div_ceil(4));
-        // Texels of the alias are blocks of the texture: both stay at guest
-        // size, so the copy between them maps one block to one texel.
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
-        renderer.keep_unscaled(texture)?;
-        renderer.guest_sized_target(alias, size.0, size.1, shape, view, levels)?;
-        self.block_aliases.insert(texture, alias);
+        // A scissor, channel mask or conditional draw can retain any of the
+        // original blocks. Seed a newly allocated image from its guest bytes.
+        if renderer.target_is_undefined(texture) {
+            let source = self.guest_texture(core, texture)?;
+            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+            renderer.initialize_target(texture, &source)?;
+            renderer.defined(texture);
+            // A binding resolved while this allocation was still undefined
+            // can hold an upload even though its allocation key did not change.
+            self.evict_texture_bindings(texture);
+        }
+        let renderer = &mut self.gpu.as_mut().unwrap().renderer;
+        let target = renderer.target_info(texture).unwrap();
+        if level >= target.levels {
+            return Err("compressed color view selects a missing mip".into());
+        }
+        let size = (
+            (target.width >> level).max(1).div_ceil(4),
+            (target.height >> level).max(1).div_ceil(4),
+        );
+        let alias = renderer.block_attachment(slot, size, view)?;
+        renderer.copy_block_plane((texture, level, layer), (alias, 0, 0))?;
         Ok(Some((alias, size)))
     }
 
@@ -4738,17 +4752,12 @@ impl Nvn {
 
     fn texture_source(&mut self, core: &Guest, texture: u64) -> Result<TextureSource, String> {
         let source = self.texture_source_resolved(core, texture)?;
-        // Blocks drawn since it was last sampled come in first.
         if let TextureSource::Target(key) | TextureSource::TargetView { key, .. } = &source {
             let backend = self.gpu.as_mut().unwrap();
             if let Some(age) = backend.retired_since.get_mut(key) {
                 *age = self.presented_frames;
             }
             backend.renderer.restore_archived_target(*key)?;
-            if let Some(alias) = self.block_aliases.remove(key) {
-                backend.renderer.copy_blocks(alias, *key)?;
-                backend.stat("stat: compressed blocks drawn copied in", 1);
-            }
         }
         Ok(source)
     }
@@ -7401,22 +7410,15 @@ impl Nvn {
         if entry.present == frame && entry.gpu_writes == now {
             return Some(read(entry));
         }
-        // From an earlier present: a render target's binding holds while
-        // the target set is unchanged (the stamp) and no blocks drawn since
-        // wait to be copied into it (`texture_source` brings those in); an
-        // upload is checked against guest memory once per present, so it
-        // is resolved again.
-        if entry.present != frame {
-            let current = match &entry.source {
-                echora_gpu::draw::TextureSource::Target(key)
-                | echora_gpu::draw::TextureSource::TargetView { key, .. } => {
-                    !self.block_aliases.contains_key(key)
-                }
-                _ => false,
-            };
-            if !current {
-                return None;
-            }
+        // A target binding holds across presents while its stamp is current.
+        // Uploads are rechecked against guest memory once per present.
+        if entry.present != frame
+            && !matches!(
+                entry.source,
+                TextureSource::Target(_) | TextureSource::TargetView { .. }
+            )
+        {
+            return None;
         }
         if entry.gpu_writes != now
             && entry.backing.as_ref().is_some_and(|backing| {
@@ -11928,13 +11930,18 @@ impl Nvn {
             .unwrap()
             .stat("stat: draw geometry bytes", geometry_bytes as u64);
         let mut extent = None;
-        for (color, format) in colors[..bound].iter_mut().zip(&mut color_formats[..bound]) {
-            if *color != 0
-                && let Some(view) = *format
-                && let Some((alias, size)) = self.block_alias_target(*color, view)?
+        let mut block_writes = Vec::new();
+        for index in 0..bound {
+            let plane = (colors[index], color_levels[index], color_layers[index]);
+            if plane.0 != 0
+                && let Some(view) = color_formats[index]
+                && let Some((alias, size)) = self.block_alias_target(core, index, plane, view)?
             {
-                *color = alias;
-                *format = None;
+                block_writes.push((alias, plane));
+                colors[index] = alias;
+                color_levels[index] = 0;
+                color_layers[index] = 0;
+                color_formats[index] = None;
                 extent.get_or_insert(size);
             }
         }
@@ -11945,7 +11952,7 @@ impl Nvn {
             &color_formats[..bound],
         );
         for (index, &texture) in colors.iter().enumerate() {
-            if texture == 0 || self.block_aliases.values().any(|&alias| alias == texture) {
+            if texture == 0 || block_writes.iter().any(|&(alias, _)| alias == texture) {
                 continue;
             }
             if self.depth_traced(texture) {
@@ -12841,6 +12848,10 @@ impl Nvn {
         }
         if let Some(serial) = table_write_serial {
             backend.record_page_table_write(serial, None);
+        }
+        for (alias, plane) in block_writes {
+            backend.renderer.copy_block_plane((alias, 0, 0), plane)?;
+            backend.stat("stat: compressed blocks drawn copied in", 1);
         }
         if let Some((key, directory)) = snap.filter(|snap| Some(snap.0) == probe_target) {
             let sequence = self.sequence;
@@ -13905,6 +13916,110 @@ mod target_tests {
             .map(base, size, READ | WRITE, STATE_NORMAL, "texture storage")
             .unwrap();
         Some((nvn, memory, base, texture))
+    }
+
+    #[test]
+    fn compressed_draw_plane_survives_finalization_and_preserves_untouched_blocks() {
+        use super::vk;
+        let Some((mut nvn, mut memory, base, texture)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        let mut props = nvn.objects[&texture].builder.clone();
+        let (texture, other) = (texture + 1, texture + 2);
+        props.remove("Stride");
+        for (key, value) in [
+            ("Width", 20),
+            ("Height", 12),
+            ("Format", 73),
+            ("Target", 4),
+            ("Depth", 2),
+            ("Levels", 3),
+        ] {
+            props.insert(
+                key.into(),
+                Args {
+                    x: [value, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        }
+        nvn.initialize(texture, "Texture", props.clone()).unwrap();
+        props.get_mut("Storage").unwrap().x[1] = 0x10000;
+        nvn.initialize(other, "Texture", props).unwrap();
+        let size = nvn.texture_storage_size(texture).unwrap() as usize;
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        core.memory.write(base, &vec![0x11; size]).unwrap();
+        core.memory
+            .write(base + 0x10000, &vec![0x88; size])
+            .unwrap();
+        let plane = (texture, 1, 1);
+        let view = vk::Format::R32G32_UINT;
+        nvn.ensure_render_target(texture).unwrap();
+        nvn.evict_bindings();
+        let (upload, backing) = nvn.resolve_sampled_texture(&mut core, texture).unwrap();
+        assert!(matches!(upload, super::TextureSource::Upload { .. }));
+        nvn.remember_binding(0x42, texture, upload, super::Sampler::default(), backing);
+        let mut expected = vec![0x11; 3 * 2 * 8];
+        let words = [0xfedc_ba98_u32, 0x7654_3210];
+        for (x, y) in [(1, 0), (2, 1)] {
+            let (alias, size) = nvn
+                .block_alias_target(&core, 0, plane, view)
+                .unwrap()
+                .unwrap();
+            assert_eq!(size, (3, 2));
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            assert_eq!(renderer.read_target_bytes(alias, 8).unwrap(), expected);
+            renderer
+                .clear_color(
+                    alias,
+                    Some([x, y, 1, 1]),
+                    vk::ClearColorValue {
+                        uint32: [words[0], words[1], 0, 0],
+                    },
+                )
+                .unwrap();
+            renderer.copy_block_plane((alias, 0, 0), plane).unwrap();
+            let at = ((y * 3 + x) * 8) as usize;
+            expected[at..at + 4].copy_from_slice(&words[0].to_le_bytes());
+            expected[at + 4..at + 8].copy_from_slice(&words[1].to_le_bytes());
+        }
+
+        assert!(nvn.memoized_binding(0x42).is_none());
+        assert!(
+            matches!(nvn.texture_source(&core, texture).unwrap(), super::TextureSource::Target(key) if key == texture)
+        );
+
+        // The same slot can be reused before the first texture is finalized.
+        let (alias, _) = nvn
+            .block_alias_target(&core, 0, (other, 1, 1), view)
+            .unwrap()
+            .unwrap();
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(
+            renderer.read_target_bytes(alias, 8).unwrap(),
+            vec![0x88; expected.len()]
+        );
+        assert!(!renderer.target_keys_in_order().contains(&alias));
+        core.cpu.regs[0] = texture;
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        let retired = crate::nvn::retired_texture((base, 73));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        renderer
+            .copy_block_plane((retired, 1, 1), (alias, 0, 0))
+            .unwrap();
+        assert_eq!(renderer.read_target_bytes(alias, 8).unwrap(), expected);
+        renderer
+            .copy_block_plane((retired, 1, 0), (alias, 0, 0))
+            .unwrap();
+        assert_eq!(
+            renderer.read_target_bytes(alias, 8).unwrap(),
+            vec![0x11; expected.len()]
+        );
     }
 
     #[test]

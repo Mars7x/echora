@@ -30,6 +30,7 @@ pub struct Target {
     pub shape: crate::draw::ImageShape,
     pub levels: u32,
     memory: vk::DeviceMemory,
+    allocation_bytes: vk::DeviceSize,
     pub format: vk::Format,
     /// Uses supported by views with this image's own format.
     view_usage: vk::ImageUsageFlags,
@@ -72,6 +73,7 @@ impl From<&Target> for TargetInfo {
 struct ArchivedTarget {
     info: TargetInfo,
     decoded_bytes: usize,
+    hash: u64,
     compressed: std::sync::Arc<[u8]>,
 }
 
@@ -251,6 +253,7 @@ struct TargetDescription {
 /// rest of `Renderer::scale_for` aside).
 fn could_scale(key: u64, description: TargetDescription) -> bool {
     matches!(description.shape, ImageShape::D2 { .. })
+        && bc_block_bytes(description.format).is_none()
         && description.width * description.height > 64
         && key < STAGING_KEYS
 }
@@ -4996,15 +4999,16 @@ impl Renderer {
             self.targets_created += 1;
             let tiny = target.width * target.height <= 64;
             // (A block-compressed image cannot be cleared: its blocks
-            // come in whole from `copy_blocks`.)
-            let chain = target.levels > 1 && bc_block_bytes(target.format).is_none();
+            // come in whole from `copy_block_plane`.)
+            let zero = bc_block_bytes(target.format).is_none()
+                && (target.levels > 1 || std::env::var_os("ECHORA_ZERO_TARGETS").is_some());
             self.register_views(&target);
             self.target_changes += 1;
             self.changed_targets.push(key);
             self.insert_target(key, target);
             if tiny {
                 self.fresh_targets.push(key);
-            } else if chain || std::env::var_os("ECHORA_ZERO_TARGETS").is_some() {
+            } else if zero {
                 self.zero_target(key)?;
             }
         }
@@ -5250,8 +5254,6 @@ impl Renderer {
         if self.pending_archives.is_empty() {
             return Ok(());
         }
-        self.archived_bytes
-            .retain(|_, block| block.strong_count() != 0);
         let compressed: Vec<_> = self
             .archive_compressor
             .get()
@@ -5344,6 +5346,7 @@ impl Renderer {
             ArchivedTarget {
                 info,
                 decoded_bytes: archive.bytes as usize,
+                hash,
                 compressed,
             },
         );
@@ -5351,8 +5354,6 @@ impl Renderer {
         self.changed_targets.push(key);
     }
 
-    /// Reconstitute an image before a command refers to it. Keep the
-    /// archive until recording the upload has succeeded.
     /// The alignment of a uniform buffer bound in place (`Draw::uniforms_in_place`).
     pub fn uniform_offset_alignment(&self) -> u64 {
         self.gpu.uniform_offset_alignment
@@ -5363,6 +5364,26 @@ impl Renderer {
         self.gpu.index_type_uint8
     }
 
+    /// Remove the archive and release its allocation when the last target
+    /// stops sharing it. A weak reference to an Arc<[u8]> holds its allocation.
+    fn remove_archive(&mut self, key: u64) -> bool {
+        let Some(archive) = self.archived_targets.remove(&key) else {
+            return false;
+        };
+        let hash = archive.hash;
+        drop(archive);
+        if self
+            .archived_bytes
+            .get(&hash)
+            .is_some_and(|block| block.strong_count() == 0)
+        {
+            self.archived_bytes.remove(&hash);
+        }
+        true
+    }
+
+    /// Reconstitute an image before a command refers to it. Keep the
+    /// archive until recording the upload has succeeded.
     pub fn restore_archived_target(&mut self, key: u64) -> Result<(), String> {
         let Some(archived) = self.archived_targets.get(&key) else {
             return Ok(());
@@ -5386,7 +5407,7 @@ impl Renderer {
                 .push(self.targets.remove(&key).unwrap());
             return Err(error);
         }
-        self.archived_targets.remove(&key);
+        self.remove_archive(key);
         self.target_changes += 1;
         self.changed_targets.push(key);
         Ok(())
@@ -5550,7 +5571,13 @@ impl Renderer {
         vec![
             ("targets", self.targets.len()),
             ("uploads", self.uploads.len()),
-            ("retired uploads", self.slot.retired_uploads.len()),
+            (
+                "retired uploads",
+                std::iter::once(&self.slot)
+                    .chain(&self.spares)
+                    .map(|slot| slot.retired_uploads.len())
+                    .sum(),
+            ),
             ("samplers", self.samplers.len()),
             (
                 "extra views",
@@ -5561,6 +5588,35 @@ impl Renderer {
             ("pending reads", self.slot.pending_reads.len()),
             ("completed reads", self.completed_reads.len()),
             ("fresh targets", self.fresh_targets.len()),
+        ]
+    }
+
+    /// Vulkan image allocations held by each cache, including command
+    /// buffers that still own images removed from either cache.
+    pub fn image_allocation_bytes(&self) -> [(&'static str, u64); 3] {
+        [
+            (
+                "target bytes",
+                self.targets
+                    .values()
+                    .map(|image| image.allocation_bytes)
+                    .sum(),
+            ),
+            (
+                "upload bytes",
+                self.uploads
+                    .values()
+                    .map(|(_, image)| image.allocation_bytes)
+                    .sum(),
+            ),
+            (
+                "retired image bytes",
+                std::iter::once(&self.slot)
+                    .chain(&self.spares)
+                    .flat_map(|slot| &slot.retired_uploads)
+                    .map(|image| image.allocation_bytes)
+                    .sum(),
+            ),
         ]
     }
 
@@ -5895,7 +5951,7 @@ impl Renderer {
         };
         // A block-compressed target is never an attachment or a storage
         // image: draws write its blocks through an integer alias that is
-        // copied in (`copy_blocks`).
+        // copied in (`copy_block_plane`).
         let usage = if is_depth(format) {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
         } else if bc_block_bytes(format).is_some() {
@@ -5931,7 +5987,7 @@ impl Renderer {
         // (retired with this batch), not after a wait for it all.
         if let Some(replaced) = self.remove_target(to) {
             self.slot.retired_uploads.push(replaced);
-        } else if self.archived_targets.remove(&to).is_some() {
+        } else if self.remove_archive(to) {
             let index = self.guest_target_keys.binary_search(&to).unwrap();
             self.guest_target_keys.remove(index);
         }
@@ -6533,6 +6589,7 @@ impl Renderer {
                 shape,
                 levels,
                 memory,
+                allocation_bytes: requirements.size,
                 format,
                 view_usage,
                 width,
@@ -6813,69 +6870,179 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copy every level and layer (or slice) of target `from`, whose
-    /// texels are the blocks of block-compressed target `to` (an RGBA16UI
-    /// image of 8-byte BC4 blocks, a quarter of its width and height),
-    /// into `to`: a size-compatible copy, its extent in `from`'s texels.
-    pub fn copy_blocks(&mut self, from: u64, to: u64) -> Result<(), String> {
-        self.transition(from, vk::ImageLayout::GENERAL)?;
-        self.transition(to, vk::ImageLayout::GENERAL)?;
-        self.order_target(from)?;
-        self.order_target(to)?;
-        let commands = self.commands()?;
-        let (source, destination) = (&self.targets[&from], &self.targets[&to]);
-        let levels = source.levels.min(destination.levels);
-        let layers = source.shape.layers().min(destination.shape.layers());
-        let regions: Vec<vk::ImageCopy> = (0..levels)
-            .map(|level| {
-                let subresource = |format| vk::ImageSubresourceLayers {
-                    aspect_mask: range(format).aspect_mask,
-                    mip_level: level,
-                    base_array_layer: 0,
-                    layer_count: layers,
-                };
-                // The destination level's blocks bound the copy (a level
-                // smaller than a block still holds one), and so does the
-                // source level: both in the images' own sizes, which a
-                // scaled image does not share with the guest.
-                let (source_width, source_height) = source.extent(level);
-                let (destination_width, destination_height) = destination.extent(level);
-                vk::ImageCopy {
-                    src_subresource: subresource(source.format),
-                    src_offset: vk::Offset3D::default(),
-                    dst_subresource: subresource(destination.format),
-                    dst_offset: vk::Offset3D::default(),
-                    extent: vk::Extent3D {
-                        width: destination_width.div_ceil(4).min(source_width),
-                        height: destination_height.div_ceil(4).min(source_height),
-                        depth: (source.shape.depth() >> level)
-                            .max(1)
-                            .min((destination.shape.depth() >> level).max(1)),
-                    },
+    /// One reusable integer attachment per color slot. Its texels hold the
+    /// compressed blocks of the mip and plane selected for a draw.
+    pub fn block_attachment(
+        &mut self,
+        slot: usize,
+        size: (u32, u32),
+        format: vk::Format,
+    ) -> Result<u64, String> {
+        if slot >= 8 {
+            return Err("block attachment index outside the eight color slots".into());
+        }
+        let key = STAGING_KEYS + 2 + slot as u64;
+        self.guest_sized_target(key, size.0, size.1, ImageShape::D2 { layers: 1 }, format, 1)?;
+        Ok(key)
+    }
+
+    /// Copy one plane between a compressed image and its integer attachment.
+    /// Vulkan measures the copy extent in the source image's texels.
+    pub fn copy_block_plane(
+        &mut self,
+        from: (u64, u32, u32),
+        to: (u64, u32, u32),
+    ) -> Result<(), String> {
+        let plane = |(key, level, plane): (u64, u32, u32)| {
+            let target = self.targets.get(&key).ok_or("no such block copy target")?;
+            let volume = matches!(target.shape, ImageShape::D3 { .. });
+            if level >= target.levels
+                || plane
+                    >= if volume {
+                        (target.shape.depth() >> level).max(1)
+                    } else {
+                        target.shape.layers()
+                    }
+            {
+                return Err("block copy outside the image subresources");
+            }
+            let subresource = vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: level,
+                base_array_layer: if volume { 0 } else { plane },
+                layer_count: 1,
+            };
+            let offset = vk::Offset3D {
+                z: if volume { plane as i32 } else { 0 },
+                ..Default::default()
+            };
+            Ok((
+                subresource,
+                offset,
+                target.extent(level),
+                target.image,
+                target.format,
+            ))
+        };
+        let (src_subresource, src_offset, (width, height), source, source_format) = plane(from)?;
+        let (dst_subresource, dst_offset, dst_size, destination, dst_format) = plane(to)?;
+        let compressed_dst = bc_block_bytes(dst_format);
+        let (block_bytes, compressed, plain, plain_format) =
+            match (bc_block_bytes(source_format), compressed_dst) {
+                (Some(bytes), None) => (bytes, (width, height), dst_size, dst_format),
+                (None, Some(bytes)) => (bytes, dst_size, (width, height), source_format),
+                _ => {
+                    return Err("block copy requires a compressed and an uncompressed image".into());
                 }
-            })
-            .collect();
+            };
+        let expected = if block_bytes == 8 {
+            vk::Format::R32G32_UINT
+        } else {
+            vk::Format::R32G32B32A32_UINT
+        };
+        if uint_alias(plain_format) != Some(expected)
+            || plain != (compressed.0.div_ceil(4), compressed.1.div_ceil(4))
+        {
+            return Err("block copy images have incompatible texel sizes or extents".into());
+        }
+        self.transition(from.0, vk::ImageLayout::GENERAL)?;
+        self.transition(to.0, vk::ImageLayout::GENERAL)?;
+        self.order_target(from.0)?;
+        self.order_target(to.0)?;
+        let region = vk::ImageCopy {
+            src_subresource,
+            src_offset,
+            dst_subresource,
+            dst_offset,
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        // A direct uncompressed-to-compressed copy implicitly multiplies
+        // its destination extent by four. At a partial block that would
+        // pass the image edge. Buffer copies specify each extent separately.
+        if compressed_dst.is_some() && (compressed.0 % 4 != 0 || compressed.1 % 4 != 0) {
+            let row_bytes = u64::from(width) * u64::from(block_bytes);
+            let rows_per_copy = (RING_SIZE / row_bytes).max(1) as u32;
+            for y in (0..height).step_by(rows_per_copy as usize) {
+                let rows = rows_per_copy.min(height - y);
+                let (buffer, offset) = self.ring_alloc(row_bytes * u64::from(rows), 16)?;
+                let transfer = |subresource, mut origin: vk::Offset3D, row, width, height| {
+                    origin.y += row as i32;
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(subresource)
+                        .image_offset(origin)
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        })
+                };
+                let read = transfer(src_subresource, src_offset, y, width, rows);
+                let write = transfer(
+                    dst_subresource,
+                    dst_offset,
+                    y * 4,
+                    compressed.0,
+                    (rows * 4).min(compressed.1 - y * 4),
+                );
+                let visible = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                let commands = self.commands()?;
+                // SAFETY: both copies fit the reserved ring range. The second
+                // consumes the first copy's bytes after the transfer barrier.
+                unsafe {
+                    let device = self.device();
+                    device.cmd_copy_image_to_buffer(
+                        commands,
+                        source,
+                        vk::ImageLayout::GENERAL,
+                        buffer,
+                        &[read],
+                    );
+                    device.cmd_pipeline_barrier(
+                        commands,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[visible],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer_to_image(
+                        commands,
+                        buffer,
+                        destination,
+                        vk::ImageLayout::GENERAL,
+                        &[write],
+                    );
+                }
+            }
+        } else {
+            let commands = self.commands()?;
+            // SAFETY: the matching block grids fit the selected subresources.
+            unsafe {
+                self.device().cmd_copy_image(
+                    commands,
+                    source,
+                    vk::ImageLayout::GENERAL,
+                    destination,
+                    vk::ImageLayout::GENERAL,
+                    &[region],
+                );
+            }
+        }
+        let commands = self.commands()?;
         let after = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
-        // SAFETY: recording outside rendering; both images are live and in
-        // GENERAL layout; an uncompressed texel the size of a compressed
-        // block copies to that block (Vulkan 1.0 size-compatible copies).
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        // SAFETY: the completed plane copy is visible to subsequent work.
         unsafe {
-            let device = &self.gpu.device;
-            device.cmd_copy_image(
-                commands,
-                source.image,
-                vk::ImageLayout::GENERAL,
-                destination.image,
-                vk::ImageLayout::GENERAL,
-                &regions,
-            );
-            *self
-                .stats
-                .entry("stat: barriers in copy_blocks")
-                .or_default() += 1;
-            device.cmd_pipeline_barrier(
+            self.device().cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -6885,6 +7052,8 @@ impl Renderer {
                 &[],
             );
         }
+        self.stat("stat: barriers in copy_blocks", 1);
+        self.defined(to.0);
         Ok(())
     }
 
@@ -9866,7 +10035,12 @@ mod tests {
             }
             assert_eq!(renderer.uploads.len(), bindings.len());
             let retired = renderer.slot.retired_uploads.len();
+            let [_, (_, upload_bytes), (_, retired_bytes)] = renderer.image_allocation_bytes();
+            assert!(upload_bytes > 0);
             renderer.forget_upload(key);
+            let [_, (_, remaining), (_, after)] = renderer.image_allocation_bytes();
+            assert_eq!(remaining, 0);
+            assert_eq!(after - retired_bytes, upload_bytes);
             assert!(renderer.uploads.is_empty());
             assert!(renderer.upload_lengths.is_empty());
             assert_eq!(
@@ -10140,16 +10314,19 @@ mod tests {
         let (width, height) = renderer.target(7, 512, 256, format).unwrap().extent(0);
         assert_eq!((width, height), (768, 384));
         let color = [0.5, 4.0, 0.25, 1.0];
-        renderer
-            .clear_color(7, None, vk::ClearColorValue { float32: color })
-            .unwrap();
-        assert_eq!(
-            renderer.queue_target_archive(7).unwrap(),
-            ArchiveRequest::Queued
-        );
+        renderer.target(9, 512, 256, format).unwrap();
+        for key in [7, 9] {
+            renderer
+                .clear_color(key, None, vk::ClearColorValue { float32: color })
+                .unwrap();
+            assert_eq!(
+                renderer.queue_target_archive(key).unwrap(),
+                ArchiveRequest::Queued
+            );
+        }
         renderer.flush().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while renderer.existing_target(7).is_some() {
+        while renderer.archived_targets.len() < 2 {
             assert!(std::time::Instant::now() < deadline);
             renderer.finish_target_archives().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -10157,14 +10334,20 @@ mod tests {
         let archive = &renderer.archived_targets[&7];
         assert_eq!(archive.decoded_bytes, (width * height * 8) as usize);
         assert!(archive.compressed.len() < archive.decoded_bytes);
-        assert!(renderer.existing_target(7).is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &archive.compressed,
+            &renderer.archived_targets[&9].compressed
+        ));
         renderer.move_target(7, 8).unwrap();
-        assert_eq!(renderer.target_keys_in_order(), [8]);
+        assert_eq!(renderer.archived_bytes.len(), 1);
+        renderer.move_target(8, 9).unwrap();
+        assert!(renderer.archived_bytes.is_empty());
+        assert_eq!(renderer.target_keys_in_order(), [9]);
         assert_eq!(
-            renderer.existing_target(8).unwrap().extent(0),
+            renderer.existing_target(9).unwrap().extent(0),
             (width, height)
         );
-        let texels = renderer.read_target_scaled(8).unwrap().0;
+        let texels = renderer.read_target_scaled(9).unwrap().0;
         assert!(texels.iter().all(|texel| *texel == color));
     }
 
