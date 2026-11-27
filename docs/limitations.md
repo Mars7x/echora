@@ -1,8 +1,8 @@
 # Known limitations
 
 Echora is in development. Runs can hang, crash or render incorrectly.
-Manual Linux runs have loaded an existing save and reached the village (no
-automated test covers it).
+Local Linux tests load a cloned save and reach Kokiri Forest. CI uses
+synthetic fixtures and runs without the game files.
 
 ## Gameplay and graphics
 
@@ -86,6 +86,15 @@ automated test covers it).
   The patched headless run exited normally at present 6,200, peaked at
   12,594 MiB and averaged 14.0 FPS from presents 3,200 to 6,200. The
   scripted inputs cover a different path from the interactive session.
+- Two subsequent saved-game runs at 2560×1440 also exited normally at
+  present 6,200. The packed vertex and channel-mask build averaged 12.53 FPS
+  over presents 3,200–6,200 and peaked at 12,885 MiB resident. Allowing GPU
+  replay during CPU decompression measured 12.59 FPS and 12,369 MiB on the
+  same scripted route. The two captures reached the same room at different
+  animation phases. This pair establishes no repeatable FPS gain.
+  Six-second CPU samples in both runs attributed 6.1–6.8% of process
+  user-mode cycles to one translated guest search function. Those samples
+  measure CPU execution across threads, separately from GPU frame time.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
@@ -97,6 +106,18 @@ automated test covers it).
   has used in test runs. A few instruction forms no program has used yet
   are still refused, naming the reason
   ([shader-translator.md](shader-translator.md)).
+- Vertex attribute arrays, vertex stream layouts, color state and channel
+  masks are read from guest bytes when a command is recorded. Replaying a
+  command preserves those values if the game has since overwritten the
+  source. The renderer applies blend enables and RGBA write masks to up to
+  eight color attachments. Nondefault alpha tests and logic operations
+  still need renderer support.
+- In a capture near the Great Deku Tree, 18 visible foliage fragments
+  matched both the depth prepass and the color stored in the render target.
+  On the middle bank the material retained about 96% of the sampled leaf
+  luminance before lighting. The median after lighting was 6.7% of that
+  value. Two upper-bank fragments became brighter. The lighting calculation
+  still needs comparison with console output at the same fragments.
 - Blending with two source colours (NVN's SRC1 factors) is not wired up in
   the renderer: such a target is drawn unblended, with a note. No program
   has asked for it so far.
