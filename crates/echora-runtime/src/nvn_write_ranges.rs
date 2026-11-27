@@ -131,7 +131,7 @@ pub(super) fn project_table_with_hints(
             furthest
         })
         .collect();
-    let mut mapped = Vec::new();
+    let mut mapped: Vec<SharedPages> = Vec::new();
     let mut max_gpu_end = 0;
     let mut page = 0;
     while let Some(&address) = entries.get(page) {
@@ -155,12 +155,26 @@ pub(super) fn project_table_with_hints(
             let stop = span.device.end.min(end);
             if start < stop {
                 let gpu = gpu.checked_add(start - address)?..gpu.checked_add(stop - address)?;
+                let offset = span.offset.checked_add(start - span.device.start)?;
                 max_gpu_end = max_gpu_end.max(gpu.end);
+                // Adjacent GPU pages can have distinct Vulkan imports but
+                // still map the same contiguous guest-file bytes. Merge
+                // their equivalent mappings once, rather than walking
+                // both imports for every subsequent write projection.
+                if let Some(last) = mapped.last_mut()
+                    && last.file == span.file
+                    && gpu.start <= last.gpu.end
+                    && last.offset.checked_add(gpu.start - last.gpu.start) == Some(offset)
+                {
+                    last.gpu.end = last.gpu.end.max(gpu.end);
+                    last.max_gpu_end = max_gpu_end;
+                    continue;
+                }
                 mapped.push(SharedPages {
                     gpu,
                     max_gpu_end,
                     file: span.file,
-                    offset: span.offset.checked_add(start - span.device.start)?,
+                    offset,
                 });
             }
         }
@@ -402,6 +416,77 @@ mod tests {
                 FileRange {
                     file: 2,
                     bytes: 1010..1070,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesces_adjacent_equivalent_imports_but_preserves_aliases() {
+        let mapping = project_table(
+            1000,
+            16,
+            &[0x1000, 0x2000, 0x2010, 0x3000, 0x4000, 0, 0x5000],
+            vec![
+                ImportedSpan {
+                    device: 0x1000..0x1010,
+                    file: 1,
+                    offset: 100,
+                },
+                ImportedSpan {
+                    device: 0x2000..0x2020,
+                    file: 1,
+                    offset: 116,
+                },
+                ImportedSpan {
+                    device: 0x2008..0x2018,
+                    file: 1,
+                    offset: 124,
+                },
+                ImportedSpan {
+                    device: 0x3000..0x3010,
+                    file: 1,
+                    offset: 100,
+                },
+                ImportedSpan {
+                    device: 0x4000..0x4010,
+                    file: 2,
+                    offset: 116,
+                },
+                ImportedSpan {
+                    device: 0x5000..0x5010,
+                    file: 2,
+                    offset: 132,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(mapping.len(), 4);
+        assert_eq!(mapping[0].gpu, 1000..1048);
+        assert_eq!(mapping[0].max_gpu_end, 1048);
+        assert_eq!(
+            project_writes(
+                &mapping,
+                &[1012..1020, 1044..1072, 1096..1100],
+                &Default::default()
+            )
+            .unwrap(),
+            [
+                FileRange {
+                    file: 1,
+                    bytes: 100..120
+                },
+                FileRange {
+                    file: 1,
+                    bytes: 144..148
+                },
+                FileRange {
+                    file: 2,
+                    bytes: 116..124
+                },
+                FileRange {
+                    file: 2,
+                    bytes: 132..136
                 },
             ]
         );

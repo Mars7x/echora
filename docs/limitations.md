@@ -277,6 +277,18 @@ synthetic fixtures and runs without the game files.
   luminance before lighting. The median after lighting was 6.7% of that
   value. Two upper-bank fragments became brighter. The lighting calculation
   still needs comparison with console output at the same fragments.
+  On the saved outdoor route, separate readbacks matched the source
+  1024×1024 cloud and 2048×2048 leaf-shadow textures, with mean absolute
+  decoded-channel errors of 0.000036 and 0.000085 respectively. The
+  shader's sampled values also matched bilinear sampling of those
+  readbacks at two traced coordinates for each texture. Nine visible
+  fragments in a later capture used a leaf-shadow
+  material scale of 1 and a cloud-shadow scale of 0; the computed lighting
+  weight was 0.0098–0.0154, matching the shader expression within
+  0.00000003. Independently reconstructing view positions from both
+  projected texture coordinate pairs and the captured matrices agreed
+  with the rasterized locations within 0.012 pixels. These checks do not
+  establish that the console chooses the same material inputs.
 - Blending with two source colours (NVN's SRC1 factors) is not wired up in
   the renderer: such a target is drawn unblended, with a note. No program
   has asked for it so far.
@@ -302,6 +314,15 @@ synthetic fixtures and runs without the game files.
 
 ## Performance
 
+- Coalescing equivalent adjacent GPU-to-guest-file mappings reduced
+  physical write-projection walks from 2,030 to 1,992 spans per query
+  on one matched 2560×1440 saved-game route. The control and candidate
+  averaged 11.53 and 11.84 FPS over presents 3,200–6,000, and 8.70 and
+  8.83 FPS over outdoor presents 3,800–4,700. Both exited normally at
+  present 6,032 with preserved cloned saves; peak process RSS was
+  13,945 and 13,133 MiB respectively. The frames differ slightly in
+  camera position and the guest instruction counts differ, so this
+  pair establishes fewer mapping scans, not a repeatable FPS gain.
 - With the same Radeon build and saved forest route at 2560×1440, retaining
   a bounded GPU page-table extent averaged 9.66 FPS over presents
   4,200–5,100, compared with 8.90 FPS with exact resizing. The renderer
