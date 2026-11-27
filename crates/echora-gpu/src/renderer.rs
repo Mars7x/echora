@@ -1987,21 +1987,19 @@ impl Renderer {
     /// Retain the most recently completed buffers within the original budget
     /// of two current-sized tables. Never allocate a larger active binding.
     fn trim_free_page_tables(&mut self, active_bytes: u64) {
-        let budget = active_bytes.saturating_mul(2);
-        let mut bytes = 0;
-        let keep = self
-            .free_page_tables
-            .iter()
-            .rev()
-            .take(2)
-            .take_while(|table| {
-                bytes += table.buffer.size;
-                bytes <= budget
-            })
-            .count();
-        let discard = self.free_page_tables.len() - keep;
-        for table in self.free_page_tables.drain(..discard) {
-            table.buffer.destroy(&self.gpu.device);
+        let mut budget = active_bytes.saturating_mul(2);
+        let mut kept = 0;
+        for index in (0..self.free_page_tables.len()).rev() {
+            let size = self.free_page_tables[index].buffer.size;
+            if kept < 2 && size <= budget {
+                kept += 1;
+                budget -= size;
+            } else {
+                self.free_page_tables
+                    .remove(index)
+                    .buffer
+                    .destroy(&self.gpu.device);
+            }
         }
     }
 
@@ -10127,6 +10125,35 @@ mod tests {
             original_bytes.unwrap(),
             [address.to_le_bytes(), [0; 8]].concat()
         );
+    }
+
+    #[test]
+    fn page_table_cache_keeps_reusable_sizes_when_a_large_buffer_finishes() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.gpu.buffer_device_address {
+            return;
+        }
+        for bytes in [2048, 4096, 16384] {
+            let buffer = renderer
+                .host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)
+                .unwrap();
+            renderer.free_page_tables.push(RecycledPageTable {
+                buffer,
+                dirty: std::iter::once(0..bytes as usize / 8).collect(),
+            });
+        }
+        renderer.trim_free_page_tables(4096);
+        let sizes: Vec<_> = renderer
+            .free_page_tables
+            .iter()
+            .map(|table| table.buffer.size)
+            .collect();
+        assert_eq!(sizes, [2048, 4096]);
+
+        renderer.set_page_table(8, &[0; 512]).unwrap();
+        assert_eq!(renderer.take_stats()["stat: page table buffers reused"], 1);
     }
 
     #[test]
