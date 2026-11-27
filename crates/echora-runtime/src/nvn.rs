@@ -7187,18 +7187,7 @@ impl Nvn {
             && code.len() as u64 == length
         {
             let checked = (*keyed).max(code.len().min(512)).min(code.len());
-            let mut buffer = [0; 4096];
-            let same = code[..checked]
-                .chunks(buffer.len())
-                .enumerate()
-                .all(|(index, cached)| {
-                    let current = &mut buffer[..cached.len()];
-                    core.memory
-                        .read(guest + (index * 4096) as u64, current)
-                        .is_ok()
-                        && current == cached
-                });
-            if same {
+            if matches!(core.memory.equals(guest, &code[..checked]), Ok(true)) {
                 return Some((code.clone(), *key));
             }
         }
@@ -7223,8 +7212,13 @@ impl Nvn {
         let Some((guest, remaining)) = self.pool_for(gpu) else {
             return false;
         };
-        let current = read_prefix(core, guest, remaining.min(0x40000));
-        if current.as_slice() == code {
+        let length = remaining.min(0x40000);
+        let same = if code.len() as u64 == length {
+            matches!(core.memory.equals(guest, code), Ok(true))
+        } else {
+            read_prefix(core, guest, length).as_slice() == code
+        };
+        if same {
             return false;
         }
         self.stage_cache.borrow_mut().entries.remove(&gpu);
@@ -13192,6 +13186,16 @@ mod tests {
         let (fresh, fresh_key) = nvn.stage_code(&guest, gpu).unwrap();
         assert_eq!(fresh[0x400], 5);
         assert_eq!(fresh_key, rewritten_key);
+
+        let GuestMemory::Checked(memory) = &mut guest.memory else {
+            unreachable!("the fixture uses checked guest memory");
+        };
+        memory.set_permissions(base + 0x1000, 0x1000, 0).unwrap();
+        assert!(nvn.stage_code_changed(&guest, gpu, &fresh));
+        let (clipped, clipped_key) = nvn.stage_code(&guest, gpu).unwrap();
+        assert_eq!(clipped.as_slice(), &fresh[..0x1000]);
+        assert_eq!(clipped_key, fresh_key);
+        assert!(!nvn.stage_code_changed(&guest, gpu, &clipped));
     }
 
     #[test]
