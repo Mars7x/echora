@@ -4238,6 +4238,14 @@ impl Renderer {
         else {
             return Err("texel buffers from render targets are not modeled".into());
         };
+        // The plugin declares its uniform texel buffers with a float sampled
+        // type. An integer view of such a buffer is not a valid binding.
+        let view_format = bit_preserving_float(*format);
+        if integer_format(view_format) {
+            return Err(format!(
+                "{format:?} needs an integer-typed texel-buffer shader"
+            ));
+        }
         if let Some((cached, _, view)) = self.texel_buffers.get(key) {
             if cached == generation {
                 return Ok(*view);
@@ -4266,7 +4274,7 @@ impl Renderer {
         buffer.write(0, &bytes[..length]);
         let info = vk::BufferViewCreateInfo::default()
             .buffer(buffer.buffer)
-            .format(bit_preserving_float(*format))
+            .format(view_format)
             .offset(0)
             .range(length.max(texel_size) as u64);
         // SAFETY: the buffer is live; the view is destroyed with it.
@@ -10834,6 +10842,63 @@ mod tests {
     }
 
     #[test]
+    fn packed_color_transfer_sizes_match_raw_archive_layouts() {
+        use vk::Format as F;
+        for format in [
+            F::A2B10G10R10_UINT_PACK32,
+            F::A2B10G10R10_SINT_PACK32,
+            F::A2B10G10R10_SNORM_PACK32,
+            F::E5B9G9R9_UFLOAT_PACK32,
+            F::B8G8R8A8_SRGB,
+        ] {
+            assert_eq!(format_bytes(format), 4);
+            assert_eq!(uint_alias(format), Some(F::R32_UINT));
+        }
+        assert_eq!(format_bytes(F::R32G32B32_SFLOAT), 12);
+        assert_eq!(uint_alias(F::R32G32B32_SFLOAT), None);
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 11;
+        for format in [F::B8G8R8A8_SRGB, F::A2B10G10R10_UINT_PACK32] {
+            renderer.target(key, 2, 2, format).unwrap();
+            let bytes = [
+                0xef, 0xcd, 0xab, 0x89, 0x11, 0x22, 0x33, 0x44, 0x71, 0x62, 0x53, 0x44, 0, 0, 0, 0,
+            ];
+            renderer.restore_target_archive(key, &bytes).unwrap();
+            let token = renderer.queue_target_archive_read(key).unwrap();
+            renderer.flush().unwrap();
+            assert_eq!(renderer.take_reads(&[token])[&token], bytes);
+        }
+    }
+
+    #[test]
+    fn float_texel_buffer_shaders_report_unsupported_integer_views() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        for format in [vk::Format::R16_SINT, vk::Format::A2B10G10R10_UINT_PACK32] {
+            let source = crate::draw::TextureSource::Upload {
+                key: 17,
+                generation: 1,
+                width: 1,
+                height: 1,
+                shape: ImageShape::D1 { layers: 1 },
+                format,
+                texels: std::sync::Arc::new(vec![0; format_bytes(format) as usize]),
+                levels: Default::default(),
+            };
+            assert!(
+                renderer
+                    .texel_buffer_view(&source)
+                    .unwrap_err()
+                    .contains("integer-typed")
+            );
+            assert!(!renderer.texel_buffers.contains_key(&17));
+        }
+    }
+
+    #[test]
     fn reusing_a_target_cancels_its_pending_archive() {
         let Some(mut renderer) = renderer() else {
             return;
@@ -11523,8 +11588,7 @@ pub(crate) fn bit_preserving_float(format: vk::Format) -> vk::Format {
     }
 }
 
-/// Bytes per texel of the uncompressed formats buffer textures use (0 for
-/// others).
+/// Bytes per texel for uncompressed color transfers (0 for other layouts).
 pub(crate) fn format_bytes(format: vk::Format) -> u32 {
     use vk::Format as F;
     match format {
@@ -11537,8 +11601,13 @@ pub(crate) fn format_bytes(format: vk::Format) -> u32 {
         | F::R8G8B8A8_SINT
         | F::R8G8B8A8_SRGB
         | F::B8G8R8A8_UNORM
+        | F::B8G8R8A8_SRGB
         | F::A2B10G10R10_UNORM_PACK32
-        | F::B10G11R11_UFLOAT_PACK32 => 4,
+        | F::A2B10G10R10_SNORM_PACK32
+        | F::A2B10G10R10_UINT_PACK32
+        | F::A2B10G10R10_SINT_PACK32
+        | F::B10G11R11_UFLOAT_PACK32
+        | F::E5B9G9R9_UFLOAT_PACK32 => 4,
         F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT | F::R16G16_SINT | F::R16G16_SFLOAT => 4,
         F::R32_UINT | F::R32_SINT | F::R32_SFLOAT => 4,
         F::R16G16B16A16_UNORM
@@ -11839,30 +11908,14 @@ mod rescaling_tests {
 /// image of it can be viewed as (None: no such size, or compressed).
 pub fn uint_alias(format: vk::Format) -> Option<vk::Format> {
     use vk::Format as F;
-    let bytes = match format {
-        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT => 1,
-        F::R16_SFLOAT | F::R16_UNORM | F::R16_SNORM | F::R16_UINT | F::R16_SINT => 2,
-        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT => 2,
-        F::R32_SFLOAT | F::R32_UINT | F::R32_SINT => 4,
-        F::R16G16_SFLOAT | F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT => 4,
-        F::R16G16_SINT => 4,
-        F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT => 4,
-        F::R8G8B8A8_SRGB | F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB => 4,
-        F::A2B10G10R10_UNORM_PACK32 | F::A2B10G10R10_UINT_PACK32 => 4,
-        F::B10G11R11_UFLOAT_PACK32 | F::E5B9G9R9_UFLOAT_PACK32 => 4,
-        F::R32G32_SFLOAT | F::R32G32_UINT | F::R32G32_SINT => 8,
-        F::R16G16B16A16_SFLOAT | F::R16G16B16A16_UNORM | F::R16G16B16A16_SNORM => 8,
-        F::R16G16B16A16_UINT | F::R16G16B16A16_SINT => 8,
-        F::R32G32B32A32_SFLOAT | F::R32G32B32A32_UINT | F::R32G32B32A32_SINT => 16,
-        _ => return None,
-    };
-    Some(match bytes {
-        1 => F::R8_UINT,
-        2 => F::R16_UINT,
-        4 => F::R32_UINT,
-        8 => F::R32G32_UINT,
-        _ => F::R32G32B32A32_UINT,
-    })
+    match format_bytes(format) {
+        1 => Some(F::R8_UINT),
+        2 => Some(F::R16_UINT),
+        4 => Some(F::R32_UINT),
+        8 => Some(F::R32G32_UINT),
+        16 => Some(F::R32G32B32A32_UINT),
+        _ => None,
+    }
 }
 
 /// The format a storage image descriptor declares (`Descriptor::flags` bits
