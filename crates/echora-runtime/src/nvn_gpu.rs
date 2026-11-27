@@ -1079,6 +1079,16 @@ impl Backend {
             .map_or(minimum, |(serial, _)| *serial)
     }
 
+    /// A matching bounded write can supply a queued uniform read. An
+    /// unbounded write is a wait dependency but does not establish that
+    /// the GPU owns these bytes. The CPU may update them between draws.
+    fn has_pending_bounded_write(&self, serial: u64) -> bool {
+        serial
+            > self
+                .unbounded_write_serial
+                .max(self.renderer.completed_serial())
+    }
+
     fn wait_for_table_writes(&mut self, range: Option<SharedRange>) -> Result<(), String> {
         if !self.page_table_writes
             || self.renderer.completed_serial() >= self.page_table_write_serial
@@ -8076,8 +8086,8 @@ impl Nvn {
     }
 
     /// Select a uniform source for replay preflight and draw submission.
-    /// An in-place GPU binding sees previous writes in queue order. A CPU
-    /// copy must wait for the submission that wrote the backing bytes.
+    /// A bounded GPU write can feed an in-place binding in queue order. A
+    /// CPU copy must wait for any submission that may write the backing.
     /// ECHORA_UNIFORMS_IN_PLACE=0 always copies. With =all, GPU-written
     /// and CPU-written uniforms are both eligible for in-place binding.
     fn draw_uniform_source(
@@ -8099,7 +8109,7 @@ impl Nvn {
         let Some(backend) = self.gpu.as_ref() else {
             return Ok(UniformSource::Copy(serial));
         };
-        let pending = serial.is_some_and(|serial| serial > backend.renderer.completed_serial());
+        let pending = serial.is_some_and(|serial| backend.has_pending_bounded_write(serial));
         if mode == 0 || (mode != 2 && !pending) || self.gpu_writes_pending(&range) {
             return Ok(UniformSource::Copy(serial));
         }
@@ -18183,6 +18193,8 @@ mod pool_tests {
         assert_eq!(backend.shared_write_serial(range(2, 21, 24)), 1);
         assert_eq!(backend.shared_write_serial(range(2, 24, 25)), 4);
         assert_eq!(backend.shared_write_serial(range(1, 32, 40)), 1);
+        assert!(backend.has_pending_bounded_write(backend.shared_write_serial(range(1, 0, 8))));
+        assert!(!backend.has_pending_bounded_write(backend.shared_write_serial(range(1, 32, 40))));
         backend.discard_shared_writes_through(2);
         assert_eq!(backend.shared_writes.front().unwrap().0, 3);
         assert_eq!(backend.shared_write_serial(range(1, 7, 9)), 4);
@@ -18190,6 +18202,7 @@ mod pool_tests {
         backend.record_page_table_write(5, None);
         assert!(backend.shared_writes.is_empty());
         assert_eq!(backend.shared_write_serial(range(1, 0, 16)), 5);
+        assert!(!backend.has_pending_bounded_write(backend.shared_write_serial(range(1, 0, 16))));
     }
 
     #[test]

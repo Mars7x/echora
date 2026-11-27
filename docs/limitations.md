@@ -265,6 +265,12 @@ synthetic fixtures and runs without the game files.
   draw read the same 640×360 blue-and-alpha target the producing pass
   wrote in all five sampled presents. The visible leaf lighting difference
   remains in the opening captures.
+- In the 1440p opening, the foliage pass samples a 64-slice noise volume.
+  With unrestricted in-place uniform reads, all 64 slices had the contents
+  of the final slice. Restricting those reads to tracked GPU-written ranges
+  restored 64 distinct slices and matched the forced-copy readback byte for
+  byte. The run reached present 10,560 with the cloned save intact. Dark
+  foliage is still visible in the captured frames.
 - In a capture near the Great Deku Tree, 18 visible foliage fragments
   matched both the depth prepass and the color stored in the render target.
   On the middle bank the material retained about 96% of the sampled leaf
@@ -327,6 +333,11 @@ synthetic fixtures and runs without the game files.
   2,188 of 133,317 in the candidate. Peak process RSS was 13,257 and
   13,641 MiB respectively. Both runs reached the same outdoor checkpoints
   and preserved the cloned save. The FPS difference comes from one pair.
+- Restricting in-place uniform reads to tracked GPU-written ranges fixed
+  the opening noise volume. In one guarded 1440p saved-route comparison,
+  the previous and corrected renderers averaged 9.15 and 8.23 FPS
+  over presents 4,200–5,100. Peak process RSS was 13,382 and 13,556 MiB.
+  Both completed the route and preserved their cloned saves.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700
