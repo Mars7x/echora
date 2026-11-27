@@ -3,6 +3,7 @@
 //! window).
 
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 
@@ -44,6 +45,7 @@ pub struct Presenter {
     extent: vk::Extent2D,
     format: vk::Format,
     fence: vk::Fence,
+    acquisition: Option<Acquisition>,
     /// The swapchain no longer matches the surface (resize).
     stale: bool,
     /// Window size the swapchain was built for.
@@ -61,6 +63,25 @@ pub struct Presenter {
 struct PresentImage {
     image: vk::Image,
     ready: Option<PresentSync>,
+}
+
+struct Acquisition {
+    index: u32,
+    ready: bool,
+}
+
+impl Acquisition {
+    fn wait(
+        &mut self,
+        device: &ash::Device,
+        fence: vk::Fence,
+        timeout: u64,
+    ) -> Result<bool, String> {
+        if !self.ready {
+            self.ready = wait_and_reset(device, fence, timeout, "waiting for the acquired image")?;
+        }
+        Ok(self.ready)
+    }
 }
 
 struct PresentSync {
@@ -91,20 +112,13 @@ impl PresentSync {
         }
     }
 
-    fn wait(&mut self, device: &ash::Device) -> Result<(), String> {
-        if self.pending {
-            // SAFETY: this fence was enqueued with the image's last present.
-            unsafe {
-                device
-                    .wait_for_fences(&[self.presented], true, u64::MAX)
-                    .map_err(vk_error("waiting for presentation"))?;
-                device
-                    .reset_fences(&[self.presented])
-                    .map_err(vk_error("vkResetFences"))?;
-            }
+    fn wait(&mut self, device: &ash::Device, timeout: u64) -> Result<bool, String> {
+        if self.pending
+            && wait_and_reset(device, self.presented, timeout, "waiting for presentation")?
+        {
             self.pending = false;
         }
-        Ok(())
+        Ok(!self.pending)
     }
 
     fn destroy(self, device: &ash::Device) {
@@ -114,6 +128,32 @@ impl PresentSync {
             device.destroy_semaphore(self.blitted, None);
         }
     }
+}
+
+/// The caller retains ownership of the pending fence on timeout.
+fn wait_and_reset(
+    device: &ash::Device,
+    fence: vk::Fence,
+    timeout: u64,
+    context: &'static str,
+) -> Result<bool, String> {
+    // SAFETY: the caller owns the fence and holds exclusive host access.
+    unsafe {
+        match device.wait_for_fences(&[fence], true, timeout) {
+            Ok(()) => device
+                .reset_fences(&[fence])
+                .map(|()| true)
+                .map_err(vk_error("vkResetFences")),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(vk_error(context)(error)),
+        }
+    }
+}
+
+fn remaining_budget(deadline: Instant) -> u64 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_nanos() as u64
 }
 
 fn vk_error(context: &'static str) -> impl Fn(vk::Result) -> String {
@@ -245,6 +285,7 @@ impl Presenter {
             extent: vk::Extent2D::default(),
             format: vk::Format::UNDEFINED,
             fence,
+            acquisition: None,
             stale: true,
             requested: (0, 0),
             srgb: false,
@@ -256,7 +297,12 @@ impl Presenter {
 
     /// (Re)create the swapchain for the surface's current size. `fallback`
     /// is used when the surface leaves the size to the swapchain (Wayland).
-    fn rebuild(&mut self, gpu: &Gpu, fallback: vk::Extent2D) -> Result<bool, String> {
+    fn rebuild(
+        &mut self,
+        gpu: &Gpu,
+        fallback: vk::Extent2D,
+        deadline: Instant,
+    ) -> Result<bool, String> {
         // SAFETY: live physical device and surface.
         let (capabilities, formats, modes) = unsafe {
             (
@@ -290,7 +336,9 @@ impl Presenter {
         if extent.width == 0 || extent.height == 0 {
             return Ok(false);
         }
-        self.wait_for_presents(gpu)?;
+        if !self.wait_for_presents(gpu, Some(deadline))? {
+            return Ok(false);
+        }
         let mut count = capabilities.min_image_count + 1;
         if capabilities.max_image_count != 0 {
             count = count.min(capabilities.max_image_count);
@@ -331,13 +379,15 @@ impl Presenter {
         Ok(true)
     }
 
-    fn wait_for_presents(&mut self, gpu: &Gpu) -> Result<(), String> {
+    fn wait_for_presents(&mut self, gpu: &Gpu, deadline: Option<Instant>) -> Result<bool, String> {
         for image in &mut self.images {
-            if let Some(ready) = &mut image.ready {
-                ready.wait(&gpu.device)?;
+            if let Some(ready) = &mut image.ready
+                && !ready.wait(&gpu.device, deadline.map_or(u64::MAX, remaining_budget))?
+            {
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn destroy_swapchain(&mut self, gpu: &Gpu) {
@@ -363,7 +413,18 @@ impl Presenter {
         unsafe {
             let _ = gpu.device.device_wait_idle();
         }
-        let _ = self.wait_for_presents(gpu);
+        if self.acquisition.as_ref().is_some_and(|image| !image.ready) {
+            // Queue idle cannot complete an acquire the presentation engine
+            // still owns. Wait before destroying its fence or swapchain.
+            loop {
+                // SAFETY: this presenter owns the fence and no other host uses it.
+                match unsafe { gpu.device.wait_for_fences(&[self.fence], true, u64::MAX) } {
+                    Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+        let _ = self.wait_for_presents(gpu, None);
         self.destroy_swapchain(gpu);
         // SAFETY: no swapchain or pending acquire references the surface/fence.
         unsafe {
@@ -397,43 +458,70 @@ impl Renderer {
             format,
             vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
         );
-        if presenter.srgb != srgb {
-            presenter.srgb = srgb;
-            presenter.stale = true;
-        }
-        if presenter.stale || presenter.requested != size {
-            self.flush()?;
-            if !presenter.rebuild(&self.gpu, fallback)? {
-                return Ok(());
-            }
-            presenter.requested = size;
-        }
-        // SAFETY: live swapchain; the fence is unsignaled.
-        let acquired = unsafe {
-            presenter.swapchain_loader.acquire_next_image(
-                presenter.swapchain,
-                ACQUIRE_TIMEOUT_NS,
-                vk::Semaphore::null(),
-                presenter.fence,
-            )
-        };
-        let index = match acquired {
-            Ok((index, suboptimal)) => {
-                presenter.stale |= suboptimal;
-                index
-            }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+        let deadline = Instant::now() + Duration::from_nanos(ACQUIRE_TIMEOUT_NS);
+        let changed = presenter.srgb != srgb || presenter.requested != size;
+        let retry = presenter.acquisition.is_some();
+        if !retry {
+            if presenter.stale || changed {
+                presenter.srgb = srgb;
                 presenter.stale = true;
-                return Ok(());
+                self.flush()?;
+                if !presenter.rebuild(&self.gpu, fallback, deadline)? {
+                    return Ok(());
+                }
+                presenter.requested = size;
             }
-            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
-                // No image was acquired and the fence is still unsignaled.
-                // The caller submits the guest's work even without a blit.
-                self.stat("stat: presents skipped waiting for a window image", 1);
-                return Ok(());
+            // SAFETY: live swapchain and an unsignaled fence with no pending acquire.
+            let acquired = unsafe {
+                presenter.swapchain_loader.acquire_next_image(
+                    presenter.swapchain,
+                    remaining_budget(deadline),
+                    vk::Semaphore::null(),
+                    presenter.fence,
+                )
+            };
+            match acquired {
+                Ok((index, suboptimal)) => {
+                    presenter.stale |= suboptimal;
+                    presenter.acquisition = Some(Acquisition {
+                        index,
+                        ready: false,
+                    });
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    presenter.stale = true;
+                    return Ok(());
+                }
+                Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
+                    self.stat("stat: presents skipped waiting for a window image", 1);
+                    return Ok(());
+                }
+                Err(error) => return Err(format!("vkAcquireNextImageKHR: {error}")),
             }
-            Err(error) => return Err(format!("vkAcquireNextImageKHR: {error}")),
-        };
+        }
+        let acquired = presenter.acquisition.as_mut().unwrap();
+        if !acquired.wait(
+            &self.gpu.device,
+            presenter.fence,
+            remaining_budget(deadline),
+        )? {
+            self.stat("stat: presents skipped waiting for acquire fence", 1);
+            return Ok(());
+        }
+        if retry && changed {
+            // The acquire has finished and the stale swapchain can be retired.
+            presenter.acquisition = None;
+            presenter.stale = true;
+            return Ok(());
+        }
+        let index = acquired.index;
+        if let Some(ready) = &mut presenter.images[index as usize].ready
+            && !ready.wait(&self.gpu.device, remaining_budget(deadline))?
+        {
+            self.stat("stat: presents skipped waiting for presentation fence", 1);
+            return Ok(());
+        }
+        presenter.acquisition = None;
         let shown = self.present_acquired(presenter, key, index);
         if shown.is_err() {
             self.abandon_present(presenter);
@@ -449,20 +537,7 @@ impl Renderer {
         key: u64,
         index: u32,
     ) -> Result<(), String> {
-        // SAFETY: the caller's acquire submitted the fence.
-        unsafe {
-            let device = &self.gpu.device;
-            device
-                .wait_for_fences(&[presenter.fence], true, u64::MAX)
-                .map_err(vk_error("vkWaitForFences"))?;
-            device
-                .reset_fences(&[presenter.fence])
-                .map_err(vk_error("vkResetFences"))?;
-        }
         let image = &mut presenter.images[index as usize];
-        if let Some(ready) = &mut image.ready {
-            ready.wait(&self.gpu.device)?;
-        }
         self.blit_to_swapchain(key, image.image, presenter.format, presenter.extent)?;
         let signal = if let Some(ready) = &image.ready {
             self.submit_for_present(ready.blitted)?;
@@ -516,15 +591,9 @@ impl Renderer {
             .queue_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: the queue is externally synchronized by the held lock. An
-        // acquire fence left signaled by a failed wait must not be reused
-        // signaled by the next acquire.
+        // SAFETY: the queue is externally synchronized by the held lock.
         unsafe {
-            let device = &self.gpu.device;
-            let _ = device.queue_wait_idle(self.gpu.queue);
-            if device.get_fence_status(presenter.fence) == Ok(true) {
-                let _ = device.reset_fences(&[presenter.fence]);
-            }
+            let _ = self.gpu.device.queue_wait_idle(self.gpu.queue);
         }
     }
 }
@@ -546,6 +615,32 @@ fn present_was_queued(result: Result<bool, vk::Result>) -> bool {
 mod tests {
     use super::*;
     use vk::PresentModeKHR as Mode;
+
+    #[test]
+    fn acquisition_timeout_keeps_the_image_until_its_fence_signals() {
+        let Ok(gpu) = Gpu::new() else { return };
+        let device = &gpu.device;
+        // SAFETY: the test owns the device, queue, and fence. The submission
+        // signals the fence without referencing any other resources.
+        unsafe {
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let mut acquisition = Acquisition {
+                index: 2,
+                ready: false,
+            };
+            assert!(!acquisition.wait(device, fence, 0).unwrap());
+            assert_eq!(acquisition.index, 2);
+            device
+                .queue_submit(gpu.queue, &[vk::SubmitInfo::default()], fence)
+                .unwrap();
+            assert!(acquisition.wait(device, fence, 1_000_000_000).unwrap());
+            assert!(!device.get_fence_status(fence).unwrap());
+            assert!(acquisition.wait(device, fence, 0).unwrap());
+            device.destroy_fence(fence, None);
+        }
+    }
 
     #[test]
     fn rejected_surfaces_still_queue_the_present() {
