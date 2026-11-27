@@ -34,6 +34,7 @@ pub struct Gpu {
     /// The depthBiasClamp feature is enabled (otherwise a polygon offset's
     /// clamp must be 0).
     pub depth_bias_clamp: bool,
+    pub(crate) logic_op: bool,
     /// Enabled sampler anisotropy limit, or 1 when unsupported.
     pub max_sampler_anisotropy: f32,
     /// Maximum absolute sampler LOD bias supported by the device.
@@ -465,6 +466,7 @@ impl Gpu {
             .image_cube_array(core.image_cube_array != 0)
             .depth_bias_clamp(core.depth_bias_clamp != 0)
             .independent_blend(core.independent_blend != 0)
+            .logic_op(core.logic_op != 0)
             .geometry_shader(core.geometry_shader != 0)
             .tessellation_shader(core.tessellation_shader != 0)
             .sample_rate_shading(core.sample_rate_shading != 0)
@@ -676,6 +678,7 @@ impl Gpu {
             occlusion_query_precise: core.occlusion_query_precise != 0,
             fill_mode_non_solid: core.fill_mode_non_solid != 0,
             depth_bias_clamp: core.depth_bias_clamp != 0,
+            logic_op: core.logic_op != 0,
             max_sampler_anisotropy: if core.sampler_anisotropy != 0 {
                 properties.limits.max_sampler_anisotropy
             } else {

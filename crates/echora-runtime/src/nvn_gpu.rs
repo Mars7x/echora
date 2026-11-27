@@ -12508,6 +12508,13 @@ impl Nvn {
         );
         let depth_state = self.render.properties("BindDepthStencilState");
         let color_state = self.render.properties("BindColorState");
+        // NVN uses Vulkan's numbering for the sixteen ROP operations.
+        // COPY selects the ordinary per-target blend and write-mask path.
+        let logic_op = match arg(color_state, "LogicOp", 0).unwrap_or(3) {
+            3 => None,
+            op @ 0..=15 => Some(vk::LogicOp::from_raw(op as i32)),
+            op => return Err(format!("unknown color logic operation {op}")),
+        };
         let mask_state = self.render.properties("BindChannelMaskState");
         let fixed = Fixed {
             topology,
@@ -12609,6 +12616,7 @@ impl Nvn {
                 0,
             )
             .is_some_and(|enable| enable != 0),
+            logic_op,
             // SetBlendColor(cmd, const float rgba[4]): the four floats
             // captured at record time; NVN's default is zero.
             blend_constants: self

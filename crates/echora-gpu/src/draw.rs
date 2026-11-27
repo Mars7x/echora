@@ -165,6 +165,7 @@ pub struct Fixed {
     /// is kept where its target 0 alpha covers it (leaf and grass cards'
     /// cut-out).
     pub alpha_to_coverage: bool,
+    pub logic_op: Option<vk::LogicOp>,
     /// The blend constant (SetBlendColor) the CONSTANT factors read.
     pub blend_constants: [f32; 4],
 }
@@ -299,6 +300,7 @@ struct RasterState {
     depth_minus_one_to_one: bool,
     depth_bias: Option<([u32; 3], bool)>,
     alpha_to_coverage: bool,
+    logic_op: Option<vk::LogicOp>,
     blend_constants: [u32; 4],
 }
 
@@ -1236,6 +1238,7 @@ impl Renderer {
                 depth_bias: None,
                 depth_bias_d24: false,
                 alpha_to_coverage: false,
+                logic_op: None,
                 blend_constants: [0.0; 4],
             },
             blends: blend.as_slice(),
@@ -1272,6 +1275,12 @@ impl Renderer {
         };
         if empty {
             return Ok(Vec::new());
+        }
+        if draw.fixed.logic_op.is_some() {
+            if !self.gpu.logic_op {
+                return Err("logic operations require Vulkan logicOp".into());
+            }
+            self.stat("stat: color logic operation draws", 1);
         }
         // Attachments render at one scale (before anything is recorded:
         // keeping a target unscaled flushes).
@@ -1733,6 +1742,7 @@ impl Renderer {
                 )
             }),
             alpha_to_coverage: fixed.alpha_to_coverage,
+            logic_op: fixed.logic_op,
             blend_constants: fixed.blend_constants.map(f32::to_bits),
         };
         let rescaling = (!program.push_stages.is_empty()).then(|| {
@@ -1907,6 +1917,12 @@ impl Renderer {
                         raster.depth_minus_one_to_one,
                     );
                 }
+                if self.gpu.logic_op && changed!(logic_op) {
+                    objects.cmd_set_logic_op_enable(commands, raster.logic_op.is_some());
+                    if let Some(op) = raster.logic_op {
+                        objects.cmd_set_logic_op(commands, op);
+                    }
+                }
                 if changed!(alpha_to_coverage) {
                     objects.cmd_set_alpha_to_coverage_enable(commands, raster.alpha_to_coverage);
                 }
@@ -1967,8 +1983,12 @@ impl Renderer {
                 }
                 self.graphics.raster = Some(raster);
             }
-            let blends = (0..draw.colors.len().max(1))
-                .map(|index| draw.blends.get(index).copied().unwrap_or_default());
+            let blends = (0..draw.colors.len().max(1)).map(|index| {
+                let mut blend = draw.blends.get(index).copied().unwrap_or_default();
+                // Logical operations replace blending for all attachments.
+                blend.enable &= fixed.logic_op.is_none();
+                blend
+            });
             if !self.graphics.blends.iter().copied().eq(blends.clone()) {
                 self.graphics.blends.clear();
                 self.graphics.blends.extend(blends);
@@ -2341,6 +2361,7 @@ pub(crate) mod tests {
                 depth_bias: None,
                 depth_bias_d24: false,
                 alpha_to_coverage: false,
+                logic_op: None,
                 blend_constants: [0.0; 4],
             },
             blends: &blend,
@@ -2483,6 +2504,53 @@ pub(crate) mod tests {
             let texels = renderer.read_target(7).unwrap();
             assert_eq!(texels[0], [0.0, 1.0, 1.0, 1.0]);
             assert_eq!(texels[3], [0.0; 4]);
+        }
+
+        if renderer.gpu.logic_op {
+            renderer
+                .clear_color(
+                    7,
+                    None,
+                    vk::ClearColorValue {
+                        float32: [0.0, 1.0, 1.0, 1.0],
+                    },
+                )
+                .unwrap();
+            let keep_destination = (
+                vk::BlendFactor::ZERO,
+                vk::BlendFactor::ONE,
+                vk::BlendOp::ADD,
+            );
+            let masked = [Blend {
+                enable: true,
+                color: keep_destination,
+                alpha: keep_destination,
+                write_mask: vk::ColorComponentFlags::G,
+            }];
+            draw.fixed.logic_op = Some(vk::LogicOp::XOR);
+            draw.fixed.scissor = [0, 0, 1, 4];
+            draw.blends = &masked;
+            renderer.draw(&draw).unwrap();
+
+            let add = (vk::BlendFactor::ONE, vk::BlendFactor::ONE, vk::BlendOp::ADD);
+            let additive = [Blend {
+                enable: true,
+                color: add,
+                alpha: add,
+                ..Blend::default()
+            }];
+            draw.fixed.logic_op = None;
+            draw.fixed.scissor = [1, 0, 1, 4];
+            draw.uniforms = &red;
+            draw.blends = &additive;
+            renderer.draw(&draw).unwrap();
+            let texels = renderer.read_target(7).unwrap();
+            assert_eq!(texels[0], [0.0, 0.0, 1.0, 1.0]);
+            assert_eq!(texels[1], [1.0, 1.0, 1.0, 1.0]);
+            assert_eq!(
+                renderer.take_stats()["stat: color logic operation draws"],
+                1
+            );
         }
 
         renderer.destroy_program(alternate).unwrap();

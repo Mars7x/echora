@@ -245,7 +245,10 @@ synthetic fixtures and runs without the game files.
   masks are read from guest bytes when a command is recorded. Replaying a
   command preserves those values if the game has since overwritten the
   source. The renderer applies blend enables and RGBA write masks to up to
-  eight color attachments. Nondefault alpha tests and logic operations
+  eight color attachments. On Vulkan devices with logic operations, an
+  active operation replaces blending and combines the source and destination
+  bits of integer and normalized fixed-point attachments. Floating-point
+  and sRGB attachments pass through source values. Nondefault alpha tests
   still need renderer support.
 - In a capture near the Great Deku Tree, 18 visible foliage fragments
   matched both the depth prepass and the color stored in the render target.
