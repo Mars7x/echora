@@ -215,7 +215,9 @@ output to a vertex component the producer never wrote. In a separate forest
 capture, both vegetation passes received 386 workgroups. A second live
 capture checked the lists themselves. The depth and color passes received
 the same 430 group IDs in the same order, covering 102,644 candidates.
-The marked slope still shows less leaf cover than the console.
+A third capture read the visibility condition from the GPU and confirmed
+the material pass was enabled. The marked slope still shows less leaf cover
+than the console.
 Speed work continues after that.
 
 ## Building

@@ -14,21 +14,33 @@ automated test covers it).
   scene targets. The adaptive path used 854×480 targets in the sampled scene.
   A traced water pixel in the opening forest retained more than 99.99% of
   its base color at the blend before the volume passes in twelve live
-  samples. The final water color still differs from the matching console
-  footage. Six consecutive 1440p captures of the opening forest (presents
+  samples. In another live capture the same pixel chose the positive Z
+  cubemap face in 16 successive samples, at mip levels 0.39–0.40. The
+  cubemap returned more red than green each time. The final water color
+  still differs from the matching console footage. Six consecutive 1440p captures of the opening forest (presents
   10,496–10,501) showed no black frame. After compensating for camera
   motion, no matched 40×40-pixel patch on the four interior frames had a
   brightness pulse above 12/255 relative to both neighbors. The check
   covered about 96% of the measured tiles in that shot. Smaller flicker
   and later scenes remain open. Unimplemented operations can stop the run
   and produce a report.
+- The reserved zero texture in a guest texture pool samples as transparent
+  black and reports zero dimensions on hosts supporting Vulkan null
+  descriptors. Two vertex programs previously skipped 35 depth draws
+  when they used this slot. A Radeon run through present 10,600 logged
+  zero draw errors after the fix. The effect on the visible gaps still
+  needs comparison at the affected camera poses.
 - Sampled views inherit the texture’s channel mapping until the guest sets
   an explicit mapping on the view. Rebinding a bindless texture slot clears
   image views left by the previous texture’s shape or numeric type. A Vulkan
   regression checks a float-to-integer replacement and the neighboring slot.
   A reset sampler builder uses linear minification and magnification, repeat
   addressing and LOD limits of 0 to 1000. The guest getters and registered
-  Vulkan samplers share defaults verified against the guest SDK.
+  Vulkan samplers share defaults verified against the guest SDK. Float and
+  integer border-color getters read the same four words. Replaying a captured
+  draw or dispatch retains the sampler settings visible to that submission.
+  A queue released by an explicit guest wait can see registrations made
+  while it was blocked.
 - Min/max filtering uses the host's Vulkan sampler reduction support. On
   Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
   levels at LOD 0.5 returned 0.4375 for minimum reduction. The expected
