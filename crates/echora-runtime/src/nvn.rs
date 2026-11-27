@@ -3390,7 +3390,7 @@ impl Nvn {
                 self.pool_epoch += 1;
                 self.pool_ranges.get_mut().epoch = None;
                 self.storage_memo.get_mut().clear();
-                self.invalidate_target_index(None);
+                self.invalidate_target_pool(this);
                 let state = &mut self.objects.get_mut(&this).unwrap().state;
                 for [physical, physical_offset, offset, size] in mappings {
                     let end = offset + size;
@@ -7972,13 +7972,13 @@ impl Nvn {
             "Program" => self.flush_epoch += 1,
             "MemoryPool" => {
                 self.storage_memo.get_mut().clear();
-                self.invalidate_target_index(None);
+                self.invalidate_target_pool(address);
             }
             "Texture" => {
                 self.target_shapes.1.remove(&address);
                 self.storage_memo.get_mut().remove(&address);
                 self.size_memo.get_mut().remove(&address);
-                self.invalidate_target_index(Some(address));
+                self.invalidate_target_texture(address);
             }
             _ => {}
         }

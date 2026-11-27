@@ -93,6 +93,8 @@ struct TargetIndex {
     storage: HashMap<u64, Vec<u64>>,
     mips: HashMap<u64, Vec<TargetMip>>,
     by_target: HashMap<u64, (u64, Vec<u64>)>,
+    /// A target's pool handle and whether it can resolve through other pools.
+    pool_dependent: HashMap<u64, (u64, bool)>,
     changed: super::FastSet<u64>,
 }
 
@@ -277,6 +279,7 @@ impl TargetIndex {
     fn remove(&mut self, key: u64) {
         use std::collections::hash_map::Entry;
 
+        self.pool_dependent.remove(&key);
         let Some((base, mip_storage)) = self.by_target.remove(&key) else {
             return;
         };
@@ -4555,21 +4558,29 @@ impl Nvn {
         })
     }
 
-    /// A texture changed, or a pool changed where textures map.
-    pub(super) fn invalidate_target_index(&mut self, texture: Option<u64>) {
-        if let Some(backend) = self.gpu.as_mut() {
-            if let Some(key) = texture {
-                if backend.renderer.target_info(key).is_some() {
-                    backend.target_index.changed.insert(key);
-                }
-            } else {
-                backend.target_index.stamp = None;
-            }
+    pub(super) fn invalidate_target_texture(&mut self, texture: u64) {
+        if let Some(backend) = self.gpu.as_mut()
+            && backend.renderer.target_info(texture).is_some()
+        {
+            backend.target_index.changed.insert(texture);
         }
     }
 
-    /// Update changed targets. A pool change can move many textures at
-    /// once, so it still rebuilds the entire index.
+    /// Recreating or releasing a pool can move its own textures and textures
+    /// in virtual pools whose mappings refer to it.
+    pub(super) fn invalidate_target_pool(&mut self, pool: u64) {
+        if let Some(backend) = self.gpu.as_mut() {
+            let index = &mut backend.target_index;
+            index.changed.extend(index.pool_dependent.iter().filter_map(
+                |(&key, &(storage_pool, virtual_pool))| {
+                    (storage_pool == pool || virtual_pool).then_some(key)
+                },
+            ));
+        }
+    }
+
+    /// Update changed targets and any whose address may depend on changed
+    /// pools. Single-level retired images keep their captured backing.
     fn refresh_target_index(&mut self) {
         if self.target_index_current() {
             return;
@@ -4583,9 +4594,22 @@ impl Nvn {
         let renderer = &backend.renderer;
         let generation = renderer.target_changes;
         let add_target = |index: &mut TargetIndex, key| {
-            if let Some(target) = renderer.target_info(key)
-                && let Some(base) = self.texture_storage(key)
-            {
+            if let Some(target) = renderer.target_info(key) {
+                if let Some(object) = self.objects.get(&key)
+                    && (target.levels != 1 || !object.state.contains_key("RetiredBacking"))
+                    && let Some(storage) = object.builder.get("Storage")
+                {
+                    let pool = storage.x[0];
+                    let virtual_pool = self
+                        .objects
+                        .get(&pool)
+                        .and_then(|object| object.builder.get("Storage"))
+                        .is_some_and(|storage| storage.x[0] == 0);
+                    index.pool_dependent.insert(key, (pool, virtual_pool));
+                }
+                let Some(base) = self.texture_storage(key) else {
+                    return;
+                };
                 let levels = (target.levels > 1)
                     .then(|| self.target_level_addresses(key, target, base))
                     .into_iter()
@@ -4598,6 +4622,7 @@ impl Nvn {
             index.storage.values_mut().for_each(Vec::clear);
             index.mips.values_mut().for_each(Vec::clear);
             index.by_target.clear();
+            index.pool_dependent.clear();
             index.changed.clear();
             for &key in renderer.target_keys_in_order() {
                 add_target(&mut index, key);
@@ -18048,6 +18073,13 @@ mod pool_tests {
         );
         nvn.initialize(0x3000, "Texture", props.clone()).unwrap();
         assert!(nvn.target_index_current());
+        nvn.initialize(
+            0x4000,
+            "MemoryPool",
+            BTreeMap::from([("Storage".to_owned(), args([0x30_0000, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        assert!(nvn.target_index_current());
 
         nvn.gpu
             .as_mut()
@@ -18083,6 +18115,8 @@ mod pool_tests {
         guest.cpu.regs[0] = 0x1000;
         assert!(nvn.call("nvnMemoryPoolFinalize", &mut guest).unwrap());
         assert!(!nvn.target_index_current());
+        let index = &nvn.gpu.as_ref().unwrap().target_index;
+        assert_eq!(index.changed.iter().copied().collect::<Vec<_>>(), [0x3000]);
         nvn.refresh_target_index();
         assert!(nvn.gpu.as_ref().unwrap().target_index.storage.is_empty());
         nvn.initialize(
