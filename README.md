@@ -210,6 +210,8 @@ flushing an idle renderer releases them without submitting another batch.
 Texture view registration validates and copies the view under the same lock.
 Shader cache lookups compare the live guest bytes directly on AVX2 hosts
 while retaining the byte-for-byte check.
+The renderer also applies each fragment shader's declared color channels
+alongside the guest's attachment write mask.
 To trace the missing ground cover, the draw log records the first instance
 and instance count of indexed instanced draws. A pixel watch can follow one
 texel through a single frame while transferring only that texel to the CPU.

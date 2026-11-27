@@ -258,6 +258,13 @@ synthetic fixtures and runs without the game files.
   bits of integer and normalized fixed-point attachments. Floating-point
   and sRGB attachments pass through source values. Nondefault alpha tests
   still need renderer support.
+- The Vulkan write mask also respects each fragment shader's declared
+  output channels. A Vulkan readback verifies that a blue-and-alpha
+  shader preserves the destination's red and green and that the guest
+  can mask alpha separately. In a guarded 1440p opening run, the foliage
+  draw read the same 640×360 blue-and-alpha target the producing pass
+  wrote in all five sampled presents. The visible leaf lighting difference
+  remains in the opening captures.
 - In a capture near the Great Deku Tree, 18 visible foliage fragments
   matched both the depth prepass and the color stored in the render target.
   On the middle bank the material retained about 96% of the sampled leaf

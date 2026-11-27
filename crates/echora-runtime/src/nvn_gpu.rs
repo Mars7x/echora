@@ -11014,6 +11014,7 @@ impl Nvn {
                     && stage.stored_generics == original.stored_generics
                     && stage.stores == original.stores
                     && stage.frag_colors == original.frag_colors
+                    && stage.frag_color_components == original.frag_color_components
                     && stage.spirv != original.spirv
             })
             .map(|(stage, _)| stage);
@@ -13767,6 +13768,7 @@ mod program_tests {
                 stored_generics: 0,
                 stores: [0; 8],
                 frag_colors: 0,
+                frag_color_components: 0,
                 cbuf_used_sizes: [0; 18],
                 spec_constants: Vec::new(),
                 push_fields: 0,
@@ -19957,6 +19959,7 @@ mod replay_input_wait_tests {
             stored_generics: 0,
             stores: [0; 8],
             frag_colors: 0,
+            frag_color_components: 0,
             cbuf_used_sizes: [0; 18],
             spec_constants: Vec::new(),
             push_fields: 0,
@@ -20314,6 +20317,7 @@ mod translation_key_tests {
             stored_generics: 0,
             stores: [0; 8],
             frag_colors: 0,
+            frag_color_components: 0,
             cbuf_used_sizes: [0; 18],
             spec_constants: Vec::new(),
             push_fields: 0,

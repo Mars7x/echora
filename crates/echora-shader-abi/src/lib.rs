@@ -271,6 +271,8 @@ pub struct Translated {
     /// Every attribute written, as a Shader IR::Attribute bit mask.
     pub stores: [u64; 8],
     pub frag_colors: u32,
+    /// Four declared RGBA output bits per fragment color attachment.
+    pub frag_color_components: u32,
     pub cbuf_used_sizes: [u32; 18],
     /// Specialization constants the pipeline builder must set.
     pub spec_constants: Vec<SpecConstant>,

@@ -826,6 +826,7 @@ mod tests {
         };
         let translated =
             translate_with_options(&program, &Parameters::default(), &options).unwrap();
+        assert_eq!(translated.frag_color_components, 0x11);
         assert_eq!(spirv::tests::validate(&translated.spirv), None);
 
         let mut remaining = &translated.spirv[5..];

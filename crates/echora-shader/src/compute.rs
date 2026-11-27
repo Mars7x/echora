@@ -937,6 +937,10 @@ impl Emitter {
             stored_generics: self.io.stored_generics,
             stores: self.io.stores,
             frag_colors: self.frag_colors,
+            frag_color_components: self
+                .header
+                .filter(|header| header.stage == Stage::Fragment)
+                .map_or(0, |header| header.targets),
             cbuf_used_sizes: self.cbuf_used_sizes,
             spec_constants: self.spec_constants,
             push_fields: if self.push_fields & echora_shader_abi::PUSH_PAGE_TABLE != 0

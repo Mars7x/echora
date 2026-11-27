@@ -488,6 +488,7 @@ pub fn translate<E: Environment>(
         stored_generics: output.stored_generics,
         stores: output.stores,
         frag_colors: output.frag_colors,
+        frag_color_components: u32::MAX,
         cbuf_used_sizes: output.cbuf_used_sizes,
         abi_version: ABI_VERSION,
         // The plugin takes pipeline state as translation parameters and

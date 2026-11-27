@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::renderer::{Renderer, Scale, descriptor_buffer_range, has_stencil};
-use crate::shader::{Descriptor, DescriptorKind, SampleType, Translated};
+use crate::shader::{Descriptor, DescriptorKind, SampleType, Stage, Translated};
 use crate::vulkan::stage_flags;
 
 /// A vertex/fragment pair, translated so its bindings share set 0.
@@ -19,6 +19,7 @@ pub struct Program {
     pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) shaders: Vec<vk::ShaderEXT>,
     shader_stages: Vec<vk::ShaderStageFlags>,
+    frag_color_components: u32,
     /// With resolution scaling: the stages given the rescaling push
     /// constants, and each texture binding's (stage index, binding) by its
     /// scaling bit (the recompiler numbers texture descriptors in binding
@@ -762,6 +763,7 @@ fn clear_stage(stage: crate::shader::Stage, output: Option<SampleType>) -> Arc<T
         stage,
         spirv: module.finish(),
         frag_colors: u32::from(!descriptors.is_empty()),
+        frag_color_components: u32::MAX,
         descriptors,
         loaded_generics: 0,
         stored_generics: 0,
@@ -1037,6 +1039,10 @@ impl Renderer {
             }
         }
         Ok(Program {
+            frag_color_components: stages
+                .iter()
+                .find(|stage| stage.stage == Stage::Fragment)
+                .map_or(u32::MAX, |stage| stage.frag_color_components),
             stages,
             layout,
             pipeline_layout,
@@ -1987,6 +1993,15 @@ impl Renderer {
                 let mut blend = draw.blends.get(index).copied().unwrap_or_default();
                 // Logical operations replace blending for all attachments.
                 blend.enable &= fixed.logic_op.is_none();
+                // The shader's output map suppresses writes to its disabled
+                // components even when the attachment allows those writes.
+                let components = draw
+                    .program
+                    .frag_color_components
+                    .checked_shr(4 * index as u32)
+                    .unwrap_or(0)
+                    & 0xf;
+                blend.write_mask &= vk::ColorComponentFlags::from_raw(components);
                 blend
             });
             if !self.graphics.blends.iter().copied().eq(blends.clone()) {
@@ -2219,6 +2234,7 @@ pub(crate) mod tests {
             stored_generics: 0,
             stores: [0; 8],
             frag_colors: 1,
+            frag_color_components: u32::MAX,
             cbuf_used_sizes: [0; 18],
             abi_version: crate::shader::ABI_VERSION,
             spec_constants: Vec::new(),
@@ -2506,6 +2522,38 @@ pub(crate) mod tests {
             assert_eq!(texels[3], [0.0; 4]);
         }
 
+        let mut partial_stage = program.stages[1].as_ref().clone();
+        partial_stage.frag_color_components = 0xc;
+        let partial = renderer
+            .create_program(vec![program.stages[0].clone(), Arc::new(partial_stage)])
+            .unwrap();
+        let red_and_blue = [Blend {
+            write_mask: vk::ColorComponentFlags::R | vk::ColorComponentFlags::B,
+            ..Blend::default()
+        }];
+        draw.program = &partial;
+        let saved_indices = std::mem::replace(&mut draw.indices, Indices::None);
+        draw.uniforms = &blue;
+        draw.fixed.scissor = [0, 0, 4, 4];
+        for (blends, alpha) in [(&blend, 1.0), (&red_and_blue, 0.0)] {
+            renderer
+                .clear_color(
+                    7,
+                    None,
+                    vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 0.0],
+                    },
+                )
+                .unwrap();
+            draw.blends = blends;
+            renderer.draw(&draw).unwrap();
+            assert_eq!(renderer.read_target(7).unwrap()[0], [1.0, 0.0, 1.0, alpha]);
+        }
+
+        draw.program = &program;
+        draw.indices = saved_indices;
+        draw.blends = &blend;
+
         if renderer.gpu.logic_op {
             renderer
                 .clear_color(
@@ -2553,6 +2601,7 @@ pub(crate) mod tests {
             );
         }
 
+        renderer.destroy_program(partial).unwrap();
         renderer.destroy_program(alternate).unwrap();
         renderer.destroy_program(program).unwrap();
     }

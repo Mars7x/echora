@@ -216,6 +216,7 @@ mod tests {
             stored_generics: 0,
             stores: [0; 8],
             frag_colors: 0,
+            frag_color_components: 0,
             spec_constants: Vec::new(),
             push_fields: 0,
             texture_pool_bindings: 0,
