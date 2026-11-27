@@ -12,12 +12,23 @@ automated test covers it).
   2160p show fog and scenery across the frame after fixes to render-target
   scaling. With Dynamic resolution disabled, a 1440p test used 2560×1440
   scene targets. The adaptive path used 854×480 targets in the sampled scene.
-  Water color and temporal stability still need verification. Unimplemented
+  A traced water pixel in the opening forest retained more than 99.99% of
+  its base color at the blend before the volume passes in twelve live
+  samples. The final water color still differs from the matching console
+  footage. Temporal stability also needs verification. Unimplemented
   operations can stop the run and produce a report.
 - Sampled views inherit the texture’s channel mapping until the guest sets
   an explicit mapping on the view. Rebinding a bindless texture slot clears
   image views left by the previous texture’s shape or numeric type. A Vulkan
   regression checks a float-to-integer replacement and the neighboring slot.
+  A reset sampler builder uses linear minification and magnification, repeat
+  addressing and LOD limits of 0 to 1000. The guest getters and registered
+  Vulkan samplers share defaults verified against the guest SDK.
+- Min/max filtering uses the host's Vulkan sampler reduction support. On
+  Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
+  levels at LOD 0.5 returned 0.4375 for minimum reduction. The expected
+  value is 0.125. Cross-mip behavior on Radeon still needs verification.
+  See [Vulkan mipmap filtering](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-texel-mip-filtering).
 - Finalizing a texture removes its texel buffer and alternate 1D, 3D and
   array images from the lookup caches. Pending GPU commands retain their
   resources until completion. Vulkan tests cover both retirement and a
@@ -44,7 +55,8 @@ automated test covers it).
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
-  console's output.
+  console's output. The guest's 3D render-enable state gates draws and
+  clears. Compute dispatches still execute under a false render condition.
 - NVN calls the Vulkan backend directly; a backend trait (for Direct3D 12) is
   still to come.
 - The Rust shader translator translates all 6,215 shader stages the game

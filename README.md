@@ -73,7 +73,9 @@ What doesn't work yet:
   textures can upload in bands through the existing staging ring. This
   path also decodes oversized guest mip levels in bands. A readback test
   checks raw and compressed images across band boundaries and through the
-  final partial row. The change in peak gameplay memory still needs measurement.
+  final partial row. A Radeon run through present 10,600 confirmed that the
+  192 MiB forest texture used this path. Memory growth later in the opening
+  still needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
   about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.
@@ -209,7 +211,9 @@ and instance count of indexed instanced draws. A pixel watch can follow one
 texel through a single frame while transferring only that texel to the CPU.
 A matched capture of the fairy beside the wooden sign now shows the pale
 core seen on console. A replay of its two shaders traced the earlier red
-output to a vertex component the producer never wrote.
+output to a vertex component the producer never wrote. In a separate forest
+capture, both the depth and color passes for the missing leaves received
+386 workgroups. The contents of their vegetation list still need checking.
 Speed work continues after that.
 
 ## Building
