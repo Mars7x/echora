@@ -1227,7 +1227,16 @@ fn upload_copies(
     })
 }
 
-/// Split tightly packed 2D color planes into ring-sized bands. Each tuple
+/// Bytes per texel for a single uncompressed plane in a Vulkan buffer/image copy.
+fn single_plane_bytes(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::D16_UNORM => 2,
+        vk::Format::D32_SFLOAT => 4,
+        other => format_bytes(other),
+    }
+}
+
+/// Split tightly packed 2D planes into ring-sized bands. Each tuple
 /// retains the destination row as well as the source region's byte offset.
 fn split_large_upload_rows(
     regions: &mut Vec<UploadBand>,
@@ -1235,7 +1244,7 @@ fn split_large_upload_rows(
     format: vk::Format,
     row_alignment: u32,
 ) {
-    let texel_bytes = u64::from(format_bytes(format));
+    let texel_bytes = u64::from(single_plane_bytes(format));
     if !texel_bytes.is_power_of_two() {
         return;
     }
@@ -1243,11 +1252,16 @@ fn split_large_upload_rows(
         let (region, _) = regions[index];
         let end = regions.get(index + 1).map_or(size, |(next, _)| next.offset);
         let row_bytes = u64::from(region.width) * texel_bytes;
-        if region.depth != 1
-            || row_bytes == 0
-            || end.saturating_sub(region.offset) <= RING_SIZE
-            || row_bytes.checked_mul(u64::from(region.height)) != end.checked_sub(region.offset)
-        {
+        let Some(plane_bytes) = row_bytes.checked_mul(u64::from(region.height)) else {
+            continue;
+        };
+        let region_bytes = end.saturating_sub(region.offset);
+        // Each depth copy begins at a four-byte aligned offset. An odd-sized
+        // D16 plane may therefore have a trailing two-byte pad.
+        let tight = region_bytes == plane_bytes
+            || (format == vk::Format::D16_UNORM
+                && plane_bytes.checked_next_multiple_of(4) == Some(region_bytes));
+        if region.depth != 1 || row_bytes == 0 || region_bytes <= RING_SIZE || !tight {
             continue;
         }
         let rows_per_band = upload_band_rows(row_bytes, row_alignment);
@@ -2944,7 +2958,7 @@ impl Renderer {
             && !self.uploads.contains_key(&key)
     }
 
-    /// A tightly packed 2D color mip can also stream when only a band of
+    /// A tightly packed single-plane 2D mip can also stream when only a band of
     /// source-block rows fits the ring. The widest mip sets the row limit.
     pub fn can_generate_upload_bands(
         &self,
@@ -2954,7 +2968,7 @@ impl Renderer {
         format: vk::Format,
         row_alignment: u32,
     ) -> bool {
-        let bytes = u64::from(format_bytes(format));
+        let bytes = u64::from(single_plane_bytes(format));
         let rows = u64::from(height).min(16 * u64::from(row_alignment));
         let batch = (u64::from(width) * bytes).saturating_mul(rows);
         bytes.is_power_of_two()
@@ -2980,7 +2994,7 @@ impl Renderer {
         )
     }
 
-    /// Generate complete layers and aligned bands of larger 2D color mips
+    /// Generate complete layers and aligned bands of larger single-plane 2D mips
     /// directly in the staging ring. Band offsets refer to the original layout.
     pub fn upload_generated_bands(
         &mut self,
@@ -8449,12 +8463,7 @@ impl Renderer {
         if target.shape != (ImageShape::D2 { layers: 1 }) || target.levels != 1 {
             return Err("target has multiple subresources".into());
         }
-        let texel_bytes = match target.format {
-            vk::Format::D16_UNORM => 2,
-            vk::Format::D32_SFLOAT => 4,
-            format if !is_depth(format) => format_bytes(format),
-            _ => 0,
-        };
+        let texel_bytes = single_plane_bytes(target.format);
         if !texel_bytes.is_power_of_two() {
             return Err("target format needs a separate archive layout".into());
         }
@@ -10342,6 +10351,93 @@ mod tests {
             let range = renderer.view_infos[&view].range;
             assert_eq!((range.base_mip_level, range.level_count), (1, 1));
             assert_eq!((range.base_array_layer, range.layer_count), selected);
+        }
+    }
+
+    #[test]
+    fn oversized_depth_planes_use_bounded_upload_bands() {
+        use crate::draw::UploadRegion;
+
+        let (width, height) = (12288, 12288);
+        let size = u64::from(width) * u64::from(height) * 2;
+        let mut bands = vec![(
+            UploadRegion {
+                width,
+                height,
+                depth: 1,
+                level: 0,
+                layer: 0,
+                offset: 0,
+            },
+            0,
+        )];
+        super::split_large_upload_rows(&mut bands, size, vk::Format::D16_UNORM, 1);
+        let mut rows = 0;
+        for (band, y) in bands {
+            assert_eq!(y, rows);
+            assert_eq!(band.offset, u64::from(y) * u64::from(width) * 2);
+            assert!(u64::from(band.height) * u64::from(width) * 2 <= super::RING_SIZE);
+            rows += band.height;
+        }
+        assert_eq!(rows, height);
+        assert_eq!(super::single_plane_bytes(vk::Format::D32_SFLOAT), 4);
+        assert_eq!(super::single_plane_bytes(vk::Format::D32_SFLOAT_S8_UINT), 0);
+    }
+
+    #[test]
+    fn streamed_depth_mip_preserves_rows_and_final_alignment() {
+        use crate::draw::{ImageShape, TextureSource, UploadRegion};
+
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        // D16 needs two padding bytes after this odd number of texels.
+        let (width, height) = (6001u32, 6001u32);
+        let size = (width as usize * height as usize * 2).next_multiple_of(4);
+        let format = vk::Format::D16_UNORM;
+        assert!(renderer.can_generate_upload_bands(7, size, [width, height], format, 1));
+        let source = TextureSource::Upload {
+            key: 7,
+            generation: 1,
+            width,
+            height,
+            shape: ImageShape::D2 { layers: 1 },
+            format,
+            texels: Default::default(),
+            levels: vec![UploadRegion {
+                width,
+                height,
+                depth: 1,
+                level: 0,
+                layer: 0,
+                offset: 0,
+            }]
+            .into(),
+        };
+        let mut checked_rows = Vec::new();
+        renderer
+            .upload_generated_bands(&source, size, 1, |bands, output| {
+                assert!(output.len() as u64 <= super::RING_SIZE);
+                let first_offset = bands[0].0.offset;
+                for &(region, y) in bands {
+                    for row in [y, y + region.height - 1] {
+                        let offset = (region.offset - first_offset) as usize
+                            + ((row - y) as usize * width as usize + width as usize - 1) * 2;
+                        output[offset..offset + 2].copy_from_slice(&(row as u16 + 1).to_le_bytes());
+                        checked_rows.push(row);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(checked_rows.len() > 2);
+        let (_, target) = renderer.uploads.remove(&7).unwrap();
+        renderer.insert_target(7, target);
+        for row in checked_rows {
+            let bytes = renderer
+                .read_target_plane_bytes(7, 0, 0, 2, [width - 1, row, 1, 1])
+                .unwrap();
+            assert_eq!(bytes, (row as u16 + 1).to_le_bytes());
         }
     }
 
