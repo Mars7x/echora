@@ -4827,10 +4827,8 @@ impl Nvn {
         // A scissor, channel mask or conditional draw can retain any of the
         // original blocks. Seed a newly allocated image from its guest bytes.
         if renderer.target_is_undefined(texture) {
-            let source = self.guest_texture(core, texture)?;
-            let renderer = &mut self.gpu.as_mut().unwrap().renderer;
-            renderer.initialize_target(texture, &source)?;
-            renderer.defined(texture);
+            self.initialize_target_from_guest(core, texture)?;
+            self.gpu.as_mut().unwrap().renderer.defined(texture);
             // A binding resolved while this allocation was still undefined
             // can hold an upload even though its allocation key did not change.
             self.evict_texture_bindings(texture);
@@ -4955,14 +4953,26 @@ impl Nvn {
     pub(super) fn initialize_new_targets(&mut self, core: &Guest) {
         let fresh: Vec<u64> = self.gpu.as_mut().unwrap().renderer.take_fresh_targets();
         for key in fresh {
-            let Ok(source) = self.guest_texture(core, key) else {
-                continue;
-            };
-            let backend = self.gpu.as_mut().unwrap();
-            if backend.renderer.initialize_target(key, &source).is_ok() {
-                backend.stat("stat: targets initialized from guest memory", 1);
+            if self.initialize_target_from_guest(core, key).is_ok() {
+                self.gpu
+                    .as_mut()
+                    .unwrap()
+                    .stat("stat: targets initialized from guest memory", 1);
             }
         }
+    }
+
+    fn initialize_target_from_guest(&mut self, core: &Guest, key: u64) -> Result<(), String> {
+        let source = self.guest_texture(core, key)?;
+        self.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .initialize_target(key, &source)?;
+        // Subsequent draws sample the initialized target directly, so the
+        // upload cache may never be looked up again to release these bytes.
+        self.release_upload_texels(key);
+        Ok(())
     }
 
     /// A cached upload of 64 KiB or more whose image the renderer holds
@@ -5667,6 +5677,9 @@ impl Nvn {
             .insert(texture, (sample, source.clone(), backing));
         backend.cached_texture_ranges = None;
         backend.storage_hashes.insert(texture, storage_hashes);
+        // The copy already wrote guest storage. Once its upload is cached,
+        // keeping the source rows here can pin them beyond GPU residency.
+        backend.copied_levels.remove(&texture);
         if uncached && storage_size <= SHADOW_LIMIT {
             if backend.shadows.contains_key(&texture) {
                 backend.stat("stat: uncached uploads changed", 1);
@@ -14769,21 +14782,87 @@ mod target_tests {
                 .flatten()
                 .expect("whole-level rows");
             nvn.record_copied_level(texture, Some(copied));
+            let rows =
+                std::sync::Arc::downgrade(&nvn.gpu.as_ref().unwrap().copied_levels[&texture].1);
             let super::TextureSource::Upload {
                 texels, generation, ..
             } = nvn.guest_texture(&guest, texture).unwrap()
             else {
                 panic!("expected a texture upload");
             };
-            let rows = &nvn.gpu.as_ref().unwrap().copied_levels[&texture].1;
             assert_eq!(texels.as_slice(), expected);
             assert_eq!(generation, super::hash_bytes(expected));
-            assert_eq!(std::sync::Arc::ptr_eq(&texels, rows), format == 37);
-            let lifetime = std::sync::Arc::downgrade(rows);
+            assert!(
+                !nvn.gpu
+                    .as_ref()
+                    .unwrap()
+                    .copied_levels
+                    .contains_key(&texture)
+            );
+            if format == 37 {
+                assert!(std::sync::Arc::ptr_eq(&texels, &rows.upgrade().unwrap()));
+            } else {
+                assert!(rows.upgrade().is_none());
+            }
             nvn.gpu_forget_texture(texture);
             drop(texels);
-            assert!(lifetime.upgrade().is_none());
+            assert!(rows.upgrade().is_none());
         }
+    }
+
+    #[test]
+    fn initializing_a_target_releases_host_texels_and_keeps_guest_writes_visible() {
+        use echora_gpu::draw::TextureSource;
+        let Some((mut nvn, mut memory, base, template)) = texture_cache_fixture(0x24) else {
+            return;
+        };
+        // Small render-target planes are initialized on first use. The array
+        // as a whole is 64 KiB, large enough to retire its host-side texels.
+        let (texture, alias) = (template + 1, template + 2);
+        let mut builder = nvn.objects[&template].builder.clone();
+        builder.remove("Stride");
+        for (name, value) in [("Width", 8), ("Height", 8), ("Target", 4), ("Depth", 256)] {
+            builder.entry(name.into()).or_default().x[0] = value;
+        }
+        nvn.initialize(texture, "Texture", builder.clone()).unwrap();
+        nvn.initialize(alias, "Texture", builder).unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        guest.memory.write(base, &[3, 5, 7, 255]).unwrap();
+        nvn.ensure_render_target(texture).unwrap();
+        nvn.initialize_new_targets(&guest);
+        let backend = nvn.gpu.as_mut().unwrap();
+        let TextureSource::Upload {
+            generation, texels, ..
+        } = &backend.textures[&texture].1
+        else {
+            panic!("expected a guest upload");
+        };
+        assert!(backend.renderer.has_upload(texture, *generation));
+        assert!(texels.is_empty());
+        assert_eq!(
+            backend
+                .renderer
+                .read_target_plane_bytes(texture, 0, 0, 4, [0, 0, 1, 1])
+                .unwrap(),
+            [3, 5, 7, 255]
+        );
+
+        assert!(
+            matches!(nvn.texture_source(&guest, alias).unwrap(), TextureSource::Target(key) if key == texture)
+        );
+
+        guest.memory.write(base, &[11, 13, 17, 255]).unwrap();
+        nvn.gpu_invalidate(base..base + 4, None);
+        let TextureSource::Upload { texels, .. } = nvn.guest_texture(&guest, texture).unwrap()
+        else {
+            panic!("expected the updated upload");
+        };
+        assert_eq!(texels[..4], [11, 13, 17, 255]);
     }
 
     #[test]
