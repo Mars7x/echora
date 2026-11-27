@@ -16136,6 +16136,15 @@ mod target_tests {
 
     #[test]
     fn whole_pitch_linear_texel_write_supersedes_old_rendering() {
+        whole_texel_write_supersedes_old_rendering(true);
+    }
+
+    #[test]
+    fn whole_dense_block_linear_texel_write_supersedes_old_rendering() {
+        whole_texel_write_supersedes_old_rendering(false);
+    }
+
+    fn whole_texel_write_supersedes_old_rendering(pitch_linear: bool) {
         use super::{Scale, TextureSource};
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
@@ -16145,6 +16154,17 @@ mod target_tests {
         else {
             return;
         };
+        if !pitch_linear {
+            nvn.objects
+                .get_mut(&texture)
+                .unwrap()
+                .builder
+                .remove("Stride");
+        }
+        assert_eq!(
+            nvn.texture_storage_size(texture),
+            Some(u64::from(width * height * 4))
+        );
         nvn.gpu
             .as_mut()
             .unwrap()
@@ -16169,7 +16189,9 @@ mod target_tests {
                 .write_u32(region_address + index as u64 * 4, value)
                 .unwrap();
         }
-        let expected = [0x11, 0x22, 0x33, 0xff].repeat((width * height) as usize);
+        let expected: Vec<_> = (0..width * height)
+            .flat_map(|pixel| [pixel as u8, (pixel >> 8) as u8, 0x33, 0xff])
+            .collect();
         memory.write(source, &expected).unwrap();
         let mut cpu = Cpu::default();
         let mut core = Guest {

@@ -7058,18 +7058,20 @@ impl Nvn {
             && 16 % bytes == 0
             && linear.row_stride == row_size
         {
-            let size = crate::nvn_format::block_linear_size(info, width, height, 1, layout, 1).0;
+            let level_size =
+                crate::nvn_format::block_linear_size(info, width, height, 1, layout, 1).0;
+            let packed_size = row_size * u64::from(rows);
             // The buffer is kept between copies (a picture each present).
             // Without padding the rows cover every byte; otherwise the
             // level is read first.
             let mut tiled = std::mem::take(&mut *self.tiled_scratch.borrow_mut());
-            tiled.resize(size as usize, 0);
-            if row_size * u64::from(rows) != size {
+            tiled.resize(level_size as usize, 0);
+            if packed_size != level_size {
                 core.memory
                     .read(base, &mut tiled)
                     .map_err(TexelError::Trap)?;
             }
-            let mut linear = vec![0u8; (row_size * u64::from(rows)) as usize];
+            let mut linear = vec![0u8; packed_size as usize];
             core.memory
                 .read(source, &mut linear)
                 .map_err(TexelError::Trap)?;
@@ -7086,10 +7088,21 @@ impl Nvn {
             }
             core.memory.write(base, &tiled).map_err(TexelError::Trap)?;
             *self.tiled_scratch.borrow_mut() = tiled;
+            // Discard old rendered pixels only when these rows replaced every
+            // storage byte another texture could read through an alias.
+            if target == 1
+                && levels == 1
+                && packed_size == level_size
+                && level_size == size
+                && let gpu::TextureBacking::Linear((0, range)) = &backing
+            {
+                self.discard_overwritten_targets(range);
+            }
             // A single-level texture's upload can take these rows as they
             // are while its storage stays as written here.
             let copied = (levels == 1).then(|| {
-                let sample = gpu::texture_sample(core, base, size, format, [width, height, 1]);
+                let sample =
+                    gpu::texture_sample(core, base, level_size, format, [width, height, 1]);
                 (sample, linear)
             });
             return Ok(copied);
