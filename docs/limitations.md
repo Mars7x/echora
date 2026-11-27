@@ -40,9 +40,24 @@ synthetic fixtures and runs without the game files.
   covered nearby leaves, but none of their triangles covered the center
   of the missing clump. A separate trace of 33 indexed, alpha-tested
   depth draws recovered all 934 triangles. None intersected the 96×64
-  patch around that clump before face culling. Its source is still unknown.
+  patch around that clump before face culling. A camera-matched trace
+  identified four plant instances in the patch. All four survived initial
+  culling. Their generator then read an empty plant definition because the
+  shader translator treated a negative constant-buffer displacement as
+  positive. Correcting the address selected the four expected definitions
+  and enabled leaf emission in a replay of the captured inputs. A Radeon
+  test triggered by camera position then showed the missing clump across
+  five consecutive frames. In a 96×64 patch matched to the same console
+  frame, green pixels rose from 0.85% to 30.75%. The console measured
+  78.91%. The restored leaves still render visibly darker.
   The missing floor has yet to be reproduced in these frames. Unimplemented
   operations can stop the run and produce a report.
+- The fairy beside the forest sign had a saturated red core in a player
+  capture. A fragment trace found a nonfinite red value after a read from
+  a varying the preceding stage had left unwritten. With corrected shader
+  stage linkage, the median core color in an archived capture was
+  RGB (235, 238, 229). The corresponding console frame measured
+  (229, 231, 226), and the player capture measured (255, 5, 1).
 - The reserved zero texture in a guest texture pool samples as transparent
   black and reports zero dimensions on hosts supporting Vulkan null
   descriptors. Two vertex programs previously skipped 35 depth draws
@@ -135,9 +150,15 @@ synthetic fixtures and runs without the game files.
   Each run used the same saved room and translated game libraries. Across
   presents 4,200–5,200 at 2560×1440, all three averaged 721–723 draws
   per frame. The busiest guest thread executed 44.5–45.0 million
-  instructions per frame with locked
-  publication and 61.9 million with the registry lock alone. The reason
+  instructions per frame with locked publication and 61.9 million with
+  the registry lock alone. The reason
   the guest issued different amounts of work is still under investigation.
+- On a route that opens the door and walks outside, 900 presents
+  (3,800–4,700) averaged 8.19 FPS at `5b572a3`, 7.78 at `02514f3`
+  and 8.63 at `cdf94fd`. The forest title appeared at the same checkpoints.
+  The last build reached present 6,200, retired nine device buffers
+  totaling 383 MiB, and peaked at 13,741 MiB process RSS. The longer
+  run did not reproduce the reported interactive crash.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
