@@ -114,7 +114,9 @@ automated test covers it).
   Both runs used the same save, fixed resolution, native render scale,
   audio and no screenshots. The current renderer logged zero skipped
   draws over the opening. The archived renderer logged 35. The cost of
-  those draws within the measured window has not been isolated.
+  those draws within the measured window has not been isolated. A repeat
+  with timing probes enabled reached 24.7 FPS on current and 24.5 FPS
+  on the archive. The size of the difference varies between runs.
 - A separate graphics test stage used an older six-bundle translation
   built without `target-cpu=native`. Its patched run reached 16.0 FPS
   in the same forest window, and its archived runner reached 21.1 FPS.

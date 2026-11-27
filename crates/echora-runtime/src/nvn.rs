@@ -197,6 +197,17 @@ struct PngCapture {
     worker: Option<std::thread::JoinHandle<Result<(), Trap>>>,
 }
 
+/// An explicit list selects only those live presents. Periodic capture keeps
+/// its original first-frame behavior, including with a later starting frame.
+fn capture_present(present: u64, selected: Option<&str>, every: u64, from: u64) -> bool {
+    if let Some(list) = selected {
+        return list
+            .split(',')
+            .any(|item| item.trim().parse() == Ok(present));
+    }
+    every != 0 && (present == 1 || (present >= from && present.is_multiple_of(every)))
+}
+
 impl PngCapture {
     fn write(&mut self, path: std::path::PathBuf, image: Image) -> Result<(), Trap> {
         self.finish()?;
@@ -1178,8 +1189,9 @@ impl Nvn {
     /// alone unsets it); each replays the frame's commands from the render
     /// state it began with, under those switches, writes the presented
     /// image as `replay-<name>.png` and renames the request `done-<name>.env`.
-    /// A `quit` file ends the replays and the run goes on. The guest stays
-    /// stopped meanwhile, its memory as at the frame's end.
+    /// A `quit` file ends interactive replay. ECHORA_REPLAY_BATCH=1 runs
+    /// prequeued requests and returns to the guest when the directory is
+    /// drained. Guest memory stays at the end of the captured frame.
     fn replay_captured_frame(&mut self, core: &mut Guest, texture: u64) -> Result<(), String> {
         let Some(capture) = self.frame_capture.take() else {
             return Ok(());
@@ -1193,6 +1205,16 @@ impl Nvn {
             .ok_or("no replay directory")?;
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         let _ = std::fs::remove_file(directory.join("quit"));
+        let batch = debug_var_os("ECHORA_REPLAY_BATCH").is_some_and(|value| value == "1");
+        if batch
+            && self.gpu.is_some()
+            && debug_var_os("ECHORA_REPLAY_NO_IMAGE").is_none()
+            && let Some(image) = self.gpu_read_back(texture)?
+        {
+            let original = directory.join(format!("original-{}.png", self.presented_frames));
+            std::fs::write(&original, image.png())
+                .map_err(|error| format!("writing {}: {error}", original.display()))?;
+        }
         std::fs::write(
             directory.join("ready"),
             format!(
@@ -1208,11 +1230,24 @@ impl Nvn {
             capture.commands.len(),
             directory.display()
         );
+        let result = self.process_replay_requests(core, texture, &capture, &directory, batch);
+        let _ = std::fs::remove_file(directory.join("ready"));
+        result
+    }
+
+    fn process_replay_requests(
+        &mut self,
+        core: &mut Guest,
+        texture: u64,
+        capture: &FrameCapture,
+        directory: &std::path::Path,
+        batch: bool,
+    ) -> Result<(), String> {
         loop {
             if directory.join("quit").exists() {
                 break;
             }
-            let mut requests: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+            let mut requests: Vec<std::path::PathBuf> = std::fs::read_dir(directory)
                 .map_err(|error| error.to_string())?
                 .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                 .filter(|path| {
@@ -1223,6 +1258,9 @@ impl Nvn {
                 .collect();
             requests.sort();
             let Some(request) = requests.first().cloned() else {
+                if batch {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             };
@@ -1232,7 +1270,8 @@ impl Nvn {
                 .unwrap_or("request")
                 .trim_start_matches("request-")
                 .to_string();
-            let text = std::fs::read_to_string(&request).unwrap_or_default();
+            let text = std::fs::read_to_string(&request)
+                .map_err(|error| format!("reading {}: {error}", request.display()))?;
             let switches: HashMap<String, Option<String>> = text
                 .lines()
                 .map(str::trim)
@@ -1249,7 +1288,7 @@ impl Nvn {
             eprintln!("replay {name} begins");
             let draws_before = self.gpu_draw_count();
             let started = std::time::Instant::now();
-            let failed = self.replay_frame_commands(&capture, core).err();
+            let failed = self.replay_frame_commands(capture, core).err();
             let replayed = started.elapsed();
             let image = (|| {
                 let Some(backend) = self.gpu() else {
@@ -1259,7 +1298,7 @@ impl Nvn {
                 let finished = started.elapsed();
                 // The replay's times, for comparing builds on one frame:
                 // its commands, and those with the GPU's work finished.
-                let _ = std::fs::write(
+                std::fs::write(
                     directory.join(format!("replay-{name}.txt")),
                     format!(
                         "commands_us {} finished_us {} draws {}\n",
@@ -1267,7 +1306,8 @@ impl Nvn {
                         finished.as_micros(),
                         self.gpu_draw_count() - draws_before
                     ),
-                );
+                )
+                .map_err(|error| format!("writing replay-{name}.txt: {error}"))?;
                 if debug_var_os("ECHORA_REPLAY_NO_IMAGE").is_some() {
                     Ok(None)
                 } else {
@@ -1275,8 +1315,12 @@ impl Nvn {
                 }
             })();
             set_debug_overrides(None);
+            if batch && let Some(error) = &failed {
+                return Err(format!("replay {name}: {error}"));
+            }
             if let Some(image) = image? {
-                let _ = std::fs::write(directory.join(format!("replay-{name}.png")), image.png());
+                std::fs::write(directory.join(format!("replay-{name}.png")), image.png())
+                    .map_err(|error| format!("writing replay-{name}.png: {error}"))?;
             }
             eprintln!(
                 "replay {name} ends{}",
@@ -1284,9 +1328,9 @@ impl Nvn {
                     .as_ref()
                     .map_or(String::new(), |failed| format!(": {failed}"))
             );
-            let _ = std::fs::rename(&request, directory.join(format!("done-{name}.env")));
+            std::fs::rename(&request, directory.join(format!("done-{name}.env")))
+                .map_err(|error| format!("finishing replay {name}: {error}"))?;
         }
-        let _ = std::fs::remove_file(directory.join("ready"));
         Ok(())
     }
 
@@ -4638,11 +4682,11 @@ impl Nvn {
         // sets it beside the report): the first and every N-th
         // presented image as frame-<present>.png, unchanged frames
         // included, so a run shows what was on screen. N=0 is off.
-        if let (Ok(every), Some(directory)) = (
-            debug_var("ECHORA_CAPTURE_EVERY"),
-            debug_var_os("ECHORA_CAPTURE_DIR"),
-        ) {
-            let every = every.parse::<u64>().unwrap_or(0);
+        if let Some(directory) = debug_var_os("ECHORA_CAPTURE_DIR") {
+            let selected = debug_var_os("ECHORA_CAPTURE_PRESENTS").and_then(|s| s.to_str());
+            let every = debug_var_os("ECHORA_CAPTURE_EVERY")
+                .and_then(|s| s.to_str()?.parse().ok())
+                .unwrap_or(0);
             let disabled = self
                 .skipped_work
                 .get("rendering disabled")
@@ -4654,11 +4698,7 @@ impl Nvn {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
-            if every != 0
-                && (self.presented_frames == 1
-                    || (self.presented_frames >= from
-                        && self.presented_frames.is_multiple_of(every)))
-            {
+            if capture_present(self.presented_frames, selected, every, from) {
                 let image = if self.gpu().is_some() {
                     self.gpu_read_back(texture).map_err(stop)?
                 } else {
@@ -9279,6 +9319,58 @@ mod tests {
     use super::*;
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+    #[test]
+    fn explicit_screenshots_capture_only_the_selected_live_presents() {
+        let chosen = |list, every, from| {
+            (1..=10)
+                .filter(|&present| capture_present(present, list, every, from))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chosen(Some("4, 7,8,7"), 2, 8), [4, 7, 8]);
+        assert_eq!(chosen(None, 3, 5), [1, 6, 9]);
+        assert!(chosen(None, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn batch_replays_finish_prequeued_requests_and_report_read_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut nvn = Nvn {
+            gpu_checked: true,
+            ..Default::default()
+        };
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let capture = FrameCapture {
+            commands: Vec::new(),
+            render: nvn.render.clone(),
+            queue_render: nvn.queue_render.clone(),
+            render_queue: nvn.render_queue,
+            oldest_descriptor_epoch: nvn.descriptor_epoch,
+        };
+        for name in ["b", "a"] {
+            std::fs::write(path.join(format!("request-{name}.env")), "").unwrap();
+        }
+        nvn.process_replay_requests(&mut guest, 0, &capture, path, true)
+            .unwrap();
+        for name in ["a", "b"] {
+            assert!(path.join(format!("done-{name}.env")).is_file());
+        }
+        let invalid = path.join("request-bad.env");
+        std::fs::write(&invalid, [0xff]).unwrap();
+        let error = nvn
+            .process_replay_requests(&mut guest, 0, &capture, path, true)
+            .unwrap_err();
+        assert!(error.contains("request-bad.env"));
+        assert!(invalid.exists());
+        assert!(!path.join("done-bad.env").exists());
+    }
 
     #[test]
     fn indexed_draw_log_includes_the_instance_range() {

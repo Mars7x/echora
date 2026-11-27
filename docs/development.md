@@ -111,6 +111,21 @@ read.
 
 **Measuring**
 
+To inspect several renderer settings at one camera position, boot once with
+`ECHORA_CAPTURE_FRAME=N`, `ECHORA_REPLAY_DIR=DIR` and
+`ECHORA_REPLAY_BATCH=1`. Before launch, put a `request-NAME.env` file in
+`DIR` for each check. An empty file repeats the frame with the current
+settings. Other files can set replay switches, one `NAME=VALUE` per line.
+Echora saves the original as `original-N.png`, runs the requests in
+filename order, writes each PNG and timing report, renames finished
+requests to `done-NAME.env` and resumes the game.
+Set `ECHORA_REPLAY_NO_IMAGE=1` in a request to collect timings alone.
+The replays share end-of-frame guest memory and GPU resources. Even two
+replays with identical settings can produce different images. For visual
+comparisons, leave replay disabled and use `ECHORA_CAPTURE_PRESENTS`.
+Select adjacent presents to inspect flicker. Measure gameplay FPS on a
+moving scene with image capture disabled.
+
 | Variable | Effect |
 |---|---|
 | `ECHORA_VIDEO_DECODE=cpu` | Decode the movies with rav1d on the CPU (`rav1d` works too). By default they decode on the GPU's video engine (Vulkan Video), and a movie the GPU cannot decode continues on rav1d. See [av1-decode.md](av1-decode.md). |
@@ -145,6 +160,7 @@ Draw counts varied from 201,301 to 208,081 across the four runs.
 | Variable | Effect |
 |---|---|
 | `ECHORA_CAPTURE_EVERY=N` | Save the first and every N-th presented frame as PNGs in `run-<time>-frames/` beside the report (`0` turns it off). |
+| `ECHORA_CAPTURE_PRESENTS=10400,10499,10500,10501` | Save only these live presents. This overrides periodic capture and can collect multiple camera positions or adjacent frames in one run. |
 | `ECHORA_GPU_DUMP=dir`, `ECHORA_GPU_DUMP_FROM=N` | Every 300th present, write each colour target as an image, starting at present N. |
 | `ECHORA_DRAW_LOG=file`, `ECHORA_DRAW_LOG_FROM=N` | Append a JSON line for every draw, with its targets, to the file, starting at present N. |
 

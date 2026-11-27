@@ -14004,6 +14004,108 @@ mod target_tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn queue_present_writes_only_requested_frames() {
+        const CHILD: &str = "ECHORA_TEST_SELECTED_PRESENTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The debug environment is snapshotted per process. A child also keeps
+            // capture switches out of other concurrently running renderer tests.
+            let directory = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "nvn::gpu::target_tests::queue_present_writes_only_requested_frames",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ECHORA_CAPTURE_DIR", directory.path())
+                .env("ECHORA_CAPTURE_PRESENTS", "2,4,5")
+                .env("ECHORA_CAPTURE_EVERY", "3")
+                .env("ECHORA_CAPTURE_FROM", "100")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let mut files: Vec<_> = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            files.sort();
+            assert_eq!(
+                files,
+                ["frame-00002.png", "frame-00004.png", "frame-00005.png"]
+            );
+            return;
+        }
+
+        let mut nvn = Nvn {
+            gpu: Backend::create(None).unwrap(),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let (queue, window, texture) = (0x100, 0x200, 0x300);
+        nvn.initialize(queue, "Queue", Default::default()).unwrap();
+        nvn.initialize(window, "Window", Default::default())
+            .unwrap();
+        nvn.objects.get_mut(&window).unwrap().state.insert(
+            "Texture0".into(),
+            Args {
+                x: [texture, 0, 0, 0],
+                ..Default::default()
+            },
+        );
+        if let Some(backend) = &mut nvn.gpu {
+            backend
+                .renderer
+                .target(texture, 2, 1, super::vk::Format::R8G8B8A8_UNORM)
+                .unwrap();
+        }
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let directory = std::path::PathBuf::from(std::env::var_os("ECHORA_CAPTURE_DIR").unwrap());
+        for frame in 1..=6 {
+            let rgba = [
+                f32::from(frame & 1 != 0),
+                f32::from(frame & 2 != 0),
+                f32::from(frame & 4 != 0),
+                1.0,
+            ];
+            let image = crate::nvn::Image {
+                width: 2,
+                height: 1,
+                texels: vec![rgba; 2],
+            };
+            if let Some(backend) = &mut nvn.gpu {
+                backend
+                    .renderer
+                    .clear_color(texture, None, super::vk::ClearColorValue { float32: rgba })
+                    .unwrap();
+            } else {
+                nvn.images.insert(texture, image.clone());
+            }
+            core.cpu.regs[..3].copy_from_slice(&[queue, window, 0]);
+            assert!(nvn.call("nvnQueuePresentTexture", &mut core).unwrap());
+            while nvn.replay_paused() {
+                nvn.resume_replay(&mut core).unwrap();
+            }
+            assert_eq!(nvn.presented_frames, frame);
+            if matches!(frame, 2 | 4 | 5) {
+                nvn.finish_png_capture().unwrap();
+                let actual =
+                    std::fs::read(directory.join(format!("frame-{frame:05}.png"))).unwrap();
+                assert_eq!(actual, image.png(), "frame {frame}");
+            }
+        }
+    }
+
+    #[test]
     fn depth_textures_sample_initialized_guest_storage() {
         use crate::nvn::{Guest, GuestMemory};
         use echora_guest::{
