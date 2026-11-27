@@ -5038,10 +5038,13 @@ impl<'a> Shared<'a> {
     /// Wake the replay thread (it has work left).
     fn wake_replay(&self) {
         let (pending, wake) = &self.replay_wake;
-        *pending
+        let mut pending = pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        wake.notify_one();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*pending {
+            *pending = true;
+            wake.notify_one();
+        }
     }
 
     /// The NVN state, counted among its waiters until it is held.
@@ -5268,15 +5271,16 @@ fn replay_thread(shared: &Shared, mut core: Core) {
         }
         drop(nvn);
         let (pending, wake) = &shared.replay_wake;
-        let mut pending = pending
+        let pending = pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !*pending {
-            pending = wake
-                .wait_timeout(pending, std::time::Duration::from_millis(2))
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
+        // Call paths that leave replay paused set this flag before releasing
+        // NVN. The main worker also signals it after setting stop.
+        let mut pending = wake
+            .wait_while(pending, |pending| {
+                !*pending && !shared.stop.load(Ordering::Acquire)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *pending = false;
     }
 }
