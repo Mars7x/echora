@@ -8345,7 +8345,7 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
 /// state, as on the console.
-const TAGGED_STATES: [&str; 2] = ["BlendState", "MultisampleState"];
+const TAGGED_STATES: [&str; 1] = ["MultisampleState"];
 
 /// The contents of tagged state structures by tag, including the snapshot
 /// shared by recorded Bind commands.
@@ -8592,6 +8592,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
         return Ok(());
     }
     let packed = match kind {
+        "BlendState" => Some(PackedState::Blend),
         "ColorState" => Some(PackedState::Color),
         "ChannelMaskState" => Some(PackedState::ChannelMask),
         "PolygonState" => Some(PackedState::Polygon),
@@ -8600,7 +8601,7 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
     };
     if let Some(kind) = packed {
         let bits = match kind {
-            PackedState::DepthStencil => core.memory.read_u64(base)?,
+            PackedState::DepthStencil | PackedState::Blend => core.memory.read_u64(base)?,
             _ => u64::from(core.memory.read_u32(base)?),
         };
         command.states = packed_state_snapshot(bits, kind);
@@ -8760,6 +8761,7 @@ fn stencil_face_property<'a>(
 
 #[derive(Clone, Copy)]
 enum PackedState {
+    Blend,
     Color,
     ChannelMask,
     Polygon,
@@ -8778,8 +8780,8 @@ const POLYGON_FIELDS: [(&str, u32, u32); 4] = [
 /// names older archived commands use.
 fn packed_state_snapshot(bits: u64, kind: PackedState) -> StateSnapshots {
     thread_local! {
-        static SNAPSHOTS: std::cell::RefCell<[Option<(u64, StateSnapshots)>; 64]> =
-            const { std::cell::RefCell::new([const { None }; 64]) };
+        static SNAPSHOTS: std::cell::RefCell<[Option<(u64, StateSnapshots)>; 80]> =
+            const { std::cell::RefCell::new([const { None }; 80]) };
     }
     SNAPSHOTS.with_borrow_mut(|entries| {
         let word = bits as u32;
@@ -8793,6 +8795,36 @@ fn packed_state_snapshot(bits: u64, kind: PackedState) -> StateSnapshots {
         }
         let mut properties = BTreeMap::from([("@Offset".into(), Args::default())]);
         match kind {
+            PackedState::Blend => {
+                for (property, shift, mask) in BLEND_FIELDS {
+                    properties.insert(
+                        property.into(),
+                        Args {
+                            x: [u64::from((word >> shift) & mask), 0, 0, 0],
+                            ..Args::default()
+                        },
+                    );
+                }
+                properties.insert(
+                    "BlendFunc".into(),
+                    Args {
+                        x: upper.to_le_bytes().map(|factor| u64::from(factor & 127)),
+                        ..Args::default()
+                    },
+                );
+                properties.insert(
+                    "BlendEquation".into(),
+                    Args {
+                        x: [
+                            u64::from((word >> 24) & 7),
+                            u64::from((word >> 28) & 7),
+                            0,
+                            0,
+                        ],
+                        ..Args::default()
+                    },
+                );
+            }
             PackedState::ChannelMask => {
                 for index in 0..8 {
                     let mask = u64::from(word >> (index * 4));
@@ -8876,6 +8908,87 @@ fn packed_state_snapshot(bits: u64, kind: PackedState) -> StateSnapshots {
         *slot = Some((bits, snapshot.clone()));
         snapshot
     })
+}
+
+const BLEND_FIELDS: [(&str, u32, u32); 5] = [
+    ("BlendTarget", 0, 7),
+    ("AdvancedMode", 8, 63),
+    ("AdvancedOverlap", 16, 3),
+    ("AdvancedPremultipliedSrc", 18, 1),
+    ("AdvancedNormalizedDst", 19, 1),
+];
+
+fn blend_state_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
+    let [state, a, b, c, d, ..] = core.cpu.regs;
+    let factors = state.wrapping_add(4);
+    match rest {
+        "SetDefaults" => core.memory.write_u64(state, 0x0102_0102_110c_0000)?,
+        "SetBlendFunc" => {
+            // The SDK retains the seven-bit fields' spare bits and ORs in
+            // any spare bits set by the original W-register arguments.
+            let word = (core.memory.read_u32(factors)? & 0x8080_8080)
+                | (a as u32 & 0x8080_80ff)
+                | ((b as u32) << 8 & 0x8080_ff00)
+                | ((c as u32) << 16 & 0x80ff_ffff)
+                | ((d as u32) << 24);
+            core.memory.write_u32(factors, word)?;
+        }
+        "SetBlendEquation" => {
+            let word = (core.memory.read_u32(state)? & 0x88ff_ffff)
+                | ((a as u32) << 24 & 0x8fff_ffff)
+                | ((b as u32) << 28);
+            core.memory.write_u32(state, word)?;
+        }
+        "GetBlendFunc" => {
+            // Each output may alias the state. Preserve native load order
+            // and widths, including the shorter loads for the alpha factors.
+            let src = core.memory.read_u32(factors)? & 127;
+            core.memory.write_u32(a, src)?;
+            let dst = (core.memory.read_u32(factors)? >> 8) & 127;
+            core.memory.write_u32(b, dst)?;
+            let mut src_alpha = [0; 2];
+            core.memory.read(state.wrapping_add(6), &mut src_alpha)?;
+            core.memory.write_u32(c, u32::from(src_alpha[0] & 127))?;
+            let mut dst_alpha = [0];
+            core.memory.read(state.wrapping_add(7), &mut dst_alpha)?;
+            core.memory.write_u32(d, u32::from(dst_alpha[0] & 127))?;
+        }
+        "GetBlendEquation" => {
+            let mut byte = [0];
+            core.memory.read(state.wrapping_add(3), &mut byte)?;
+            core.memory.write_u32(a, u32::from(byte[0] & 7))?;
+            let alpha = (core.memory.read_u32(state)? >> 28) & 7;
+            core.memory.write_u32(b, alpha)?;
+        }
+        _ => {
+            let Some(name) = rest
+                .strip_prefix("Set")
+                .or_else(|| rest.strip_prefix("Get"))
+            else {
+                return Ok(false);
+            };
+            let Some((_, shift, mask)) = BLEND_FIELDS.into_iter().find(|field| field.0 == name)
+            else {
+                return Ok(false);
+            };
+            if rest.starts_with("Set") {
+                let field = if mask == 1 {
+                    u32::from(a as u8 != 0)
+                } else {
+                    a as u32
+                };
+                let word = (core.memory.read_u32(state)? & !(mask << shift)) | (field << shift);
+                core.memory.write_u32(state, word)?;
+            } else if name == "AdvancedOverlap" {
+                let mut half = [0; 2];
+                core.memory.read(state.wrapping_add(2), &mut half)?;
+                core.cpu.regs[0] = u64::from(half[0] & 3);
+            } else {
+                core.cpu.regs[0] = u64::from((core.memory.read_u32(state)? >> shift) & mask);
+            }
+        }
+    }
+    Ok(true)
 }
 
 const DEPTH_FIELDS: [(&str, u32, u32); 4] = [
@@ -9122,6 +9235,7 @@ fn bag_call(
     x: [u64; 31],
 ) -> Result<bool, Trap> {
     let native = match kind {
+        "BlendState" => Some(blend_state_call(core, rest)?),
         "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
         "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
         "ColorState" => Some(color_state_call(core, rest)?),
@@ -10177,6 +10291,195 @@ mod tests {
         );
     }
 
+    fn centered_point_shader() -> Vec<u8> {
+        let word = |fields: &[(u32, u128)]| {
+            fields
+                .iter()
+                .fold(7 << 12, |word, &(shift, value)| word | value << shift)
+        };
+        let mov = |register, value| word(&[(0, 0x802), (16, register), (32, value), (72, 15)]);
+        let exit = word(&[(0, 0x94d), (87, 7)]);
+        let ast = |offset, register, words_minus_one| {
+            word(&[
+                (0, 0x322),
+                (24, 255),
+                (32, register),
+                (40, offset),
+                (64, 255),
+                (74, words_minus_one),
+            ])
+        };
+        // A single centered point with a one-pixel size.
+        let mut vertex_code = vec![0; 128];
+        vertex_code[..4].copy_from_slice(&(1u32 | (1 << 10)).to_le_bytes());
+        vertex_code.extend(
+            [
+                mov(0, 0),
+                mov(1, 0),
+                mov(2, 0),
+                mov(3, u128::from(1f32.to_bits())),
+                ast(0x70, 0, 3),
+                ast(0x6c, 3, 0),
+                exit,
+            ]
+            .into_iter()
+            .flat_map(u128::to_le_bytes),
+        );
+        vertex_code
+    }
+
+    #[test]
+    fn native_blend_state_drives_color_and_alpha_on_a_vulkan_target() {
+        use echora_gpu::ash::vk;
+        let Ok(Some(backend)) = gpu::Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10_0000;
+        let fragment = base + 0x400;
+        let state = base + 0xc00;
+        let args = |x| Args {
+            x,
+            ..Default::default()
+        };
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 4096, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.objects
+            .get_mut(&1)
+            .unwrap()
+            .state
+            .insert("GpuAddress".into(), args([base, 0, 0, 0]));
+        nvn.initialize(2, "Program", Default::default()).unwrap();
+        nvn.objects.get_mut(&2).unwrap().state.extend([
+            ("Stage0".into(), args([base, 0, 0, 0])),
+            ("Stage1".into(), args([fragment, 0, 0, 0])),
+        ]);
+        let mut fs = vec![0u8; 128];
+        fs[..4].copy_from_slice(&(2u32 | (5 << 10)).to_le_bytes());
+        fs[576 / 8] = 15;
+        // MOV R0..R3, RGBA; EXIT. Each draw shades a single sample.
+        for (reg, value) in [1.0f32, 0.5, 0.0, 0.25].into_iter().enumerate() {
+            let mov = 0x7802u128
+                | ((reg as u128) << 16)
+                | (u128::from(value.to_bits()) << 32)
+                | (15 << 72);
+            fs.extend(mov.to_le_bytes());
+        }
+        fs.extend((0x794du128 | (7 << 87)).to_le_bytes());
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 4096, READ | WRITE, STATE_NORMAL, "blend draw")
+            .unwrap();
+        memory.write(base, &centered_point_shader()).unwrap();
+        memory.write(fragment, &fs).unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let output = 8;
+        nvn.initialize(
+            output,
+            "Texture",
+            BTreeMap::from([
+                ("Width".into(), args([1, 0, 0, 0])),
+                ("Height".into(), args([1, 0, 0, 0])),
+                ("Format".into(), args([37, 0, 0, 0])),
+            ]),
+        )
+        .unwrap();
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .target(output, 1, 1, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        let buffer = 5;
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnColorStateSetDefaults",
+            &[state + 8],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnColorStateSetBlendEnable",
+            &[state + 8, 0, 1],
+        );
+        guest.memory.write_u64(state + 16, output).unwrap();
+        for (word, expected) in [
+            // Source replaces destination, then source-alpha blend on RGB with
+            // the original destination alpha. Source and destination differ on all channels.
+            (0x0102_0102_110c_0000, [255, 128, 0, 64]),
+            (0x0201_0605_110c_0000, [64, 32, 191, 128]),
+        ] {
+            guest.memory.write_u64(state, word).unwrap();
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnCommandBufferBeginRecording",
+                &[buffer],
+            );
+            for (name, values) in [
+                ("nvnCommandBufferBindProgram", &[buffer, 2, 3][..]),
+                ("nvnCommandBufferBindColorState", &[buffer, state + 8]),
+                ("nvnCommandBufferBindBlendState", &[buffer, state]),
+                (
+                    "nvnCommandBufferSetRenderTargets",
+                    &[buffer, 1, state + 16, 0, 0, 0],
+                ),
+                ("nvnCommandBufferDrawArrays", &[buffer, 0, 0, 1]),
+            ] {
+                call(&mut nvn, &mut guest, name, values);
+            }
+            let handle = call(
+                &mut nvn,
+                &mut guest,
+                "nvnCommandBufferEndRecording",
+                &[buffer],
+            );
+            // Force the test to exercise the recording snapshot rather than
+            // consulting the bound pointer at draw time.
+            guest.memory.write_u64(state, 0).unwrap();
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .clear_color(
+                    output,
+                    None,
+                    vk::ClearColorValue {
+                        float32: [0.0, 0.0, 1.0, 0.5],
+                    },
+                )
+                .unwrap();
+            let list = nvn.lists.lock().use_command_list(handle, 0).unwrap();
+            for cmd in list.iter() {
+                nvn.execute(cmd, &mut guest).unwrap();
+            }
+            let pixels = nvn
+                .gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(output, 4)
+                .unwrap();
+            assert_eq!(pixels, expected);
+        }
+    }
+
     #[test]
     fn graphics_draw_samples_bound_integer_textures() {
         use echora_gpu::ash::vk;
@@ -10221,31 +10524,6 @@ mod tests {
             bytes
         };
         let exit = word(&[(0, 0x94d), (87, 7)]);
-        let ast = |offset, register, words_minus_one| {
-            word(&[
-                (0, 0x322),
-                (24, 255),
-                (32, register),
-                (40, offset),
-                (64, 255),
-                (74, words_minus_one),
-            ])
-        };
-        // A single centered point with a one-pixel size.
-        let mut vertex_code = header(1 | (1 << 10));
-        vertex_code.extend(
-            [
-                mov(0, 0),
-                mov(1, 0),
-                mov(2, 0),
-                mov(3, u128::from(1f32.to_bits())),
-                ast(0x70, 0, 3),
-                ast(0x6c, 3, 0),
-                exit,
-            ]
-            .into_iter()
-            .flat_map(u128::to_le_bytes),
-        );
         // TEX R0, R4, R6, 2D, 0x1, c[2][0x20], explicit LOD0.
         let mut fragment_code = header(2 | (5 << 10));
         fragment_code[576 / 8] = 1;
@@ -10282,7 +10560,7 @@ mod tests {
                 "graphics texture test",
             )
             .unwrap();
-        memory.write(address, &vertex_code).unwrap();
+        memory.write(address, &centered_point_shader()).unwrap();
         memory.write(fragment, &fragment_code).unwrap();
         let mut cpu = Cpu::default();
         let mut guest = Guest {
@@ -10857,6 +11135,157 @@ mod tests {
                 assert_eq!(props[key].x[0], expected, "{key}");
             }
         }
+    }
+
+    #[test]
+    fn blend_state_matches_guest_bytes_and_preserves_recorded_target() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 4096, READ | WRITE, STATE_NORMAL, "blend state")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let (state, copy, buffer, out) = (0x1100, 0x1ff8, 0x1200, 0x1300);
+        let recorder = nvn.recorder();
+        guest.cpu.regs[0] = state;
+        assert!(
+            recorder
+                .front("nvnBlendStateSetDefaults", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0x0102_0102_110c_0000);
+        // The native setters' treatment of high argument bits is observable
+        // through guest reads and independent of valid blend enumerants.
+        guest
+            .memory
+            .write_u64(state, 0x86a7_4a63_a8c7_d9e0)
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBlendStateSetBlendFunc",
+            &[state, 0x10e8_ad01, 0xbee8_0626, 0xbc9e_28ea, 0x794e_c926],
+        );
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0xa6ea_a601_a8c7_d9e0);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBlendStateGetBlendFunc",
+            &[state, out, out + 4, out + 8, out + 12],
+        );
+        assert_eq!(guest.memory.read_u64(out).unwrap(), 0x0000_0026_0000_0001);
+        assert_eq!(
+            guest.memory.read_u64(out + 8).unwrap(),
+            0x0000_0026_0000_006a
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBlendStateGetBlendFunc",
+            &[state, state + 4, out + 4, out + 8, out + 12],
+        );
+        assert_eq!(guest.memory.read_u32(state + 4).unwrap(), 1);
+        assert_eq!(guest.memory.read_u32(out + 4).unwrap(), 0);
+        assert_eq!(guest.memory.read_u64(out + 8).unwrap(), 0);
+        guest
+            .memory
+            .write_u64(state, 0xa66d_58b5_d1a4_c01e)
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBlendStateSetBlendEquation",
+            &[state, 0x6ea3_30a1, 0xa811_00a1],
+        );
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0xa66d_58b5_91a4_c01e);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBlendStateGetBlendEquation",
+            &[state, state, out],
+        );
+        assert_eq!(guest.memory.read_u32(state).unwrap(), 1);
+        assert_eq!(guest.memory.read_u32(out).unwrap(), 0);
+
+        // A native memcpy into memory ending on a page boundary followed by
+        // field setters must retain the factors, equations, and other flags.
+        guest
+            .memory
+            .write_u64(state, 0x0201_0605_210c_0000)
+            .unwrap();
+        let mut bytes = [0; 8];
+        guest.memory.read(state, &mut bytes).unwrap();
+        guest.memory.write(copy, &bytes).unwrap();
+        for (property, value, expected) in [
+            ("BlendTarget", 5, 5),
+            ("AdvancedMode", 33, 33),
+            ("AdvancedOverlap", 2, 2),
+            ("AdvancedNormalizedDst", 0x100, 0),
+            ("AdvancedPremultipliedSrc", 0x180, 1),
+        ] {
+            call(
+                &mut nvn,
+                &mut guest,
+                &format!("nvnBlendStateSet{property}"),
+                &[copy, value],
+            );
+            assert_eq!(
+                call(
+                    &mut nvn,
+                    &mut guest,
+                    &format!("nvnBlendStateGet{property}"),
+                    &[copy]
+                ),
+                expected
+            );
+        }
+        assert_eq!(guest.memory.read_u64(copy).unwrap(), 0x0201_0605_2106_2105);
+        assert_eq!(nvn.bags.len(), 0);
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        guest.cpu.regs[..2].copy_from_slice(&[buffer, copy]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindBlendState", &mut guest)
+                .unwrap()
+        );
+        guest.memory.write_u64(copy, 0x0102_0102_110c_0000).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBindBlendState",
+            &[buffer, copy],
+        );
+        let handle = call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let archived =
+            ArchivedList::pack(&nvn.lists.lock().use_command_list(handle, 0).unwrap()).unpack();
+        for bind in archived.iter() {
+            nvn.execute(bind, &mut guest).unwrap();
+        }
+        let fifth = nvn.render.properties("BindBlendState/5");
+        assert_eq!(fifth["BlendFunc"].x, [5, 6, 1, 2]);
+        assert_eq!(fifth["BlendEquation"].x, [1, 2, 0, 0]);
+        assert_eq!(fifth["AdvancedMode"].x[0], 33);
+        assert_eq!(fifth["AdvancedPremultipliedSrc"].x[0], 1);
+        let zero = nvn.render.properties("BindBlendState/0");
+        assert_eq!(zero["BlendFunc"].x, [2, 1, 2, 1]);
+        assert_eq!(zero["BlendEquation"].x, [1, 1, 0, 0]);
     }
 
     #[test]
