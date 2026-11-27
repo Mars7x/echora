@@ -312,6 +312,14 @@ synthetic fixtures and runs without the game files.
   presents 4,200–5,100 and 10.00 and 10.50 FPS over 4,600–5,100.
   The candidate issued about 2% fewer draws over the longer interval.
   Both runs reached the same outdoor checkpoints and preserved the save.
+- Comparing guest memory directly on AVX2 hosts removes the staging copy
+  from live shader-cache validation. In a guarded Radeon pair at 1440p,
+  the signed base and the candidate averaged 9.46 and 9.68 FPS over
+  saved-route presents 4,200–5,100. The byte comparison and its direct
+  callees accounted for 2,996 of 131,863 CPU samples in the base and
+  2,188 of 133,317 in the candidate. Peak process RSS was 13,257 and
+  13,641 MiB respectively. Both runs reached the same outdoor checkpoints
+  and preserved the cloned save. The FPS difference comes from one pair.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700

@@ -109,6 +109,14 @@ impl GuestMemory<'_> {
         match self {
             Self::Checked(memory) => memory.equals(address, expected),
             Self::View(view) => {
+                #[cfg(target_arch = "x86_64")]
+                if std::arch::is_x86_feature_detected!("avx2")
+                    && let Some(guest) = view.host_span(address, expected.len())
+                {
+                    // SAFETY: host_span checked the full range, and the CPU supports AVX2.
+                    #[allow(unsafe_code)]
+                    return Ok(unsafe { guest_bytes_equal_avx2(guest, expected) });
+                }
                 let mut chunk = [0u8; 4096];
                 for (index, part) in expected.chunks(chunk.len()).enumerate() {
                     let out = &mut chunk[..part.len()];
@@ -121,6 +129,40 @@ impl GuestMemory<'_> {
             }
         }
     }
+}
+
+/// Compare the live view without creating a Rust reference into memory
+/// other guest workers can write. The view's page protections still apply.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[target_feature(enable = "avx2")]
+unsafe fn guest_bytes_equal_avx2(guest: *const u8, expected: &[u8]) -> bool {
+    let (blocks, tail) = expected.as_chunks::<32>();
+    for (index, reference) in blocks.iter().enumerate() {
+        let mask: u32;
+        // SAFETY: the caller checked the live range, and both operands
+        // contain all 32 bytes of this block. Neither needs alignment.
+        unsafe {
+            std::arch::asm!(
+                "vmovdqu ymm0, [{guest}]",
+                "vpcmpeqb ymm0, ymm0, [{reference}]",
+                "vpmovmskb {mask:e}, ymm0",
+                guest = in(reg) guest.add(index * 32),
+                reference = in(reg) reference.as_ptr(),
+                mask = out(reg) mask,
+                out("ymm0") _,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        if mask != u32::MAX {
+            return false;
+        }
+    }
+    let tail_start = blocks.len() * 32;
+    tail.iter().enumerate().all(|(index, &byte)| {
+        // SAFETY: these are the remaining bytes in the checked range.
+        unsafe { guest.add(tail_start + index).read_volatile() == byte }
+    })
 }
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -9845,6 +9887,35 @@ mod tests {
     use super::*;
 
     use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+    #[test]
+    fn guest_view_compares_unaligned_ranges_across_pages() {
+        let end = 1 << 39;
+        let mut memory = Memory::new(end);
+        let base = 0x20_0000;
+        let bytes: Vec<u8> = (0..8192).map(|i| (i >> 4) as u8).collect();
+        memory
+            .map(base, 8192, READ | WRITE, STATE_NORMAL, "comparison input")
+            .unwrap();
+        memory.write(base, &bytes).unwrap();
+        let mut view = memory.view();
+        let view = GuestMemory::View(&mut view);
+        for length in [0_usize, 1, 31, 32, 33, 4095, 4096, 4097, 8189] {
+            let mut expected = bytes[3..3 + length].to_vec();
+            assert!(view.equals(base + 3, &expected).unwrap());
+            for index in [0, length / 2, length.saturating_sub(1)] {
+                if let Some(byte) = expected.get_mut(index) {
+                    *byte ^= 1;
+                    assert!(!view.equals(base + 3, &expected).unwrap());
+                    expected[index] ^= 1;
+                }
+            }
+        }
+        assert!(matches!(
+            view.equals(end, &[0]),
+            Err(Trap::MemoryFault { address, .. }) if address == end
+        ));
+    }
 
     #[test]
     fn explicit_screenshots_capture_only_the_selected_live_presents() {

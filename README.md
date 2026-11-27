@@ -77,7 +77,9 @@ What doesn't work yet:
   192 MiB forest texture used this path. Memory growth later in the opening
   still needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
-  about 26 FPS with the opt-in code generation options. See the
+  about 26 FPS with the opt-in code generation options. In a separate
+  scripted route from a saved game into Kokiri Forest, a guarded 1440p
+  test averaged 9.68 FPS over its final 900 presents. See the
   [performance notes](docs/limitations.md#performance) for the test scope.
 - Platforms. The game only runs on Linux at the moment. The rest of the
   project builds and passes its tests on Windows too.
@@ -206,6 +208,8 @@ many bytes the renderer holds in targets, uploads and images awaiting release.
 Tests check that finalized images stay alive until the GPU finishes and that
 flushing an idle renderer releases them without submitting another batch.
 Texture view registration validates and copies the view under the same lock.
+Shader cache lookups compare the live guest bytes directly on AVX2 hosts
+while retaining the byte-for-byte check.
 To trace the missing ground cover, the draw log records the first instance
 and instance count of indexed instanced draws. A pixel watch can follow one
 texel through a single frame while transferring only that texel to the CPU.
