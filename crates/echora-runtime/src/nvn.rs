@@ -174,6 +174,9 @@ pub enum HostEntry {
 #[path = "nvn_gpu.rs"]
 mod gpu;
 
+#[path = "nvn_multisample.rs"]
+mod multisample;
+
 #[path = "nvn_list_archive.rs"]
 mod list_archive;
 
@@ -1699,33 +1702,10 @@ pub struct Args {
     pub v: [u64; 2],
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Bag {
     pub kind: String,
     pub props: BTreeMap<String, Args>,
-    #[serde(skip)]
-    tag: Option<u32>,
-}
-
-impl PartialEq for Bag {
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.props == other.props
-    }
-}
-
-impl Eq for Bag {}
-
-impl Bag {
-    fn set(&mut self, property: &str, args: Args) {
-        match self.props.get_mut(property) {
-            Some(value) if *value == args => return,
-            Some(value) => *value = args,
-            None => {
-                self.props.insert(property.into(), args);
-            }
-        }
-        self.tag = None;
-    }
 }
 
 /// Builder and state bags by guest address, shared with workers that
@@ -2488,7 +2468,7 @@ impl Recorder {
             x: [x[1], x[2], x[3], x[4]],
             v: [core.cpu.vectors[0] as u64, core.cpu.vectors[1] as u64],
         };
-        bag_call(&self.bags, core, name, kind, rest, this, args, x)
+        bag_call(&self.bags, core, name, kind, rest, this, args)
     }
 
     /// Record NVN call `name` when it is a call on a recording command
@@ -4617,7 +4597,7 @@ impl Nvn {
         // pointer, like builders.
         let bag_like =
             kind.ends_with("Builder") || kind == "TextureView" || kind.ends_with("State");
-        if bag_like && bag_call(&self.bags, core, name, kind, rest, this, args, x)? {
+        if bag_like && bag_call(&self.bags, core, name, kind, rest, this, args)? {
             return Ok(true);
         }
         // Generic getters on initialized objects for properties their
@@ -8340,163 +8320,6 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
     Ok(region)
 }
 
-/// Fixed-function state structures a Bind reads from memory: their
-/// contents go with the structure's bytes, so a copy (the game keeps
-/// prebuilt states and copies them into its pass objects) binds the same
-/// state, as on the console.
-const TAGGED_STATES: [&str; 1] = ["MultisampleState"];
-
-/// The contents of tagged state structures by tag, including the snapshot
-/// shared by recorded Bind commands.
-type StateTags = FastMap<u32, TaggedState>;
-static STATE_TAGS: std::sync::RwLock<Option<StateTags>> = std::sync::RwLock::new(None);
-
-#[derive(Clone)]
-struct TaggedState {
-    kind: &'static str,
-    hash: u64,
-    snapshot: StateSnapshots,
-}
-
-impl TaggedState {
-    fn matches(&self, kind: &str, properties: &BTreeMap<String, Args>, hash: u64) -> bool {
-        self.hash == hash
-            && self.kind == kind
-            && self.snapshot[0]
-                .iter()
-                .filter(|(key, _)| key.as_str() != "@Offset")
-                .eq(properties.iter())
-    }
-}
-
-fn tagged_state(kind: &str, tag: u32) -> Option<StateSnapshots> {
-    STATE_TAGS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()?
-        .get(&tag)
-        .filter(|state| state.kind == kind)
-        .map(|state| state.snapshot.clone())
-}
-
-fn state_hash(kind: &str, props: &BTreeMap<String, Args>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    // The entries themselves are hashed (formatting them for every setter
-    // cost more than the setter), and the table is written only for a tag
-    // not seen yet. The fast hash is mixed at the end (a 64-bit finalizer),
-    // so the 32 bits kept depend on every word.
-    let mut hasher = FastHasher::default();
-    kind.hash(&mut hasher);
-    for (name, value) in props {
-        name.hash(&mut hasher);
-        value.x.hash(&mut hasher);
-        value.v.hash(&mut hasher);
-    }
-    let mut mixed = hasher.finish();
-    mixed = (mixed ^ mixed >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ mixed >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
-    mixed
-}
-
-/// The tag written into a state's first word. Existing tags stay valid for
-/// copies of guest state, so resolve collisions without replacing an entry.
-fn state_tag(kind: &str, props: &BTreeMap<String, Args>) -> Option<u32> {
-    let kind = TAGGED_STATES.iter().copied().find(|&known| known == kind)?;
-    let hash = state_hash(kind, props);
-    thread_local! {
-        static SEEN: std::cell::RefCell<FastMap<u64, (u32, TaggedState)>> =
-            std::cell::RefCell::default();
-    }
-    if let Some(tag) = SEEN.with(|seen| {
-        let seen = seen.borrow();
-        let (tag, state) = seen.get(&hash)?;
-        state.matches(kind, props, hash).then_some(*tag)
-    }) {
-        return Some(tag);
-    }
-    let locate = |tags: &StateTags| {
-        let mut tag = (hash as u32) | 1;
-        while let Some(state) = tags.get(&tag) {
-            if state.matches(kind, props, hash) {
-                return (tag, true);
-            }
-            tag = tag.wrapping_add(2);
-        }
-        (tag, false)
-    };
-    let known = {
-        let shared = STATE_TAGS
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shared.as_ref().and_then(|tags| {
-            let (tag, found) = locate(tags);
-            found.then(|| (tag, tags[&tag].clone()))
-        })
-    };
-    let (tag, state) = known.unwrap_or_else(|| {
-        let mut shared = STATE_TAGS
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tags = shared.get_or_insert_with(FastMap::default);
-        let (tag, _) = locate(tags);
-        let state = tags.entry(tag).or_insert_with(|| {
-            let mut properties = props.clone();
-            properties.insert("@Offset".into(), Args::default());
-            TaggedState {
-                kind,
-                hash,
-                snapshot: vec![properties].into(),
-            }
-        });
-        (tag, state.clone())
-    });
-    SEEN.with(|seen| seen.borrow_mut().insert(hash, (tag, state)));
-    Some(tag)
-}
-
-/// The tag of a tagged state after a setter (`property`, its arguments and
-/// X5) changed the state tagged `before`, as `state_tag` gives it for the
-/// new properties (`compute`). A tagged state's properties are its tag's
-/// snapshot, and a tag, once given to properties, stays theirs, so the
-/// transition is remembered instead of hashing and comparing every property
-/// again (each setter of a state built field by field did).
-fn state_transition(
-    before: Option<u32>,
-    property: &str,
-    args: Args,
-    x5: u64,
-    compute: impl FnOnce() -> Option<u32>,
-) -> Option<u32> {
-    use std::hash::{Hash, Hasher};
-    type Transitions = FastMap<(u32, u64, Args, u64), (Box<str>, Option<u32>)>;
-    thread_local! {
-        static TRANSITIONS: std::cell::RefCell<Transitions> = std::cell::RefCell::default();
-    }
-    let Some(before) = before else {
-        return compute();
-    };
-    let mut hasher = FastHasher::default();
-    property.hash(&mut hasher);
-    let key = (before, hasher.finish(), args, x5);
-    if let Some(after) = TRANSITIONS.with(|transitions| {
-        transitions
-            .borrow()
-            .get(&key)
-            .filter(|(known, _)| &**known == property)
-            .map(|(_, after)| *after)
-    }) {
-        return after;
-    }
-    let after = compute();
-    TRANSITIONS.with(|transitions| {
-        transitions
-            .borrow_mut()
-            .insert(key, (property.into(), after));
-    });
-    after
-}
-
 // The SDK's four-byte attribute and eight-byte stream travel with guest
 // memory, including ordinary memcpy and prebuilt arrays. Bind captures the
 // decoded values in the same format as previously recorded commands.
@@ -8606,32 +8429,8 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
         command.states = packed_state_snapshot(bits, kind);
         return Ok(());
     }
-    // A single tagged state: what the bound structure's bytes hold; an
-    // untagged one (never set through NVN) is the defaults, not another
-    // structure's state.
-    if TAGGED_STATES.contains(&kind) {
-        let tagged = core
-            .memory
-            .read_u32(base)
-            .ok()
-            .and_then(|tag| tagged_state(kind, tag));
-        if let Some(snapshot) = tagged {
-            command.states = snapshot;
-            return Ok(());
-        }
-        let mut props = read_shared(bags.at(base))
-            .get(&base)
-            .filter(|bag| bag.kind == kind)
-            .map(|bag| bag.props.clone())
-            .unwrap_or_default();
-        props.insert(
-            "@Offset".into(),
-            Args {
-                x: [0; 4],
-                v: [0; 2],
-            },
-        );
-        command.states = vec![props].into();
+    if kind == "MultisampleState" {
+        command.states = multisample::snapshot(core, base)?;
         return Ok(());
     }
     command.states = bags
@@ -9217,12 +9016,8 @@ fn vertex_state_call(core: &mut Guest, kind: &str, rest: &str) -> Result<bool, T
     Ok(true)
 }
 
-/// The generic property bags (SetDefaults / Set<Prop> / Get<Prop> on
-/// builders, fixed-function state structures and texture views): Ok(true)
-/// when `kind`/`rest` is one of those calls and it was made. They touch
-/// only the shared bags and the structure's tag, so workers make the hot
-/// ones without the NVN state (`Recorder::front`).
-#[allow(clippy::too_many_arguments)]
+/// Read or update guest fixed-function structures and host-side builder or view
+/// properties. Recording workers can make these calls without the NVN state.
 fn bag_call(
     bags: &Bags,
     core: &mut Guest,
@@ -9231,10 +9026,10 @@ fn bag_call(
     rest: &str,
     this: u64,
     args: Args,
-    x: [u64; 31],
 ) -> Result<bool, Trap> {
     let native = match kind {
         "BlendState" => Some(blend_state_call(core, rest)?),
+        "MultisampleState" => Some(multisample::call(core, rest)?),
         "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
         "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
         "ColorState" => Some(color_state_call(core, rest)?),
@@ -9269,7 +9064,7 @@ fn bag_call(
     {
         let mut words = [0u64; 4];
         for (index, word) in words.iter_mut().enumerate() {
-            *word = u64::from(core.memory.read_u32(x[1] + index as u64 * 4)?);
+            *word = u64::from(core.memory.read_u32(args.x[0] + index as u64 * 4)?);
         }
         let mut bags = write_shared(bags.at(this));
         let bag = bags.entry(this).or_insert_with(|| Bag {
@@ -9303,18 +9098,10 @@ fn bag_call(
         if let Some(device) = device {
             bag.props.insert("Device".into(), device);
         }
-        bag.tag = state_tag(kind, &bag.props);
-        if let Some(tag) = bag.tag {
-            core.memory.write_u32(this, tag)?;
-        }
         shard.insert(this, bag);
         return Ok(true);
     }
     if bag_like {
-        let memory_tag = TAGGED_STATES
-            .contains(&kind)
-            .then(|| core.memory.read_u32(this).ok())
-            .flatten();
         if let Some(property) = rest.strip_prefix("Set") {
             // Structures live in application memory (often the stack):
             // a setter of another kind at the same address means the old
@@ -9334,19 +9121,6 @@ fn bag_call(
                     kind: kind.into(),
                     ..Bag::default()
                 });
-            // A copy of a state structure carries the source's tag, even
-            // when the destination address held a different state before.
-            if let Some(tag) = memory_tag
-                && bag.tag != Some(tag)
-                && let Some(snapshot) = tagged_state(kind, tag)
-            {
-                bag.props.clone_from(&snapshot[0]);
-                bag.props.remove("@Offset");
-                bag.tag = Some(tag);
-            }
-            // The tag before this setter: with it, the setter's property
-            // and arguments determine the tag after (`state_transition`).
-            let before = bag.tag;
             // SetSize1D/2D/3D(builder, width[, height[, depth]]) are the
             // combined forms of SetWidth/SetHeight/SetDepth.
             if let Some(dimensions) = property
@@ -9378,31 +9152,20 @@ fn bag_call(
                     0
                 };
             }
-            bag.set(property, args);
-            let tag = bag.tag.or_else(|| {
-                state_transition(before, property, args, x[5], || state_tag(kind, &bag.props))
-            });
-            bag.tag = tag;
-            drop(bags);
-            if let Some(tag) = tag {
-                core.memory.write_u32(this, tag)?;
+            if let Some(value) = bag.props.get_mut(property) {
+                *value = args;
+            } else {
+                bag.props.insert(property.into(), args);
             }
             return Ok(true);
         }
         if let Some(property) = rest.strip_prefix("Get") {
-            let snapshot = memory_tag.and_then(|tag| tagged_state(kind, tag));
-            let locked;
-            let props = if let Some(snapshot) = &snapshot {
-                &snapshot[0]
-            } else {
-                locked = read_shared(bags.at(this));
-                &locked
-                    .get(&this)
-                    .filter(|bag| bag.kind == kind)
-                    .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?
-                    .props
-            };
-            let Some(value) = props.get(property) else {
+            let locked = read_shared(bags.at(this));
+            let bag = locked
+                .get(&this)
+                .filter(|bag| bag.kind == kind)
+                .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?;
+            let Some(value) = bag.props.get(property) else {
                 return Err(stop(format!("{property} was never set")));
             };
             core.cpu.regs[0] = value.x[0];
@@ -9410,7 +9173,6 @@ fn bag_call(
             return Ok(true);
         }
     }
-    let _ = (&invalid, &stop);
     Ok(false)
 }
 
@@ -10926,88 +10688,6 @@ mod tests {
         ));
     }
 
-    /// A state tag a thread has already seen is answered without the shared
-    /// table, and still names the snapshot another thread finds there.
-    #[test]
-    fn seen_state_tags_stay_in_the_shared_table() {
-        let mut props = BTreeMap::new();
-        props.insert(
-            "Samples".to_string(),
-            Args {
-                x: [0x6a17, 0, 0, 0],
-                v: [0; 2],
-            },
-        );
-        let first = state_tag("MultisampleState", &props).unwrap();
-        assert_eq!(state_tag("MultisampleState", &props), Some(first));
-        let elsewhere = std::thread::spawn({
-            let props = props.clone();
-            move || state_tag("MultisampleState", &props)
-        })
-        .join()
-        .unwrap();
-        assert_eq!(elsewhere, Some(first));
-        let tags = STATE_TAGS.read().unwrap();
-        let state = tags.as_ref().unwrap().get(&first).unwrap();
-        assert_eq!(state.kind, "MultisampleState");
-        assert_eq!(state.snapshot[0]["Samples"].x[0], 0x6a17);
-        assert_eq!(state_tag("Unknown", &props), None);
-    }
-
-    #[test]
-    fn colliding_state_tags_keep_both_alpha_to_coverage_settings() {
-        let kind = "MultisampleState";
-        let states = [(0x1100, 0, 183_095), (0x1200, 1, 4_039)];
-        let hashes = states.map(|(_, enabled, unused)| {
-            let props = BTreeMap::from([(
-                "AlphaToCoverageEnable".into(),
-                Args {
-                    x: [enabled, unused, 0, 0],
-                    v: [0; 2],
-                },
-            )]);
-            state_hash(kind, &props) as u32 | 1
-        });
-        assert_eq!(hashes[0], hashes[1]);
-
-        let mut memory = Memory::new(1 << 39);
-        memory
-            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
-            .unwrap();
-        let mut cpu = Cpu::default();
-        let mut guest = Guest {
-            cpu: &mut cpu,
-            memory: GuestMemory::Checked(&mut memory),
-            counter: Some(0),
-        };
-        let mut nvn = Nvn::default();
-        for (address, enabled, unused) in states {
-            call(
-                &mut nvn,
-                &mut guest,
-                "nvnMultisampleStateSetAlphaToCoverageEnable",
-                &[address, enabled, unused, 0, 0],
-            );
-        }
-        assert_ne!(
-            guest.memory.read_u32(states[0].0).unwrap(),
-            guest.memory.read_u32(states[1].0).unwrap()
-        );
-        for (address, enabled, _) in states {
-            let tag = guest.memory.read_u32(address).unwrap();
-            guest.memory.write_u32(0x1300, tag).unwrap();
-            assert_eq!(
-                call(
-                    &mut nvn,
-                    &mut guest,
-                    "nvnMultisampleStateGetAlphaToCoverageEnable",
-                    &[0x1300]
-                ),
-                enabled
-            );
-        }
-    }
-
     fn call(nvn: &mut Nvn, core: &mut Guest, name: &str, args: &[u64]) -> u64 {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
@@ -11845,54 +11525,157 @@ mod tests {
     }
 
     #[test]
-    fn remembered_state_transitions_give_the_tags_of_the_properties() {
+    fn multisample_bind_records_copied_state_and_replays_archived_properties() {
         let mut memory = Memory::new(1 << 39);
         memory
-            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "test")
+            .map(0x1000, 4096, READ | WRITE, STATE_NORMAL, "multisample")
             .unwrap();
         let mut cpu = Cpu::default();
         let mut guest = Guest {
             cpu: &mut cpu,
             memory: GuestMemory::Checked(&mut memory),
-            counter: Some(0),
+            counter: None,
         };
         let mut nvn = Nvn::default();
-        // The same properties reached in other orders and again after a
-        // detour: each structure's tag is the one its properties have.
-        let sequences: [(u64, &[(&str, u64)]); 3] = [
-            (0x1100, &[("Samples", 3), ("AlphaToCoverageEnable", 1)]),
-            (0x1200, &[("AlphaToCoverageEnable", 1), ("Samples", 3)]),
-            (
-                0x1300,
-                &[("Samples", 5), ("AlphaToCoverageEnable", 1), ("Samples", 3)],
+        let recorder = nvn.recorder();
+        let (state, copy, buffer, grid_x, grid_y) = (0x1100, 0x1fe8, 0x1200, 0x1300, 0x1304);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnTextureBuilderSetDefaults",
+            &[copy],
+        );
+        guest.cpu.regs[0] = state;
+        assert!(
+            recorder
+                .front("nvnMultisampleStateSetDefaults", &mut guest)
+                .unwrap()
+        );
+        let mut bytes = [0; 24];
+        guest.memory.read(state, &mut bytes).unwrap();
+        guest.memory.write(copy, &bytes).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnMultisampleStateSetSamples",
+            &[copy, 2],
+        );
+        assert_eq!(nvn.bags.len(), 0);
+        guest.cpu.regs[..2].copy_from_slice(&[copy, 0x101]);
+        assert!(
+            recorder
+                .front("nvnMultisampleStateSetAlphaToCoverageEnable", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMultisampleStateGetAlphaToCoverageEnable",
+                &[copy]
             ),
-        ];
-        for _ in 0..2 {
-            for (address, setters) in sequences {
-                call(
-                    &mut nvn,
-                    &mut guest,
-                    "nvnMultisampleStateSetDefaults",
-                    &[address],
-                );
-                for (property, value) in setters {
-                    call(
-                        &mut nvn,
-                        &mut guest,
-                        &format!("nvnMultisampleStateSet{property}"),
-                        &[address, *value],
-                    );
-                    let props = read_shared(nvn.bags.at(address))[&address].props.clone();
-                    assert_eq!(
-                        Some(guest.memory.read_u32(address).unwrap()),
-                        state_tag("MultisampleState", &props)
-                    );
-                }
-            }
-            let tags = sequences.map(|(address, _)| guest.memory.read_u32(address).unwrap());
-            assert_eq!(tags[0], tags[1]);
-            assert_eq!(tags[0], tags[2]);
+            1
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMultisampleStateGetAlphaToCoverageEnable",
+                &[state]
+            ),
+            0
+        );
+        // Grid selection uses the larger of the framebuffer and raster sample counts.
+        for (raster, expected) in [
+            (1, (2, 4)),
+            (4, (2, 2)),
+            (8, (1, 2)),
+            (16, (1, 1)),
+            (3, (99, 100)),
+        ] {
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMultisampleStateSetRasterSamples",
+                &[copy, raster],
+            );
+            guest.memory.write_u32(grid_x, 99).unwrap();
+            guest.memory.write_u32(grid_y, 100).unwrap();
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnMultisampleStateGetSampleLocationsGrid",
+                &[copy, grid_x, grid_y],
+            );
+            assert_eq!(
+                (
+                    guest.memory.read_u32(grid_x).unwrap(),
+                    guest.memory.read_u32(grid_y).unwrap()
+                ),
+                expected
+            );
         }
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnMultisampleStateSetSampleLocationsEnable",
+            &[copy, 1],
+        );
+        guest.memory.write(copy + 4, &[0x36]).unwrap();
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        guest.cpu.regs[..2].copy_from_slice(&[buffer, copy]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindMultisampleState", &mut guest)
+                .unwrap()
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnMultisampleStateSetDefaults",
+            &[copy],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBindMultisampleState",
+            &[buffer, copy],
+        );
+        let handle = call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let archived =
+            ArchivedList::pack(&nvn.lists.lock().use_command_list(handle, 0).unwrap()).unpack();
+        assert_eq!(archived.len(), 2);
+        let first = &archived[0].states[0];
+        assert_eq!(first["AlphaToCoverageEnable"].x[0], 1);
+        assert_eq!(first["PackedSampleLocations"].x[0] as u8, 0x36);
+        assert_eq!(first["@Offset"], Args::default());
+        assert_eq!(archived[1].states[0]["AlphaToCoverageEnable"].x[0], 0);
+        assert!(!archived[1].states[0].contains_key("PackedSampleLocations"));
+        // Older archives retain the setter's spare registers and may omit defaults.
+        let mut legacy = archived[0].clone();
+        legacy.x[1] = 0x3000;
+        let saved = Args {
+            x: [1, 0xcafe, 0, 0],
+            ..Args::default()
+        };
+        legacy.states = vec![BTreeMap::from([("AlphaToCoverageEnable".into(), saved)])].into();
+        nvn.execute(&legacy, &mut guest).unwrap();
+        assert_eq!(
+            nvn.render.state["BindMultisampleState"].states[0]["AlphaToCoverageEnable"],
+            saved
+        );
     }
 
     #[test]
@@ -12892,7 +12675,6 @@ mod tests {
                         ..Args::default()
                     },
                 )]),
-                ..Bag::default()
             });
             nvn.apply_registration(Registration {
                 pool,

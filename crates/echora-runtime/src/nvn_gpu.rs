@@ -15511,7 +15511,6 @@ mod target_tests {
                         ("Levels".into(), args([1, 0, 0, 0])),
                         ("Layers".into(), args([1, 2, 0, 0])),
                     ]),
-                    ..Default::default()
                 },
             );
             let source = TextureSource::Upload {
@@ -15658,7 +15657,6 @@ mod target_tests {
             Bag {
                 kind: "TextureBuilder".into(),
                 props: builder,
-                ..Bag::default()
             },
         );
         let mut cpu = Cpu::default();
@@ -15737,7 +15735,6 @@ mod target_tests {
             Bag {
                 kind: "TextureBuilder".into(),
                 props: properties(4),
-                ..Bag::default()
             },
         );
         let mut cpu = Cpu::default();
@@ -15950,7 +15947,6 @@ mod target_tests {
             Bag {
                 kind: "TextureBuilder".into(),
                 props: builder,
-                ..Bag::default()
             },
         );
         let mut cpu = Cpu::default();
@@ -16633,7 +16629,6 @@ mod target_tests {
             crate::nvn::Bag {
                 kind: "TextureView".into(),
                 props: BTreeMap::from([("Levels".into(), args([1, 0, 0, 0]))]),
-                ..Default::default()
             },
         );
         assert!(matches!(
