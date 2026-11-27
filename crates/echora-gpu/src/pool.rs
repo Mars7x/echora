@@ -14,7 +14,7 @@ use ash::vk;
 use ash::vk::Handle;
 use echora_shader_abi::texture_pool as binding;
 
-use crate::draw::{ImageShape, Sampler, TextureSource};
+use crate::draw::{ImageShape, Sampler, TextureIdentity, TextureSource, UploadIdentity};
 use crate::fast_map::FastMap;
 use crate::renderer::{HostBuffer, Renderer, sampled_texture_type};
 use crate::shader::SampleType;
@@ -38,11 +38,30 @@ impl PoolEntry {
     }
 }
 
+/// The last whole list, identified by allocation or by the values its
+/// descriptors depend on. A weak reference keeps its address unique after
+/// the caller drops its entries and their host texture bytes.
+pub(crate) struct BoundPool {
+    list: std::sync::Weak<[PoolEntry]>,
+    entries: Vec<(u32, u32, TextureIdentity, Sampler)>,
+    changes: u64,
+    targets: Vec<vk::Image>,
+}
+
+fn binding_identity(entry: &PoolEntry) -> (u32, u32, TextureIdentity, Sampler) {
+    (
+        entry.texture,
+        entry.sampler,
+        entry.source.identity(),
+        entry.sampler_state,
+    )
+}
+
 /// A pool entry of an upload as `bind_pool` resolved it: the entry, its
 /// (binding, index, sampler or view) descriptors and its numeric flags.
 /// Valid while no view it names is destroyed (`forget_pool_views`).
 pub(crate) struct ResolvedEntry {
-    source: TextureSource,
+    upload: UploadIdentity,
     sampler_state: Sampler,
     wanted: Vec<(u32, u32, u64)>,
     numeric: u32,
@@ -356,18 +375,16 @@ impl Renderer {
         }
         // The same entries as the last call, with no target made again
         // since (a view of one would change): the set already holds them.
-        if let Some((last, changes, targets)) = &self.pool_cache
-            && *changes == self.target_changes
-            // The same shared list (the runtime keeps one while nothing it
-            // was made from changed), or equal entries.
-            && (std::sync::Arc::ptr_eq(last, entries)
-                || last.len() == entries.len()
-                    && last.iter().zip(entries.iter()).all(|(last, entry)| {
-                        (last.texture, last.sampler) == (entry.texture, entry.sampler)
-                            && last.matches_binding(&entry.source, &entry.sampler_state)
-                    }))
+        if let Some(last) = &self.pool_cache
+            && last.changes == self.target_changes
+            && (std::ptr::eq(last.list.as_ptr(), std::sync::Arc::as_ptr(entries))
+                || last
+                    .entries
+                    .iter()
+                    .copied()
+                    .eq(entries.iter().map(binding_identity)))
         {
-            let pending = self.rendering_pending(targets.iter().copied());
+            let pending = self.rendering_pending(last.targets.iter().copied());
             self.stat("stat: texture pool sets unchanged", 1);
             if pending {
                 self.memory_barrier()?;
@@ -392,11 +409,11 @@ impl Renderer {
             // An upload resolved before with the same source and sampler
             // names the same sampler and views (render targets resolve
             // every time: sampling them transitions and refreshes copies).
-            let upload = matches!(entry.source, TextureSource::Upload { .. });
-            if upload
+            let identity = entry.source.upload_identity();
+            if let Some(upload) = identity
                 && let Some(memo) = self.pool_entry_memo.get(&(entry.texture, entry.sampler))
                 && memo.sampler_state == entry.sampler_state
-                && memo.source.same_as(&entry.source)
+                && memo.upload == upload
             {
                 wanted.extend_from_slice(&memo.wanted);
                 kinds.push((entry.texture, memo.numeric, memo.view_mask));
@@ -435,9 +452,9 @@ impl Renderer {
                 view_mask |= 1 << array;
             }
             kinds.push((entry.texture, numeric, view_mask));
-            if upload {
+            if let Some(upload) = identity {
                 let resolved = ResolvedEntry {
-                    source: entry.source.clone(),
+                    upload,
                     sampler_state: entry.sampler_state,
                     wanted: wanted[first..].to_vec(),
                     numeric,
@@ -571,7 +588,18 @@ impl Renderer {
             }
         }
         pool.write_entries(&self.gpu.device, &changed);
-        self.pool_cache = Some((entries.clone(), self.target_changes, targets));
+        let mut identities = self
+            .pool_cache
+            .take()
+            .map_or_else(Vec::new, |last| last.entries);
+        identities.clear();
+        identities.extend(entries.iter().map(binding_identity));
+        self.pool_cache = Some(BoundPool {
+            list: std::sync::Arc::downgrade(entries),
+            entries: identities,
+            changes: self.target_changes,
+            targets,
+        });
         Ok(set)
     }
 
@@ -851,6 +879,69 @@ mod tests {
                 assert_eq!(actual, expected, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn resolved_pool_entry_reuses_descriptors_without_retaining_host_texels() {
+        use crate::draw::UploadRegion;
+        use std::sync::Arc;
+
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let texels = Arc::new(vec![11; 4]);
+        let released = Arc::downgrade(&texels);
+        let entry = |texels| PoolEntry {
+            texture: 1,
+            sampler: 1,
+            sampler_state: Sampler::default(),
+            source: TextureSource::Upload {
+                key: 21,
+                generation: 1,
+                width: 1,
+                height: 1,
+                shape: ImageShape::D2 { layers: 1 },
+                format: vk::Format::R8G8B8A8_UNORM,
+                texels,
+                levels: vec![UploadRegion {
+                    level: 0,
+                    layer: 0,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    offset: 0,
+                }]
+                .into(),
+            },
+        };
+        renderer.bind_pool(&vec![entry(texels)].into()).unwrap();
+        assert!(
+            released.upgrade().is_none(),
+            "an old pool entry retained texels after upload"
+        );
+        // A fresh allocation containing the same effective bindings still takes
+        // the equal-list fast path after its original allocation expired.
+        renderer
+            .bind_pool(&vec![entry(Arc::default())].into())
+            .unwrap();
+        assert_eq!(renderer.stats["stat: texture pool sets unchanged"], 1);
+        renderer.bind_pool(&Arc::from([])).unwrap();
+        let reused = renderer
+            .stats
+            .get("stat: texture pool entries reused")
+            .copied()
+            .unwrap_or(0);
+        renderer
+            .bind_pool(&vec![entry(Arc::default())].into())
+            .unwrap();
+        assert_eq!(
+            renderer.stats["stat: texture pool entries reused"],
+            reused + 1
+        );
     }
 
     #[test]

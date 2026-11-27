@@ -50,26 +50,9 @@ pub struct Program {
 /// generation is unchanged).
 struct TextureMemo {
     epoch: u64,
-    upload: (u64, u64, u32, u32, ImageShape, vk::Format),
+    upload: UploadIdentity,
     sampler: Sampler,
     info: vk::DescriptorImageInfo,
-}
-
-impl TextureMemo {
-    fn upload(source: &TextureSource) -> Option<(u64, u64, u32, u32, ImageShape, vk::Format)> {
-        match *source {
-            TextureSource::Upload {
-                key,
-                generation,
-                width,
-                height,
-                shape,
-                format,
-                ..
-            } => Some((key, generation, width, height, shape, format)),
-            _ => None,
-        }
-    }
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -364,70 +347,63 @@ pub enum TextureSource {
     },
 }
 
+pub(crate) type UploadIdentity = (u64, u64, u32, u32, ImageShape, vk::Format);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextureIdentity {
+    Null,
+    Target(u64),
+    TargetView {
+        key: u64,
+        base_level: u32,
+        level_count: u32,
+        base_layer: u32,
+        layer_count: u32,
+    },
+    Upload(UploadIdentity),
+}
+
 impl TextureSource {
-    /// Whether two sources name the same texels: an upload by its key and
-    /// generation (its texels are cached under them and never compared).
-    pub(crate) fn same_as(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Target(a), Self::Target(b)) => a == b,
-            (
-                Self::TargetView {
-                    key,
-                    base_level,
-                    level_count,
-                    base_layer,
-                    layer_count,
-                },
-                Self::TargetView {
-                    key: other_key,
-                    base_level: other_base_level,
-                    level_count: other_level_count,
-                    base_layer: other_base_layer,
-                    layer_count: other_layer_count,
-                },
-            ) => {
-                (key, base_level, level_count, base_layer, layer_count)
-                    == (
-                        other_key,
-                        other_base_level,
-                        other_level_count,
-                        other_base_layer,
-                        other_layer_count,
-                    )
-            }
-            (
-                Self::Upload {
-                    key,
-                    generation,
-                    width,
-                    height,
-                    shape,
-                    format,
-                    ..
-                },
-                Self::Upload {
-                    key: other_key,
-                    generation: other_generation,
-                    width: other_width,
-                    height: other_height,
-                    shape: other_shape,
-                    format: other_format,
-                    ..
-                },
-            ) => {
-                (key, generation, width, height, shape, format)
-                    == (
-                        other_key,
-                        other_generation,
-                        other_width,
-                        other_height,
-                        other_shape,
-                        other_format,
-                    )
-            }
-            _ => false,
+    /// The image revision or subresource a descriptor names, without its
+    /// CPU-side upload bytes.
+    pub(crate) fn identity(&self) -> TextureIdentity {
+        match *self {
+            Self::Null => TextureIdentity::Null,
+            Self::Target(key) => TextureIdentity::Target(key),
+            Self::TargetView {
+                key,
+                base_level,
+                level_count,
+                base_layer,
+                layer_count,
+            } => TextureIdentity::TargetView {
+                key,
+                base_level,
+                level_count,
+                base_layer,
+                layer_count,
+            },
+            Self::Upload {
+                key,
+                generation,
+                width,
+                height,
+                shape,
+                format,
+                ..
+            } => TextureIdentity::Upload((key, generation, width, height, shape, format)),
         }
+    }
+
+    pub(crate) fn upload_identity(&self) -> Option<UploadIdentity> {
+        match self.identity() {
+            TextureIdentity::Upload(upload) => Some(upload),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
     }
 }
 
@@ -1312,7 +1288,7 @@ impl Renderer {
                             ));
                         };
                         let slot = scratch.textures.len();
-                        let upload = TextureMemo::upload(source);
+                        let upload = source.upload_identity();
                         let memoized = upload.and_then(|upload| {
                             let memo = program.texture_memo.lock().unwrap();
                             memo.get(slot)?
