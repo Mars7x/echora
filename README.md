@@ -59,7 +59,9 @@ What works today:
 What doesn't work yet:
 
 - Water and fog don't match the console yet. They are being compared
-  against real-hardware footage of the same scenes. Shader traces now
+  against real-hardware footage of the same scenes. In a matched live
+  frame, foreground water reflections have less color and a nearby leaf
+  patch exposes more brown ground. Shader traces now
   wait for GPU writes and distinguish new texture samples from values
   retained since an earlier report.
 - Gameplay past the opening scene. Around the flight through Kokiri Forest
@@ -197,6 +199,7 @@ water color comparisons use live frames. The memory trace now reports how
 many bytes the renderer holds in targets, uploads and images awaiting release.
 Tests check that finalized images stay alive until the GPU finishes and that
 flushing an idle renderer releases them without submitting another batch.
+Texture view registration validates and copies the view under the same lock.
 Speed work continues after that.
 
 ## Building

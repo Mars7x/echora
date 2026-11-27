@@ -2478,7 +2478,7 @@ fn registry_call(
         "nvnBufferInitialize" => {
             let (device, storage) = {
                 let bags = read_shared(bags.at(x[1]));
-                let builder = bag_in(&bags, x[1], "BufferBuilder").map_err(invalid)?;
+                let builder = &bag_in(&bags, x[1], "BufferBuilder").map_err(invalid)?.props;
                 let device = builder
                     .get("Device")
                     .ok_or_else(|| invalid("builder device was never set".into()))?
@@ -2613,14 +2613,9 @@ fn registry_call(
     }
 }
 
-fn bag_in<'a>(
-    bags: &'a BTreeMap<u64, Bag>,
-    address: u64,
-    kind: &str,
-) -> Result<&'a BTreeMap<String, Args>, String> {
+fn bag_in<'a>(bags: &'a BTreeMap<u64, Bag>, address: u64, kind: &str) -> Result<&'a Bag, String> {
     bags.get(&address)
         .filter(|bag| bag.kind == kind)
-        .map(|bag| &bag.props)
         .ok_or_else(|| format!("no {kind} at {address:#x}"))
 }
 
@@ -3747,8 +3742,9 @@ impl Nvn {
                 let mut entry = Args::default();
                 let (sampler, view) = match rest {
                     "RegisterSamplerBuilder" => {
-                        let props = self.bag(x[2], "SamplerBuilder").map_err(invalid)?;
-                        (Some(Self::sampler_from_properties(&props)), None)
+                        let bags = read_shared(self.bags.at(x[2]));
+                        let builder = bag_in(&bags, x[2], "SamplerBuilder").map_err(invalid)?;
+                        (Some(Self::sampler_from_properties(&builder.props)), None)
                     }
                     "RegisterSampler" => {
                         let object = self.object(x[2], "Sampler").map_err(invalid)?;
@@ -3757,8 +3753,8 @@ impl Nvn {
                     _ => {
                         self.object(x[2], "Texture").map_err(invalid)?;
                         let view = if x[3] != 0 {
-                            self.bag(x[3], "TextureView").map_err(invalid)?;
-                            Some(read_shared(self.bags.at(x[3]))[&x[3]].clone())
+                            let bags = read_shared(self.bags.at(x[3]));
+                            Some(bag_in(&bags, x[3], "TextureView").map_err(invalid)?.clone())
                         } else {
                             None
                         };
@@ -7634,7 +7630,9 @@ impl Nvn {
     }
 
     fn bag(&self, address: u64, kind: &str) -> Result<BTreeMap<String, Args>, String> {
-        bag_in(&read_shared(self.bags.at(address)), address, kind).cloned()
+        Ok(bag_in(&read_shared(self.bags.at(address)), address, kind)?
+            .props
+            .clone())
     }
 
     /// The handle workers record command buffers through without the NVN
@@ -8757,7 +8755,9 @@ fn record_command(
     if let Some(view_address) = copy_view {
         if view_address != 0 {
             let view_bags = read_shared(bags.at(view_address));
-            let view = bag_in(&view_bags, view_address, "TextureView").map_err(invalid)?;
+            let view = &bag_in(&view_bags, view_address, "TextureView")
+                .map_err(invalid)?
+                .props;
             for (index, key) in ["Levels", "Layers"].iter().enumerate() {
                 command.captured[7 + index] = view.get(*key).map_or(0, |value| value.x[0]);
             }
@@ -8771,7 +8771,9 @@ fn record_command(
             [0, 0, 0]
         } else {
             let view_bags = read_shared(bags.at(command.x[2]));
-            let view = bag_in(&view_bags, command.x[2], "TextureView").map_err(invalid)?;
+            let view = &bag_in(&view_bags, command.x[2], "TextureView")
+                .map_err(invalid)?
+                .props;
             ["Levels", "Layers", "Format"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
         };
         command.captured.extend(view);
@@ -8784,7 +8786,9 @@ fn record_command(
                 [0, 0]
             } else {
                 let view_bags = read_shared(bags.at(view));
-                let view = bag_in(&view_bags, view, "TextureView").map_err(invalid)?;
+                let view = &bag_in(&view_bags, view, "TextureView")
+                    .map_err(invalid)?
+                    .props;
                 ["Levels", "Layers"].map(|key| view.get(key).map_or(0, |value| value.x[0]))
             };
             command.captured.extend(bases);
@@ -8803,7 +8807,9 @@ fn record_command(
         for (index, view) in views.iter_mut().enumerate() {
             if *view != 0 {
                 let view_bags = read_shared(bags.at(*view));
-                let bag = bag_in(&view_bags, *view, "TextureView").map_err(invalid)?;
+                let bag = &bag_in(&view_bags, *view, "TextureView")
+                    .map_err(invalid)?
+                    .props;
                 if let (Some(format), Some(slot)) = (bag.get("Format"), formats.get_mut(index)) {
                     *slot = format.x[0];
                 }
@@ -10648,6 +10654,50 @@ mod tests {
         assert!(first.record(command, &mut guest).unwrap());
         assert_eq!(lock_shared(&replacement).commands.len(), 1);
         assert_eq!(lock_shared(&original).commands.len(), 2);
+    }
+
+    #[test]
+    fn texture_registration_captures_the_validated_view() {
+        let mut nvn = Nvn::default();
+        let (pool, texture, view) = (0x1000, 0x2000, 0x3000);
+        let storage = Args {
+            x: [0, 0, 4, 0],
+            ..Args::default()
+        };
+        nvn.initialize(
+            pool,
+            "TexturePool",
+            BTreeMap::from([("Storage".into(), storage)]),
+        )
+        .unwrap();
+        nvn.initialize(texture, "Texture", BTreeMap::new()).unwrap();
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        call(&mut nvn, &mut guest, "nvnTextureViewSetDefaults", &[view]);
+        call(&mut nvn, &mut guest, "nvnTextureViewSetFormat", &[view, 56]);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnTexturePoolRegisterTexture",
+            &[pool, 1, texture, view],
+        );
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetDefaults",
+            &[view],
+        );
+        guest.cpu.regs[..4].copy_from_slice(&[pool, 1, texture, view]);
+        assert!(
+            nvn.call("nvnTexturePoolRegisterTexture", &mut guest)
+                .is_err()
+        );
+        assert_eq!(nvn.views[&(pool, 1)].props["Format"].x[0], 56);
     }
 
     #[test]

@@ -31,6 +31,12 @@ automated test covers it).
   `ECHORA_CACHE_SIZES` reports Vulkan allocation bytes for render targets,
   uploads and images still held by command buffers. The effect on memory
   growth during the flight through Kokiri Forest still needs measurement.
+- An instrumented Radeon run reached present 10,700 and exercised 128
+  compressed texture writebacks. Forest entry allocated about 3.7 GiB
+  of additional live Vulkan images between presents 10,200 and 10,300.
+  Across the next four samples (10,400–10,700), targets and uploads stayed
+  within 16 MiB of their initial total and held no retired image bytes
+  at the sampling points. The later driver failure and memory growth remain open.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
