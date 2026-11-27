@@ -128,6 +128,16 @@ synthetic fixtures and runs without the game files.
   default uses the original sampler path. A separate route with scripted
   stick movement stayed inside Link's room through present 6,200, averaged
   10.55 FPS over its final 3,000 presents and peaked at 13,015 MiB resident.
+- Workers record commands on each command buffer independently. Publishing
+  the finished list takes the NVN lock shared with replay. A Radeon comparison
+  measured 14.08 and 14.53 FPS with locked publication on either side of a
+  13.12 FPS run that published under the command-list registry lock alone.
+  Each run used the same saved room and translated game libraries. Across
+  presents 4,200–5,200 at 2560×1440, all three averaged 721–723 draws
+  per frame. The busiest guest thread executed 44.5–45.0 million
+  instructions per frame with locked
+  publication and 61.9 million with the registry lock alone. The reason
+  the guest issued different amounts of work is still under investigation.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
