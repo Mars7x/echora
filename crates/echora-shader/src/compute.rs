@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use echora_shader_abi::{ABI_VERSION, Descriptor, Stage, Translated, Unsupported};
 
 use crate::decode::{
-    Combine, FloatCompare, FloatModes, Instruction, IntCompare, Op, Operand, Pred, Src,
+    Combine, FloatCompare, FloatModes, Instruction, IntCompare, Op, Operand, Pred, Reg, Src,
+    UniformReg,
 };
 use crate::jump_tables::JumpTargets;
 use crate::spirv::{
@@ -2043,13 +2044,13 @@ impl Emitter {
                 combine,
                 accumulate,
             } => {
-                let (a, b) = (self.float(index, a)?, self.float(index, b)?);
-                let (a, b) = if flush_to_zero {
-                    (self.flush_subnormal(a), self.flush_subnormal(b))
+                let result = if flush_to_zero {
+                    let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+                    let (a, b) = (self.flush_subnormal(a), self.flush_subnormal(b));
+                    self.float_compare(compare, a, b)
                 } else {
-                    (a, b)
+                    self.preserving_float_compare(index, compare, a, b)?
                 };
-                let result = self.float_compare(compare, a, b);
                 self.set_predicates(p, q, result, combine, accumulate);
             }
             Op::Isetp {
@@ -3457,6 +3458,121 @@ impl Emitter {
             result = self.value(op::BITWISE_OR, self.u32, &[result, term]);
         }
         result
+    }
+
+    /// FSETP without .FTZ must distinguish adjacent subnormals even when an
+    /// unrelated instruction selects DenormFlushToZero for this entry point.
+    fn preserving_float_compare(
+        &mut self,
+        index: usize,
+        compare: FloatCompare,
+        a: Operand,
+        b: Operand,
+    ) -> Result<u32, Unsupported> {
+        use FloatCompare::*;
+        // Flushing a subnormal cannot cross a known normal threshold, change
+        // an infinity comparison, or turn a number into a NaN.
+        if matches!(compare, False | True | Num | Nan)
+            || matches!(b.src, Src::Imm(bits) if bits & 0x7f80_0000 != 0)
+        {
+            let (a, b) = (self.float(index, a)?, self.float(index, b)?);
+            return Ok(self.float_compare(compare, a, b));
+        }
+        // Express each unordered relation as the complement of the opposite
+        // ordered relation; this includes every NaN in the unordered forms.
+        let (relation, invert) = match compare {
+            Lt | Geu => (IntCompare::Lt, compare == Geu),
+            Le | Gtu => (IntCompare::Le, compare == Gtu),
+            Gt | Leu => (IntCompare::Gt, compare == Leu),
+            Ge | Ltu => (IntCompare::Ge, compare == Ltu),
+            Eq | Neu => (IntCompare::Eq, compare == Neu),
+            Ne | Equ => (IntCompare::Ne, compare == Equ),
+            _ => unreachable!(),
+        };
+        let modified_bits = |e: &mut Self, operand: Operand| -> Result<u32, Unsupported> {
+            let mut bits = e.source(index, operand.src)?;
+            if operand.abs {
+                let magnitude = e.constant(0x7fff_ffff);
+                bits = e.value(op::BITWISE_AND, e.u32, &[bits, magnitude]);
+            }
+            if operand.neg {
+                let sign = e.constant(0x8000_0000);
+                bits = e.value(op::BITWISE_XOR, e.u32, &[bits, sign]);
+            }
+            Ok(bits)
+        };
+        let a = modified_bits(self, a)?;
+        let b_zero = matches!(b.src, Src::Reg(Reg::ZERO) | Src::Uniform(UniformReg::ZERO))
+            || matches!(b.src, Src::Imm(bits) if bits & 0x7fff_ffff == 0);
+        let ordered = if b_zero {
+            self.ordered_compare_to_zero(relation, a)
+        } else {
+            let b = modified_bits(self, b)?;
+            // Map sign-magnitude bits to signed integers ordered like the
+            // numbers. A negative value with magnitude m maps to -m,
+            // including -0 mapping to the same key as +0.
+            let key = |e: &mut Self, bits| {
+                let sign = e.constant(0x8000_0000);
+                let zero = e.constant(0);
+                let negative = e.value(op::S_LESS_THAN, e.bool, &[bits, zero]);
+                let negated = e.value(op::I_SUB, e.u32, &[sign, bits]);
+                e.value(op::SELECT, e.u32, &[negative, negated, bits])
+            };
+            let (ka, kb) = (key(self, a), key(self, b));
+            let cmp = self.int_compare(relation, true, ka, kb);
+            // Dropping the sign bits orders magnitudes as unsigned integers.
+            // Either NaN makes the larger magnitude exceed infinity.
+            let mask = self.constant(0x7fff_ffff);
+            let abs_a = self.value(op::BITWISE_AND, self.u32, &[a, mask]);
+            let abs_b = self.value(op::BITWISE_AND, self.u32, &[b, mask]);
+            let max = self.glsl(self.u32, glsl::U_MAX, &[abs_a, abs_b]);
+            let inf = self.constant(f32::INFINITY.to_bits());
+            let numbers = self.value(op::U_LESS_THAN_EQUAL, self.bool, &[max, inf]);
+            self.value(op::LOGICAL_AND, self.bool, &[numbers, cmp])
+        };
+        Ok(if invert {
+            self.value(op::LOGICAL_NOT, self.bool, &[ordered])
+        } else {
+            ordered
+        })
+    }
+
+    /// Against zero, the nonzero positives and negatives are each a
+    /// contiguous range of encodings up to and including infinity.
+    fn ordered_compare_to_zero(&mut self, relation: IntCompare, bits: u32) -> u32 {
+        use IntCompare::*;
+        let zero = self.constant(0);
+        let inf = self.constant(f32::INFINITY.to_bits());
+        match relation {
+            Eq | Ne => {
+                let mask = self.constant(0x7fff_ffff);
+                let mag = self.value(op::BITWISE_AND, self.u32, &[bits, mask]);
+                if relation == Eq {
+                    self.value(op::I_EQUAL, self.bool, &[mag, zero])
+                } else {
+                    let one = self.constant(1);
+                    let offset = self.value(op::I_SUB, self.u32, &[mag, one]);
+                    self.value(op::U_LESS_THAN, self.bool, &[offset, inf])
+                }
+            }
+            Lt | Gt => {
+                let first = self.constant(if relation == Lt { 0x8000_0001 } else { 1 });
+                let offset = self.value(op::I_SUB, self.u32, &[bits, first]);
+                self.value(op::U_LESS_THAN, self.bool, &[offset, inf])
+            }
+            Le | Ge => {
+                let sign = self.constant(0x8000_0000);
+                let (offset, other_zero) = if relation == Le {
+                    (self.value(op::BITWISE_XOR, self.u32, &[bits, sign]), zero)
+                } else {
+                    (bits, sign)
+                };
+                let in_range = self.value(op::U_LESS_THAN_EQUAL, self.bool, &[offset, inf]);
+                let other = self.value(op::I_EQUAL, self.bool, &[bits, other_zero]);
+                self.value(op::LOGICAL_OR, self.bool, &[in_range, other])
+            }
+            False | True => unreachable!(),
+        }
     }
 
     fn float_compare(&mut self, compare: FloatCompare, a: u32, b: u32) -> u32 {

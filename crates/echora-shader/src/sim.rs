@@ -8659,6 +8659,72 @@ mod tests {
     }
 
     #[test]
+    fn preserving_fsetp_survives_a_flushing_entry_point_or_device() {
+        // FMUL.FTZ.DNZ in the same program can select a flush mode for the
+        // entire entry point, independently of the following FSETP.
+        let dnz = word(&[
+            (0, 12, 0x220),
+            (16, 8, 4),
+            (24, 8, 0),
+            (32, 8, 1),
+            (76, 1, 1),
+            (80, 1, 1),
+            (84, 3, 4),
+        ]);
+        let cmp = |opcode, b, code, modifiers| {
+            word(&[
+                (0, 12, opcode),
+                (24, 8, 0),
+                (32, 32, b),
+                (72, 2, modifiers),
+                (76, 4, code),
+                (81, 3, 0),
+                (84, 3, 7),
+                (87, 3, 7),
+            ])
+        };
+        for (bits, other, op, b, code, modifiers, expected) in [
+            (1, 0, 0x20b, 1, 4, 0, true),                     // +min > +0
+            (0x8000_0002, 0x8000_0001, 0x20b, 1, 1, 0, true), // -2 ulp < -1 ulp
+            (0x007f_ffff, 0x0080_0000, 0x20b, 1, 1, 0, true),
+            (1, 0, 0x20b, 255, 2, 0, false),         // RZ
+            (0x8000_0001, 0, 0x80b, 0, 4, 2, true),  // |-min| > 0
+            (1, 0, 0x80b, 0, 1, 1, true),            // -min < 0
+            (0x8000_0000, 0, 0x80b, 0, 2, 0, true),  // -0 == +0
+            (0x7f80_0001, 0, 0x80b, 0, 12, 0, true), // NaN GTU 0
+        ] {
+            let code = [
+                mov(0, bits),
+                mov(1, other),
+                dnz,
+                cmp(op, b, code, modifiers),
+                EXIT,
+            ]
+            .map(decode);
+            for declared in [false, true] {
+                let layout = Layout {
+                    denorm_flush_32: declared,
+                    ..Layout::workgroup([1, 1, 1])
+                };
+                let (translated, _, predicates) = translate_with_registers(&code, &layout).unwrap();
+                let machine = Machine::new(&translated.spirv);
+                assert_eq!(machine.declared_flush32, declared);
+                let report = machine.simulate(&Inputs {
+                    workgroup_count: [1; 3],
+                    flush_denormals32: !declared,
+                    ..Inputs::default()
+                });
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                assert_eq!(
+                    report.invocations[0][&predicates[&0]][0] != 0,
+                    expected,
+                    "{bits:#x} vs {other:#x}, declared flush {declared}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn float_compares_follow_all_sixteen_codes_with_nan_and_ftz() {
         let specials = [
             0.0f32,
@@ -8685,11 +8751,11 @@ mod tests {
                 for &right in &specials {
                     let (a, b) = (operand(left), operand(right));
                     for code in 0..16u32 {
-                        // FSETP.code.AND P0, PT, R0, R1, PT.
+                        // Both RZ and dynamic operands, including register -0.
                         let fsetp = word(&[
                             (0, 12, 0x20b),
                             (24, 8, 0),
-                            (32, 8, 1),
+                            (32, 8, if right.to_bits() == 0 { 255 } else { 1 }),
                             (76, 4, u128::from(code)),
                             (80, 1, u128::from(flush)),
                             (81, 3, 0),
