@@ -78,6 +78,14 @@ automated test covers it).
   resident memory reached 15,078 MiB shortly after present 6,100. The test
   watchdog terminated the process at its 14,336 MiB limit. Its junction
   temperature was 38°C. The earlier black-screen failure remains open.
+- Large single-plane depth textures stream through the upload ring. On a
+  saved Kokiri Forest route, the 12,288×12,288 D16 shadow texture used
+  bounded transfers for all 288 MiB. After this and the texture-cache
+  lifetime fixes, peak resident memory through the matching 1440p capture
+  at present 3,200 was 11,789 MiB, down from 12,290 MiB in the control.
+  The patched headless run exited normally at present 6,200, peaked at
+  12,594 MiB and averaged 14.0 FPS from presents 3,200 to 6,200. The
+  scripted inputs cover a different path from the interactive session.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
