@@ -1533,7 +1533,7 @@ impl Renderer {
         self.slot.fence
     }
 
-    /// Gate draws, dispatches and attachment clears on the 32-bit
+    /// Gate draws and attachment clears on the 32-bit
     /// word at `offset` in `buffer` (the guest memory's device copy): they
     /// run while it is nonzero, or zero when `inverted`; None: always.
     /// The GPU reads the word in place, as the console reads a render
@@ -1571,7 +1571,7 @@ impl Renderer {
     }
 
     /// Begin the wanted condition if it is not active (before recording a
-    /// draw, attachment clear or dispatch, inside a rendering pass or outside any):
+    /// draw or attachment clear, inside a rendering pass or outside any):
     /// one begun inside a pass ends with it.
     pub(crate) fn apply_condition(&mut self) -> Result<(), String> {
         let Some((buffer, offset, inverted)) = self.condition else {

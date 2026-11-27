@@ -74,6 +74,9 @@ impl Renderer {
     /// buffer it writes, the token of its contents after the next flush
     /// (`take_reads`).
     pub fn dispatch_deferred(&mut self, dispatch: &Dispatch) -> Result<Vec<(u32, u64)>, String> {
+        // NVN's render enable gates 3D work. Vulkan also predicates dispatches,
+        // so leave its active scope and keep the wanted predicate for the next draw.
+        self.end_condition();
         // Storage images are written at the guest's coordinates: their
         // targets stay unscaled (before recording: that may flush).
         for image in dispatch.images.values() {
@@ -273,7 +276,7 @@ impl Renderer {
         let gpu = unsafe { self.detached_gpu() };
         let objects = gpu.shader_objects()?;
         // The group counts an indirect dispatch reads, bounded by the
-        // device's limit on the GPU (`mesh_count`), before the condition.
+        // device's limit on the GPU (`mesh_count`).
         let indirect = match dispatch.indirect {
             Some(source) => {
                 let (ring, at) = self.ring_upload(&[0; 12], 16)?;
@@ -290,10 +293,7 @@ impl Renderer {
             }
             None => None,
         };
-        // Gated on the guest's render condition, as the hardware gates
-        // compute too.
         let commands = self.commands()?;
-        self.apply_condition()?;
         // Compute can overwrite images and buffers that earlier work wrote.
         // Publish those writes to shader writes as well as shader reads.
         let before = vk::MemoryBarrier::default()
@@ -1237,6 +1237,40 @@ mod tests {
             results[&1],
             [0xaa, 0xaa, 0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12]
         );
+        if renderer.supports_conditions() {
+            let (predicate, _) = renderer.resident_buffer(1, 16).unwrap();
+            renderer.fill_resident(1, 0, 16, 0).unwrap();
+            let (groups, _) = renderer.resident_buffer(2, 16).unwrap();
+            renderer.fill_resident(2, 0, 16, 1).unwrap();
+            renderer.target(3, 1, 1, vk::Format::R32_UINT).unwrap();
+            let clear = |renderer: &mut Renderer, value| {
+                renderer
+                    .clear_color(3, None, vk::ClearColorValue { uint32: [value; 4] })
+                    .unwrap();
+            };
+            clear(&mut renderer, 7);
+            renderer.set_condition(Some((predicate, 0, false)));
+            let mut tokens = Vec::new();
+            for indirect in [None, Some((groups, 0))] {
+                clear(&mut renderer, 9); // Starts a false rendering scope.
+                dispatch.indirect = indirect;
+                let pending = renderer.dispatch_deferred(&dispatch).unwrap();
+                assert_eq!(pending.len(), 1);
+                tokens.push(pending[0].1);
+            }
+            clear(&mut renderer, 11);
+            assert_eq!(
+                renderer.read_target_bytes(3, 4).unwrap(),
+                7_u32.to_le_bytes()
+            );
+            let results = renderer.take_reads(&tokens);
+            for token in tokens {
+                assert_eq!(
+                    results[&token],
+                    [0xaa, 0xaa, 0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12]
+                );
+            }
+        }
         renderer.destroy_program(program).unwrap();
     }
 

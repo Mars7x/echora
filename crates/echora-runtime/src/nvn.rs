@@ -957,7 +957,7 @@ pub struct RenderState {
     pub scissor: Option<[i32; 4]>,
     /// SetRenderEnable(false) (`Some((2, 0))`) or
     /// SetRenderEnableConditional(mode, address) (`Some((mode, address))`):
-    /// draws, clears and dispatches run only while it holds (`render_enabled`).
+    /// draws and 3D clears run only while it holds (`render_enabled`).
     pub render_enable: Option<(u64, u64)>,
     /// The current queue's predicate is being evaluated by the GPU.
     gpu_render_condition: bool,
@@ -5633,7 +5633,7 @@ impl Nvn {
                 return Ok(());
             }
             name if (name.starts_with("nvnCommandBufferDraw")
-                || name.starts_with("nvnCommandBufferDispatch")
+                || name.starts_with("nvnCommandBufferMultiDraw")
                 || name.starts_with("nvnCommandBufferClear"))
                 && name != "nvnCommandBufferClearBuffer"
                 && !self
@@ -9410,6 +9410,7 @@ mod tests {
             command("nvnCommandBufferSetTexturePool", [0, 3, 0, 0, 0, 0, 0, 0]),
             command("nvnCommandBufferSetSamplerPool", [0, 4, 0, 0, 0, 0, 0, 0]),
             command("nvnCommandBufferBindImage", [0, 5, 0, output, 0, 0, 0, 0]),
+            command("nvnCommandBufferSetRenderEnable", [0; 8]),
         ] {
             nvn.execute(&bind, &mut guest).unwrap();
         }
@@ -9426,7 +9427,7 @@ mod tests {
             );
             nvn.execute(&bind, &mut guest).unwrap();
             let dispatch = command("nvnCommandBufferDispatchCompute", [0, 1, 1, 1, 0, 0, 0, 0]);
-            nvn.gpu_dispatch(&mut guest, &dispatch).unwrap();
+            nvn.execute(&dispatch, &mut guest).unwrap();
             let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
             assert_eq!(
                 renderer.read_target_bytes(output, 4).unwrap(),
