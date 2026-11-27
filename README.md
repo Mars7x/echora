@@ -207,6 +207,9 @@ Texture view registration validates and copies the view under the same lock.
 To trace the missing ground cover, the draw log records the first instance
 and instance count of indexed instanced draws. A pixel watch can follow one
 texel through a single frame while transferring only that texel to the CPU.
+A matched capture of the fairy beside the wooden sign now shows the pale
+core seen on console. A replay of its two shaders traced the earlier red
+output to a vertex component the producer never wrote.
 Speed work continues after that.
 
 ## Building

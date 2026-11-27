@@ -46,6 +46,7 @@ pub(crate) struct ResolvedEntry {
     sampler_state: Sampler,
     wanted: Vec<(u32, u32, u64)>,
     numeric: u32,
+    view_mask: u32,
 }
 
 pub(crate) struct TexturePool {
@@ -58,6 +59,8 @@ pub(crate) struct TexturePool {
     /// What each written (binding, index) holds: a view's or sampler's
     /// raw handle.
     written: FastMap<(u32, u32), u64>,
+    /// Sampled-image bindings currently populated at each texture index.
+    view_masks: FastMap<u32, u32>,
     /// The slots containing each image view, for retirement by handle.
     view_slots: FastMap<u64, Vec<(u32, u32)>>,
     /// Last batch that bound this set. Its draws may access any descriptor
@@ -132,6 +135,12 @@ impl TexturePool {
             }
             if handle != 0 {
                 self.view_slots.entry(handle).or_default().push(slot);
+                *self.view_masks.entry(index).or_default() |= 1 << array;
+            } else if let Some(mask) = self.view_masks.get_mut(&index) {
+                *mask &= !(1 << array);
+                if *mask == 0 {
+                    self.view_masks.remove(&index);
+                }
             }
         }
     }
@@ -282,6 +291,7 @@ impl Renderer {
             numeric: FastMap::default(),
             default_samplers,
             written: FastMap::default(),
+            view_masks: FastMap::default(),
             view_slots: FastMap::default(),
             last_use: 0,
         })
@@ -367,7 +377,7 @@ impl Renderer {
         // (binding, index, view or sampler) for every entry, resolved
         // before the set is touched (views can upload).
         let mut wanted: Vec<(u32, u32, u64)> = Vec::new();
-        let mut kinds: Vec<(u32, u32)> = Vec::new();
+        let mut kinds = Vec::new();
         let mut targets = Vec::new();
         for entry in entries.iter() {
             if entry.texture >= TEXTURE_POOL_CAPACITY || entry.sampler >= SAMPLER_POOL_CAPACITY {
@@ -384,7 +394,7 @@ impl Renderer {
                 && memo.source.same_as(&entry.source)
             {
                 wanted.extend_from_slice(&memo.wanted);
-                kinds.push((entry.texture, memo.numeric));
+                kinds.push((entry.texture, memo.numeric, memo.view_mask));
                 self.stat("stat: texture pool entries reused", 1);
                 continue;
             }
@@ -407,7 +417,7 @@ impl Renderer {
                 ));
                 self.stat("stat: texture pool integer entries", 1);
             }
-            kinds.push((entry.texture, numeric));
+            let mut view_mask = 0;
             for (kind, array) in arrays(shape, integer) {
                 // A type the texture has no view of stays null.
                 let Ok(view) =
@@ -416,13 +426,16 @@ impl Renderer {
                     continue;
                 };
                 wanted.push((array, entry.texture, view.as_raw()));
+                view_mask |= 1 << array;
             }
+            kinds.push((entry.texture, numeric, view_mask));
             if upload {
                 let resolved = ResolvedEntry {
                     source: entry.source.clone(),
                     sampler_state: entry.sampler_state,
                     wanted: wanted[first..].to_vec(),
                     numeric,
+                    view_mask,
                 };
                 self.pool_entry_memo
                     .insert((entry.texture, entry.sampler), resolved);
@@ -434,6 +447,15 @@ impl Renderer {
             }
         }
         let pool = self.texture_pool.as_ref().unwrap();
+        // A guest descriptor replaces the entire texture, including views of
+        // the previous shape or numeric class that the new image cannot supply.
+        for &(index, _, view_mask) in &kinds {
+            let mut removed = pool.view_masks.get(&index).copied().unwrap_or(0) & !view_mask;
+            while removed != 0 {
+                wanted.push((removed.trailing_zeros(), index, 0));
+                removed &= removed - 1;
+            }
+        }
         let changed: Vec<(u32, u32, u64)> = wanted
             .into_iter()
             .filter(|(array, index, handle)| pool.written.get(&(*array, *index)) != Some(handle))
@@ -442,6 +464,7 @@ impl Renderer {
             .collect();
         let flips: Vec<(u32, u32)> = kinds
             .into_iter()
+            .map(|(index, numeric, _)| (index, numeric))
             .filter(|(index, numeric)| {
                 pool.numeric.get(index).copied().unwrap_or_default() != *numeric
             })
@@ -813,6 +836,40 @@ mod tests {
                 assert_eq!(actual, expected, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn rebinding_a_texture_slot_clears_views_of_its_previous_type() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        if gpu.texture_pool_layout.is_none() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        renderer
+            .target(7, 4, 4, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        renderer.target(8, 4, 4, vk::Format::R32_UINT).unwrap();
+        let entry = |texture, key| PoolEntry {
+            texture,
+            sampler: 1,
+            source: TextureSource::Target(key),
+            sampler_state: Sampler::default(),
+        };
+        renderer
+            .bind_pool(&vec![entry(1, 7), entry(2, 7)].into())
+            .unwrap();
+        renderer.bind_pool(&vec![entry(1, 8)].into()).unwrap();
+        let pool = renderer.texture_pool.as_ref().unwrap();
+        assert!(pool.written.contains_key(&(binding::UINT_2D, 1)));
+        assert!(!pool.written.contains_key(&(binding::SAMPLED_2D, 1)));
+        assert!(!pool.written.contains_key(&(binding::SAMPLED_2D_ARRAY, 1)));
+        assert!(pool.written.contains_key(&(binding::SAMPLED_2D, 2)));
+        renderer.bind_pool(&vec![entry(1, 7)].into()).unwrap();
+        let pool = renderer.texture_pool.as_ref().unwrap();
+        assert!(!pool.written.contains_key(&(binding::UINT_2D, 1)));
+        assert!(pool.written.contains_key(&(binding::SAMPLED_2D, 1)));
     }
 
     #[test]

@@ -14,6 +14,10 @@ automated test covers it).
   scene targets. The adaptive path used 854×480 targets in the sampled scene.
   Water color and temporal stability still need verification. Unimplemented
   operations can stop the run and produce a report.
+- Sampled views inherit the texture’s channel mapping until the guest sets
+  an explicit mapping on the view. Rebinding a bindless texture slot clears
+  image views left by the previous texture’s shape or numeric type. A Vulkan
+  regression checks a float-to-integer replacement and the neighboring slot.
 - Finalizing a texture removes its texel buffer and alternate 1D, 3D and
   array images from the lookup caches. Pending GPU commands retain their
   resources until completion. Vulkan tests cover both retirement and a

@@ -3999,7 +3999,7 @@ impl Nvn {
     /// Vulkan sampler for every texture paired with it).
     fn binding_sampler(&self, handle: u64, texture: u64, source: &TextureSource) -> Sampler {
         let mut sampler = self.handle_sampler(handle);
-        sampler.components = self.handle_components(handle);
+        sampler.components = self.handle_components(handle, texture);
         sampler.format = self.handle_view_format(handle);
         // A separate texture can name the same render storage in the other
         // color space even when the descriptor has no explicit view format.
@@ -4072,8 +4072,8 @@ impl Nvn {
     /// swizzle values 0 ZERO, 1 ONE, 2..5 R, G, B, A (2, 3, 4, 5 is the
     /// identity; inferred from the application's views, which use that and
     /// 4, 3, 2, 5).
-    fn handle_components(&self, handle: u64) -> vk::ComponentMapping {
-        let Some(swizzle) = self.handle_swizzle(handle) else {
+    fn handle_components(&self, handle: u64, texture: u64) -> vk::ComponentMapping {
+        let Some(swizzle) = self.handle_swizzle(handle, texture) else {
             return vk::ComponentMapping::default();
         };
         let component = |value: u64, identity: vk::ComponentSwizzle| match value {
@@ -4106,13 +4106,16 @@ impl Nvn {
         }
     }
 
-    /// The swizzle (R, G, B, A sources) the texture view registered with
-    /// a handle sets, if any.
-    fn handle_swizzle(&self, handle: u64) -> Option<[u64; 4]> {
-        let pool = self.render.state.get("SetTexturePool")?.x[1];
-        let view = self.render_texture_view(pool, (handle & 0xf_ffff) as u32)?;
-        let swizzle = view.props.get("Swizzle")?;
-        Some([swizzle.x[0], swizzle.x[1], swizzle.x[2], swizzle.x[3]])
+    /// An explicit view mapping overrides the texture's creation-time mapping,
+    /// including when the view explicitly restores the identity mapping.
+    fn handle_swizzle(&self, handle: u64, texture: u64) -> Option<[u64; 4]> {
+        self.render
+            .state
+            .get("SetTexturePool")
+            .and_then(|pool| self.render_texture_view(pool.x[1], (handle & 0xf_ffff) as u32))
+            .and_then(|view| view.props.get("Swizzle"))
+            .or_else(|| self.objects.get(&texture)?.builder.get("Swizzle"))
+            .map(|swizzle| swizzle.x)
     }
 
     /// A render target sampled through a handle whose view selects array
@@ -6771,11 +6774,10 @@ impl Nvn {
                     let started = std::time::Instant::now();
                     let (source, _) = self.resolve_sampled_texture(core, texture)?;
                     let source = self.through_view(source, handle);
-                    if let Some(swizzle) = self.handle_swizzle(handle) {
-                        if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
-                            let note = format!("flow view swizzle {swizzle:?} on {texture:x}");
-                            self.gpu_note(note);
-                        }
+                    if super::debug_var_os("ECHORA_GPU_FLOW").is_some()
+                        && let Some(swizzle) = self.handle_swizzle(handle, texture)
+                    {
+                        self.gpu_note(format!("flow view swizzle {swizzle:?} on {texture:x}"));
                     }
                     self.gpu.as_mut().unwrap().stat(
                         "stat: dispatch texture microseconds",
@@ -11308,12 +11310,12 @@ impl Nvn {
                                 texture_time += started.elapsed();
                             }
                             let source = self.through_view(source, handle);
-                            if let Some(swizzle) = self.handle_swizzle(handle) {
-                                if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some() {
-                                    let note =
-                                        format!("flow view swizzle {swizzle:?} on {texture:x}");
-                                    self.gpu_note(note);
-                                }
+                            if draw_var_os(switches, "ECHORA_GPU_FLOW").is_some()
+                                && let Some(swizzle) = self.handle_swizzle(handle, texture)
+                            {
+                                self.gpu_note(format!(
+                                    "flow view swizzle {swizzle:?} on {texture:x}"
+                                ));
                             }
                             let sampler = self.binding_sampler(handle, texture, &source);
                             let sample_type = self.remember_binding(
@@ -14704,6 +14706,60 @@ mod target_tests {
         let texels = upload(&mut nvn, &mut guest);
         assert_eq!(texels[..4], [0; 4]);
         assert_eq!(texels[0x2100..0x2104], blue);
+    }
+
+    #[test]
+    fn sampled_view_inherits_texture_channels_until_it_overrides_them() {
+        use super::{TextureSource, vk::ComponentSwizzle as C};
+        let mut nvn = Nvn::default();
+        let (pool, texture, handle) = (1, 2, 3);
+        nvn.initialize(
+            texture,
+            "Texture",
+            BTreeMap::from([(
+                "Swizzle".into(),
+                Args {
+                    x: [4, 3, 2, 1],
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        nvn.render.state.insert(
+            "SetTexturePool",
+            Command {
+                name: "nvnCommandBufferSetTexturePool",
+                x: [0, pool, 0, 0, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+        );
+        let components = |nvn: &Nvn| {
+            let c = nvn
+                .binding_sampler(handle, texture, &TextureSource::Target(texture))
+                .components;
+            [c.r, c.g, c.b, c.a]
+        };
+        assert_eq!(components(&nvn), [C::B, C::G, C::R, C::ONE]);
+        let view = crate::nvn::Bag {
+            kind: "TextureView".into(),
+            ..Default::default()
+        };
+        nvn.views.insert((pool, handle as u32), view);
+        assert_eq!(components(&nvn), [C::B, C::G, C::R, C::ONE]);
+        nvn.views
+            .get_mut(&(pool, handle as u32))
+            .unwrap()
+            .props
+            .insert(
+                "Swizzle".into(),
+                Args {
+                    x: [2, 3, 4, 5],
+                    ..Default::default()
+                },
+            );
+        assert_eq!(components(&nvn), [C::IDENTITY; 4]);
     }
 
     #[test]
