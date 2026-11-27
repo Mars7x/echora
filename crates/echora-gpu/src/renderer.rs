@@ -1712,27 +1712,12 @@ impl Renderer {
             unsafe { device.create_buffer(&info, None) }.map_err(vk_error("vkCreateBuffer"))?;
         // SAFETY: the buffer is live.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory = match self.allocate_with(
+        let allocation = self.allocate_with(
             requirements,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             addressable,
-        ) {
-            Ok(memory) => memory,
-            Err(error) => {
-                // SAFETY: the new buffer was never bound or used.
-                unsafe { device.destroy_buffer(buffer, None) };
-                return Err(error);
-            }
-        };
-        // SAFETY: both handles are new and the allocation matches the requirements.
-        if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-            // SAFETY: neither resource has been exposed to a command.
-            unsafe {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
-            }
-            return Err(vk_error("vkBindBufferMemory")(error));
-        }
+        );
+        let memory = self.bind_new_buffer(buffer, allocation)?;
         self.retire_resident_buffer(key);
         self.resident.insert(key, (buffer, memory, size));
         Ok((buffer, true))
@@ -8924,6 +8909,34 @@ impl Renderer {
         self.host_buffer_with(size, usage, false)
     }
 
+    /// Bind a freshly created buffer. If allocation or binding fails, release
+    /// the unpublished handles before returning the original error.
+    fn bind_new_buffer(
+        &self,
+        buffer: vk::Buffer,
+        allocation: Result<vk::DeviceMemory, String>,
+    ) -> Result<vk::DeviceMemory, String> {
+        let device = self.device();
+        let memory = match allocation {
+            Ok(memory) => memory,
+            Err(error) => {
+                // SAFETY: the buffer has never been bound or used.
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+        // SAFETY: the allocation matches this buffer's memory requirements.
+        if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: neither resource has been exposed to a command.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(vk_error("vkBindBufferMemory")(error));
+        }
+        Ok(memory)
+    }
+
     /// `host_buffer`, with a device address when `addressable`.
     #[track_caller]
     pub(crate) fn host_buffer_with(
@@ -8948,21 +8961,27 @@ impl Renderer {
         // PCIe-mapped) memory are an order of magnitude slower.
         let coherent =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let memory = self
+        let allocation = self
             .allocate_with(
                 requirements,
                 coherent | vk::MemoryPropertyFlags::HOST_CACHED,
                 addressable,
             )
-            .or_else(|_| self.allocate_with(requirements, coherent, addressable))?;
-        // SAFETY: fresh buffer and memory; mapped for the buffer's lifetime.
-        let mapped = unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .map_err(vk_error("vkBindBufferMemory"))?;
-            device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(vk_error("vkMapMemory"))?
+            .or_else(|_| self.allocate_with(requirements, coherent, addressable));
+        let memory = self.bind_new_buffer(buffer, allocation)?;
+        // SAFETY: fresh bound host-visible memory, mapped for the buffer's life.
+        let mapped = match unsafe {
+            device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                // SAFETY: the mapping failed and no command uses the new buffer.
+                unsafe {
+                    device.destroy_buffer(buffer, None);
+                    device.free_memory(memory, None);
+                }
+                return Err(vk_error("vkMapMemory")(error));
+            }
         };
         Ok(HostBuffer {
             buffer,
@@ -10214,6 +10233,23 @@ mod tests {
                 .read_bytes(expected.len()),
             expected,
         );
+    }
+
+    #[test]
+    fn a_failed_host_buffer_allocation_can_be_retried() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let types = renderer.memory_types;
+        renderer.memory_types.memory_type_count = 0;
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC;
+        assert!(renderer.host_buffer(64, usage).is_err());
+        renderer.memory_types = types;
+        let mut buffer = renderer.host_buffer(64, usage).unwrap();
+        buffer.write(32, &[6, 5, 4]);
+        assert_eq!(buffer.slice_mut(32, 3), &[6, 5, 4]);
+        buffer.destroy(&renderer.gpu.device);
     }
 
     #[test]
