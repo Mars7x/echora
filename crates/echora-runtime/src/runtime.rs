@@ -3184,8 +3184,7 @@ impl Machine {
                     self.profile_instructions = self.thread_instructions();
                     self.pc_samples.clear();
                     self.services.reset_profile();
-                    self.nvn.calls.clear();
-                    self.nvn.call_microseconds.clear();
+                    self.nvn.reset_call_profile();
                     self.nvn.replay_microseconds.clear();
                     self.nvn.reset_gpu_stats();
                     crate::host_profile::restart();

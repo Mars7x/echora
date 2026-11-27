@@ -2550,13 +2550,20 @@ impl Nvn {
         if !self.presented_frames.is_multiple_of(every) {
             return;
         }
-        let commands = self.command_list_commands;
-        let captured: usize = self
-            .command_lists
-            .values()
-            .flat_map(|list| list.commands.iter())
-            .map(|command| command.captured.len() * 8 + command.states.len() * 512)
-            .sum();
+        let (commands, captured, list_count) = {
+            let lists = self.lists.lock();
+            let captured: usize = lists
+                .command_lists
+                .values()
+                .flat_map(|list| list.commands.iter())
+                .map(|command| command.captured.len() * 8 + command.states.len() * 512)
+                .sum();
+            (
+                lists.command_list_commands,
+                captured,
+                lists.command_lists.len(),
+            )
+        };
         let mut line = format!(
             "present {} objects {} bags {} views {} finalized {} images {} lists {} commands {commands} captured~{}MB recording {}",
             self.presented_frames,
@@ -2565,7 +2572,7 @@ impl Nvn {
             self.views.len(),
             self.finalized_storage.len(),
             self.images.len(),
-            self.command_lists.len(),
+            list_count,
             captured >> 20,
             super::read_shared(&self.recording)
                 .values()

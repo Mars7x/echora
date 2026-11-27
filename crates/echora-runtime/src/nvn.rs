@@ -282,6 +282,52 @@ impl CommandList {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct SharedCommandLists(std::sync::Arc<std::sync::Mutex<CommandLists>>);
+
+impl SharedCommandLists {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CommandLists> {
+        lock_shared(&self.0)
+    }
+}
+
+impl Serialize for SharedCommandLists {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.lock().serialize(serializer)
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CommandLists {
+    // Successful worker publications otherwise bypass the NVN call counters.
+    #[serde(skip)]
+    worker_ends: u64,
+    #[serde(skip)]
+    worker_end_micros: u64,
+    /// Finished command lists by NVNcommandHandle, with the order of their
+    /// last recording or submission.
+    #[serde(skip)]
+    command_lists: FastMap<u64, CommandList>,
+    /// Valid handles whose recorded lists are outside the replay cache.
+    #[serde(skip)]
+    archived_lists: FastMap<u64, ArchivedList>,
+    restored_command_lists: u64,
+    /// Recent (clock, handle) entries, oldest first, separated by list
+    /// size so the command limit can skip short lists in constant time.
+    #[serde(skip)]
+    command_list_use: [VecDeque<(u64, u64)>; 2],
+    /// The command buffer that recorded each live or archived handle.
+    #[serde(skip)]
+    list_recorders: FastMap<u64, u64>,
+    /// Lists archived under replay cache pressure (`COMMAND_LIST_LIMIT`,
+    /// `COMMAND_LIMIT`) while still valid.
+    pub capped_command_lists: u64,
+    command_list_clock: u64,
+    /// Commands in `command_lists`.
+    command_list_commands: usize,
+    next_command_handle: u64,
+}
+
 /// A descriptor registration, with the sampler or texture view state
 /// captured when it was registered.
 #[derive(Debug)]
@@ -629,30 +675,11 @@ pub struct Nvn {
     /// without the NVN state's lock (see `Registry`). Buffers live only here.
     #[serde(skip)]
     registry: SharedRegistry,
-    /// Finished command lists by NVNcommandHandle, with the order of their
-    /// last recording or submission.
-    #[serde(skip)]
-    command_lists: FastMap<u64, CommandList>,
-    /// Valid handles whose recorded lists are outside the replay cache.
-    #[serde(skip)]
-    archived_lists: FastMap<u64, ArchivedList>,
-    restored_command_lists: u64,
-    /// Recent (clock, handle) entries, oldest first, separated by list
-    /// size so the command limit can skip short lists in constant time.
-    #[serde(skip)]
-    command_list_use: [VecDeque<(u64, u64)>; 2],
-    /// The command buffer that recorded each live or archived handle.
-    #[serde(skip)]
-    list_recorders: FastMap<u64, u64>,
-    /// Lists archived under replay cache pressure (`COMMAND_LIST_LIMIT`,
-    /// `COMMAND_LIMIT`) while still valid.
-    pub capped_command_lists: u64,
-    command_list_clock: u64,
-    /// Commands in `command_lists`.
-    command_list_commands: usize,
+    /// List publication is independent of the renderer and its pending work.
+    #[serde(flatten)]
+    lists: SharedCommandLists,
     /// Submissions of command handles no longer kept (skipped).
     pub stale_command_submissions: u64,
-    next_command_handle: u64,
     /// Host images of textures that have been rendered to.
     #[serde(skip)]
     images: BTreeMap<u64, Image>,
@@ -1153,7 +1180,7 @@ fn big_vertex_bind(commands: &[Command]) -> Option<(u64, u64, u64)> {
         .map(|command| (command.x[1], command.x[2], command.x[3]))
 }
 
-impl Nvn {
+impl CommandLists {
     /// The kept lists by the command buffer that recorded them (the 16 that
     /// hold the most captured bytes): lists, commands, captured bytes.
     fn kept_lists_by_buffer(&self) -> Vec<(String, u64, u64, u64)> {
@@ -1375,10 +1402,44 @@ impl Nvn {
     }
 }
 
-impl Nvn {
+impl CommandLists {
+    fn publish(
+        &mut self,
+        this: u64,
+        place: Option<u64>,
+        commands: Vec<Command>,
+        present: Option<u64>,
+    ) -> (u64, std::sync::Arc<Vec<Command>>) {
+        self.next_command_handle += 1;
+        let handle = 0x4e56_0000_0000_0000
+            | place.map_or(self.next_command_handle, |place| {
+                0x8000_0000_0000 | (place & 0x7fff_ffff_ffff)
+            });
+        // The list recorded there before is replaced.
+        self.archived_lists.remove(&handle);
+        if let Some(old) = self.command_lists.remove(&handle) {
+            self.command_list_commands -= old.commands.len();
+            release_list(old.commands);
+        }
+        self.list_recorders.insert(handle, this);
+        self.command_list_clock += 1;
+        self.command_list_commands += commands.len();
+        let list = CommandList::new(commands, self.command_list_clock);
+        let small = list.small;
+        let commands = list.commands.clone();
+        self.command_lists.insert(handle, list);
+        self.note_command_list_use(handle, small);
+        self.trim_command_lists(COMMAND_LIST_LIMIT, COMMAND_LIMIT, present);
+        (handle, commands)
+    }
+
     /// A list run again (submitted or called): most recently used, and
     /// counted as reused (the resource cap's second chance).
-    fn use_command_list(&mut self, handle: u64) -> Option<std::sync::Arc<Vec<Command>>> {
+    fn use_command_list(
+        &mut self,
+        handle: u64,
+        present: u64,
+    ) -> Option<std::sync::Arc<Vec<Command>>> {
         let restored = !self.command_lists.contains_key(&handle);
         let list = match self.command_lists.entry(handle) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -1401,7 +1462,7 @@ impl Nvn {
         // the one just used is the newest and stays (the caller holds its
         // commands either way).
         if restored {
-            self.trim_command_lists(2 * COMMAND_LIST_LIMIT, 2 * COMMAND_LIMIT);
+            self.trim_command_lists(2 * COMMAND_LIST_LIMIT, 2 * COMMAND_LIMIT, Some(present));
         }
         Some(commands)
     }
@@ -1464,7 +1525,12 @@ impl Nvn {
         order.pop_front().map(|(_, handle)| handle)
     }
 
-    fn trim_command_lists(&mut self, list_limit: usize, command_limit: usize) {
+    fn trim_command_lists(
+        &mut self,
+        list_limit: usize,
+        command_limit: usize,
+        present: Option<u64>,
+    ) {
         // With too many commands, long lists are the most useful to
         // archive. When short lists alone exceed the budget, archive the
         // least recently used ones too. Exceeding the handle count limit
@@ -1488,13 +1554,11 @@ impl Nvn {
             }
             let list = self.command_lists.remove(&oldest).unwrap().commands;
             self.capped_command_lists += 1;
-            if debug_var_os("ECHORA_LIST_LOG").is_some()
+            if let Some(present) = present
+                && debug_var_os("ECHORA_LIST_LOG").is_some()
                 && let Some(bind) = big_vertex_bind(&list)
             {
-                eprintln!(
-                    "list archived present {} handle {oldest:#x} bind {bind:x?}",
-                    self.presented_frames
-                );
+                eprintln!("list archived present {present} handle {oldest:#x} bind {bind:x?}");
             }
             self.command_list_commands -= list.len();
             self.archived_lists
@@ -1758,8 +1822,7 @@ impl CommandMemory {
 /// each buffer behind its own lock, so the game's management calls on its
 /// many command buffers (AddCommandMemory, BeginRecording, the used-memory
 /// queries...) run on any worker without the NVN state's lock, which the
-/// replay holds. Only EndRecording, which hands the list to the NVN state,
-/// takes that lock (see `command_buffer_call`).
+/// replay holds. EndRecording publishes through the command-list registry.
 #[derive(Debug, Default)]
 pub struct CommandBufferObject {
     /// Command memory, then control memory.
@@ -1815,13 +1878,74 @@ struct CommandBufferState<'a> {
 }
 
 /// Command buffer management calls `command_buffer_call` makes without
-/// the NVN state (all but EndRecording, which hands the finished list to
-/// it).
+/// the NVN state. EndRecording has a separate publication path.
 fn command_buffer_unlocked(rest: &str) -> bool {
     COMMAND_BUFFER_MANAGEMENT.contains(&rest) && rest != "EndRecording"
 }
 
 impl CommandBufferState<'_> {
+    /// Publish before releasing the buffer so a new recording at the same
+    /// control address cannot overtake this one. The registry never takes
+    /// buffer or renderer locks.
+    fn end_recording(
+        &self,
+        this: u64,
+        lists: &SharedCommandLists,
+        present: Option<u64>,
+    ) -> Result<(u64, std::sync::Arc<Vec<Command>>), String> {
+        // Worker EndRecording has no renderer present. Its call statistics
+        // are accumulated under the same registry lock as its handle.
+        let started = (present.is_none() && debug_var_os("ECHORA_NVN_PROFILE").is_some())
+            .then(std::time::Instant::now);
+        // Recording needs an initialized buffer (Finalize ends it).
+        let buffer = self
+            .buffer(this)
+            .map_err(|_| "command buffer is not recording")?;
+        let mut object = CommandBufferState::live(&buffer, this)?;
+        let recording = write_shared(self.recordings)
+            .remove(&this)
+            .ok_or("command buffer is not recording")?;
+        let (commands, (start_chunk, start_used)) = {
+            let mut recording = lock_shared(&recording);
+            recording.ended = true;
+            // Fold the same command bytes whose list we are publishing.
+            if recording.command_memory != 0 {
+                object.memory[0].use_bytes(recording.command_memory);
+            }
+            (
+                std::mem::take(&mut recording.commands),
+                recording.control_start,
+            )
+        };
+        if !commands.is_empty() {
+            object.memory[1].use_bytes(CONTROL_MEMORY_PER_LIST);
+        }
+        // NVN's handle is the list's place in control memory: a list
+        // recorded at the same place later has the same handle, and
+        // a stored handle runs whatever was recorded there last.
+        // The place is the control chunk's address plus the amount
+        // used when the recording began (from the chunk's start when
+        // memory was added during it), by the host's used amounts,
+        // which are the ones the application allocates by.
+        let control_chunk = object.memory[1].chunk.map_or(0, |chunk| chunk[0]);
+        let place = if control_chunk == 0 {
+            None
+        } else if start_chunk == control_chunk {
+            Some(control_chunk + start_used)
+        } else {
+            Some(control_chunk)
+        };
+        let mut lists = lists.lock();
+        let published = lists.publish(this, place, commands, present);
+        if present.is_none() {
+            lists.worker_ends += 1;
+            if let Some(started) = started {
+                lists.worker_end_micros += started.elapsed().as_micros() as u64;
+            }
+        }
+        Ok(published)
+    }
+
     /// The command buffer at `address`, if initialized.
     /// Lock command buffer `buffer` at `address` for a management call:
     /// refused once a Finalize on another thread has retired it (between
@@ -1932,7 +2056,6 @@ fn command_buffer_call(
                 .ok_or_else(|| invalid(format!("CommandBuffer {this:#x} is not initialized")))?;
             lock_shared(&buffer).finalized = true;
             write_shared(state.registry).objects.remove(&this);
-            drop(buffers);
             if let Some(recording) = write_shared(state.recordings).remove(&this) {
                 // A recorder's cached handle to it is stale now.
                 lock_shared(&recording).ended = true;
@@ -2089,9 +2212,10 @@ fn lock_shared<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Records calls on recording command buffers without the NVN state's
 /// lock: the game records command buffers on several cores at once, and
 /// recording needs only the buffer's own recording and the bags it reads.
-/// Everything else (management calls, submission) takes the NVN state.
+/// Finished lists are published before the handle is returned to the guest.
 #[derive(Clone, Debug)]
 pub struct Recorder {
+    lists: SharedCommandLists,
     bags: Bags,
     recordings: Recordings,
     command_buffers: CommandBuffers,
@@ -2188,9 +2312,9 @@ pub fn front_call(name: &str) -> bool {
 /// copying newly published thunks.
 #[derive(Clone, Copy)]
 pub(crate) enum RecordedCall<'a> {
-    /// A command on a recording buffer; None for its management calls the
-    /// NVN state makes (EndRecording).
-    Command(Option<&'a str>),
+    /// A command on a recording buffer.
+    Command(&'a str),
+    EndRecording,
     /// A command buffer management call made on the buffer's own state
     /// (`command_buffer_call`).
     Management(&'a str),
@@ -2209,12 +2333,13 @@ impl<'a> RecordedCall<'a> {
 
     fn command(name: &'a str) -> Option<Self> {
         let rest = name.strip_prefix("nvnCommandBuffer")?;
+        if rest == "EndRecording" {
+            return Some(Self::EndRecording);
+        }
         if command_buffer_unlocked(rest) {
             return Some(Self::Management(rest));
         }
-        Some(Self::Command(
-            (!COMMAND_BUFFER_MANAGEMENT.contains(&rest)).then_some(rest),
-        ))
+        Some(Self::Command(rest))
     }
 
     fn front(name: &'a str) -> Option<Self> {
@@ -2260,8 +2385,27 @@ impl Recorder {
         core: &mut Guest,
     ) -> Result<bool, Trap> {
         match call {
-            RecordedCall::Command(Some(rest)) => self.record_known(name, rest, core),
-            RecordedCall::Command(None) => Ok(false),
+            RecordedCall::Command(rest) => self.record_known(name, rest, core),
+            RecordedCall::EndRecording => {
+                // Inline replay can advance on the calling thread. List diagnostics
+                // use the current present and ordered renderer notes.
+                if !Nvn::replay_thread()
+                    || debug_var_os("ECHORA_LIST_LOG").is_some()
+                    || debug_var_os("ECHORA_GPU_FLOW").is_some()
+                    || core.cpu.regs[0] == 0
+                {
+                    return Ok(false);
+                }
+                call_watch(name, core);
+                let (handle, _) = self
+                    .command_buffer_state()
+                    .end_recording(core.cpu.regs[0], &self.lists, None)
+                    .map_err(|message| Trap::InvalidState {
+                        message: format!("{name}: {message}"),
+                    })?;
+                core.cpu.regs[0] = handle;
+                Ok(true)
+            }
             RecordedCall::Management(rest) => {
                 call_watch(name, core);
                 command_buffer_call(self.command_buffer_state(), name, rest, core)
@@ -2350,7 +2494,7 @@ impl Recorder {
 
     /// Record NVN call `name` when it is a call on a recording command
     /// buffer (X0), or make it when it is a management call on the
-    /// buffer's own state (all but EndRecording): Ok(true) once made,
+    /// buffer's own state, or publish at EndRecording: Ok(true) once made,
     /// Ok(false) when it is not (the caller makes it with the NVN state).
     pub fn record(&self, name: &'static str, core: &mut Guest) -> Result<bool, Trap> {
         let Some(call) = RecordedCall::command(name) else {
@@ -3472,59 +3616,14 @@ impl Nvn {
             }
             // EndRecording(cmd) -> NVNcommandHandle: a nonzero host handle.
             "nvnCommandBufferEndRecording" => {
-                let state = self.command_buffer_state();
-                // Recording needs an initialized buffer (Finalize ends it).
-                let buffer = state
-                    .buffer(this)
-                    .map_err(|_| invalid("command buffer is not recording".into()))?;
-                let mut object = CommandBufferState::live(&buffer, this).map_err(invalid)?;
-                state.fold(this, &mut object);
-                let recording = write_shared(&self.recording)
-                    .remove(&this)
-                    .ok_or_else(|| invalid("command buffer is not recording".into()))?;
-                let (commands, (start_chunk, start_used)) = {
-                    let mut recording = lock_shared(&recording);
-                    recording.ended = true;
-                    (
-                        std::mem::take(&mut recording.commands),
-                        recording.control_start,
-                    )
-                };
-                if !commands.is_empty() {
-                    object.memory[1].use_bytes(CONTROL_MEMORY_PER_LIST);
-                }
-                // NVN's handle is the list's place in control memory: a list
-                // recorded at the same place later has the same handle, and
-                // a stored handle runs whatever was recorded there last.
-                // The place is the control chunk's address plus the amount
-                // used when the recording began (from the chunk's start when
-                // memory was added during it), by the host's used amounts,
-                // which are the ones the application allocates by.
-                let control_chunk = object.memory[1].chunk.map_or(0, |chunk| chunk[0]);
-                drop(object);
-                let place = if control_chunk == 0 {
-                    None
-                } else if start_chunk == control_chunk {
-                    Some(control_chunk + start_used)
-                } else {
-                    Some(control_chunk)
-                };
-                self.next_command_handle += 1;
-                let handle = 0x4e56_0000_0000_0000
-                    | place.map_or(self.next_command_handle, |place| {
-                        0x8000_0000_0000 | (place & 0x7fff_ffff_ffff)
-                    });
-                // The list recorded there before is replaced.
-                self.archived_lists.remove(&handle);
-                if let Some(old) = self.command_lists.remove(&handle) {
-                    self.command_list_commands -= old.commands.len();
-                    release_list(old.commands);
-                }
+                let (handle, commands) = self.command_buffer_state().end_recording(
+                    this, &self.lists, Some(self.presented_frames),
+                ).map_err(invalid)?;
                 // Only in a sequenced present: lists are recorded by the
                 // dozen per frame.
                 if debug_var_os("ECHORA_GPU_FLOW").is_some() && self.sequencing() {
                     let mut names: BTreeMap<&str, usize> = BTreeMap::new();
-                    for command in &commands {
+                    for command in commands.iter() {
                         *names
                             .entry(without_prefix(&command.name, "nvnCommandBuffer"))
                             .or_default() += 1;
@@ -3553,14 +3652,6 @@ impl Nvn {
                         commands.len()
                     );
                 }
-                self.list_recorders.insert(handle, this);
-                self.command_list_clock += 1;
-                self.command_list_commands += commands.len();
-                let list = CommandList::new(commands, self.command_list_clock);
-                let small = list.small;
-                self.command_lists.insert(handle, list);
-                self.note_command_list_use(handle, small);
-                self.trim_command_lists(COMMAND_LIST_LIMIT, COMMAND_LIMIT);
                 core.cpu.regs[0] = handle;
                 return Ok(true);
             }
@@ -3568,13 +3659,14 @@ impl Nvn {
             // handle's command list is released; it cannot be submitted again.
             "nvnDeviceFinalizeCommandHandle" => {
                 self.object(this, "Device").map_err(invalid)?;
-                if let Some(list) = self.command_lists.remove(&x[1]) {
-                    self.command_list_commands -= list.commands.len();
-                    self.prune_command_list_use();
-                } else if self.archived_lists.remove(&x[1]).is_none() {
+                let mut lists = self.lists.lock();
+                if let Some(list) = lists.command_lists.remove(&x[1]) {
+                    lists.command_list_commands -= list.commands.len();
+                    lists.prune_command_list_use();
+                } else if lists.archived_lists.remove(&x[1]).is_none() {
                     return Err(invalid(format!("unknown command handle {:#x}", x[1])));
                 }
-                self.list_recorders.remove(&x[1]);
+                lists.list_recorders.remove(&x[1]);
                 return Ok(true);
             }
             // nvnQueueSubmitCommands(NVNqueue*, int count, const
@@ -3588,9 +3680,11 @@ impl Nvn {
                 if count > 4096 {
                     return Err(invalid(format!("{count} command handles")));
                 }
+                let shared_lists = self.lists.clone();
+                let mut lists = shared_lists.lock();
                 for index in 0..u64::from(count) {
                     let handle = core.memory.read_u64(x[2] + index * 8)?;
-                    let Some(list) = self.use_command_list(handle) else {
+                    let Some(list) = lists.use_command_list(handle, self.presented_frames) else {
                         // Count unavailable NVN handles so the diagnostic
                         // report identifies skipped work.
                         if handle >> 48 == 0x4e56 {
@@ -3629,6 +3723,7 @@ impl Nvn {
                             descriptor_epoch: self.descriptor_epoch,
                         });
                 }
+                drop(lists);
                 self.pump_queues_handed_on(core)?;
                 return Ok(true);
             }
@@ -5422,8 +5517,10 @@ impl Nvn {
                     if matches!(rest, "CallCommands" | "CopyCommands") {
                         // The called lists run next, in order, ahead of
                         // the rest of this one (their waits block too).
+                        let shared_lists = self.lists.clone();
+                        let mut lists = shared_lists.lock();
                         for handle in command.captured.iter().rev() {
-                            match self.use_command_list(*handle) {
+                            match lists.use_command_list(*handle, self.presented_frames) {
                                 Some(list) => {
                                     if debug_var_os("ECHORA_LIST_LOG").is_some()
                                         && let Some(bind) = big_vertex_bind(&list)
@@ -5804,8 +5901,23 @@ impl Nvn {
                 if self.call_depth >= 8 {
                     return Err(stop("command lists call each other too deeply".into()));
                 }
-                for &handle in &command.captured {
-                    let Some(list) = self.use_command_list(handle) else {
+                // Resolve this group together, then release the registry before
+                // executing any child (which may call another group).
+                let children: Vec<_> = {
+                    let mut lists = self.lists.lock();
+                    command
+                        .captured
+                        .iter()
+                        .map(|&handle| {
+                            (
+                                handle,
+                                lists.use_command_list(handle, self.presented_frames),
+                            )
+                        })
+                        .collect()
+                };
+                for (handle, child) in children {
+                    let Some(list) = child else {
                         self.note_stale(handle, "call");
                         continue;
                     };
@@ -7733,6 +7845,7 @@ impl Nvn {
 
     pub fn recorder(&self) -> Recorder {
         Recorder {
+            lists: self.lists.clone(),
             bags: self.bags.clone(),
             recordings: self.recording.clone(),
             command_buffers: self.command_buffers.clone(),
@@ -7918,26 +8031,48 @@ impl Nvn {
         Ok(())
     }
 
+    pub(crate) fn reset_call_profile(&mut self) {
+        self.calls.clear();
+        self.call_microseconds.clear();
+        let mut lists = self.lists.lock();
+        lists.worker_ends = 0;
+        lists.worker_end_micros = 0;
+    }
+
     pub fn report(&self) -> serde_json::Value {
+        let objects = self.objects.len() + read_shared(&self.command_buffers).len();
+        let lists = self.lists.lock();
+        let mut calls = self.calls.clone();
+        let mut call_microseconds = self.call_microseconds.clone();
+        if lists.worker_ends != 0 {
+            *calls
+                .entry("nvnCommandBufferEndRecording".into())
+                .or_default() += lists.worker_ends;
+        }
+        if lists.worker_end_micros != 0 {
+            *call_microseconds
+                .entry("nvnCommandBufferEndRecording".into())
+                .or_default() += lists.worker_end_micros;
+        }
         serde_json::json!({
             "model": "host_nvn_entry_points",
-            "objects": self.objects.len() + read_shared(&self.command_buffers).len(),
+            "objects": objects,
             "devices": self.objects.values().filter(|o| o.kind == "Device").collect::<Vec<_>>(),
             "hooked_exports": self.hooks.values().collect::<Vec<_>>(),
             "entry_points_looked_up": self.thunks.len(),
-            "calls": self.calls,
-            "call_microseconds": self.call_microseconds,
+            "calls": calls,
+            "call_microseconds": call_microseconds,
             "replay_microseconds": self.replay_microseconds,
             "presented_frames": self.presented_frames,
             "texture_log": self.texture_log,
             "stale_command_submissions": self.stale_command_submissions,
-            "capped_command_lists": self.capped_command_lists,
-            "archived_command_lists": self.archived_lists.len(),
-            "archived_command_bytes": self.archived_lists.values().map(ArchivedList::bytes).sum::<usize>(),
-            "restored_command_lists": self.restored_command_lists,
-            "kept_command_lists": self.command_lists.len(),
-            "kept_commands": self.command_list_commands,
-            "kept_lists_by_buffer": self.kept_lists_by_buffer(),
+            "capped_command_lists": lists.capped_command_lists,
+            "archived_command_lists": lists.archived_lists.len(),
+            "archived_command_bytes": lists.archived_lists.values().map(ArchivedList::bytes).sum::<usize>(),
+            "restored_command_lists": lists.restored_command_lists,
+            "kept_command_lists": lists.command_lists.len(),
+            "kept_commands": lists.command_list_commands,
+            "kept_lists_by_buffer": lists.kept_lists_by_buffer(),
             "skipped_work": self.skipped_work,
             "forced_waits": self.forced_waits,
             "sync_timeouts": self.sync_timeouts.iter().map(|(sync, count)| (format!("{sync:#x}"), count)).collect::<BTreeMap<_, _>>(),
@@ -10486,7 +10621,7 @@ mod tests {
             if *management == "EndRecording" {
                 assert!(matches!(
                     RecordedCall::classify(&name),
-                    Some(RecordedCall::Command(None))
+                    Some(RecordedCall::EndRecording)
                 ));
             } else {
                 assert!(matches!(
@@ -10497,7 +10632,7 @@ mod tests {
         }
         assert!(matches!(
             RecordedCall::classify("nvnCommandBufferDrawArrays"),
-            Some(RecordedCall::Command(Some("DrawArrays")))
+            Some(RecordedCall::Command("DrawArrays"))
         ));
         assert!(matches!(
             RecordedCall::classify("nvnTextureBuilderSetWidth"),
@@ -10703,7 +10838,8 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let binds = ArchivedList::pack(&nvn.use_command_list(list).unwrap()).unpack();
+        let binds =
+            ArchivedList::pack(&nvn.lists.lock().use_command_list(list, 0).unwrap()).unpack();
         assert_eq!(binds.len(), 2);
         for (bind, expected) in binds.iter().zip([[2, 1, 1, 2], [0, 1, 2, 0]]) {
             nvn.execute(bind, &mut core).unwrap();
@@ -10863,7 +10999,8 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let archived = ArchivedList::pack(&nvn.use_command_list(handle).unwrap()).unpack();
+        let archived =
+            ArchivedList::pack(&nvn.lists.lock().use_command_list(handle, 0).unwrap()).unpack();
         assert_eq!(archived.len(), 2);
         for (bind, (blend, logic, alpha)) in archived.iter().zip([(0xa5, 0x13, 6), (0, 3, 8)]) {
             nvn.execute(bind, &mut core).unwrap();
@@ -10972,7 +11109,8 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let archived = ArchivedList::pack(&nvn.use_command_list(handle).unwrap()).unpack();
+        let archived =
+            ArchivedList::pack(&nvn.lists.lock().use_command_list(handle, 0).unwrap()).unpack();
         assert_eq!(archived.len(), 2);
         for (bind, word) in archived.iter().zip([packed, 0]) {
             nvn.execute(bind, &mut guest).unwrap();
@@ -11245,7 +11383,7 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let recorded = nvn.use_command_list(handle).unwrap();
+        let recorded = nvn.lists.lock().use_command_list(handle, 0).unwrap();
         let archived = ArchivedList::pack(&recorded).unpack();
         assert_eq!(archived.len(), 3);
         let attrs = &archived[0].states;
@@ -11711,7 +11849,7 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let list = nvn.use_command_list(handle).unwrap();
+        let list = nvn.lists.lock().use_command_list(handle, 0).unwrap();
         assert_eq!(list.len(), 1);
         let copy = TexelTransfer::recorded(&list[0]);
         assert_eq!(copy.region, [1, 2, 0, 3, 4, 1]);
@@ -11766,7 +11904,7 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let list = nvn.use_command_list(handle).unwrap();
+        let list = nvn.lists.lock().use_command_list(handle, 0).unwrap();
         assert_eq!(list.len(), 2);
         nvn.execute_command(&list[0], &mut core).unwrap();
         assert_eq!(nvn.render.viewport(), Some(viewport));
@@ -11872,7 +12010,7 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        let list = nvn.use_command_list(handle).unwrap();
+        let list = nvn.lists.lock().use_command_list(handle, 0).unwrap();
         for command in list.iter() {
             nvn.execute_command(command, &mut core).unwrap();
         }
@@ -12017,7 +12155,8 @@ mod tests {
             "nvnCommandBufferEndRecording",
             &[buffer],
         );
-        for command in nvn.use_command_list(handle).unwrap().iter() {
+        let commands = nvn.lists.lock().use_command_list(handle, 0).unwrap();
+        for command in commands.iter() {
             nvn.execute_command(command, &mut core).unwrap();
         }
         let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
@@ -12487,7 +12626,10 @@ mod tests {
                 [0, pool, 0, 0, 0, 0, 0, 0],
             ),
         ];
-        nvn.command_lists.insert(handle, CommandList::new(list, 0));
+        nvn.lists
+            .lock()
+            .command_lists
+            .insert(handle, CommandList::new(list, 0));
         guest.memory.write_u64(address + 16, handle).unwrap();
         call(
             &mut nvn,
@@ -12963,12 +13105,12 @@ mod tests {
             &[buffer],
         );
         assert_eq!(handle, 0x4e56_8000_0000_1600);
-        let list = &nvn.command_lists[&handle].commands;
+        let list = nvn.lists.lock().command_lists[&handle].commands.clone();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "nvnCommandBufferSetScissor");
         assert_eq!(&list[0].x[1..5], &[11, 12, 13, 14]);
         assert_eq!(
-            nvn.kept_lists_by_buffer()[0],
+            nvn.lists.lock().kept_lists_by_buffer()[0],
             (format!("{buffer:#x}"), 1, 1, 0),
         );
         call(
@@ -12977,8 +13119,8 @@ mod tests {
             "nvnDeviceFinalizeCommandHandle",
             &[device, handle],
         );
-        assert!(!nvn.list_recorders.contains_key(&handle));
-        assert!(nvn.kept_lists_by_buffer().is_empty());
+        assert!(!nvn.lists.lock().list_recorders.contains_key(&handle));
+        assert!(nvn.lists.lock().kept_lists_by_buffer().is_empty());
 
         for (new_chunk, expected) in [(None, 0x1610), (Some(0x1700), 0x1700)] {
             call(
@@ -13030,7 +13172,9 @@ mod tests {
             captured: Vec::new(),
             states: StateSnapshots::default(),
         };
-        nvn.archived_lists
+        nvn.lists
+            .lock()
+            .archived_lists
             .insert(handle, ArchivedList::pack(std::slice::from_ref(&recorded)));
         guest.memory.write_u64(0x1000, handle).unwrap();
         call(
@@ -13040,12 +13184,14 @@ mod tests {
             &[queue, 1, 0x1000],
         );
         assert_eq!(nvn.render.scissor, Some([11, 12, 13, 14]));
-        assert_eq!(nvn.restored_command_lists, 1);
+        assert_eq!(nvn.lists.lock().restored_command_lists, 1);
         assert_eq!(nvn.stale_command_submissions, 0);
-        assert_eq!(nvn.command_list_commands, 1);
+        assert_eq!(nvn.lists.lock().command_list_commands, 1);
 
         let archived = handle + 1;
-        nvn.archived_lists
+        nvn.lists
+            .lock()
+            .archived_lists
             .insert(archived, ArchivedList::pack(&[recorded]));
         for handle in [archived, handle] {
             call(
@@ -13054,10 +13200,182 @@ mod tests {
                 "nvnDeviceFinalizeCommandHandle",
                 &[device, handle],
             );
-            assert!(nvn.use_command_list(handle).is_none());
+            assert!(nvn.lists.lock().use_command_list(handle, 0).is_none());
         }
-        assert_eq!(nvn.command_list_commands, 0);
-        assert!(nvn.command_list_use.iter().all(VecDeque::is_empty));
+        assert_eq!(nvn.lists.lock().command_list_commands, 0);
+        assert!(
+            nvn.lists
+                .lock()
+                .command_list_use
+                .iter()
+                .all(VecDeque::is_empty)
+        );
+    }
+
+    #[test]
+    fn submitted_lists_keep_their_generation_and_nested_handles_resolve_after_a_wait() {
+        for nested in [
+            "nvnCommandBufferCallCommands",
+            "nvnCommandBufferCopyCommands",
+        ] {
+            let (direct, indirect, leaf, caller, device, pool, event) = (1, 2, 3, 4, 5, 6, 7);
+            let (address, handles) = (0x1000, 0x1100);
+            let mut memory = Memory::new(1 << 39);
+            memory
+                .map(
+                    address,
+                    4096,
+                    READ | WRITE,
+                    STATE_NORMAL,
+                    "event and handles",
+                )
+                .unwrap();
+            let mut cpu = Cpu::default();
+            let mut guest = Guest {
+                cpu: &mut cpu,
+                memory: GuestMemory::Checked(&mut memory),
+                counter: None,
+            };
+            let mut nvn = Nvn::default();
+            for (handle, kind) in [
+                (device, "Device"),
+                (direct, "Queue"),
+                (indirect, "Queue"),
+                (leaf, "CommandBuffer"),
+                (caller, "CommandBuffer"),
+            ] {
+                nvn.initialize(handle, kind, BTreeMap::new()).unwrap();
+            }
+            for (handle, kind, storage) in [
+                (pool, "MemoryPool", [address, 4096, 0, 0]),
+                (event, "Event", [pool, 0, 0, 0]),
+            ] {
+                nvn.initialize(
+                    handle,
+                    kind,
+                    BTreeMap::from([(
+                        "Storage".into(),
+                        Args {
+                            x: storage,
+                            ..Default::default()
+                        },
+                    )]),
+                )
+                .unwrap();
+            }
+            let recorder = nvn.recorder();
+            let record = |guest: &mut Guest, name, args: &[u64]| {
+                made_free(&recorder, guest, name, args).unwrap()
+            };
+            let end = |nvn: &mut Nvn, guest: &mut Guest, buffer| {
+                guest.cpu.regs[0] = buffer;
+                let name = "nvnCommandBufferEndRecording";
+                let made = recorder
+                    .call(name, RecordedCall::EndRecording, guest)
+                    .unwrap();
+                assert_eq!(made, worker_publishes_lists());
+                if !made {
+                    assert!(nvn.call(name, guest).unwrap());
+                }
+                guest.cpu.regs[0]
+            };
+            let start = |guest: &mut Guest, buffer, control| {
+                record(
+                    guest,
+                    "nvnCommandBufferAddControlMemory",
+                    &[buffer, control, 0x100],
+                );
+                record(guest, "nvnCommandBufferBeginRecording", &[buffer]);
+            };
+            start(&mut guest, leaf, 0x2000);
+            record(
+                &mut guest,
+                "nvnCommandBufferWaitEvent",
+                &[leaf, event, 0, 1],
+            );
+            record(
+                &mut guest,
+                "nvnCommandBufferSetScissor",
+                &[leaf, 11, 2, 3, 4],
+            );
+            let original = end(&mut nvn, &mut guest, leaf);
+            guest.memory.write_u64(handles, original).unwrap();
+            start(&mut guest, caller, 0x3000);
+            record(
+                &mut guest,
+                "nvnCommandBufferWaitEvent",
+                &[caller, event, 0, 1],
+            );
+            record(&mut guest, nested, &[caller, 1, handles]);
+            let parent = end(&mut nvn, &mut guest, caller);
+            guest.memory.write_u64(handles + 8, original).unwrap();
+            guest.memory.write_u64(handles + 16, parent).unwrap();
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnQueueSubmitCommands",
+                &[direct, 2, handles],
+            );
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnQueueSubmitCommands",
+                &[indirect, 1, handles + 16],
+            );
+            assert!(nvn.render.blocked_on_wait);
+            let mut submitted = nvn.pending[&direct].iter().map(|item| match item {
+                QueueItem::List { commands, .. } => commands,
+                _ => panic!("expected a submitted list"),
+            });
+            assert!(std::sync::Arc::ptr_eq(
+                submitted.next().unwrap(),
+                submitted.next().unwrap()
+            ));
+            assert!(submitted.next().is_none());
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnDeviceFinalizeCommandHandle",
+                &[device, parent],
+            );
+
+            // Replace the leaf in the exact same control bytes while both queues wait.
+            start(&mut guest, leaf, 0x2000);
+            record(
+                &mut guest,
+                "nvnCommandBufferSetScissor",
+                &[leaf, 33, 2, 3, 4],
+            );
+            assert_eq!(end(&mut nvn, &mut guest, leaf), original);
+            guest.memory.write_u32(address, 1).unwrap();
+            assert!(nvn.run_queue(direct, &mut guest, false).unwrap());
+            assert_eq!(nvn.render.scissor, Some([11, 2, 3, 4]));
+            assert!(nvn.run_queue(indirect, &mut guest, false).unwrap());
+            assert_eq!(nvn.render.scissor, Some([33, 2, 3, 4]));
+            assert_eq!(nvn.stale_command_submissions, 0);
+            // The removed NVN handle is stale. An arbitrary invalid handle is an error.
+            call(
+                &mut nvn,
+                &mut guest,
+                "nvnQueueSubmitCommands",
+                &[direct, 1, handles + 16],
+            );
+            assert_eq!(nvn.stale_command_submissions, 1);
+            guest.memory.write_u64(handles, 0x1234).unwrap();
+            guest.cpu.regs[..3].copy_from_slice(&[direct, 1, handles]);
+            assert!(
+                matches!(nvn.call("nvnQueueSubmitCommands", &mut guest), Err(Trap::InvalidState { message }) if message.contains("unknown command handle 0x1234"))
+            );
+            if worker_publishes_lists() {
+                let report = nvn.report();
+                assert_eq!(report["calls"]["nvnCommandBufferEndRecording"], 3);
+                assert_eq!(report["kept_command_lists"], 1);
+                nvn.reset_call_profile();
+                let report = nvn.report();
+                assert!(report["calls"]["nvnCommandBufferEndRecording"].is_null());
+                assert_eq!(report["kept_command_lists"], 1);
+            }
+        }
     }
 
     #[test]
@@ -13077,7 +13395,7 @@ mod tests {
             let mut commands = Vec::new();
             for (clock, handle) in [(1, 10), (2, 20)] {
                 commands.push(handle);
-                nvn.command_lists.insert(
+                nvn.lists.lock().command_lists.insert(
                     handle,
                     CommandList::new(
                         vec![Command {
@@ -13090,9 +13408,9 @@ mod tests {
                         clock,
                     ),
                 );
-                nvn.command_list_use[1].push_back((clock, handle));
+                nvn.lists.lock().command_list_use[1].push_back((clock, handle));
             }
-            nvn.command_list_clock = 2;
+            nvn.lists.lock().command_list_clock = 2;
             let caller = Command {
                 name,
                 x: [0; 8],
@@ -13102,8 +13420,8 @@ mod tests {
             };
             nvn.execute(&caller, &mut guest).unwrap();
             assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
-            assert_eq!(nvn.command_lists[&10].last_used, 3);
-            assert_eq!(nvn.command_lists[&20].last_used, 4);
+            assert_eq!(nvn.lists.lock().command_lists[&10].last_used, 3);
+            assert_eq!(nvn.lists.lock().command_lists[&20].last_used, 4);
 
             nvn.render.scissor = None;
             nvn.pending
@@ -13116,20 +13434,26 @@ mod tests {
                 });
             nvn.run_queue(1, &mut guest, false).unwrap();
             assert_eq!(nvn.render.scissor, Some([20, 2, 3, 4]));
-            assert_eq!(nvn.command_lists[&20].last_used, 5);
-            assert_eq!(nvn.command_lists[&10].last_used, 6);
-            assert_eq!(nvn.pop_oldest_command_list_use(false), Some(20));
-            assert_eq!(nvn.pop_oldest_command_list_use(false), Some(10));
-            assert_eq!(nvn.pop_oldest_command_list_use(false), None);
-            assert_eq!(nvn.command_lists[&10].submissions, 2);
-            assert_eq!(nvn.command_lists[&20].submissions, 2);
+            assert_eq!(nvn.lists.lock().command_lists[&20].last_used, 5);
+            assert_eq!(nvn.lists.lock().command_lists[&10].last_used, 6);
+            assert_eq!(
+                nvn.lists.lock().pop_oldest_command_list_use(false),
+                Some(20)
+            );
+            assert_eq!(
+                nvn.lists.lock().pop_oldest_command_list_use(false),
+                Some(10)
+            );
+            assert_eq!(nvn.lists.lock().pop_oldest_command_list_use(false), None);
+            assert_eq!(nvn.lists.lock().command_lists[&10].submissions, 2);
+            assert_eq!(nvn.lists.lock().command_lists[&20].submissions, 2);
         }
     }
 
     #[test]
     fn command_list_use_pruning_keeps_idle_and_replaced_handles_in_order() {
-        let mut nvn = Nvn::default();
-        let record = |nvn: &mut Nvn, handle| {
+        let mut nvn = CommandLists::default();
+        let record = |nvn: &mut CommandLists, handle| {
             nvn.command_list_clock += 1;
             nvn.command_lists
                 .insert(handle, CommandList::new(Vec::new(), nvn.command_list_clock));
@@ -13139,7 +13463,7 @@ mod tests {
             record(&mut nvn, handle);
         }
         for _ in 0..800 {
-            assert!(nvn.use_command_list(2).is_some());
+            assert!(nvn.use_command_list(2, 0).is_some());
         }
         assert!(
             nvn.command_list_use
@@ -13150,7 +13474,7 @@ mod tests {
         );
         nvn.command_lists.remove(&3);
         record(&mut nvn, 1);
-        assert!(nvn.use_command_list(2).is_some());
+        assert!(nvn.use_command_list(2, 0).is_some());
 
         assert_eq!(nvn.pop_oldest_command_list_use(false), Some(4));
         assert_eq!(nvn.pop_oldest_command_list_use(false), Some(1));
@@ -13167,8 +13491,8 @@ mod tests {
             captured: Vec::new(),
             states: StateSnapshots::default(),
         };
-        let mut nvn = Nvn::default();
-        let record = |nvn: &mut Nvn, handle, count| {
+        let mut nvn = CommandLists::default();
+        let record = |nvn: &mut CommandLists, handle, count| {
             nvn.command_list_clock += 1;
             nvn.command_list_commands += count;
             let list = CommandList::new(vec![fixture.clone(); count], nvn.command_list_clock);
@@ -13180,7 +13504,7 @@ mod tests {
             record(&mut nvn, handle, 3);
         }
         record(&mut nvn, 5, SMALL_COMMAND_LIST + 1);
-        nvn.trim_command_lists(12, 12);
+        nvn.trim_command_lists(12, 12, None);
         assert_eq!(nvn.command_list_commands, 12);
         assert_eq!(nvn.command_list_clock, 5);
         assert!(nvn.archived_lists.contains_key(&5));
@@ -13190,15 +13514,15 @@ mod tests {
         // A reused list gets a second chance, and the next oldest remains
         // usable through its original handle after it goes to the archive.
         nvn.command_lists.get_mut(&1).unwrap().submissions = 2;
-        nvn.trim_command_lists(12, 9);
+        nvn.trim_command_lists(12, 9, None);
         assert_eq!(nvn.command_list_commands, 9);
         assert_eq!(nvn.command_lists[&1].submissions, 1);
         assert!(nvn.archived_lists.contains_key(&2));
-        assert_eq!(nvn.use_command_list(2).unwrap()[0].x, fixture.x);
+        assert_eq!(nvn.use_command_list(2, 0).unwrap()[0].x, fixture.x);
 
         // A handle-count limit considers both queues in recency order.
         record(&mut nvn, 6, SMALL_COMMAND_LIST + 1);
-        nvn.trim_command_lists(4, 100);
+        nvn.trim_command_lists(4, 100, None);
         assert!(nvn.archived_lists.contains_key(&3));
         assert!(nvn.command_lists.contains_key(&6));
     }
@@ -13736,6 +14060,12 @@ mod tests {
         );
     }
 
+    fn worker_publishes_lists() -> bool {
+        Nvn::replay_thread()
+            && debug_var_os("ECHORA_GPU_FLOW").is_none()
+            && debug_var_os("ECHORA_LIST_LOG").is_none()
+    }
+
     /// Make `name` through the recorder, as a worker does without the NVN
     /// state: its X0 result, or the error.
     fn made_free(
@@ -13835,7 +14165,7 @@ mod tests {
         ];
         for &(name, args) in script {
             let locked = !lock_free
-                || name.ends_with("EndRecording")
+                || (name.ends_with("EndRecording") && !worker_publishes_lists())
                 || !name.starts_with("nvnCommandBuffer");
             let result = if locked {
                 core.cpu.regs[..args.len()].copy_from_slice(args);
@@ -13857,7 +14187,7 @@ mod tests {
         let lists = handles
             .iter()
             .map(|handle| {
-                nvn.command_lists[handle]
+                nvn.lists.lock().command_lists[handle]
                     .commands
                     .iter()
                     .map(|command| {
@@ -13935,7 +14265,7 @@ mod tests {
     }
 
     /// Several threads manage and record their own command buffers at once
-    /// without the NVN state, handing each list to it at EndRecording: each
+    /// without the NVN state, publishing each list at EndRecording: each
     /// list holds its thread's commands, at the handle its control memory
     /// gives it.
     #[test]
@@ -14003,12 +14333,20 @@ mod tests {
                             let control_used =
                                 free(&mut core, "nvnCommandBufferGetControlMemoryUsed", &[buffer]);
                             assert_eq!(control_used, 16 * list);
-                            let mut nvn = lock_shared(nvn);
                             core.cpu.regs[0] = buffer;
-                            assert!(nvn.call("nvnCommandBufferEndRecording", &mut core).unwrap());
+                            let end = "nvnCommandBufferEndRecording";
+                            let published = recorder
+                                .call(end, RecordedCall::EndRecording, &mut core)
+                                .unwrap();
+                            assert_eq!(published, worker_publishes_lists());
+                            if !published {
+                                assert!(lock_shared(nvn).call(end, &mut core).unwrap());
+                            }
                             let handle = core.cpu.regs[0];
                             assert_eq!(handle, 0x4e56_8000_0000_0000 | (control + control_used));
-                            let commands = &nvn.command_lists[&handle].commands;
+                            let commands = recorder.lists.lock().command_lists[&handle]
+                                .commands
+                                .clone();
                             assert_eq!(commands.len() as u64, count);
                             for (index, command) in commands.iter().enumerate() {
                                 assert_eq!(command.name, "nvnCommandBufferSetScissor");
@@ -14030,7 +14368,7 @@ mod tests {
         let nvn = nvn.into_inner().unwrap();
         assert!(read_shared(&nvn.command_buffers).is_empty());
         assert!(read_shared(&nvn.recording).is_empty());
-        assert_eq!(nvn.command_lists.len() as u64, THREADS * LISTS);
+        assert_eq!(nvn.lists.lock().command_lists.len() as u64, THREADS * LISTS);
     }
 
     /// A list recorded without the NVN state, then submitted, replays as
@@ -14109,7 +14447,7 @@ mod tests {
                 "nvnCommandBufferEndRecording",
                 &[command_buffer],
             );
-            let commands = nvn.command_lists[&handle]
+            let commands = nvn.lists.lock().command_lists[&handle]
                 .commands
                 .iter()
                 .map(|command| {
