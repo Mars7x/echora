@@ -168,13 +168,13 @@ pub(super) fn project_table_with_hints(
     Some(mapped)
 }
 
-/// Calls of `project_writes`, the writes they projected, the file ranges
-/// before merging and the mapping spans they walked (the report's
-/// statistics: the sort was ~3% of the replay thread in the forest).
-pub static PROJECTION_COUNTS: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<Vec<FileRange>> {
+/// Count the calls, input writes, file ranges before merging and mapping
+/// spans walked for this backend's current profiling interval.
+pub(super) fn project_writes(
+    mapping: &[SharedPages],
+    writes: &[Range<u64>],
+    counters: &std::cell::Cell<[u64; 4]>,
+) -> Option<Vec<FileRange>> {
     let mut physical: Vec<FileRange> = Vec::new();
     let mut walked = 0u64;
     for write in writes {
@@ -210,13 +210,13 @@ pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<
             }
         }
     }
-    for (counter, amount) in
-        PROJECTION_COUNTS
-            .iter()
-            .zip([1, writes.len() as u64, physical.len() as u64, walked])
-    {
-        counter.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
-    }
+    let [calls, inputs, outputs, spans] = counters.get();
+    counters.set([
+        calls + 1,
+        inputs + writes.len() as u64,
+        outputs + physical.len() as u64,
+        spans + walked,
+    ]);
     physical.sort_unstable_by_key(|range| (range.file, range.bytes.start));
     physical.dedup_by(|next, previous| {
         if previous.file == next.file && next.bytes.start <= previous.bytes.end {
@@ -337,7 +337,7 @@ mod tests {
         )
         .unwrap();
         let bounds = [105..111, 170..194, 220..270, 700..10000];
-        let writes = project_writes(&map, &bounds).unwrap();
+        let writes = project_writes(&map, &bounds, &Default::default()).unwrap();
         assert_eq!(
             writes,
             [
@@ -355,10 +355,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(project_writes(&map, &[140..159]).unwrap(), []);
+        assert_eq!(
+            project_writes(&map, &[140..159], &Default::default()).unwrap(),
+            []
+        );
         // A different Vulkan buffer and GPU virtual address can write
         // the same guest file bytes.
-        let aliased = project_writes(&map, &[165..175]).unwrap();
+        let aliased = project_writes(&map, &[165..175], &Default::default()).unwrap();
         assert_eq!(
             aliased,
             [FileRange {
@@ -388,7 +391,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let writes = project_writes(&mapping, &[150..170, 110..160]).unwrap();
+        let writes = project_writes(&mapping, &[150..170, 110..160], &Default::default()).unwrap();
         assert_eq!(
             writes,
             [
@@ -450,7 +453,7 @@ mod tests {
                 })
                 .collect();
             let mapping = project_table(first, page, &entries, imports.clone()).unwrap();
-            let actual: BTreeSet<_> = project_writes(&mapping, &writes)
+            let actual: BTreeSet<_> = project_writes(&mapping, &writes, &Default::default())
                 .unwrap()
                 .into_iter()
                 .flat_map(|range| range.bytes.map(move |offset| (range.file, offset)))

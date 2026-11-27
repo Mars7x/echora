@@ -547,6 +547,7 @@ pub struct Backend {
     /// length, file, offset in the file).
     shared_pieces: HashMap<u64, Vec<(u64, u64, i32, u64)>>,
     shared_guest_index: std::cell::RefCell<GuestFileIndex>,
+    projection_counts: std::cell::Cell<[u64; 4]>,
     /// The publication of each live share, even when its span count or
     /// file offsets match those of an earlier share.
     pool_share_versions: HashMap<u64, usize>,
@@ -657,8 +658,7 @@ impl SharedRange {
 struct GuestFileIndex {
     generation: usize,
     spans: Vec<GuestFileSpan>,
-    /// `overlapping` lookups and the spans they walked since the index was
-    /// built (the report's statistics).
+    /// Lookups and spans walked in the current profiling interval.
     walks: std::cell::Cell<[u64; 2]>,
 }
 
@@ -852,6 +852,7 @@ impl Backend {
             shared_pools: HashMap::default(),
             shared_pieces: HashMap::default(),
             shared_guest_index: Default::default(),
+            projection_counts: Default::default(),
             pool_share_versions: HashMap::default(),
             share_generation: 0,
             target_index: TargetIndex::default(),
@@ -1028,7 +1029,7 @@ impl Backend {
             })
             .as_ref()?;
         Some(
-            writer_ranges::project_writes(mapping, ranges)?
+            writer_ranges::project_writes(mapping, ranges, &self.projection_counts)?
                 .into_iter()
                 .map(|range| SharedRange {
                     file: range.file,
@@ -1195,12 +1196,9 @@ impl Backend {
             "stat: shared write projection spans walked",
         ]
         .into_iter()
-        .zip(&writer_ranges::PROJECTION_COUNTS)
+        .zip(self.projection_counts.get())
         {
-            notes.insert(
-                name.into(),
-                counter.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            notes.insert(name.into(), counter);
         }
         if let Ok(index) = self.shared_guest_index.try_borrow() {
             let [lookups, walked] = index.walks.get();
@@ -1861,6 +1859,8 @@ impl Nvn {
         if let Some(backend) = self.gpu.as_mut() {
             backend.notes.retain(|name, _| !name.starts_with("stat: "));
             backend.stats.clear();
+            backend.projection_counts.set([0; 4]);
+            backend.shared_guest_index.get_mut().walks.set([0; 2]);
         }
     }
 
@@ -10131,7 +10131,9 @@ impl Nvn {
                     .iter()
                     .map(move |&(at, length, file, offset)| (base + at, length, file, offset))
             });
+            let walks = index.walks.get();
             *index = GuestFileIndex::new(backend.share_generation, whole.chain(pieces));
+            index.walks.set(walks);
         }
         Some(index)
     }
@@ -18116,6 +18118,51 @@ mod pool_tests {
         );
         assert_eq!(index.range(0x13ff, 0x400), None);
         assert_eq!(index.range(u64::MAX, 8), None);
+    }
+
+    #[test]
+    fn shared_memory_counters_follow_the_profiling_interval() {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        backend.shared_pools.insert(0x4000, (4096, 1, 0));
+        backend.record_pool_share(0x4000);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            ..Nvn::default()
+        };
+        let walk = |nvn: &Nvn| {
+            assert_eq!(
+                nvn.shared_guest_index()
+                    .unwrap()
+                    .overlapping(0x4000..0x4100)
+                    .count(),
+                1
+            );
+            let counts = &nvn.gpu.as_ref().unwrap().projection_counts;
+            super::writer_ranges::project_writes(&[], std::slice::from_ref(&(10..20)), counts)
+                .unwrap();
+        };
+        let check = |nvn: &Nvn, calls| {
+            let notes = nvn.gpu.as_ref().unwrap().notes_with_stats();
+            for name in [
+                "stat: shared write projections",
+                "stat: shared write projection writes",
+                "stat: shared span index lookups",
+                "stat: shared span index spans walked",
+            ] {
+                assert_eq!(notes[name], calls, "{name}");
+            }
+            assert_eq!(notes["stat: shared span index spans"], 1);
+        };
+        walk(&nvn);
+        nvn.gpu.as_mut().unwrap().record_pool_share(0x4000);
+        walk(&nvn);
+        check(&nvn, 2);
+        nvn.reset_gpu_stats();
+        check(&nvn, 0);
+        walk(&nvn);
+        check(&nvn, 1);
     }
 
     #[test]
