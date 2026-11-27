@@ -188,6 +188,25 @@ under `functions` with that set (also on main's tree alone), and adding
 `mxcsr-groups` to the set breaks `vector_runs`' compile-time
 `vector_run_reference::RUNS == 0`.
 
+**Forest measurements, 24 November 2026.** Candidate 9 enabled structured
+functions on 148 hot regions, including `regalloc-return-entries` and
+`regalloc-summarized-entries`, alongside corrected `mxcsr-groups` and
+inlining options. It averaged 26.32 forest presents/s over three runs.
+The plain build averaged 23.44 in the paired runs, a 12.3% gain for the
+combined options. Each later comparison reran its own baseline.
+
+| Comparison | Baseline forest presents/s, three runs | Candidate forest presents/s, paired runs |
+|---|---|---|
+| Plain → candidate 9 | 23.53, 23.26, 23.53 | 26.32, 26.32, 26.32 |
+| Candidate 9 → 10, adding `shared-reloads` to hot regions and changing options for other regions | 25.97, 25.97, 25.32 | 25.97, 26.32, 26.32 |
+| Candidate 9 → 11, using candidate 10's options with updated FP helpers | 25.64, 26.67, 26.67 | 26.32, 25.97, 25.97 |
+| Candidate 11 → 12, adding `regalloc-split-capped` | 26.32, 25.97, 26.32 | 26.67, 26.32, 26.32 |
+
+Candidate 10 generated 5,037 MiB of Rust against candidate 9's
+5,390 MiB. Candidate 12 completed all three runs, with a 0.9% mean
+increase over candidate 11. The CLI exposes these lift options
+individually.
+
 **Coverage of the winning candidate** (coordinator, exact diagnostic
 relift, perf cycles): hot-region windows still 24.2% of guest cycles,
 structured functions 9.3%. Of all cycles, 11.2% in 314 functions over
@@ -258,6 +277,18 @@ what a callee writes but nothing reads before it is written again (the
 translation's liveness allows it; the exit stores must then not store
 those locals, a gen/kill change to their dataflow).
 
+**Error-path store experiment.** Structured functions store changed
+register locals at each trap, SVC or failed helper or callee return.
+Moving those stores into cold, never-inlined methods kept the caller's
+locals in memory when passed by reference. Host instructions per guest
+instruction rose from 2.32 to 3.27 on `gamefn` and from 2.14 to 2.82 on
+`gamecalls`. Passing the locals by value measured 2.32 on `gamefn`,
+2.09 on `gamecalls`, 2.13 on `crossing` and 8.01 on `vchain`.
+Building the argument at each error site grew the structured functions
+from 85.7 KB to 92.2 KB of machine code, plus 7.5 KB for the cold
+methods. The lifter kept the existing `exit_stores` analysis, which
+emits stores for locals possibly written on a path to that return.
+
 **Fixed: `direct-q-pairs` under regalloc did not compile** (coordinator,
 cloud/lift e31de94, region crate 710025): where a function keeps FP status
 in locals, `wrap_cpu_helpers` wraps each call handing the CPU to a helper
@@ -313,14 +344,10 @@ option: `1024` keeps exactly the functions of candidate 3 and splits
 only those over the size caps, which tells the two halves of the option
 apart.
 
-To find it: rerun candidate 6 with `ECHORA_REGALLOC_SPLIT_BLOCK_LIMIT=1024`
-(hang gone: the newly lifted functions past 1,024 blocks or their
-callers; still there: the pieces of capped functions), and with the
-option on only for region 0x710169; the lift log lists the functions run
-in pieces ("run in structured pieces"), so whether 0x7101692860 is one
-of them, or calls one, says which code to look at. Its guest code (the
-function's blocks and the pieces' entries from the emitted crate) is
-what a reproduction needs.
+The lift log marks functions that were split with “run in structured
+pieces”. For candidate 6 the relevant region was `0x710169`, containing
+`run_function_7101692860`. Candidate 12 later completed all three forest
+runs with the corrected FP groups and splitting enabled.
 
 For the third (structured code run as windows), two opt-in options:
 
@@ -360,6 +387,11 @@ only where summaries prove them needed), the call boundary itself
 (results through memory, the callee's prologue), code size (inlining and
 copies only where hot), and the remaining in-function costs (the guest
 memory range test per access).
+
+One unmeasured way to reduce live locals is to choose split points by
+the registers live across loop nests. The current splitter groups
+strongly connected components and cuts oversized components below their
+headers according to the size budget.
 
 ## Where the cost was
 
@@ -578,8 +610,8 @@ and function table name each one's crate; windows enter structured
 functions and every function calls the others through the function table
 (`function_at`, `run_entry_at`); an inlined PLT stub's predicted call goes
 through the window table instead of naming its window; and the root
-installs the function table into every crate. Resume functions are not
-emitted then. The sink gets the extra crates as regions, so the game's
+installs the function table into every crate. With resume entries enabled,
+windows reach them by PC through that table. The sink gets the extra crates as regions, so the game's
 workspace and bundles take them as they are. Independently, a structured
 function whose Rust with its inlined callees passes
 `regalloc::FUNCTION_BYTES` (1.5 MB) is emitted again without inlining.
@@ -661,5 +693,4 @@ listed too):
 ECHORA_LIFT_OPTIONS=inline-vector,fused-flags,whole-vector-checks,fp-status-locals,window-memory,untagged-blocks,split-ticks,float-runs,functions,function-table,call-summaries,transitive-summaries,regalloc,regalloc-crates
 ```
 
-(`regalloc-loop-inlining` and `regalloc-resume-loops` are further
-opt-ins; resume functions are off with `regalloc-crates`.)
+(`regalloc-loop-inlining` and `regalloc-resume-loops` are further opt-ins.)
