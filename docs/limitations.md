@@ -81,8 +81,10 @@ synthetic fixtures and runs without the game files.
   while it was blocked.
 - Min/max filtering uses the host's Vulkan sampler reduction support. On
   Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
-  levels at LOD 0.5 returned 0.4375 for minimum reduction. The expected
-  value is 0.125. Cross-mip behavior on Radeon still needs verification.
+  levels at LOD 0.5 returned 0.4375 for both minimum and maximum reduction.
+  The same headless test on Radeon with the local RADV 26.2.7 build
+  returned the expected 0.125 and 0.75 respectively. Both drivers passed
+  the same-level min/max checks.
   See [Vulkan mipmap filtering](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-texel-mip-filtering).
 - Finalizing a texture removes its texel buffer and alternate 1D, 3D and
   array images from the lookup caches. Pending GPU commands retain their
