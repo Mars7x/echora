@@ -79,7 +79,7 @@ read.
 | `ECHORA_WINDOW=1`, `ECHORA_AUDIO=1` | Show the game in a window, and play its sound. |
 | `ECHORA_STOP_PRESENT=N` | End the run, with its report, at presented frame N. |
 | `ECHORA_WALL_SECONDS=N` | End an idle run after N host seconds, so the report shows what every thread waits on. |
-| `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. |
+| `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. Use `STICK_L_UP`, `STICK_L_DOWN`, `STICK_L_LEFT` or `STICK_L_RIGHT` to move and `NONE` for an idle interval. |
 | `ECHORA_GPU=0` | Run without the GPU backend. |
 | `ECHORA_ALLOW_OLD_RADV=1` | Run on a Mesa RADV driver older than 26.1.4, which Echora otherwise refuses at start: those versions hang the GPU on the game's task shader draws, and after the kernel resets the GPU every later run hangs until a reboot. For debugging the driver only. |
 | `ECHORA_UNBOUNDED_WRITE_WAITS=1` | CPU reads of guest memory wait for every pending shader store through the GPU page table, not only for the dispatches whose analysed write ranges overlap the read. For checking whether a stale read comes from those ranges. |

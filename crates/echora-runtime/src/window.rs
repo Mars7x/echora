@@ -60,6 +60,11 @@ pub mod button {
             "UP" => UP,
             "RIGHT" => RIGHT,
             "DOWN" => DOWN,
+            "STICK_L_LEFT" => STICK_L_LEFT,
+            "STICK_L_UP" => STICK_L_UP,
+            "STICK_L_RIGHT" => STICK_L_RIGHT,
+            "STICK_L_DOWN" => STICK_L_DOWN,
+            "NONE" => 0,
             _ => return None,
         })
     }

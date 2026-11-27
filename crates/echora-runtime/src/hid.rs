@@ -147,6 +147,23 @@ mod tests {
     use crate::memory::{READ, STATE_SHARED};
 
     #[test]
+    fn scripted_movement_drives_the_stick_and_preserves_dpad_input() {
+        use crate::window::button::named;
+        for (name, stick) in [
+            ("STICK_L_UP", (0, STICK_MAX)),
+            ("STICK_L_DOWN", (0, -STICK_MAX)),
+            ("STICK_L_LEFT", (-STICK_MAX, 0)),
+            ("STICK_L_RIGHT", (STICK_MAX, 0)),
+            ("UP", (0, 0)),
+            ("NONE", (0, 0)),
+        ] {
+            assert_eq!(digital_stick(named(name).unwrap()), stick);
+        }
+        assert_eq!(named("NONE"), Some(0));
+        assert_ne!(named("UP"), Some(0));
+    }
+
+    #[test]
     fn samples_land_in_the_player1_and_handheld_rings() {
         let base = 0x1000_0000;
         let mut memory = Memory::new(1 << 39);
