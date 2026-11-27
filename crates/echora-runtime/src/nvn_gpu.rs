@@ -4910,6 +4910,14 @@ impl Nvn {
     /// mip chain. When extending a same-layout image, keep the levels
     /// already written through its shorter alias.
     fn resolve_color_target(&mut self, texture: u64, level: u32) -> Result<(u64, u32), String> {
+        if !self.target_index_current()
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|backend| backend.renderer.target_info(texture).is_none())
+        {
+            self.refresh_target_index();
+        }
         let levels = self.texture_levels(texture);
         if let Some((key, base)) = self.resolve_target_with_levels(texture, levels, false) {
             return Ok((key, base + level));
@@ -4939,11 +4947,13 @@ impl Nvn {
 
     /// Depth tests and clears must see the same image when the guest makes
     /// a second attachment object over the prepass's storage.
-    fn resolve_depth_attachment(&self, texture: u64, level: u32) -> u64 {
+    fn resolve_depth_attachment(&mut self, texture: u64, level: u32) -> u64 {
         let renderer = &self.gpu.as_ref().unwrap().renderer;
         if renderer.target_info(texture).is_some() {
             return texture;
         }
+        self.refresh_target_index();
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
         let levels = self.texture_levels(texture);
         let Some((alias, 0)) = self.resolve_target_with_levels(texture, levels, true) else {
             return texture;
@@ -18432,7 +18442,8 @@ mod pool_tests {
             .unwrap();
         nvn.evict_bindings();
         assert!(!nvn.target_index_current());
-        nvn.refresh_target_index();
+        assert_eq!(nvn.resolve_color_target(0x2000, 0).unwrap(), (0x3000, 0));
+        assert!(nvn.target_index_current());
         assert_eq!(
             nvn.gpu.as_ref().unwrap().target_index.storage[&0x10_2000],
             [0x3000]
