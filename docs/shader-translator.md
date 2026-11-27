@@ -205,6 +205,13 @@ where the hardware gives 1 or n). A bindless TXQ.B is queried as 2D (its
 pool entry's view type is not known). The survey example counts the two
 kinds over a dump.
 
+When replaying a recorded shader on the CPU, the simulator selects a cube
+face and projects the three-component sample direction onto it. Six image
+layers make one cube. The simulator projects gradients before choosing a mip
+and takes linear filtering taps across face edges. At a three-face corner
+it picks one incident face consistently. These rules apply to offline
+reflection comparisons. The live renderer uses the GPU's cube sampler.
+
 **Storage images.** A formatted image access (SULD.P, SUST.P) leaves the
 SPIR-V image format unspecified. When the runtime resolves a storage image
 view, the compute translation declares one image with the view's numeric

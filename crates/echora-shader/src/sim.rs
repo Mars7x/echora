@@ -521,7 +521,95 @@ impl std::fmt::Debug for Texels {
     }
 }
 
+/// Signed axes for (s, t, positive major coordinate) on each Vulkan cube
+/// face, in image-layer order +X, -X, +Y, -Y, +Z, -Z.
+const CUBE_AXES: [[(usize, f64); 3]; 6] = [
+    [(2, -1.0), (1, -1.0), (0, 1.0)],
+    [(2, 1.0), (1, -1.0), (0, -1.0)],
+    [(0, 1.0), (2, 1.0), (1, 1.0)],
+    [(0, 1.0), (2, -1.0), (1, -1.0)],
+    [(0, 1.0), (1, -1.0), (2, 1.0)],
+    [(0, -1.0), (1, -1.0), (2, -1.0)],
+];
+
+fn float3(words: &[u64]) -> [f64; 3] {
+    std::array::from_fn(|i| f64::from(f32::from_bits(words.get(i).copied().unwrap_or(0) as u32)))
+}
+
+#[derive(Clone, Copy)]
+struct CubeProjection {
+    face: usize,
+    uv: [f64; 2],
+    major: f64,
+}
+
+impl CubeProjection {
+    fn new(direction: [f64; 3]) -> Self {
+        let [x, y, z] = direction.map(f64::abs);
+        // Break major-axis ties in Z, Y, X order.
+        let axis = if z >= x && z >= y {
+            2
+        } else if y >= x {
+            1
+        } else {
+            0
+        };
+        let face = axis * 2 + usize::from(direction[axis] < 0.0);
+        let major = direction[axis].abs();
+        let uv = std::array::from_fn(|i| {
+            let (axis, sign) = CUBE_AXES[face][i];
+            if major == 0.0 {
+                0.5
+            } else {
+                0.5 + 0.5 * sign * direction[axis] / major
+            }
+        });
+        Self { face, uv, major }
+    }
+
+    fn gradient(self, gradient: [f64; 3]) -> [f64; 2] {
+        let [ds, dt, dm] = CUBE_AXES[self.face].map(|(axis, sign)| sign * gradient[axis]);
+        if self.major == 0.0 {
+            return [0.0; 2];
+        }
+        std::array::from_fn(|i| ([ds, dt][i] - (2.0 * self.uv[i] - 1.0) * dm) / (2.0 * self.major))
+    }
+
+    /// A filtering tap across a seam belongs to the adjacent face. At a
+    /// corner select one incident face deterministically, a choice allowed
+    /// by Vulkan. Point sampling clamps to the selected face.
+    fn texel(self, image: &Image, cube: i64, i: i64, j: i64, filtered: bool) -> [u32; 4] {
+        let w = i64::from(image.width.max(1));
+        let h = i64::from(image.height.max(1));
+        if !filtered || ((0..w).contains(&i) && (0..h).contains(&j)) {
+            return image.texel(i, j, cube * 6 + self.face as i64);
+        }
+        let face_coordinates = [
+            (2 * i + 1) as f64 / w as f64 - 1.0,
+            (2 * j + 1) as f64 / h as f64 - 1.0,
+            1.0,
+        ];
+        let mut direction = [0.0; 3];
+        for ((axis, sign), component) in CUBE_AXES[self.face].into_iter().zip(face_coordinates) {
+            direction[axis] = sign * component;
+        }
+        let adjacent = Self::new(direction);
+        image.texel(
+            (adjacent.uv[0] * w as f64).floor() as i64,
+            (adjacent.uv[1] * h as f64).floor() as i64,
+            cube * 6 + adjacent.face as i64,
+        )
+    }
+}
+
 impl Image {
+    fn gradient_length(&self, gradient: [f64; 3], cube: Option<CubeProjection>) -> f64 {
+        let [du, dv] = cube.map_or([gradient[0], gradient[1]], |projection| {
+            projection.gradient(gradient)
+        });
+        (du * f64::from(self.width.max(1))).hypot(dv * f64::from(self.height.max(1)))
+    }
+
     fn slices(&self) -> u32 {
         self.depth.max(1) * self.layers.max(1)
     }
@@ -1590,14 +1678,15 @@ impl Machine {
                             if gather {
                                 results.iter().map(|r| u64::from(r.to_bits())).collect()
                             } else {
-                                let fraction = |n: usize, extent: u32| {
-                                    let x = f64::from(f32::from_bits(
-                                        coordinate.get(n).copied().unwrap_or(0) as u32,
-                                    )) * f64::from(extent.max(1))
-                                        - 0.5;
+                                let [u, v, _] = float3(&coordinate);
+                                let [u, v] = self
+                                    .cube_projection(image_type, &coordinate)
+                                    .map_or([u, v], |cube| cube.uv);
+                                let fraction = |uv: f64, extent: u32| {
+                                    let x = uv * f64::from(extent.max(1)) - 0.5;
                                     (x - x.floor()) as f32
                                 };
-                                let (a, b) = (fraction(0, image.width), fraction(1, image.height));
+                                let (a, b) = (fraction(u, image.width), fraction(v, image.height));
                                 let weights =
                                     [(1.0 - a) * b, a * b, a * (1.0 - b), (1.0 - a) * (1.0 - b)];
                                 let filtered: f32 =
@@ -1664,13 +1753,8 @@ impl Machine {
         }
         if mask & 4 != 0 {
             let (dx, dy) = (value(at)?, value(at + 1)?);
-            let sizes = [f64::from(base.width.max(1)), f64::from(base.height.max(1))];
-            let length = |gradient: &Value| {
-                (0..gradient.len().min(2))
-                    .map(|n| (float(gradient, n) * sizes[n]).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-            };
+            let cube = self.cube_projection(invocation.value_types[&args[0]], value(1)?);
+            let length = |gradient: &Value| base.gradient_length(float3(gradient), cube);
             let rho = length(dx).max(length(dy));
             return Some(if rho > 0.0 {
                 rho.log2()
@@ -2488,17 +2572,13 @@ impl Machine {
                 .array_element(handle)
                 .and_then(|key| shared.image_arrays.get(&key)),
         }?;
-        let sizes = [
-            f64::from(image.width.max(1)),
-            f64::from(image.height.max(1)),
-        ];
+        let cube = self.cube_projection(
+            invocation.value_types[&args[0]],
+            invocation.values.get(&args[1])?,
+        );
         let length = |d: &[f32]| {
-            d.iter()
-                .take(2)
-                .zip(sizes)
-                .map(|(&v, size)| (f64::from(v) * size).powi(2))
-                .sum::<f64>()
-                .sqrt()
+            let gradient = std::array::from_fn(|i| f64::from(d.get(i).copied().unwrap_or(0.0)));
+            image.gradient_length(gradient, cube)
         };
         let rho = length(dx?).max(length(dy?));
         let mut lambda = if rho > 0.0 {
@@ -2983,6 +3063,10 @@ impl Machine {
         }
     }
 
+    fn cube_projection(&self, image_type: u32, coordinate: &[u64]) -> Option<CubeProjection> {
+        (self.image_shape(image_type).0 == 3).then(|| CubeProjection::new(float3(coordinate)))
+    }
+
     /// Integer coordinates (x, y, then z or the layer).
     fn integer_coordinates(&self, image_type: u32, coordinate: &Value) -> [i64; 3] {
         let get = |n: usize| coordinate.get(n).map_or(0, |&v| i64::from(v as u32 as i32));
@@ -3027,7 +3111,11 @@ impl Machine {
                     sizes.push(u64::from(image.depth));
                 }
                 if arrayed {
-                    sizes.push(u64::from(image.layers));
+                    sizes.push(u64::from(if dim == 3 {
+                        image.layers / 6
+                    } else {
+                        image.layers
+                    }));
                 }
                 sizes.truncate(size.max(1));
                 sizes
@@ -3040,7 +3128,14 @@ impl Machine {
             _ => {
                 // Normalized coordinates; an array's layer is a float index.
                 let scaled = |n: usize, extent: u32| float(n) * f64::from(extent.max(1));
-                let (u, v) = (scaled(0, image.width), scaled(1, image.height));
+                let cube = self.cube_projection(image_type, coordinate);
+                let (u, v) = match cube {
+                    Some(cube) => (
+                        cube.uv[0] * f64::from(image.width.max(1)),
+                        cube.uv[1] * f64::from(image.height.max(1)),
+                    ),
+                    None => (scaled(0, image.width), scaled(1, image.height)),
+                };
                 // An array's layer is clamped; a 3D texture's w addressed.
                 let z = match (dim, arrayed) {
                     (1, true) => Some(float(2).round_ties_even() as i64),
@@ -3048,11 +3143,24 @@ impl Machine {
                     (2, _) => {
                         sampler.address[2].apply(scaled(2, image.depth).floor() as i64, image.depth)
                     }
+                    (3, true) => Some(
+                        (float(3).round_ties_even() as i64)
+                            .clamp(0, i64::from((image.layers / 6).saturating_sub(1))),
+                    ),
                     _ => Some(0),
                 };
                 // A texel by the sampler's address modes: the border's
                 // outside the image where a mode clamps to it.
                 let at = |i: i64, j: i64| {
+                    if let Some(cube) = cube {
+                        return cube.texel(
+                            image,
+                            z.unwrap_or(0),
+                            i,
+                            j,
+                            linear || opcode == op::IMAGE_GATHER,
+                        );
+                    }
                     let u = sampler.address[0].apply(i, image.width);
                     let v = if dim == 0 {
                         Some(0)
@@ -6101,7 +6209,7 @@ mod tests {
         // (the sample's dimension, if any; level 0; further levels; the
         // query's results).
         type Case = (Option<u128>, Image, Vec<Image>, [u32; 4]);
-        let cases: [Case; 4] = [
+        let cases: [Case; 6] = [
             (
                 Some(5),
                 image(4, 2, 1, 3),
@@ -6110,6 +6218,8 @@ mod tests {
             ),
             (Some(2), image(4, 2, 5, 1), Vec::new(), [4, 2, 5, 1]),
             (Some(4), image(8, 1, 1, 3), Vec::new(), [8, 3, 1, 1]),
+            (Some(3), image(4, 4, 1, 6), Vec::new(), [4, 4, 1, 1]),
+            (Some(7), image(4, 4, 1, 12), Vec::new(), [4, 4, 2, 1]),
             (None, image(4, 2, 1, 3), Vec::new(), [4, 2, 3, 1]),
         ];
         for (dimension, base, mips, expected) in cases {
@@ -10215,6 +10325,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cube_samples_project_directions_into_their_face_and_mip() {
+        // Each face labels its own (x,y) texels. The two cubes and both
+        // mip levels have distinct values even at coincident coordinates.
+        let image = |side, mip: u32, layers| Image {
+            width: side,
+            height: side,
+            depth: 1,
+            layers,
+            texels: (0..side * side * layers)
+                .map(|i| {
+                    let label =
+                        1000 * mip + 100 * (i / (side * side)) + 10 * (i / side % side) + i % side;
+                    [(label as f32).to_bits(), 0, 0, 0]
+                })
+                .collect(),
+        };
+        let sample = |direction: [f32; 3], cube: Option<u32>, lod: f32, sampler| {
+            // TEX.LL with the guest's direction (and optional leading cube
+            // index) in Ra, explicit level in Rb.
+            let mut words: Vec<_> = cube
+                .into_iter()
+                .chain(direction.map(f32::to_bits))
+                .enumerate()
+                .map(|(i, w)| mov(i as u128, w))
+                .collect();
+            words.extend([
+                mov(8, lod.to_bits()),
+                word(&[
+                    (0, 12, 0xb60),
+                    (16, 8, 4),
+                    (32, 8, 8),
+                    (40, 14, 0x10),
+                    (61, 3, if cube.is_some() { 7 } else { 3 }),
+                    (64, 8, 255),
+                    (72, 4, 1),
+                    (81, 3, 7),
+                    (87, 3, 3),
+                ]),
+                EXIT,
+            ]);
+            let code: Vec<_> = words.into_iter().map(decode).collect();
+            let (stage, registers, _) =
+                translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+            let binding = stage
+                .descriptors
+                .iter()
+                .find(|d| d.cbuf_offset == 0x40)
+                .unwrap()
+                .binding;
+            let layers = if cube.is_some() { 12 } else { 6 };
+            let result = Machine::new(&stage.spirv).simulate(&Inputs {
+                workgroup_count: [1; 3],
+                sampler,
+                images: HashMap::from([((0, binding), image(4, 0, layers))]),
+                mips: HashMap::from([((0, binding), vec![image(2, 1, layers)])]),
+                ..Inputs::default()
+            });
+            assert!(result.problems.is_empty(), "{:?}", result.problems);
+            f32::from_bits(result.invocations[0][&registers[&4]][0] as u32)
+        };
+        let nearest = Sampler::default();
+        // Derivatives in the major direction change UV off-axis but a
+        // scaled copy of the whole direction leaves UV unchanged.
+        let projection = CubeProjection::new([2.0, 1.0, -1.0]);
+        assert_eq!(projection.gradient([2.0, 1.0, -1.0]), [0.0; 2]);
+        assert_eq!(projection.gradient([1.0, 0.0, 0.0]), [-0.125, 0.125]);
+        for (face, (axis, off_axis)) in [
+            ([1., 0., 0.], [2., 1., -1.]),
+            ([-1., 0., 0.], [-2., 1., 1.]),
+            ([0., 1., 0.], [1., 2., -1.]),
+            ([0., -1., 0.], [1., -2., 1.]),
+            ([0., 0., 1.], [1., 1., 2.]),
+            ([0., 0., -1.], [-1., 1., -2.]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(sample(axis, None, 0., nearest), (100 * face + 22) as f32);
+            assert_eq!(
+                sample(off_axis, None, 0., nearest),
+                (100 * face + 13) as f32
+            );
+        }
+        assert_eq!(sample([0., 0., -1.], Some(1), 1., nearest), 2111.);
+        assert_eq!(sample([0., 0., -1.], Some(7), 1., nearest), 2111.);
+        let linear = Sampler {
+            mag_linear: true,
+            mip_linear: true,
+            ..nearest
+        };
+        // +Z's right edge meets +X's left edge. Both adjacent face rows
+        // contribute even when the sampler asks for ordinary repeat wrapping.
+        assert_eq!(sample([1., 0., 1.], None, 0., linear.repeat()), 216.5);
+        assert_eq!(
+            sample(
+                [1., 0., 0.],
+                None,
+                0.5,
+                Sampler {
+                    mip_linear: true,
+                    ..nearest
+                }
+            ),
+            516.5
+        );
     }
 
     #[test]
