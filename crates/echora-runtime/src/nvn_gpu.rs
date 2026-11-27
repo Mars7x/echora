@@ -5710,8 +5710,7 @@ impl Nvn {
         self.render
             .state
             .get("SetSamplerPool")
-            .and_then(|bind| self.sampler_states.get(&bind.x[1]))
-            .and_then(|pool| pool.get(&id))
+            .and_then(|bind| self.render_sampler_descriptor(bind.x[1], id))
             .copied()
             .unwrap_or_default()
     }

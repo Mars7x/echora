@@ -286,8 +286,13 @@ struct Registration {
 #[derive(Debug)]
 struct PreviousDescriptor {
     epoch: u64,
-    entry: Args,
-    view: Option<Bag>,
+    registration: ReplacedRegistration,
+}
+
+#[derive(Debug)]
+enum ReplacedRegistration {
+    Texture { entry: Args, view: Option<Bag> },
+    Sampler(echora_gpu::draw::Sampler),
 }
 
 /// The ECHORA_* environment, read once: the draw path consulted debug
@@ -3716,6 +3721,7 @@ impl Nvn {
                     }
                     "SamplerPool" => {
                         self.sampler_states.remove(&this);
+                        self.descriptor_history.retain(|&(pool, _), _| pool != this);
                         self.bump_binding_serial("stat: binding serial by sampler pool finalized");
                     }
                     _ => {}
@@ -4806,25 +4812,35 @@ impl Nvn {
         self.texture_descriptors.get(&pool)?.get(&id)
     }
 
-    fn previous_descriptor(&self, pool: u64, id: u32) -> Option<&PreviousDescriptor> {
+    fn previous_descriptor(&self, pool: u64, id: u32) -> Option<&ReplacedRegistration> {
         let epoch = self.render.descriptor_epoch?;
         if epoch == self.descriptor_epoch {
             return None;
         }
         let changes = self.descriptor_history.get(&(pool, id))?;
-        changes.get(changes.partition_point(|change| change.epoch <= epoch))
+        changes
+            .get(changes.partition_point(|change| change.epoch <= epoch))
+            .map(|change| &change.registration)
     }
 
     fn render_texture_descriptor(&self, pool: u64, id: u32) -> Option<&Args> {
-        self.previous_descriptor(pool, id)
-            .map(|change| &change.entry)
-            .or_else(|| self.texture_descriptor(pool, id))
+        match self.previous_descriptor(pool, id) {
+            Some(ReplacedRegistration::Texture { entry, .. }) => Some(entry),
+            _ => self.texture_descriptor(pool, id),
+        }
     }
 
     fn render_texture_view(&self, pool: u64, id: u32) -> Option<&Bag> {
         match self.previous_descriptor(pool, id) {
-            Some(change) => change.view.as_ref(),
-            None => self.views.get(&(pool, id)),
+            Some(ReplacedRegistration::Texture { view, .. }) => view.as_ref(),
+            _ => self.views.get(&(pool, id)),
+        }
+    }
+
+    fn render_sampler_descriptor(&self, pool: u64, id: u32) -> Option<&echora_gpu::draw::Sampler> {
+        match self.previous_descriptor(pool, id) {
+            Some(ReplacedRegistration::Sampler(sampler)) => Some(sampler),
+            _ => self.sampler_states.get(&pool)?.get(&id),
         }
     }
 
@@ -4929,13 +4945,27 @@ impl Nvn {
         {
             return;
         }
+        self.replace_descriptor(pool, id, |nvn| ReplacedRegistration::Texture {
+            entry: previous,
+            view: nvn.views.get(&(pool, id)).cloned(),
+        });
+    }
+
+    /// Only clone a replaced registration while a submitted list or capture
+    /// can still use it. Both descriptor kinds share the submission's epoch.
+    fn replace_descriptor(
+        &mut self,
+        pool: u64,
+        id: u32,
+        previous: impl FnOnce(&Self) -> ReplacedRegistration,
+    ) {
         let oldest = self.oldest_descriptor_epoch();
         self.descriptor_epoch += 1;
         let Some(oldest) = oldest else {
             self.descriptor_history.clear();
             return;
         };
-        let view = current_view.cloned();
+        let registration = previous(self);
         self.descriptor_history.retain(|_, versions| {
             let first_live = versions.partition_point(|version| version.epoch <= oldest);
             versions.drain(..first_live);
@@ -4946,8 +4976,7 @@ impl Nvn {
             .or_default()
             .push(PreviousDescriptor {
                 epoch: self.descriptor_epoch,
-                entry: previous,
-                view,
+                registration,
             });
     }
 
@@ -4976,10 +5005,14 @@ impl Nvn {
         }
         self.pool_inputs += 1;
         if let Some(sampler) = sampler {
-            self.sampler_states
+            let previous = self
+                .sampler_states
                 .entry(pool)
                 .or_default()
                 .insert(id, sampler);
+            if let Some(previous) = previous.filter(|value| *value != sampler) {
+                self.replace_descriptor(pool, id, |_| ReplacedRegistration::Sampler(previous));
+            }
         } else if self.objects.contains_key(&pool) {
             self.replace_texture_descriptor(pool, id, entry, view.as_ref());
         }
@@ -9431,6 +9464,52 @@ mod tests {
                 expected.to_le_bytes()
             );
         }
+
+        // A captured dispatch retains the border color that was registered
+        // for its frame, even if the same pool index changes before replay.
+        let dispatch = command("nvnCommandBufferDispatchCompute", [0, 1, 1, 1, 0, 0, 0, 0]);
+        let epoch = nvn.descriptor_epoch;
+        nvn.frame_capture = Some(Box::new(FrameCapture {
+            commands: vec![(None, epoch, dispatch.clone())],
+            render: nvn.render.clone(),
+            queue_render: nvn.queue_render.clone(),
+            render_queue: nvn.render_queue,
+            oldest_descriptor_epoch: epoch,
+        }));
+        nvn.objects
+            .get_mut(&4)
+            .unwrap()
+            .builder
+            .insert("Storage".into(), args([0, 0, 16, 0]));
+        call(&mut nvn, &mut guest, "nvnSamplerBuilderSetDefaults", &[10]);
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerPoolRegisterSamplerBuilder",
+            &[4, 1, 10],
+        );
+        let capture = nvn.frame_capture.take().unwrap();
+        nvn.select_descriptors(nvn.descriptor_epoch);
+        nvn.execute(&dispatch, &mut guest).unwrap();
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(output, 4)
+                .unwrap(),
+            0u32.to_le_bytes()
+        );
+        nvn.replay_frame_commands(&capture, &mut guest).unwrap();
+        assert_eq!(
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_bytes(output, 4)
+                .unwrap(),
+            1.0f32.to_bits().to_le_bytes()
+        );
     }
 
     #[test]
@@ -10968,6 +11047,108 @@ mod tests {
         guest.memory.write_u32(address, 1).unwrap();
         check(&mut nvn, &mut guest, 6, 200, Some(41));
         register(&mut nvn, 300, None);
+        assert!(nvn.descriptor_history.is_empty());
+    }
+
+    #[test]
+    fn queued_sampler_keeps_the_registration_visible_when_its_wait_released() {
+        use echora_gpu::ash::vk;
+        let mut nvn = Nvn::default();
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let address = 0x100000;
+        memory
+            .map(address, 4096, READ | WRITE, STATE_NORMAL, "queue and event")
+            .unwrap();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let (queue, pool, builder, memory_pool, event, handle) = (1, 2, 3, 4, 5, 6);
+        let storage = |x| {
+            BTreeMap::from([(
+                "Storage".into(),
+                Args {
+                    x,
+                    ..Args::default()
+                },
+            )])
+        };
+        nvn.initialize(queue, "Queue", BTreeMap::new()).unwrap();
+        nvn.initialize(pool, "SamplerPool", storage([0, 0, 4, 0]))
+            .unwrap();
+        nvn.initialize(memory_pool, "MemoryPool", storage([address, 4096, 0, 0]))
+            .unwrap();
+        nvn.initialize(event, "Event", storage([memory_pool, 0, 0, 0]))
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnSamplerBuilderSetDefaults",
+            &[builder],
+        );
+        let register = |nvn: &mut Nvn, guest: &mut Guest, filter| {
+            call(
+                nvn,
+                guest,
+                "nvnSamplerBuilderSetMinMagFilter",
+                &[builder, filter, filter],
+            );
+            call(
+                nvn,
+                guest,
+                "nvnSamplerPoolRegisterSamplerBuilder",
+                &[pool, 1, builder],
+            );
+        };
+        let cmd = |name, x| Command {
+            name,
+            x,
+            v: [0; 8],
+            captured: Vec::new(),
+            states: Default::default(),
+        };
+        // The real submit is blocked on the guest event. Resume just through
+        // that wait before a second replacement arrives between replay pieces.
+        register(&mut nvn, &mut guest, 0);
+        let list = vec![
+            cmd("nvnCommandBufferWaitEvent", [0, event, 0, 1, 0, 0, 0, 0]),
+            cmd(
+                "nvnCommandBufferSetSamplerPool",
+                [0, pool, 0, 0, 0, 0, 0, 0],
+            ),
+        ];
+        nvn.command_lists.insert(handle, CommandList::new(list, 0));
+        guest.memory.write_u64(address + 16, handle).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnQueueSubmitCommands",
+            &[queue, 1, address + 16],
+        );
+        assert!(nvn.render.blocked_on_wait);
+        register(&mut nvn, &mut guest, 1);
+        guest.memory.write_u32(address, 1).unwrap();
+        nvn.replay_budget = Some(1);
+        nvn.run_queue(queue, &mut guest, false).unwrap();
+        nvn.replay_budget = None;
+        assert!(!nvn.render.blocked_on_wait);
+        register(&mut nvn, &mut guest, 0);
+        let epoch = nvn.descriptor_epoch;
+        register(&mut nvn, &mut guest, 0);
+        assert_eq!(nvn.descriptor_epoch, epoch);
+        nvn.run_queue(queue, &mut guest, false).unwrap();
+        assert_eq!(
+            nvn.render_sampler_descriptor(pool, 1).unwrap().min_filter,
+            vk::Filter::LINEAR
+        );
+        nvn.select_descriptors(nvn.descriptor_epoch);
+        assert_eq!(
+            nvn.render_sampler_descriptor(pool, 1).unwrap().min_filter,
+            vk::Filter::NEAREST
+        );
+        register(&mut nvn, &mut guest, 1);
         assert!(nvn.descriptor_history.is_empty());
     }
 
