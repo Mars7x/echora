@@ -179,6 +179,7 @@ impl Renderer {
                     .ok_or_else(|| format!("no texture for compute binding {binding}"))?;
                 let image_view =
                     self.texture_view_swizzled(source, descriptor.texture_type, sampler)?;
+                self.check_sampler_view(sampler, image_view)?;
                 let sampler = self.sampler(
                     sampler,
                     descriptor.flags & crate::shader::Descriptor::INTEGER != 0,
@@ -604,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_respects_mirror_clamp_and_base_level_filtering() {
+    fn sampling_respects_mirror_clamp_base_levels_and_reduction() {
         use crate::draw::{ImageShape, UploadRegion};
         use echora_shader::compute::{Layout, translate};
         use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
@@ -651,7 +652,7 @@ mod tests {
         let stage = Arc::new(
             translate(
                 &[
-                    mov(0, 1.75f32.to_bits()),
+                    mov(0, 1.625f32.to_bits()),
                     mov(1, 0.5f32.to_bits()),
                     mov(2, 1.0f32.to_bits()),
                     mov(4, guest_address),
@@ -725,7 +726,7 @@ mod tests {
         let mut repeated = mirror;
         repeated.address[0] = vk::SamplerAddressMode::MIRRORED_REPEAT;
         let edge = if supported { 0.75 } else { 0.25 };
-        for (sampler, expected) in [
+        let mut cases = vec![
             (repeated, 0.25f32),
             (mirror, edge),
             (
@@ -744,7 +745,52 @@ mod tests {
                 },
                 edge,
             ),
-        ] {
+        ];
+        // At x=1.625 clamp-to-edge selects 0.75 in the base mip and 0.125
+        // in mip 1. Fractional LOD gives both texels non-zero weight.
+        let trilinear = Sampler {
+            address: [vk::SamplerAddressMode::CLAMP_TO_EDGE; 3],
+            lod: [0.5, 0.5, 0.0],
+            mipmap: vk::SamplerMipmapMode::LINEAR,
+            ..mirror
+        };
+        cases.push((trilinear, 0.4375));
+        // Wrapping x to 0.625 interpolates adjacent base-level texels at
+        // weights 0.25 and 0.75; both contribute to the min/max footprint.
+        let spatial = Sampler {
+            address: [vk::SamplerAddressMode::REPEAT; 3],
+            ..Sampler::default()
+        };
+        cases.push((spatial, 0.625));
+        // SAFETY: this instance owns the live physical device.
+        let formats = unsafe {
+            renderer.gpu.instance.get_physical_device_format_properties(
+                renderer.gpu.physical,
+                vk::Format::R32_SFLOAT,
+            )
+        };
+        if renderer.gpu.sampler_filter_minmax
+            && renderer.gpu.filter_minmax_image_component_mapping
+            && formats
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_MINMAX)
+        {
+            cases.push((
+                Sampler {
+                    reduction: vk::SamplerReductionMode::MIN,
+                    ..spatial
+                },
+                0.25,
+            ));
+            cases.push((
+                Sampler {
+                    reduction: vk::SamplerReductionMode::MAX,
+                    ..spatial
+                },
+                0.75,
+            ));
+        }
+        for (sampler, expected) in cases {
             let dispatch = Dispatch {
                 program: &program,
                 groups: [1, 1, 1],

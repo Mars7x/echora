@@ -711,6 +711,7 @@ pub struct Renderer {
     /// Draws and dispatches recorded since the last submission.
     work_items: u32,
     samplers: FastMap<SamplerKey, vk::Sampler>,
+    filter_minmax_formats: FastMap<vk::Format, bool>,
     /// Additional views retired with their image, by image and then by
     /// their range, format, and usage used to identify them.
     extra_views: FastMap<vk::Image, FastMap<ExtraView, vk::ImageView>>,
@@ -862,7 +863,34 @@ enum ExtraView {
     },
 }
 
-type SamplerKey = (i32, i32, i32, [i32; 3], [u32; 3], u32, Option<i32>, i32);
+type SamplerKey = (
+    i32,
+    i32,
+    i32,
+    i32,
+    [i32; 3],
+    [u32; 3],
+    u32,
+    Option<i32>,
+    i32,
+);
+
+/// A single point from a single mip has the same minimum, maximum and mean.
+fn effective_reduction(sampler: &crate::draw::Sampler) -> vk::SamplerReductionMode {
+    if matches!(
+        sampler.reduction,
+        vk::SamplerReductionMode::MIN | vk::SamplerReductionMode::MAX
+    ) && sampler.min_filter == vk::Filter::NEAREST
+        && sampler.mag_filter == vk::Filter::NEAREST
+        && (sampler.base_level_only || sampler.mipmap == vk::SamplerMipmapMode::NEAREST)
+        && sampler.max_anisotropy <= 1.0
+        && sampler.compare.is_none()
+    {
+        vk::SamplerReductionMode::WEIGHTED_AVERAGE
+    } else {
+        sampler.reduction
+    }
+}
 
 /// What one submission owns until the GPU finishes it: its command
 /// buffer and fence, the ring its uploads went to, its descriptor pool,
@@ -1337,6 +1365,7 @@ impl Renderer {
             labels: Vec::new(),
             work_items: 0,
             samplers: FastMap::default(),
+            filter_minmax_formats: FastMap::default(),
             extra_views: FastMap::default(),
             imported: FastMap::default(),
             addressed: Vec::new(),
@@ -2438,6 +2467,7 @@ impl Renderer {
         let view = unsafe { self.gpu.device.create_image_view(&create, None) }
             .map_err(vk_error("vkCreateImageView"))?;
         self.add_extra_view(cache, view);
+        self.note_view(view, ViewInfo::of(&create));
         Ok(view)
     }
 
@@ -3389,14 +3419,80 @@ impl Renderer {
         Ok(filled)
     }
 
+    /// Check the final sampled view, including format reinterpretation. Pool
+    /// descriptors resolve a sampler independently of the images paired with it.
+    pub(crate) fn check_sampler_view(
+        &mut self,
+        sampler: &crate::draw::Sampler,
+        view: vk::ImageView,
+    ) -> Result<(), String> {
+        if effective_reduction(sampler) == vk::SamplerReductionMode::WEIGHTED_AVERAGE {
+            return Ok(());
+        }
+        let info = self
+            .view_infos
+            .get(&view)
+            .ok_or("unknown min/max sampler view")?;
+        let format = info.format;
+        let supported = self.filter_minmax_formats.entry(format).or_insert_with(|| {
+            // SAFETY: this instance owns the live physical device.
+            unsafe {
+                self.gpu
+                    .instance
+                    .get_physical_device_format_properties(self.gpu.physical, format)
+            }
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_MINMAX)
+        });
+        if !*supported
+            || info
+                .range
+                .aspect_mask
+                .contains(vk::ImageAspectFlags::STENCIL)
+        {
+            return Err(format!(
+                "min/max sampler filtering unsupported for {format:?} {:?}",
+                info.range.aspect_mask
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn sampler(
         &mut self,
         sampler: &crate::draw::Sampler,
         integer: bool,
     ) -> Result<vk::Sampler, String> {
-        // Raw integer texels use point filtering, even when the guest
-        // sampler is also shared with a linearly filtered float view.
-        let (min_filter, mag_filter, anisotropy) = if integer {
+        let reduction = effective_reduction(sampler);
+        let minmax = reduction != vk::SamplerReductionMode::WEIGHTED_AVERAGE;
+        if minmax {
+            if !matches!(
+                reduction,
+                vk::SamplerReductionMode::MIN | vk::SamplerReductionMode::MAX
+            ) {
+                return Err(format!(
+                    "unknown sampler reduction mode {}",
+                    reduction.as_raw()
+                ));
+            }
+            if sampler.compare.is_some() {
+                return Err("Vulkan min/max filtering does not support depth comparison".into());
+            }
+            if !self.gpu.sampler_filter_minmax {
+                return Err("min/max filtering requires Vulkan samplerFilterMinmax".into());
+            }
+            if !self.gpu.filter_minmax_image_component_mapping {
+                // Without this property even an identity view only defines R.
+                return Err(
+                    "full RGBA min/max filtering requires Vulkan filterMinmaxImageComponentMapping"
+                        .into(),
+                );
+            }
+        }
+        // Integer formats use point sampling for weighted filtering. Min/max
+        // can filter integers on formats which advertise that capability.
+        let point = integer && !minmax;
+        let (min_filter, mag_filter, anisotropy) = if point {
             (vk::Filter::NEAREST, vk::Filter::NEAREST, 1.0)
         } else {
             (
@@ -3418,7 +3514,7 @@ impl Renderer {
             (vk::SamplerMipmapMode::NEAREST, 0.0, 0.25)
         } else {
             (
-                if integer {
+                if point {
                     vk::SamplerMipmapMode::NEAREST
                 } else {
                     sampler.mipmap
@@ -3448,6 +3544,7 @@ impl Renderer {
             min_filter.as_raw(),
             mag_filter.as_raw(),
             mipmap.as_raw(),
+            reduction.as_raw(),
             address.map(|mode| mode.as_raw()),
             [min_lod, max_lod, lod_bias].map(f32::to_bits),
             anisotropy.to_bits(),
@@ -3457,7 +3554,7 @@ impl Renderer {
         if let Some(existing) = self.samplers.get(&key) {
             return Ok(*existing);
         }
-        let info = vk::SamplerCreateInfo::default()
+        let mut info = vk::SamplerCreateInfo::default()
             .min_filter(min_filter)
             .mag_filter(mag_filter)
             .mipmap_mode(mipmap)
@@ -3472,6 +3569,11 @@ impl Renderer {
             .compare_enable(sampler.compare.is_some())
             .compare_op(sampler.compare.unwrap_or(vk::CompareOp::ALWAYS))
             .border_color(border);
+        let mut reduction_info =
+            vk::SamplerReductionModeCreateInfo::default().reduction_mode(reduction);
+        if minmax {
+            info = info.push_next(&mut reduction_info);
+        }
         // SAFETY: valid create info; destroyed in Drop.
         let created = unsafe { self.gpu.device.create_sampler(&info, None) }
             .map_err(vk_error("vkCreateSampler"))?;
@@ -9025,6 +9127,76 @@ mod tests {
         assert_ne!(
             renderer.sampler(&linear, false).unwrap(),
             renderer.sampler(&nearest, false).unwrap()
+        );
+    }
+
+    #[test]
+    fn reduction_filters_reject_unsupported_combinations_and_preserve_point_sampling() {
+        use crate::draw::{Sampler, TextureSource};
+
+        let Ok(mut gpu) = Gpu::new() else {
+            return;
+        };
+        gpu.sampler_filter_minmax = false;
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let min = Sampler {
+            reduction: vk::SamplerReductionMode::MIN,
+            ..Sampler::default()
+        };
+        let max = Sampler {
+            reduction: vk::SamplerReductionMode::MAX,
+            ..min
+        };
+        assert_ne!(min, max);
+        let shadow = Sampler {
+            compare: Some(vk::CompareOp::LESS),
+            ..min
+        };
+        assert!(
+            renderer
+                .sampler(&shadow, false)
+                .unwrap_err()
+                .contains("depth comparison")
+        );
+        assert!(
+            renderer
+                .sampler(&min, false)
+                .unwrap_err()
+                .contains("samplerFilterMinmax")
+        );
+        let point = Sampler {
+            min_filter: vk::Filter::NEAREST,
+            mag_filter: vk::Filter::NEAREST,
+            ..min
+        };
+        let average = Sampler {
+            reduction: vk::SamplerReductionMode::WEIGHTED_AVERAGE,
+            ..point
+        };
+        assert_eq!(
+            renderer.sampler(&point, false).unwrap(),
+            renderer.sampler(&average, false).unwrap()
+        );
+
+        // The bound sRGB twin can have different format features from the image.
+        let unorm = vk::Format::R8G8B8A8_UNORM;
+        let srgb = vk::Format::R8G8B8A8_SRGB;
+        renderer.target(1, 2, 2, unorm).unwrap();
+        renderer.filter_minmax_formats.insert(unorm, true);
+        renderer.filter_minmax_formats.insert(srgb, false);
+        let source = TextureSource::Target(1);
+        let plain = renderer.texture_view_swizzled(&source, 2, &min).unwrap();
+        renderer.check_sampler_view(&min, plain).unwrap();
+        let twin = Sampler {
+            format: Some(srgb),
+            ..min
+        };
+        let view = renderer.texture_view_swizzled(&source, 2, &twin).unwrap();
+        assert!(
+            renderer
+                .check_sampler_view(&twin, view)
+                .unwrap_err()
+                .contains("SRGB")
         );
     }
 

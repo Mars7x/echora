@@ -5708,6 +5708,14 @@ impl Nvn {
 
     pub(super) fn sampler_from_properties(props: &BTreeMap<String, super::Args>) -> Sampler {
         let mut sampler = Sampler::default();
+        // SetDefaults leaves only explicit overrides in the property bag.
+        // A registered NVN sampler uses the same defaults its getters return.
+        let property = |name: &str| {
+            props
+                .get(name)
+                .copied()
+                .or_else(|| super::sampler_default(name))
+        };
         let filter = |value: u64| match value {
             0 | 2 | 4 => vk::Filter::NEAREST,
             _ => vk::Filter::LINEAR,
@@ -5720,7 +5728,7 @@ impl Nvn {
             5 => vk::SamplerAddressMode::CLAMP_TO_BORDER,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
-        if let Some(args) = props.get("MinMagFilter") {
+        if let Some(args) = property("MinMagFilter") {
             sampler.min_filter = filter(args.x[0]);
             sampler.mag_filter = filter(args.x[1]);
             // Mipmapped min filters: 2/3 pick the nearest level, 4/5 blend
@@ -5732,26 +5740,30 @@ impl Nvn {
                 vk::SamplerMipmapMode::NEAREST
             };
         }
-        if let Some(args) = props.get("WrapMode") {
+        if let Some(args) = property("WrapMode") {
             sampler.address = [wrap(args.x[0]), wrap(args.x[1]), wrap(args.x[2])];
+        }
+        // NVN's AVERAGE, MIN and MAX are 0, 1 and 2, as in Vulkan.
+        if let Some(args) = property("ReductionFilter") {
+            sampler.reduction = vk::SamplerReductionMode::from_raw(args.x[0] as i32);
         }
         // SetLodClamp(builder, float min, float max) and SetLodBias(builder,
         // float bias): the floats are the first vector registers.
         let float = |bits: u64| f32::from_bits(bits as u32);
-        if let Some(args) = props.get("MaxAnisotropy") {
+        if let Some(args) = property("MaxAnisotropy") {
             let value = float(args.v[0]);
             if value.is_finite() {
                 sampler.max_anisotropy = value.max(1.0);
             }
         }
-        if let Some(args) = props.get("LodClamp") {
+        if let Some(args) = property("LodClamp") {
             let (min, max) = (float(args.v[0]), float(args.v[1]));
             if min.is_finite() && max.is_finite() {
                 sampler.lod[0] = min.max(0.0);
                 sampler.lod[1] = max.max(0.0);
             }
         }
-        if let Some(args) = props.get("LodBias") {
+        if let Some(args) = property("LodBias") {
             let bias = float(args.v[0]);
             if bias.is_finite() {
                 sampler.lod[2] = bias.clamp(-16.0, 16.0);
@@ -5760,14 +5772,14 @@ impl Nvn {
         // SetCompare(builder, mode, function): mode 1 (compare R to the
         // texture) makes a shadow-map sampler; the function in the depth
         // test's numbering.
-        if let Some(args) = props.get("Compare")
+        if let Some(args) = property("Compare")
             && args.x[0] != 0
         {
             sampler.compare = Some(compare_op(args.x[1]));
         }
         // SetBorderColor (floats): the colour clamp-to-border reads outside
         // the texture (1.0 for the game's shadow maps: outside is lit).
-        if let Some(args) = props.get("BorderColor") {
+        if let Some(args) = property("BorderColor") {
             sampler.border = args.x.map(|word| word as u32);
         }
         sampler
@@ -17646,6 +17658,23 @@ mod pool_tests {
         );
         call(
             &mut nvn,
+            "nvnSamplerPoolRegisterSamplerBuilder",
+            [pool, 2, builder, 0],
+            0.0,
+        );
+        let defaults = nvn.handle_sampler(2 << 20);
+        assert_eq!(defaults.min_filter, vk::Filter::LINEAR);
+        assert_eq!(defaults.mag_filter, vk::Filter::LINEAR);
+        assert_eq!(
+            defaults.reduction,
+            vk::SamplerReductionMode::WEIGHTED_AVERAGE
+        );
+        assert_eq!(defaults.mipmap, vk::SamplerMipmapMode::NEAREST);
+        assert!(defaults.base_level_only);
+        assert_eq!(defaults.address, [vk::SamplerAddressMode::REPEAT; 3]);
+        assert_eq!(defaults.lod, [0.0, 1000.0, 0.0]);
+        call(
+            &mut nvn,
             "nvnSamplerBuilderSetMinMagFilter",
             [builder, 0, 0, 0],
             0.0,
@@ -17655,6 +17684,12 @@ mod pool_tests {
             "nvnSamplerBuilderSetMaxAnisotropy",
             [builder, 0, 0, 0],
             2.5,
+        );
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetReductionFilter",
+            [builder, 1, 0, 0],
+            0.0,
         );
         call(
             &mut nvn,
@@ -17677,6 +17712,10 @@ mod pool_tests {
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
         assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 2.5);
         assert_eq!(
+            nvn.handle_sampler(2 << 20).reduction,
+            vk::SamplerReductionMode::MIN
+        );
+        assert_eq!(
             nvn.handle_sampler(2 << 20).address,
             [
                 vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
@@ -17696,6 +17735,12 @@ mod pool_tests {
             [builder, 0, 0, 0],
             8.0,
         );
+        call(
+            &mut nvn,
+            "nvnSamplerBuilderSetReductionFilter",
+            [builder, 2, 0, 0],
+            0.0,
+        );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::NEAREST);
         assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 2.5);
         call(
@@ -17706,11 +17751,19 @@ mod pool_tests {
         );
         assert_eq!(nvn.handle_sampler(2 << 20).min_filter, vk::Filter::LINEAR);
         assert_eq!(nvn.handle_sampler(2 << 20).max_anisotropy, 8.0);
+        assert_eq!(
+            nvn.handle_sampler(2 << 20).reduction,
+            vk::SamplerReductionMode::MAX
+        );
         call(
             &mut nvn,
             "nvnSamplerPoolRegisterSampler",
             [pool, 3, sampler, 0],
             0.0,
+        );
+        assert_eq!(
+            nvn.handle_sampler(3 << 20).reduction,
+            vk::SamplerReductionMode::MIN
         );
         assert_eq!(nvn.handle_sampler(3 << 20).min_filter, vk::Filter::NEAREST);
         assert_eq!(nvn.handle_sampler(3 << 20).max_anisotropy, 2.5);

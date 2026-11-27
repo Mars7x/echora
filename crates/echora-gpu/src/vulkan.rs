@@ -40,6 +40,8 @@ pub struct Gpu {
     pub max_sampler_lod_bias: f32,
     /// The device enables the Vulkan mirror clamp-to-edge address mode.
     pub(crate) sampler_mirror_clamp_to_edge: bool,
+    pub(crate) sampler_filter_minmax: bool,
+    pub(crate) filter_minmax_image_component_mapping: bool,
     pub(crate) texture_compression_astc_ldr: bool,
     /// Compute shaders can require 32-lane subgroups (the guest's warp
     /// width; VK_EXT_subgroup_size_control, core in 1.3).
@@ -479,6 +481,7 @@ impl Gpu {
         let sampler_mirror_clamp_to_edge = s12.sampler_mirror_clamp_to_edge != 0;
         let mut enable12 = vk::PhysicalDeviceVulkan12Features::default()
             .sampler_mirror_clamp_to_edge(sampler_mirror_clamp_to_edge)
+            .sampler_filter_minmax(s12.sampler_filter_minmax != 0)
             .storage_buffer8_bit_access(s12.storage_buffer8_bit_access != 0)
             .uniform_and_storage_buffer8_bit_access(s12.uniform_and_storage_buffer8_bit_access != 0)
             .shader_float16(s12.shader_float16 != 0)
@@ -674,6 +677,10 @@ impl Gpu {
             },
             max_sampler_lod_bias: properties.limits.max_sampler_lod_bias,
             sampler_mirror_clamp_to_edge,
+            sampler_filter_minmax: s12.sampler_filter_minmax != 0,
+            filter_minmax_image_component_mapping: properties12
+                .filter_minmax_image_component_mapping
+                != 0,
             texture_compression_astc_ldr: core.texture_compression_astc_ldr != 0,
             compute_subgroup_32,
             subgroup_32_stages,

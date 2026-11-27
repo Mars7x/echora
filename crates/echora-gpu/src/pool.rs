@@ -425,6 +425,7 @@ impl Renderer {
                 else {
                     continue;
                 };
+                self.check_sampler_view(&entry.sampler_state, view)?;
                 wanted.push((array, entry.texture, view.as_raw()));
                 view_mask |= 1 << array;
             }

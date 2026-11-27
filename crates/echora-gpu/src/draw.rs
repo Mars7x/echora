@@ -481,6 +481,8 @@ pub struct Sampler {
     pub min_filter: vk::Filter,
     pub mag_filter: vk::Filter,
     pub mipmap: vk::SamplerMipmapMode,
+    /// How filtered texels are combined, including across mip levels.
+    pub reduction: vk::SamplerReductionMode,
     /// Sample only level 0 (filters without mipmapping).
     pub base_level_only: bool,
     pub address: [vk::SamplerAddressMode; 3],
@@ -537,6 +539,7 @@ impl PartialEq for Sampler {
             other.format,
             other.view_levels,
         ) && self.view_layers == other.view_layers
+            && self.reduction == other.reduction
     }
 }
 
@@ -546,6 +549,7 @@ impl Default for Sampler {
             min_filter: vk::Filter::LINEAR,
             mag_filter: vk::Filter::LINEAR,
             mipmap: vk::SamplerMipmapMode::NEAREST,
+            reduction: vk::SamplerReductionMode::WEIGHTED_AVERAGE,
             base_level_only: true,
             address: [vk::SamplerAddressMode::CLAMP_TO_EDGE; 3],
             lod: [0.0, vk::LOD_CLAMP_NONE, 0.0],
@@ -1325,6 +1329,7 @@ impl Renderer {
                                     descriptor.texture_type,
                                     sampler,
                                 )?;
+                                self.check_sampler_view(sampler, view)?;
                                 let info = vk::DescriptorImageInfo {
                                     sampler: self.sampler(
                                         sampler,

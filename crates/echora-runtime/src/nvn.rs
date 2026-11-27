@@ -9160,20 +9160,16 @@ fn device_integer(property: u32) -> Option<i32> {
     }
 }
 
-/// A sampler property SetDefaults sets, for getters on samplers whose
-/// builder never set it: OpenGL's defaults, which NVN sampler state mirrors
-/// (LOD clamp -1000..1000, LOD bias 0, no depth compare with function
-/// LEQUAL, anisotropy 1, min filter nearest-mipmap-linear and mag linear,
-/// repeat wrapping, average reduction 0, LOD snap 0), in the enum numbering `nvn_gpu` decodes: compare
-/// LEQUAL 4, filters 4 and 1, wrap 1. Floats are in `v`. Provisional.
+/// Default NVN sampler properties, verified by running the guest builder's
+/// reset and getter routines. Registrations and getters use the same values.
 fn sampler_default(property: &str) -> Option<Args> {
     let float = |value: f32| u64::from(value.to_bits());
     let (x, v) = match property {
-        "LodClamp" => ([0; 4], [float(-1000.0), float(1000.0)]),
+        "LodClamp" => ([0; 4], [float(0.0), float(1000.0)]),
         "LodBias" => ([0; 4], [float(0.0), 0]),
-        "Compare" => ([0, 4, 0, 0], [0; 2]),
+        "Compare" => ([0, 2, 0, 0], [0; 2]),
         "MaxAnisotropy" => ([0; 4], [float(1.0), 0]),
-        "MinMagFilter" => ([4, 1, 0, 0], [0; 2]),
+        "MinMagFilter" => ([1, 1, 0, 0], [0; 2]),
         "WrapMode" => ([1, 1, 1, 0], [0; 2]),
         "ReductionFilter" => ([0; 4], [0; 2]),
         "LodSnap" => ([0; 4], [float(0.0), 0]),
@@ -10140,6 +10136,45 @@ mod tests {
         assert_eq!(bind.states[0]["DepthFunc"].x[0], 3);
         assert_eq!(bind.states[0]["DepthWriteEnable"].x[0], 1);
         assert_eq!(guest.memory.read_u32(source).unwrap(), original);
+    }
+
+    #[test]
+    fn reset_sampler_builder_reports_guest_filter_compare_and_lod_defaults() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "sampler")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let (builder, left, right) = (0x1100, 0x1200, 0x1204);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnSamplerBuilderSetDefaults",
+            &[builder],
+        );
+        for (name, expected) in [
+            ("nvnSamplerBuilderGetMinMagFilter", [1, 1]),
+            ("nvnSamplerBuilderGetCompare", [0, 2]),
+            (
+                "nvnSamplerBuilderGetLodClamp",
+                [0.0_f32.to_bits(), 1000.0_f32.to_bits()],
+            ),
+        ] {
+            core.memory.write_u32(left, u32::MAX).unwrap();
+            core.memory.write_u32(right, u32::MAX).unwrap();
+            call(&mut nvn, &mut core, name, &[builder, left, right]);
+            assert_eq!(
+                [left, right].map(|at| core.memory.read_u32(at).unwrap()),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
