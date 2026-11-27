@@ -5948,6 +5948,13 @@ impl Renderer {
 
     /// Debugging: the sizes of the renderer's caches.
     pub fn cache_sizes(&self) -> Vec<(&'static str, usize)> {
+        let mut payloads = FastSet::default();
+        let archive_bytes = self
+            .archived_targets
+            .values()
+            .filter(|archive| payloads.insert(archive.compressed.as_ptr()))
+            .map(|archive| archive.compressed.len())
+            .sum();
         vec![
             ("targets", self.targets.len()),
             ("uploads", self.uploads.len()),
@@ -5968,6 +5975,8 @@ impl Renderer {
             ("pending reads", self.slot.pending_reads.len()),
             ("completed reads", self.completed_reads.len()),
             ("fresh targets", self.fresh_targets.len()),
+            ("retained archive targets", self.archived_targets.len()),
+            ("unique retained archive bytes", archive_bytes),
         ]
     }
 
@@ -11681,9 +11690,20 @@ mod tests {
             &archive.compressed,
             &renderer.archived_targets[&9].compressed
         ));
+        let compressed_size = archive.compressed.len();
+        let occupancy = |renderer: &Renderer| {
+            let sizes: FastMap<_, _> = renderer.cache_sizes().into_iter().collect();
+            (
+                sizes["retained archive targets"],
+                sizes["unique retained archive bytes"],
+            )
+        };
+        assert_eq!(occupancy(&renderer), (2, compressed_size));
         renderer.move_target(7, 8).unwrap();
+        assert_eq!(occupancy(&renderer), (1, compressed_size));
         assert_eq!(renderer.archived_bytes.len(), 1);
         renderer.move_target(8, 9).unwrap();
+        assert_eq!(occupancy(&renderer), (0, 0));
         assert!(renderer.archived_bytes.is_empty());
         assert_eq!(renderer.target_keys_in_order(), [9]);
         assert_eq!(
