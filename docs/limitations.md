@@ -22,9 +22,14 @@ automated test covers it).
   10,496–10,501) showed no black frame. After compensating for camera
   motion, no matched 40×40-pixel patch on the four interior frames had a
   brightness pulse above 12/255 relative to both neighbors. The check
-  covered about 96% of the measured tiles in that shot. Smaller flicker
-  and later scenes remain open. Unimplemented operations can stop the run
-  and produce a report.
+  covered about 96% of the measured tiles in that shot. Six later live frames
+  (10,580–10,585) showed fine shimmer on the foreground bank. In one
+  motion-aligned patch, 3.56% of pixel samples reversed brightness by more
+  than 20/255 across three frames. None did in the matching compressed
+  console footage. No 4×4 block in either patch showed a reversal above
+  12/255 after averaging its pixels.
+  The missing floor has yet to be reproduced in these frames. Unimplemented
+  operations can stop the run and produce a report.
 - The reserved zero texture in a guest texture pool samples as transparent
   black and reports zero dimensions on hosts supporting Vulkan null
   descriptors. Two vertex programs previously skipped 35 depth draws
@@ -69,7 +74,10 @@ automated test covers it).
   of additional live Vulkan images between presents 10,200 and 10,300.
   Across the next four samples (10,400–10,700), targets and uploads stayed
   within 16 MiB of their initial total and held no retired image bytes
-  at the sampling points. The later driver failure and memory growth remain open.
+  at the sampling points. In a separate interactive run from a saved game,
+  resident memory reached 15,078 MiB shortly after present 6,100. The test
+  watchdog terminated the process at its 14,336 MiB limit. Its junction
+  temperature was 38°C. The earlier black-screen failure remains open.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
