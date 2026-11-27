@@ -2055,18 +2055,20 @@ impl Nvn {
 
     /// An initialized target can override guest RAM on sampling, including
     /// through a finalized texture's storage alias. Discard it only when a
-    /// guest write has replaced every byte of its backing.
-    pub(super) fn discard_overwritten_targets(&mut self, written: &std::ops::Range<u64>) {
+    /// guest write has replaced every byte of its backing or, for a padded
+    /// write, it has the same layout and every texel was written.
+    pub(super) fn discard_overwritten_targets(
+        &mut self,
+        written: &std::ops::Range<u64>,
+        padded_texture: Option<u64>,
+    ) {
         if self.gpu.is_none() || written.is_empty() {
             return;
         }
         self.refresh_target_index();
         let backend = self.gpu.as_ref().unwrap();
         let mut discarded = Vec::new();
-        for (&base, keys) in &backend.target_index.storage {
-            if !written.contains(&base) {
-                continue;
-            }
+        let mut find_overwritten = |base, keys: &[u64]| {
             for &key in keys {
                 let Some(target) = backend.renderer.target_info(key) else {
                     continue;
@@ -2076,6 +2078,7 @@ impl Nvn {
                 };
                 let value =
                     |name: &str, default| object.builder.get(name).map_or(default, |v| v.x[0]);
+                let extent = (target.width, target.height, target.format);
                 // The footprint of a single 2D subresource is known in both
                 // pitch-linear and block-linear storage. Multisample layouts,
                 // partial virtual mappings and other shapes need their own proof.
@@ -2085,8 +2088,7 @@ impl Nvn {
                     || value("Depth", 1) > 1
                     || value("Levels", 1) > 1
                     || value("Samples", 1) > 1
-                    || self.target_shape(key).ok()
-                        != Some((target.width, target.height, target.format))
+                    || self.target_shape(key).ok() != Some(extent)
                 {
                     continue;
                 }
@@ -2094,8 +2096,25 @@ impl Nvn {
                     && range.start == base
                     && range.start < range.end
                     && range.end <= written.end
+                    && padded_texture.is_none_or(|texture| {
+                        &range == written
+                            && self.target_shape(texture).ok() == Some(extent)
+                            && self.texture_alias_layout_matches(texture, key, target)
+                    })
                 {
                     discarded.push(key);
+                }
+            }
+        };
+        let by_base = &backend.target_index.storage;
+        if padded_texture.is_some() {
+            if let Some(keys) = by_base.get(&written.start) {
+                find_overwritten(written.start, keys);
+            }
+        } else {
+            for (&base, keys) in by_base {
+                if written.contains(&base) {
+                    find_overwritten(base, keys);
                 }
             }
         }
@@ -2117,7 +2136,7 @@ impl Nvn {
         range: std::ops::Range<u64>,
         value: u32,
     ) -> Result<(), String> {
-        self.discard_overwritten_targets(&range);
+        self.discard_overwritten_targets(&range, None);
         self.gpu_invalidate(range.clone(), None);
         let Some(backend) = self.gpu.as_mut() else {
             return Ok(());
@@ -16136,34 +16155,48 @@ mod target_tests {
 
     #[test]
     fn whole_pitch_linear_texel_write_supersedes_old_rendering() {
-        whole_texel_write_supersedes_old_rendering(true);
+        whole_texel_write_supersedes_old_rendering(64, true);
     }
 
     #[test]
     fn whole_dense_block_linear_texel_write_supersedes_old_rendering() {
-        whole_texel_write_supersedes_old_rendering(false);
+        whole_texel_write_supersedes_old_rendering(64, false);
     }
 
-    fn whole_texel_write_supersedes_old_rendering(pitch_linear: bool) {
+    #[test]
+    fn whole_padded_block_linear_texel_write_supersedes_old_rendering() {
+        whole_texel_write_supersedes_old_rendering(60, false);
+    }
+
+    fn whole_texel_write_supersedes_old_rendering(width: u32, pitch_linear: bool) {
         use super::{Scale, TextureSource};
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
-        let (width, height) = (64_u32, 16_u32);
-        let Some((mut nvn, mut memory, _, texture)) =
-            texture_cache_fixture_of_size(0x24, width.into(), height.into())
+        let height = 16_u32;
+        let Some((mut nvn, mut memory, base, texture)) =
+            texture_cache_fixture_of_size(0x24, 64, height.into())
         else {
             return;
         };
+        let padded = width < 64;
+        let pitch_alias = 4;
+        if padded {
+            nvn.initialize(
+                pitch_alias,
+                "Texture",
+                nvn.objects[&texture].builder.clone(),
+            )
+            .unwrap();
+            memory.write(base, &[0x7b; 4096]).unwrap();
+        }
         if !pitch_linear {
-            nvn.objects
-                .get_mut(&texture)
-                .unwrap()
-                .builder
-                .remove("Stride");
+            let builder = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+            builder.get_mut("Width").unwrap().x[0] = width.into();
+            builder.remove("Stride");
         }
         assert_eq!(
             nvn.texture_storage_size(texture),
-            Some(u64::from(width * height * 4))
+            Some(u64::from(64 * height * 4))
         );
         nvn.gpu
             .as_mut()
@@ -16202,16 +16235,35 @@ mod target_tests {
         let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
         nvn.gpu_clear_color(&core, (texture, 0, 0), red, None, 15, 0)
             .unwrap();
+        if padded {
+            nvn.gpu_clear_color(&core, (pitch_alias, 0, 0), red, None, 15, 0)
+                .unwrap();
+        }
         assert!(matches!(
             nvn.texture_source(&core, alias),
             Ok(TextureSource::Target(_))
         ));
-        core.cpu.regs[..4].copy_from_slice(&[texture, 0, region_address, source]);
+        core.cpu.regs[..4].copy_from_slice(&[alias, 0, region_address, source]);
         assert!(nvn.call("nvnTextureWriteTexels", &mut core).unwrap());
-        let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, alias).unwrap() else {
+        let TextureSource::Upload { texels, .. } = nvn.texture_source(&core, texture).unwrap()
+        else {
             panic!("alias must see the new texels after a complete write");
         };
         assert_eq!(&**texels, &expected);
+        if padded {
+            assert!(matches!(
+                nvn.texture_source(&core, pitch_alias),
+                Ok(TextureSource::Target(key)) if key == pitch_alias
+            ));
+            let format = crate::nvn_format::info(37).unwrap();
+            let shape = crate::nvn_format::level_block_shape(format, height, 1, 1, 0);
+            let padding = crate::nvn_format::block_linear_offset_in(
+                format, width, height, shape, width, 0, 0,
+            );
+            let mut byte = [0];
+            core.memory.read(base + padding, &mut byte).unwrap();
+            assert_eq!(byte, [0x7b]);
+        }
     }
 
     #[test]

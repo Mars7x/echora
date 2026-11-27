@@ -7088,15 +7088,16 @@ impl Nvn {
             }
             core.memory.write(base, &tiled).map_err(TexelError::Trap)?;
             *self.tiled_scratch.borrow_mut() = tiled;
-            // Discard old rendered pixels only when these rows replaced every
-            // storage byte another texture could read through an alias.
+            // Padding can be read as texels by an alias with another layout.
+            // Only a matching layout is fully overwritten in that case.
             if target == 1
                 && levels == 1
-                && packed_size == level_size
+                && get("Samples").unwrap_or(1) <= 1
                 && level_size == size
                 && let gpu::TextureBacking::Linear((0, range)) = &backing
             {
-                self.discard_overwritten_targets(range);
+                let padded = (packed_size != level_size).then_some(texture_object);
+                self.discard_overwritten_targets(range, padded);
             }
             // A single-level texture's upload can take these rows as they
             // are while its storage stays as written here.
@@ -7218,7 +7219,7 @@ impl Nvn {
             && row_size.checked_mul(u64::from(rows)) == Some(size)
             && let gpu::TextureBacking::Linear((0, range)) = &backing
         {
-            self.discard_overwritten_targets(range);
+            self.discard_overwritten_targets(range, None);
         }
         result
     }
