@@ -443,6 +443,10 @@ impl Emitter {
         }
         let result = match (output, region, size) {
             // The program's own outputs, read back.
+            // Index bytes start at 4. The count uses separate addressing.
+            (true, 0, 0) if !mesh.task && offset >= 4 => {
+                self.bounded_word(map, storage::WORKGROUP, address, map_words)
+            }
             (true, 3, 2) if mesh.task => {
                 let payload = payload.expect("a task payload");
                 self.bounded_word(payload, payload_class, word_index, mesh.payload_words)

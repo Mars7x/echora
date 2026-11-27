@@ -257,8 +257,9 @@ program's, lists the per-primitive ones). Its map holds the primitive
 count at byte 3 and the vertex indices as bytes from byte 4; a map write
 at byte 3 (of any size, also through a register address) sets the count,
 and a 16- or 32-bit write elsewhere sets two or four index bytes, low
-byte first. At
-the end, after a barrier, the program sets its outputs (all its
+byte first. A mesh program can also read back an individual index byte
+from its output map using the register address plus an immediate offset
+of four or more. At the end, after a barrier, the program sets its outputs (all its
 `max_vertices` vertices, the written primitive count capped at
 `max_primitives`) and copies the lines to the position, point size (for
 points) and generic vector arrays and to the per-primitive id, layer and
@@ -647,7 +648,7 @@ programs read bank 24). The layouts were cross-checked against NAK's encoder.
 | KILL | 0x95b | condition 87-90 |
 | LDSM | 0x83b | matrices 1 << 72-73, `.MT88` 78; address register 24, uniform register 32 with bit 91, offset 40-63; row addresses shuffled from the lanes that supply them, shared words read (halves for `.MT88`) |
 | MOVM | 0x23a | `.16.MT88` only (bits 32-95 zero); the 8x8 half matrix transposed in the same lane layout: two subgroup shuffles from lanes 8(t%4) + t/8 and +4, the half picked by (t/4)%2 |
-| ISBERD, ISBEWR | 0x923, 0x927 | NAK's fields: address register 24, offset 40-55 (56-73 must be clear), size 74-75, region 76-77 (0 the map, 3 attributes), `.SKEW` 78, `.O` 79; ISBERD destination 16, ISBEWR data 32. 32-bit attribute reads and writes, U8 map writes and the primitive count; see Task and mesh programs |
+| ISBERD, ISBEWR | 0x923, 0x927 | NAK's fields: address register 24, offset 40-55 (56-73 must be clear), size 74-75, region 76-77 (0 the map, 3 attributes), `.SKEW` 78, `.O` 79; ISBERD destination 16, ISBEWR data 32. 32-bit attribute reads and writes, U8 index map reads, packed map writes and the primitive count; see Task and mesh programs |
 | HMMA | 0x23c | d 16, a 24, b 32, c 64; m16n8k16 with bit 75 (else m16n8k8; 78 the k4 form, not decoded), 32-bit accumulator with bit 76 (else halves), half sources (82-83 zero); PTX fragment layout per lane, rows and columns gathered by subgroup shuffles |
 | BAR.SYNC | 0xb1d | mode 77-78 (0 SYNC); a workgroup control barrier that orders uniform (buffer and physical), workgroup and image memory, as bar.sync orders all memory for the CTA |
 | MEMBAR | 0x992 | scope 76-78 (0 CTA, 1 SM, 2 GPU, 3 system; .MMIO 72 and other bits but .SC 80 refused); OpMemoryBarrier over all memory at the workgroup (CTA, SM) or the device (GPU, system: Vulkan has nothing wider) |

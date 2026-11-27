@@ -961,6 +961,40 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_program_reads_its_own_primitive_indices() {
+        let registers = mesh_registers(4, 3, 1, 0);
+        let immediate = |register, value| {
+            word(&[
+                (0, 12, 0x802),
+                (72, 4, 0xf),
+                (16, 8, register),
+                (32, 32, value),
+            ])
+        };
+        for (index, expected) in [(0, 1), (1, 2), (2, 3)] {
+            let mut mesh = header(1, 3, &POSITION_AND_GENERIC);
+            mesh.extend(bytes(&[
+                immediate(0, index),
+                immediate(1, 0x030201),
+                isbe(true, 1, 255, 4, 0, 2, true),
+                isbe(true, 255, 255, 8, 0, 2, true),
+                isbe(true, 255, 255, 12, 0, 0, true),
+                isbe(false, 2, 0, 4, 0, 0, true),
+                // Use the byte read back as the primitive count.
+                isbe(true, 2, 255, 3, 0, 2, true),
+                EXIT,
+            ]));
+            let translated = validated_with(&mesh, &mesh_parameters(false, registers, None));
+            let report = sim::Machine::new(&translated.spirv).simulate(&sim::Inputs {
+                workgroup_count: [1, 1, 1],
+                ..Default::default()
+            });
+            assert!(report.problems.is_empty(), "{:?}", report.problems);
+            assert_eq!(report.mesh_outputs, Some((4, expected)));
+        }
+    }
+
+    #[test]
     fn a_task_program_passes_its_payload_to_the_mesh_program() {
         // The task program: its workgroup index into the payload (byte
         // 0x14), the mesh workgroup count at byte 4.
