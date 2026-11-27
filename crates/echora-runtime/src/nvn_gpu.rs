@@ -63,6 +63,7 @@ pub struct PageBuild {
     first: u64,
     entries: Vec<u64>,
     pools: HashMap<PagePool, (PoolShareVersion, bool)>,
+    run_hints: std::cell::OnceCell<writer_ranges::PageRunHints>,
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
     /// Virtual write ranges projected through `shared_mapping`, kept with
     /// it (the forest's culling passes project the same ranges, ~870 file
@@ -998,10 +999,14 @@ impl Backend {
                         offset,
                     })
                     .collect();
-                writer_ranges::project_table(
+                let hints = built
+                    .run_hints
+                    .get_or_init(|| writer_ranges::PageRunHints::new(&built.entries, PAGE_SIZE));
+                writer_ranges::project_table_with_hints(
                     built.first << PAGE_SHIFT,
                     PAGE_SIZE,
                     &built.entries,
+                    hints,
                     imports,
                 )
             })
@@ -8656,8 +8661,12 @@ impl Nvn {
             .filter(|built| built.entries.len() == count)
             .map(|_| Vec::new());
         let mut built_pools = HashMap::default();
+        let mut run_hints = std::cell::OnceCell::new();
         let mut entries = match previous {
             Some(built) => {
+                if modified.is_some() {
+                    run_hints = built.run_hints;
+                }
                 built_pools = built.pools;
                 built.entries
             }
@@ -8751,6 +8760,9 @@ impl Nvn {
         );
         if let Some(modified) = &mut modified {
             merge_ranges(modified);
+            if let Some(hints) = run_hints.get_mut() {
+                hints.update(&entries, PAGE_SIZE, modified);
+            }
         }
         let table = backend.set_page_table(
             key,
@@ -8758,6 +8770,7 @@ impl Nvn {
                 first,
                 entries,
                 pools: built_pools,
+                run_hints,
                 shared_mapping: std::cell::OnceCell::new(),
                 projections: Default::default(),
             },
@@ -17438,6 +17451,7 @@ mod pool_tests {
                 first: 10,
                 entries: addresses.to_vec(),
                 pools: Default::default(),
+                run_hints: Default::default(),
                 shared_mapping: std::cell::OnceCell::from(mapping),
                 projections: Default::default(),
             }

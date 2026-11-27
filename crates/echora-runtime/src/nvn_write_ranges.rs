@@ -26,10 +26,77 @@ pub struct FileRange {
     pub bytes: Range<u64>,
 }
 
-pub fn project_table(
+/// Length of the first run of holes or consecutive device pages in each
+/// block. A page-table patch only invalidates the blocks it touches.
+pub(super) struct PageRunHints(Vec<u16>);
+
+impl PageRunHints {
+    const BLOCK: usize = 256;
+
+    pub(super) fn new(entries: &[u64], page_size: u64) -> Self {
+        Self(
+            entries
+                .chunks(Self::BLOCK)
+                .map(|chunk| Self::prefix(chunk, page_size))
+                .collect(),
+        )
+    }
+
+    fn prefix(chunk: &[u64], page_size: u64) -> u16 {
+        let step = if chunk[0] == 0 { 0 } else { page_size };
+        (1 + chunk
+            .windows(2)
+            .take_while(|pair| pair[0].checked_add(step) == Some(pair[1]))
+            .count()) as u16
+    }
+
+    pub(super) fn update(&mut self, entries: &[u64], page_size: u64, patches: &[Range<u64>]) {
+        let mut next = 0;
+        for patch in patches.iter().filter(|p| !p.is_empty()) {
+            let start = (patch.start as usize / Self::BLOCK).max(next);
+            let end = (patch.end as usize).div_ceil(Self::BLOCK);
+            for index in start..end {
+                let at = index * Self::BLOCK;
+                self.0[index] = Self::prefix(
+                    &entries[at..(at + Self::BLOCK).min(entries.len())],
+                    page_size,
+                );
+            }
+            next = end;
+        }
+    }
+
+    #[inline]
+    fn advance(&self, page: usize) -> usize {
+        if page.is_multiple_of(Self::BLOCK) {
+            usize::from(self.0[page / Self::BLOCK])
+        } else {
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn project_table(
     first_gpu: u64,
     page_size: u64,
     entries: &[u64],
+    imported: Vec<ImportedSpan>,
+) -> Option<Vec<SharedPages>> {
+    project_table_with_hints(
+        first_gpu,
+        page_size,
+        entries,
+        &PageRunHints::new(entries, page_size),
+        imported,
+    )
+}
+
+pub(super) fn project_table_with_hints(
+    first_gpu: u64,
+    page_size: u64,
+    entries: &[u64],
+    hints: &PageRunHints,
     mut imported: Vec<ImportedSpan>,
 ) -> Option<Vec<SharedPages>> {
     imported.sort_unstable_by_key(|span| span.device.start);
@@ -43,19 +110,21 @@ pub fn project_table(
         .collect();
     let mut mapped = Vec::new();
     let mut max_gpu_end = 0;
-    let mut pages = entries.iter().copied().enumerate().peekable();
-    while let Some((first, address)) = pages.next() {
+    let mut page = 0;
+    while let Some(&address) = entries.get(page) {
+        let first = page;
+        let mut end = address;
+        while entries.get(page) == Some(&end) {
+            let count = hints.advance(page);
+            page += count;
+            if address != 0 {
+                end = end.checked_add((count as u64).checked_mul(page_size)?)?;
+            }
+        }
         if address == 0 {
             continue;
         }
-        let mut last = first + 1;
-        let mut end = address.checked_add(page_size)?;
-        while pages.next_if(|&(_, next)| next == end).is_some() {
-            end = end.checked_add(page_size)?;
-            last += 1;
-        }
         let gpu = first_gpu.checked_add((first as u64).checked_mul(page_size)?)?;
-        debug_assert_eq!(end - address, (last - first) as u64 * page_size);
         let since = maximum_ends.partition_point(|&end| end <= address);
         let until = imported.partition_point(|span| span.device.start < end);
         for span in &imported[since..until] {
@@ -140,6 +209,61 @@ pub fn project_writes(mapping: &[SharedPages], writes: &[Range<u64>]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_run_hints_follow_holes_remaps_and_short_final_blocks() {
+        let page = 16;
+        let mut entries: Vec<_> = (0..803).map(|index| 0x2000 + index * page).collect();
+        let mut hints = PageRunHints::new(&entries, page);
+        let imports = vec![
+            ImportedSpan {
+                device: 0x2000..0x8000,
+                file: 1,
+                offset: 12,
+            },
+            ImportedSpan {
+                device: 0x2ff0..0x3800,
+                file: 2,
+                offset: 0,
+            },
+        ];
+        let scalar = PageRunHints(vec![1; hints.0.len()]);
+        let check = |entries: &[u64], hints: &PageRunHints| {
+            assert_eq!(
+                project_table_with_hints(0x1500, page, entries, hints, imports.clone()),
+                project_table_with_hints(0x1500, page, entries, &scalar, imports.clone()),
+            );
+        };
+        check(&entries, &hints);
+        for (start, end, base) in [
+            (16, 255, 0),
+            (255, 513, 0),
+            (400, 770, 0x3000),
+            (766, 803, 0),
+            (0, 256, 0),
+            (0, 17, 0x4000),
+        ] {
+            for (i, entry) in entries[start..end].iter_mut().enumerate() {
+                *entry = if base == 0 {
+                    0
+                } else {
+                    base + (i as u64) * page
+                };
+            }
+            // Separate modified intervals can fall into the same hint block.
+            let mid = (start + end) / 2;
+            hints.update(
+                &entries,
+                page,
+                &[start as u64..mid as u64, mid as u64..end as u64],
+            );
+            assert_eq!(hints.0, PageRunHints::new(&entries, page).0);
+            check(&entries, &hints);
+        }
+        entries[800] = u64::MAX;
+        hints.update(&entries, page, &[800..801]);
+        assert!(project_table_with_hints(0, page, &entries, &hints, imports).is_none());
+    }
 
     #[test]
     fn projects_aliases_holes_and_noncontiguous_pages() {
