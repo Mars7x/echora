@@ -4431,7 +4431,6 @@ impl Nvn {
                             }
                         }
                     }
-                    self.gpu_forget_pool(base);
                     // Another live pool over the same memory loses the
                     // shared span with it (spans are kept by base): it is
                     // shared again at the next present.
@@ -4445,6 +4444,7 @@ impl Nvn {
                             .then_some(other)
                         })
                         .collect();
+                    self.gpu_forget_pool(base, others.is_empty());
                     if base != 0 && !others.is_empty() {
                         // ECHORA_POOL_SHARE_LOG (debugging, works without a
                         // GPU): each such finalize.

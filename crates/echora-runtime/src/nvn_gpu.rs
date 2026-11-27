@@ -8458,7 +8458,7 @@ impl Nvn {
     /// A memory pool at guest `base` is finalized: its mirror is dropped
     /// (the memory may hold something else next). GPU writes the guest has
     /// not seen are lost with it, as the pool is.
-    pub(super) fn gpu_forget_pool(&mut self, base: u64) {
+    pub(super) fn gpu_forget_pool(&mut self, base: u64, last_pool_at_base: bool) {
         if let Some(backend) = self.gpu.as_mut() {
             if backend
                 .resident
@@ -8466,6 +8466,9 @@ impl Nvn {
                 .is_some_and(|pool| !pool.gpu_dirty.is_empty())
             {
                 backend.dirty_removals += 1;
+            }
+            if last_pool_at_base {
+                backend.renderer.retire_resident_buffer(base);
             }
             // Its pages may be released and reused: shared spans of them
             // would keep the old ones.
@@ -18167,6 +18170,62 @@ mod pool_tests {
     }
 
     #[test]
+    fn the_last_pool_at_a_guest_base_retires_its_resident_buffer() {
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        if !backend.renderer.gpu.buffer_device_address {
+            return;
+        }
+        let base = 0x10_0000;
+        let (old, _) = backend.renderer.resident_buffer(base, 4096).unwrap();
+        backend
+            .renderer
+            .upload_resident(base, 0, &[13, 16, 19, 22])
+            .unwrap();
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let mut memory = echora_guest::memory::Memory::new(1 << 39);
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        for handle in [0x3000, 0x4000] {
+            nvn.initialize(
+                handle,
+                "MemoryPool",
+                BTreeMap::from([(
+                    "Storage".into(),
+                    Args {
+                        x: [base, 4096, 0, 0],
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap();
+        }
+        guest.cpu.regs[0] = 0x3000;
+        nvn.call("nvnMemoryPoolFinalize", &mut guest).unwrap();
+        let r = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert_eq!(r.resident_buffer(base, 4096).unwrap(), (old, false));
+        let pending = r.read_resident(base, 0, 4).unwrap();
+        guest.cpu.regs[0] = 0x4000;
+        nvn.call("nvnMemoryPoolFinalize", &mut guest).unwrap();
+        let r = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(r.resident_address(base).is_none());
+        let (new, fresh) = r.resident_buffer(base, 4096).unwrap();
+        assert!(fresh);
+        assert_ne!(new, old);
+        r.flush().unwrap();
+        assert_eq!(r.take_reads(&[pending])[&pending], [13, 16, 19, 22]);
+    }
+
+    #[test]
     fn finalizing_a_pool_drops_all_of_its_shared_pieces() {
         let Ok(Some(mut backend)) = Backend::create(None) else {
             return;
@@ -18195,7 +18254,7 @@ mod pool_tests {
         let whole_alias = nvn.pool_share_signature(0x2000, 4);
         let split_alias = nvn.pool_share_signature(0x3000, 4);
         let unrelated = nvn.pool_share_signature(0x4000, 4);
-        nvn.gpu_forget_pool(0x1000);
+        nvn.gpu_forget_pool(0x1000, true);
         assert_eq!(nvn.shared_guest_range(0x1020, 8), None);
         assert_eq!(nvn.shared_guest_range(0x1200, 8), None);
         assert_ne!(nvn.pool_share_signature(0x2000, 4), whole_alias);

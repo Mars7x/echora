@@ -816,6 +816,8 @@ pub struct Renderer {
     /// The condition draws and dispatches are gated on (`set_condition`):
     /// wanted, and active in the command buffer being recorded.
     condition: Option<(vk::Buffer, u64, bool)>,
+    /// A finalized resident allocation still supplying the current predicate.
+    retired_condition: Option<(vk::Buffer, vk::DeviceMemory)>,
     /// A failure that must end the run rather than skip one draw (an upload
     /// over MAX_UPLOAD_BYTES): the runtime takes it after each draw and
     /// dispatch and stops with it.
@@ -905,7 +907,7 @@ struct Slot {
     retired_uploads: Vec<Target>,
     retired_texel_buffers: Vec<(HostBuffer, vk::BufferView)>,
     retired_page_tables: Vec<RecycledPageTable>,
-    retired_shared: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     /// Submitted and not yet waited for.
     in_flight: bool,
     /// The submit thread's batch number of this slot's last submission (0:
@@ -961,7 +963,7 @@ impl Slot {
             retired_uploads: Vec::new(),
             retired_texel_buffers: Vec::new(),
             retired_page_tables: Vec::new(),
-            retired_shared: Vec::new(),
+            retired_buffers: Vec::new(),
             in_flight: false,
             handed: 0,
             serial: 0,
@@ -1426,6 +1428,7 @@ impl Renderer {
             mesh_count: None,
             word_conditions: None,
             condition: None,
+            retired_condition: None,
         };
         let usage = vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1582,6 +1585,11 @@ impl Renderer {
     pub fn set_condition(&mut self, condition: Option<(vk::Buffer, u64, bool)>) {
         if self.condition != condition {
             self.end_condition();
+            if self.condition.map(|old| old.0) != condition.map(|next| next.0)
+                && let Some(storage) = self.retired_condition.take()
+            {
+                self.slot.retired_buffers.push(storage);
+            }
             self.condition = condition;
         }
     }
@@ -1665,26 +1673,19 @@ impl Renderer {
         self.slot.condition_active = false;
     }
 
-    /// Copy `bytes` into the ring at an `alignment`-aligned offset, flushing
-    /// first when the ring is full.
     /// A device-local storage buffer of `size` bytes kept under `key`
     /// across dispatches (created, or recreated at another size, as
     /// needed), and whether it is new (its contents undefined).
     #[track_caller]
     pub fn resident_buffer(&mut self, key: u64, size: u64) -> Result<(vk::Buffer, bool), String> {
-        let size = size.max(16).next_multiple_of(16);
-        if let Some(&(buffer, _, held)) = self.resident.get(&key) {
-            if held == size {
-                return Ok((buffer, false));
-            }
-            // Another size: the old one retires after the work using it.
-            self.flush()?;
-            let (buffer, memory, _) = self.resident.remove(&key).unwrap();
-            // SAFETY: the flush finished every use.
-            unsafe {
-                self.gpu.device.destroy_buffer(buffer, None);
-                self.gpu.device.free_memory(memory, None);
-            }
+        let size = size
+            .max(16)
+            .checked_next_multiple_of(16)
+            .ok_or("resident buffer size overflow")?;
+        if let Some(&(buffer, _, held)) = self.resident.get(&key)
+            && held == size
+        {
+            return Ok((buffer, false));
         }
         let device = self.gpu.device.clone();
         let addressable = self.gpu.buffer_device_address;
@@ -1711,16 +1712,47 @@ impl Renderer {
             unsafe { device.create_buffer(&info, None) }.map_err(vk_error("vkCreateBuffer"))?;
         // SAFETY: the buffer is live.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory = self.allocate_with(
+        let memory = match self.allocate_with(
             requirements,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             addressable,
-        )?;
-        // SAFETY: fresh buffer and memory of the required size.
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-            .map_err(vk_error("vkBindBufferMemory"))?;
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                // SAFETY: the new buffer was never bound or used.
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+        // SAFETY: both handles are new and the allocation matches the requirements.
+        if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: neither resource has been exposed to a command.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(vk_error("vkBindBufferMemory")(error));
+        }
+        self.retire_resident_buffer(key);
         self.resident.insert(key, (buffer, memory, size));
         Ok((buffer, true))
+    }
+
+    /// Remove a device-local guest allocation from future bindings. Batches
+    /// already using it retain its memory through the recording slot's fence.
+    pub fn retire_resident_buffer(&mut self, key: u64) {
+        if let Some((buffer, memory, size)) = self.resident.remove(&key) {
+            if self
+                .condition
+                .is_some_and(|(source, _, _)| source == buffer)
+            {
+                self.retired_condition = Some((buffer, memory));
+            } else {
+                self.slot.retired_buffers.push((buffer, memory));
+            }
+            self.stat("stat: resident buffers retired", 1);
+            self.stat("stat: resident buffer bytes retired", size);
+        }
     }
 
     /// The device address of `buffer` (made by this renderer with device
@@ -4298,7 +4330,7 @@ impl Renderer {
             }
             self.trim_free_page_tables(active_bytes);
         }
-        for (buffer, memory) in std::mem::take(&mut self.slot.retired_shared) {
+        for (buffer, memory) in std::mem::take(&mut self.slot.retired_buffers) {
             // SAFETY: the work reading it has completed.
             unsafe {
                 self.gpu.device.destroy_buffer(buffer, None);
@@ -4494,7 +4526,7 @@ impl Renderer {
         while self.shared_bytes > MAX_SHARED_BYTES && self.shared.len() > 1 {
             let ((_, _, dropped), buffer, memory) = self.shared.remove(0);
             self.shared_bytes -= dropped;
-            self.slot.retired_shared.push((buffer, memory));
+            self.slot.retired_buffers.push((buffer, memory));
         }
         Ok(Some((imported.0, offset - start)))
     }
@@ -4576,7 +4608,7 @@ impl Renderer {
         };
         let Some(address) = self.buffer_address(buffer) else {
             self.stat("stat: shared spans without a device address", 1);
-            self.slot.retired_shared.push((buffer, memory));
+            self.slot.retired_buffers.push((buffer, memory));
             return Ok(None);
         };
         let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.addressed)
@@ -4693,7 +4725,7 @@ impl Renderer {
                             address,
                         })
                     } else {
-                        self.slot.retired_shared.push((buffer, memory));
+                        self.slot.retired_buffers.push((buffer, memory));
                         None
                     }
                 }
@@ -4745,7 +4777,7 @@ impl Renderer {
     pub fn take_superseded(&mut self, count: usize) {
         let count = count.min(self.superseded.len());
         for entry in self.superseded.drain(..count) {
-            self.slot.retired_shared.push((entry.buffer, entry.memory));
+            self.slot.retired_buffers.push((entry.buffer, entry.memory));
         }
         self.dropped_shared_span = false;
     }
@@ -4777,7 +4809,7 @@ impl Renderer {
                 .any(|&(start, size, _)| offset < start + size)
             {
                 self.dropped_shared_span = true;
-                self.slot.retired_shared.push((group.buffer, group.memory));
+                self.slot.retired_buffers.push((group.buffer, group.memory));
                 false
             } else {
                 true
@@ -4791,7 +4823,7 @@ impl Renderer {
             if entry.start < offset || end < entry.start + entry.size {
                 self.dropped_shared_span = true;
             }
-            self.slot.retired_shared.push((entry.buffer, entry.memory));
+            self.slot.retired_buffers.push((entry.buffer, entry.memory));
         }
         // Joined-away spans of the range keep old pages too: the table is
         // built whole before more work is recorded.
@@ -4801,7 +4833,7 @@ impl Renderer {
         self.superseded = kept;
         for entry in gone {
             self.dropped_shared_span = true;
-            self.slot.retired_shared.push((entry.buffer, entry.memory));
+            self.slot.retired_buffers.push((entry.buffer, entry.memory));
         }
         let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shared)
             .into_iter()
@@ -4811,7 +4843,7 @@ impl Renderer {
         self.shared = kept;
         for ((_, _, span), buffer, memory) in dropped {
             self.shared_bytes -= span;
-            self.slot.retired_shared.push((buffer, memory));
+            self.slot.retired_buffers.push((buffer, memory));
         }
         self.shared_refused.retain(|&(backing, start, span)| {
             backing != file || start >= end || start + span <= offset
@@ -9107,6 +9139,7 @@ impl Drop for Renderer {
         if let Some(Some(compressor)) = self.archive_compressor.take() {
             compressor.stop();
         }
+        self.set_condition(None);
         let flushed = self.flush();
         if let Some(mut submitter) = self.submitter.take() {
             submitter.stop();
@@ -9173,12 +9206,12 @@ impl Drop for Renderer {
                     .into_iter()
                     .map(|group| (group.buffer, group.memory)),
             );
-        let retired = std::mem::take(&mut self.slot.retired_shared)
+        let retired = std::mem::take(&mut self.slot.retired_buffers)
             .into_iter()
             .chain(
                 self.spares
                     .iter_mut()
-                    .flat_map(|spare| std::mem::take(&mut spare.retired_shared))
+                    .flat_map(|spare| std::mem::take(&mut spare.retired_buffers))
                     .collect::<Vec<_>>(),
             );
         for (buffer, memory) in shared.chain(retired) {
@@ -9957,7 +9990,10 @@ mod tests {
         );
         assert!(renderer.shared_refused.contains(&(second, page * 2, page)));
         assert!(!renderer.shared_refused.contains(&(first, page * 2, page)));
-        assert_eq!(renderer.slot.retired_shared, [(first_buffer, first_memory)]);
+        assert_eq!(
+            renderer.slot.retired_buffers,
+            [(first_buffer, first_memory)]
+        );
     }
 
     #[test]
@@ -10178,6 +10214,46 @@ mod tests {
                 .read_bytes(expected.len()),
             expected,
         );
+    }
+
+    #[test]
+    fn resident_replacement_keeps_prior_commands_and_recovers_from_allocation_failure() {
+        let Ok(gpu) = crate::vulkan::Gpu::new() else {
+            return;
+        };
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let (first, _) = renderer.resident_buffer(7, 64).unwrap();
+        renderer.upload_resident(7, 0, &[7, 8, 9, 10]).unwrap();
+        let memory_types = renderer.memory_types;
+        renderer.memory_types.memory_type_count = 0;
+        let failed = renderer.resident_buffer(7, 128);
+        renderer.memory_types = memory_types;
+        assert!(failed.is_err());
+        assert_eq!(renderer.resident_buffer(7, 64).unwrap(), (first, false));
+        let old_bytes = renderer.read_resident(7, 0, 4).unwrap();
+        let (second, created) = renderer.resident_buffer(7, 128).unwrap();
+        assert!(created);
+        assert_ne!(first, second);
+        renderer.upload_resident(7, 0, &[20, 21, 22, 23]).unwrap();
+        let new_bytes = renderer.read_resident(7, 0, 4).unwrap();
+        renderer.flush().unwrap();
+        let reads = renderer.take_reads(&[old_bytes, new_bytes]);
+        assert_eq!(reads[&old_bytes], [7, 8, 9, 10]);
+        assert_eq!(reads[&new_bytes], [20, 21, 22, 23]);
+        // A condition can outlive the submission in which its pool was retired.
+        renderer.set_condition(Some((second, 0, false)));
+        renderer.retire_resident_buffer(7);
+        renderer.flush().unwrap();
+        assert_eq!(
+            renderer.retired_condition.map(|(buffer, _)| buffer),
+            Some(second)
+        );
+        renderer.set_condition(Some((second, 4, true)));
+        assert!(renderer.retired_condition.is_some());
+        renderer.set_condition(None);
+        assert!(renderer.retired_condition.is_none());
+        renderer.flush().unwrap();
+        assert!(renderer.slot.retired_buffers.is_empty());
     }
 
     #[test]
