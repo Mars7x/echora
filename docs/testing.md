@@ -40,14 +40,16 @@ The running game is checked from its run reports and from presented frames
 saved with `ECHORA_CAPTURE_EVERY` ([development](development.md)). These
 checks need the game and are not part of CI.
 
-To trace a color difference, choose a pixel in guest render-target coordinates
-and set `ECHORA_GPU_PIXEL_WATCH=first:end:key:x,y`. Use a hexadecimal target
-key or `@storage` with a hexadecimal guest storage address. Join several
-same-size targets with `+`. The watch reads the bound mip and layer and records draws
-that change the pixel. Use `end = first + 1` to inspect one present. Longer
-ranges sample multiples of 60 and exclude the end. When the game renders at a
-different scale, the watch uses the same nearest-filter conversion as a full
-readback. A color sample transfers 16 bytes to the CPU.
+To trace a color difference, set `ECHORA_GPU_PIXEL_WATCH=first:end:key:x,y`
+with decimal pixel coordinates in the guest render target. Use a hexadecimal
+target key or `@storage` with a hexadecimal guest storage address. Join
+multiple targets or coordinate pairs with `+`. For example,
+`ECHORA_GPU_PIXEL_WATCH=10600:10601:12+@ab:64,32+96,48` watches both
+points on both matching targets at present 10,600. Each point records its
+first value and subsequent changes independently for the bound mip and layer.
+Use `end = first + 1` to inspect one present. Longer ranges sample multiples
+of 60 and exclude the end. Scaled targets use the same nearest-filter
+conversion as a full readback. Each sampled point transfers 16 bytes to the CPU.
 
 Set `ECHORA_DRAW_LOG` to a JSONL path and `ECHORA_DRAW_LOG_FROM` to the
 first present to log. Indexed instanced draws include the first instance and

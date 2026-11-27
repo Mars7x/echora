@@ -331,6 +331,49 @@ impl PixelWatchTarget {
     }
 }
 
+struct PixelWatchSelection {
+    targets: Vec<PixelWatchTarget>,
+    pixels: Vec<(u32, u32)>,
+}
+
+impl PixelWatchSelection {
+    fn at(setting: &str, present: u64) -> Option<Self> {
+        let mut fields = setting.splitn(4, ':');
+        let first = fields.next()?.parse::<u64>().ok()?;
+        let end = fields.next()?.parse::<u64>().ok()?;
+        if !(first..end).contains(&present) || (end - first > 1 && !present.is_multiple_of(60)) {
+            return None;
+        }
+        let targets = fields
+            .next()?
+            .split('+')
+            .map(PixelWatchTarget::parse)
+            .collect::<Option<_>>()?;
+        let mut pixels = Vec::new();
+        for pair in fields.next()?.split('+') {
+            let (x, y) = pair.split_once(',')?;
+            let pixel = (x.parse().ok()?, y.parse().ok()?);
+            if !pixels.contains(&pixel) {
+                pixels.push(pixel);
+            }
+        }
+        Some(Self { targets, pixels })
+    }
+}
+
+type WatchedPlane = (u64, u32, u32);
+
+#[derive(Default)]
+struct PixelWatchHistory {
+    values: HashMap<(WatchedPlane, (u32, u32)), [f32; 4]>,
+}
+
+impl PixelWatchHistory {
+    fn changed(&mut self, plane: WatchedPlane, pixel: (u32, u32), value: [f32; 4]) -> bool {
+        self.values.insert((plane, pixel), value) != Some(value)
+    }
+}
+
 impl VertexTraceReport {
     fn begin_report(&mut self, present: u64, records: usize) -> Option<u64> {
         let previous = (!self.texture_counts.is_empty()).then_some(self.reported);
@@ -409,8 +452,8 @@ pub struct Backend {
     traced: u32,
     /// Draws probed (ECHORA_GPU_PROBE).
     probed: u32,
-    /// The watched pixel's last value in each watched target (ECHORA_GPU_PIXEL_WATCH).
-    watched_pixel: HashMap<(u64, u32, u32), [f32; 4]>,
+    /// Per-pixel last observations for ECHORA_GPU_PIXEL_WATCH.
+    watched_pixels: PixelWatchHistory,
     /// The window swapchain (ECHORA_WINDOW), once created; None after a
     /// failure, which is noted and not retried.
     presenter: Option<Result<Presenter, ()>>,
@@ -767,7 +810,7 @@ impl Backend {
             stats: Default::default(),
             traced: 0,
             probed: 0,
-            watched_pixel: HashMap::default(),
+            watched_pixels: PixelWatchHistory::default(),
             presenter: None,
             textures: HashMap::default(),
             texture_checked: HashMap::default(),
@@ -13048,49 +13091,36 @@ impl Nvn {
                 ));
             }
         }
-        // ECHORA_GPU_PIXEL_WATCH=<first>:<end>:<key or @storage>[+...]:<x>,<y>:
-        // Watch one present, or every 60th present in a longer range. Each draw
-        // that changes the watched pixel records its program, instances and
-        // the new value. Multiple targets follow a pixel through successive passes.
-        if let Ok(watch) = draw_var(switches, "ECHORA_GPU_PIXEL_WATCH") {
-            let fields: Vec<&str> = watch.split([':', ',']).collect();
-            if let [first, end, targets, x, y] = fields[..] {
-                let (first, end) = (first.parse::<u64>(), end.parse::<u64>());
-                let targets: Option<Vec<_>> =
-                    targets.split('+').map(PixelWatchTarget::parse).collect();
-                let (x, y) = (x.parse::<u32>(), y.parse::<u32>());
-                if let (Ok(first), Ok(end), Some(targets), Ok(x), Ok(y)) =
-                    (first, end, targets, x, y)
+        let present = self.presented_frames;
+        if let Some(watch) = draw_var_os(switches, "ECHORA_GPU_PIXEL_WATCH")
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|setting| PixelWatchSelection::at(setting, present))
+        {
+            for (&target, &(level, layer)) in colors_written.iter().zip(&color_places) {
+                let storage = self.texture_storage(target);
+                if !watch
+                    .targets
+                    .iter()
+                    .any(|selector| selector.matches(target, storage))
                 {
-                    let present = self.presented_frames;
-                    if (first..end).contains(&present)
-                        && (end - first == 1 || present.is_multiple_of(60))
+                    continue;
+                }
+                let backend = self.gpu.as_mut().unwrap();
+                for &(x, y) in &watch.pixels {
+                    let Some(value) = backend
+                        .renderer
+                        .read_target_plane_pixel(target, level, layer, x, y)?
+                    else {
+                        continue;
+                    };
+                    if backend
+                        .watched_pixels
+                        .changed((target, level, layer), (x, y), value)
                     {
-                        for (&target, &(level, layer)) in colors_written.iter().zip(&color_places) {
-                            let storage = self.texture_storage(target);
-                            if !targets
-                                .iter()
-                                .any(|selector| selector.matches(target, storage))
-                            {
-                                continue;
-                            }
-                            let backend = self.gpu.as_mut().unwrap();
-                            let Some(value) = backend
-                                .renderer
-                                .read_target_plane_pixel(target, level, layer, x, y)?
-                            else {
-                                continue;
-                            };
-                            if backend.watched_pixel.insert((target, level, layer), value)
-                                != Some(value)
-                            {
-                                let line = format!(
-                                    "pixel watch present {present} {target:x} ({x},{y}) after {:016x}/{:016x} count {} instances {}: {value:?} level {level} layer {layer} storage {storage:x?}",
-                                    keys.0, keys.1, draw_count, draw_instances
-                                );
-                                backend.note(line);
-                            }
-                        }
+                        backend.note(format!(
+                            "pixel watch present {present} {target:x} ({x},{y}) after {:016x}/{:016x} count {} instances {}: {value:?} level {level} layer {layer} storage {storage:x?}",
+                            keys.0, keys.1, draw_count, draw_instances
+                        ));
                     }
                 }
             }
@@ -19076,7 +19106,7 @@ const ARCHIVES_PER_SUBMIT: usize = 6;
 
 #[cfg(test)]
 mod vertex_trace_report_tests {
-    use super::{PixelWatchTarget, VertexTraceReport};
+    use super::{PixelWatchHistory, PixelWatchSelection, PixelWatchTarget, VertexTraceReport};
 
     #[test]
     fn pixel_watch_distinguishes_texture_keys_and_storage_addresses() {
@@ -19090,6 +19120,58 @@ mod vertex_trace_report_tests {
         assert!(targets[1].matches(0x56, Some(0xab)));
         assert!(!targets[1].matches(0xab, None));
         assert!(PixelWatchTarget::parse("@").is_none());
+    }
+
+    #[test]
+    fn pixel_watch_selects_coordinates_and_scheduled_presents() {
+        let range = "59:121:12+@ab:7,8+21,4+7,8";
+        for present in [58, 59, 61, 119, 121] {
+            assert!(PixelWatchSelection::at(range, present).is_none());
+        }
+        for present in [60, 120] {
+            let selected = PixelWatchSelection::at(range, present).unwrap();
+            assert_eq!(selected.pixels, [(7, 8), (21, 4)]);
+            assert!(selected.targets[0].matches(0x12, None));
+            assert!(selected.targets[1].matches(0x42, Some(0xab)));
+        }
+        let single = PixelWatchSelection::at("61:62:12:9,2", 61).unwrap();
+        assert_eq!(single.pixels, [(9, 2)]);
+        for invalid in [
+            "61:60:12:9,2",
+            "61:61:12:9,2",
+            "61:62:@:9,2",
+            "61:62:12:9,2+",
+            "61:62:12:9,2,3",
+            "61:62:12:9,2+4",
+            "61:62:12:-1,0",
+        ] {
+            assert!(PixelWatchSelection::at(invalid, 61).is_none());
+        }
+    }
+
+    #[test]
+    fn pixel_watch_reports_only_points_that_change_on_each_plane() {
+        let mut history = PixelWatchHistory::default();
+        let points = [(1, 2), (3, 4)];
+        let mut reported = |plane, samples: [[f32; 4]; 2]| {
+            points
+                .into_iter()
+                .zip(samples)
+                .filter(|&(point, value)| history.changed(plane, point, value))
+                .map(|(point, _)| point)
+                .collect::<Vec<_>>()
+        };
+        let a = [0.25; 4];
+        let b = [0.75; 4];
+        let plane = (1, 0, 0);
+        assert_eq!(reported(plane, [a, b]), points);
+        assert!(reported(plane, [a, b]).is_empty());
+        assert_eq!(reported(plane, [b, b]), [points[0]]);
+        assert_eq!(reported(plane, [b, a]), [points[1]]);
+        for other in [(2, 0, 0), (1, 1, 0), (1, 0, 1)] {
+            assert_eq!(reported(other, [b, a]), points);
+        }
+        assert!(reported(plane, [b, a]).is_empty());
     }
 
     #[test]
