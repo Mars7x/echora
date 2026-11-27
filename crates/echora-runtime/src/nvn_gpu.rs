@@ -6745,8 +6745,7 @@ impl Nvn {
         // workgroup counts (x, y, z), which programs read to size their
         // work (a reduction's 1 / invocation count). The SDK's own buffers
         // under Lichii read [0xb0, 8, 9, 12] for an 8x9x12 dispatch whose
-        // tables end at 0xb0. An indirect dispatch the GPU reads itself
-        // (`indirect` below) keeps zero counts.
+        // tables end at 0xb0. The GPU fills the counts for indirect work.
         c0[..4].copy_from_slice(&table_end.to_le_bytes());
         if !command.name.ends_with("DispatchComputeIndirect") {
             for (axis, count) in command.x[1..4].iter().enumerate() {
@@ -7101,8 +7100,10 @@ impl Nvn {
         }
         self.initialize_new_targets(core);
         // c0 itself, once every handle in it is known.
+        let mut grid_uniform = None;
         for descriptor in &stage.descriptors {
             if descriptor.kind() == DescriptorKind::UniformBuffer && descriptor.index == 0 {
+                grid_uniform = Some(descriptor.binding);
                 let used = (stage.cbuf_used_sizes[0] as usize).max(16);
                 let mut bytes = c0.clone();
                 self.graphics_addons
@@ -7593,7 +7594,7 @@ impl Nvn {
         }
         let tokens: HashMap<u32, u64> = backend
             .renderer
-            .dispatch_deferred(&dispatch)?
+            .dispatch_deferred_with_grid_uniform(&dispatch, grid_uniform)?
             .into_iter()
             .collect();
         if writes_page_table {

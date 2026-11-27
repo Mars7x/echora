@@ -1639,7 +1639,7 @@ impl Renderer {
                     crate::mesh_count::IndirectCounts::Mesh,
                 )? {
                     self.stat("stat: mesh counts copied unbounded", 1);
-                    self.copy_mesh_count((buffer, offset), (ring, at))?;
+                    self.copy_indirect_counts((buffer, offset), (ring, at), 4)?;
                 }
                 Some((ring, at))
             }
@@ -2110,19 +2110,18 @@ pub(crate) fn words_as_bytes(words: &[u32]) -> &[u8] {
 }
 
 impl Renderer {
-    /// Copy an indirect mesh draw's group count from `source` into
-    /// `target` as it is (no bound), on devices whose buffers have no
-    /// addresses.
-    fn copy_mesh_count(
+    /// Copy indirect arguments after their producer on devices without buffer addresses.
+    pub(crate) fn copy_indirect_counts(
         &mut self,
         (buffer, offset): (vk::Buffer, u64),
         (ring, at): (vk::Buffer, u64),
+        size: u64,
     ) -> Result<(), String> {
         let commands = self.commands()?;
         let copy = vk::BufferCopy {
             src_offset: offset,
             dst_offset: at,
-            size: 4,
+            size,
         };
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)

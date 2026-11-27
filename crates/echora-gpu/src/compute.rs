@@ -74,6 +74,19 @@ impl Renderer {
     /// buffer it writes, the token of its contents after the next flush
     /// (`take_reads`).
     pub fn dispatch_deferred(&mut self, dispatch: &Dispatch) -> Result<Vec<(u32, u64)>, String> {
+        self.dispatch_deferred_with_grid_uniform(dispatch, None)
+    }
+
+    /// An NVN driver uniform starts with the table size followed by the three
+    /// workgroup counts. Indirect dispatches write those counts on the GPU so
+    /// the command and the shader see the same values after preceding work.
+    /// The indirect source must also support transfer reads on devices without
+    /// buffer addresses.
+    pub fn dispatch_deferred_with_grid_uniform(
+        &mut self,
+        dispatch: &Dispatch,
+        grid_uniform: Option<u32>,
+    ) -> Result<Vec<(u32, u64)>, String> {
         // NVN's render enable gates 3D work. Vulkan also predicates dispatches,
         // so leave its active scope and keep the wanted predicate for the next draw.
         self.end_condition();
@@ -132,6 +145,7 @@ impl Renderer {
             bytes += 32;
         }
         self.reserve(bytes, descriptors)?;
+        let mut grid_target = None;
         let mut writes = Vec::new();
         let mut images = Vec::new();
         let mut storage_images = Vec::new();
@@ -230,6 +244,12 @@ impl Renderer {
             } else {
                 self.ring_upload_padded(bytes)?
             };
+            if dispatch.indirect.is_some() && grid_uniform == Some(binding) {
+                if kind != vk::DescriptorType::UNIFORM_BUFFER || bytes.len() < 16 {
+                    return Err("indirect grid header needs a 16-byte uniform".into());
+                }
+                grid_target = Some((buffer, offset + 4));
+            }
             // Only buffers the shader writes come back (flags bit 0).
             if kind == vk::DescriptorType::STORAGE_BUFFER && descriptor.flags & 1 != 0 {
                 storage.push((binding, offset, bytes.len()));
@@ -289,16 +309,24 @@ impl Renderer {
         // device's limit on the GPU (`mesh_count`).
         let indirect = match dispatch.indirect {
             Some(source) => {
-                let (ring, at) = self.ring_upload(&[0; 12], 16)?;
+                let target = match grid_target {
+                    Some(target) => target,
+                    None => self.ring_upload(&[0; 12], 16)?,
+                };
                 if self.bounded_indirect(
                     source,
-                    (ring, at),
+                    target,
                     crate::mesh_count::IndirectCounts::Dispatch,
                 )? {
-                    Some((ring, at))
+                    Some(target)
                 } else {
                     self.stat("stat: dispatch counts read unbounded", 1);
-                    Some(source)
+                    if grid_target.is_some() {
+                        self.copy_indirect_counts(source, target, 12)?;
+                        Some(target)
+                    } else {
+                        Some(source)
+                    }
                 }
             }
             None => None,
@@ -444,6 +472,100 @@ mod tests {
     use crate::draw::tests::{spirv, translated};
     use crate::shader::{Descriptor, Stage};
     use crate::vulkan::Gpu;
+
+    #[test]
+    fn indirect_driver_uniform_matches_the_gpu_written_dispatch_grid() {
+        for use_addresses in [true, false] {
+            let Ok(mut gpu) = Gpu::new() else { return };
+            if gpu.shader_objects().is_err() {
+                return;
+            }
+            gpu.buffer_device_address &= use_addresses;
+            let mut renderer = Renderer::new(gpu).unwrap();
+            let code = spirv(
+                "@group(0) @binding(0) var<uniform> header: vec4<u32>;
+                 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
+                 @compute @workgroup_size(1) fn main(
+                    @builtin(workgroup_id) id: vec3<u32>, @builtin(num_workgroups) grid: vec3<u32>
+                 ) {
+                    if any(id != vec3<u32>(0)) { return; }
+                    output[0] = header.x; output[1] = header.y;
+                    output[2] = header.z; output[3] = header.w;
+                    output[4] = grid.x; output[5] = grid.y; output[6] = grid.z;
+                 }",
+                naga::ShaderStage::Compute,
+            );
+            let descriptors = vec![
+                Descriptor {
+                    kind: DescriptorKind::UniformBuffer as u32,
+                    binding: 0,
+                    count: 1,
+                    ..Default::default()
+                },
+                Descriptor {
+                    kind: DescriptorKind::StorageBuffer as u32,
+                    binding: 1,
+                    count: 1,
+                    flags: 1,
+                    ..Default::default()
+                },
+            ];
+            let program = renderer
+                .create_program(vec![translated(Stage::Compute, code, descriptors)])
+                .unwrap();
+            let (args, _) = renderer.resident_buffer(1, 32).unwrap();
+            let mut dispatch = Dispatch {
+                program: &program,
+                groups: [1; 3],
+                uniforms: HashMap::new(),
+                storage: HashMap::new(),
+                storage_in_place: HashMap::new(),
+                textures: HashMap::new(),
+                images: HashMap::new(),
+                image_formats: HashMap::new(),
+                indirect: None,
+                page_table: Default::default(),
+                pool: Default::default(),
+            };
+            let mut pending = Vec::new();
+            for grid in [[2u32, 3, 1], [1, 2, 4]] {
+                let [x, y, z] = grid;
+                dispatch.indirect = None;
+                dispatch.storage_in_place.insert(1, (args, 0, 32));
+                dispatch.uniforms.insert(
+                    0,
+                    [0u32, x, y, z]
+                        .map(u32::to_le_bytes)
+                        .as_flattened()
+                        .to_vec(),
+                );
+                renderer.dispatch_deferred(&dispatch).unwrap();
+
+                dispatch.indirect = Some((args, 4));
+                dispatch.storage_in_place.clear();
+                dispatch.storage.insert(1, vec![0; 28]);
+                dispatch.uniforms.insert(
+                    0,
+                    [208u32, 0, 0, 0]
+                        .map(u32::to_le_bytes)
+                        .as_flattened()
+                        .to_vec(),
+                );
+                let result = renderer
+                    .dispatch_deferred_with_grid_uniform(&dispatch, Some(0))
+                    .unwrap();
+                pending.push((result[0].1, [208, x, y, z, x, y, z]));
+            }
+            renderer.flush().unwrap();
+            for (token, expected) in pending {
+                assert_eq!(
+                    renderer.take_reads(&[token])[&token],
+                    expected.map(u32::to_le_bytes).as_flattened()
+                );
+            }
+            renderer.destroy_program(program).unwrap();
+        }
+    }
 
     #[test]
     fn storage_array_length_uses_the_bound_bytes_for_shared_and_copied_buffers() {
