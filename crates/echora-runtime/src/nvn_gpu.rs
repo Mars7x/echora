@@ -8729,15 +8729,12 @@ impl Nvn {
             superseded = backend.renderer.superseded_spans().0;
         }
         let previous = previous.filter(|_| whole.is_none());
-        let mut modified = previous
-            .as_ref()
-            .filter(|built| built.entries.len() == count)
-            .map(|_| Vec::new());
+        let mut modified = previous.as_ref().map(|_| Vec::new());
         let mut built_pools = HashMap::default();
         let mut run_hints = std::cell::OnceCell::new();
         let mut entries = match previous {
             Some(built) => {
-                if modified.is_some() {
+                if built.entries.len() == count {
                     run_hints = built.run_hints;
                 }
                 built_pools = built.pools;
@@ -17154,9 +17151,10 @@ mod pool_tests {
             "nvnDeviceInitialize",
             &[device, device_builder],
         );
+        let virtual_size = (1 << 30) + 8 * PAGE_SIZE;
         for (object, base, size, flags) in [
             (physical, storage, 4 * PAGE_SIZE, 8),
-            (virtual_pool, 0, 8 * PAGE_SIZE, 0x100),
+            (virtual_pool, 0, virtual_size, 0x100),
         ] {
             call(
                 &mut nvn,
@@ -17345,6 +17343,31 @@ mod pool_tests {
         );
         assert_eq!(neighbor(&mut nvn, &mut guest), sides);
 
+        // Map one distant page, remove it, then map the next page. This
+        // crosses the table's 1 GiB rounding boundary without allocating
+        // extra guest memory. Old tail entries must not return on regrowth.
+        let distant = (1 << 30) + 4 * PAGE_SIZE;
+        let first = nvn.page_table(&mut guest).unwrap();
+        assert_eq!(first.page_count, 1 << 18);
+        for (backing, offset, size) in [
+            (physical, distant, 2 << 18),
+            (0, distant, 1 << 18),
+            (physical, distant + PAGE_SIZE, 2 << 18),
+        ] {
+            update(&mut nvn, &mut guest, &[[backing, 0, offset, PAGE_SIZE]]).unwrap();
+            let table = nvn.page_table(&mut guest).unwrap();
+            assert_eq!(
+                (table.first_page, table.page_count),
+                (first.first_page, size)
+            );
+            assert_eq!(neighbor(&mut nvn, &mut guest), sides);
+            assert_eq!(
+                page(&mut nvn, &mut guest, gpu + offset),
+                if backing == 0 { 0 } else { sides[0] }
+            );
+        }
+        assert_eq!(page(&mut nvn, &mut guest, gpu + distant), 0);
+
         // A request list with an invalid range leaves every mapping intact.
         assert!(
             update(
@@ -17352,7 +17375,7 @@ mod pool_tests {
                 &mut guest,
                 &[
                     [0, 0, 3 * PAGE_SIZE, PAGE_SIZE],
-                    [0, 0, 8 * PAGE_SIZE, PAGE_SIZE]
+                    [0, 0, virtual_size, PAGE_SIZE]
                 ],
             )
             .is_err()
@@ -17628,6 +17651,30 @@ mod pool_tests {
             .unwrap();
         assert_eq!(backend.shared_write_serial(touches(page + 8)), 0);
         assert_eq!(backend.shared_write_serial(touches(page)), 1);
+
+        // A resize also changes the binding. A real shared write through
+        // the retired table remains pending, but its virtual addresses must
+        // not acquire mappings from the smaller or subsequently reused table.
+        backend.record_page_table_write(
+            2,
+            Some(super::BoundedWrites {
+                shared: vec![touches(64)],
+                virtual_ranges: std::iter::once(initial + page..initial + page + 128).collect(),
+            }),
+        );
+        let short = backend
+            .set_page_table((0, 5), entries(&[address + page]), Some(&[]))
+            .unwrap();
+        assert_ne!(short.address, replaced.address);
+        backend
+            .set_page_table(
+                (0, 6),
+                entries(&[address + page, address, 0]),
+                Some(&[1..2]),
+            )
+            .unwrap();
+        assert_eq!(backend.shared_write_serial(touches(64)), 2);
+        assert_eq!(backend.shared_write_serial(touches(96)), 1);
     }
 
     #[test]

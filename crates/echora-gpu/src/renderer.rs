@@ -1770,8 +1770,9 @@ impl Renderer {
     }
 
     /// Change sorted, non-overlapping ranges of an existing page table.
-    /// The existing mappings outside the patch, and the table's extent,
-    /// carry over. All addresses are kept stable for submitted commands.
+    /// Keep the common prefix outside the patches. On growth, other new
+    /// entries are zero. A different extent always produces a new binding,
+    /// leaving all recorded or submitted readers on their original table.
     pub fn patch_page_table(
         &mut self,
         first_page: u32,
@@ -1784,8 +1785,8 @@ impl Renderer {
         let table = self
             .page_table
             .as_ref()
-            .filter(|table| table.first_page == first_page && table.entries.len() == count)
-            .ok_or("page table patch does not match the current extent")?;
+            .filter(|table| table.first_page == first_page)
+            .ok_or("page table patch does not match the current first page")?;
         let mut last = 0;
         for &(start, patch) in patches {
             if start < last {
@@ -1795,6 +1796,22 @@ impl Renderer {
                 .checked_add(patch.len())
                 .filter(|&end| end <= count)
                 .ok_or("page table patch runs past the end of the table")?;
+        }
+
+        let extent_delta = table.entries.len().abs_diff(count);
+        if extent_delta != 0 {
+            let changed = patches
+                .iter()
+                .map(|&(start, patch)| start..start + patch.len());
+            self.replace_page_table(first_page, count, changed, |entries| {
+                entries.resize(count, 0);
+                for &(start, patch) in patches {
+                    entries[start..start + patch.len()].copy_from_slice(patch);
+                }
+            })?;
+            self.stat("stat: page table extent patches", 1);
+            self.stat("stat: page table extent delta pages", extent_delta as u64);
+            return Ok((self.page_table_binding(), false));
         }
 
         let mut added = Vec::new();
@@ -1875,22 +1892,32 @@ impl Renderer {
         changed: impl Iterator<Item = std::ops::Range<usize>> + Clone,
         update: impl FnOnce(&mut Vec<u64>),
     ) -> Result<(), String> {
-        let bytes = (count.max(1) * 8) as u64;
-        // Acquire the new buffer before retiring the current one.
-        let mut storage = if self
+        let bytes = u64::from(
+            u32::try_from(count.max(1)).map_err(|_| "page count exceeds the shader ABI")?,
+        ) * 8;
+        // A larger retired table can have mappings in the removed tail.
+        // Invalidate those entries before it can be reused on a later grow.
+        let previous_count = self
+            .page_table
+            .as_ref()
+            .map_or(0, |table| table.entries.len());
+        let changed = changed.chain((previous_count > count).then_some(count..previous_count));
+
+        // Acquire a completed buffer of exactly this size. The old binding
+        // stays live until the submissions that used it finish.
+        let recycled = self
             .free_page_tables
-            .last()
-            .is_some_and(|table| table.buffer.size == bytes)
-        {
+            .iter()
+            .rposition(|table| table.buffer.size == bytes)
+            .map(|index| self.free_page_tables.remove(index));
+        self.trim_free_page_tables(bytes);
+        let mut storage = if let Some(storage) = recycled {
             self.stat("stat: page table buffers reused", 1);
-            self.free_page_tables.pop().unwrap()
+            storage
         } else {
             let buffer =
                 self.host_buffer_with(bytes, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
             self.stat("stat: page table buffers allocated", 1);
-            for old in self.free_page_tables.drain(..) {
-                old.buffer.destroy(&self.gpu.device);
-            }
             RecycledPageTable {
                 buffer,
                 dirty: std::iter::once(0..count).collect(),
@@ -1935,6 +1962,27 @@ impl Renderer {
             submitted_read: 0,
         });
         Ok(())
+    }
+
+    /// Retain the most recently completed buffers within the original budget
+    /// of two current-sized tables. Never allocate a larger active binding.
+    fn trim_free_page_tables(&mut self, active_bytes: u64) {
+        let budget = active_bytes.saturating_mul(2);
+        let mut bytes = 0;
+        let keep = self
+            .free_page_tables
+            .iter()
+            .rev()
+            .take(2)
+            .take_while(|table| {
+                bytes += table.buffer.size;
+                bytes <= budget
+            })
+            .count();
+        let discard = self.free_page_tables.len() - keep;
+        for table in self.free_page_tables.drain(..discard) {
+            table.buffer.destroy(&self.gpu.device);
+        }
     }
 
     fn page_table_binding(&self) -> echora_shader_abi::PageTable {
@@ -4222,17 +4270,19 @@ impl Renderer {
         for (buffer, view) in std::mem::take(&mut self.slot.retired_texel_buffers) {
             self.destroy_texel_buffer(buffer, view);
         }
-        for storage in self.slot.retired_page_tables.drain(..) {
-            if self.free_page_tables.len() < 2
-                && self
-                    .page_table
-                    .as_ref()
-                    .is_some_and(|table| table.buffer.size == storage.buffer.size)
-            {
-                self.free_page_tables.push(storage);
-            } else {
-                storage.buffer.destroy(&self.gpu.device);
+        if !self.slot.retired_page_tables.is_empty() {
+            let active_bytes = self
+                .page_table
+                .as_ref()
+                .map_or(0, |table| table.buffer.size);
+            for storage in self.slot.retired_page_tables.drain(..) {
+                if storage.buffer.size <= active_bytes.saturating_mul(2) {
+                    self.free_page_tables.push(storage);
+                } else {
+                    storage.buffer.destroy(&self.gpu.device);
+                }
             }
+            self.trim_free_page_tables(active_bytes);
         }
         for (buffer, memory) in std::mem::take(&mut self.slot.retired_shared) {
             // SAFETY: the work reading it has completed.
@@ -8876,6 +8926,8 @@ struct RecycledPageTable {
 
 impl RecycledPageTable {
     fn mark_dirty(&mut self, mut changed: std::ops::Range<usize>) {
+        // A completed or retiring buffer may belong to a shorter extent.
+        changed.end = changed.end.min((self.buffer.size / 8) as usize);
         if changed.is_empty() {
             return;
         }
@@ -9931,6 +9983,12 @@ mod tests {
         }
         let submitted = renderer.submit_frame();
         let replacement = renderer.set_page_table(8, &[address, address + 4096]);
+        let resized = renderer.patch_page_table(8, 3, &[(0, &[0])]);
+        let original_bytes = renderer
+            .slot
+            .retired_page_tables
+            .first()
+            .map(|table| table.buffer.read_bytes(16));
         let signal = vk::SemaphoreSignalInfo::default().semaphore(gate).value(1);
         // SAFETY: signal a new value on a live timeline semaphore.
         let released = unsafe { device.signal_semaphore(&signal) };
@@ -9944,7 +10002,91 @@ mod tests {
         let (after, extended) = replacement.unwrap();
         assert!(!extended);
         assert_ne!(original.address, after.address);
-        assert_eq!(renderer.page_table_entries(), [address, address + 4096]);
+        let (new_extent, extended) = resized.unwrap();
+        assert!(!extended);
+        assert_ne!(new_extent.address, original.address);
+        assert_eq!(renderer.page_table_entries(), [0, address + 4096, 0]);
+        assert_eq!(
+            original_bytes.unwrap(),
+            [address.to_le_bytes(), [0; 8]].concat()
+        );
+    }
+
+    #[test]
+    fn resized_page_tables_reuse_only_finished_exact_sizes_with_valid_entries() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        if !renderer.gpu.buffer_device_address {
+            return;
+        }
+        let initial = [11u64, 22, 33, 44, 71, 72, 73, 74];
+        let (large, _) = renderer.set_page_table(5, &initial).unwrap();
+        renderer.commands().unwrap();
+        renderer.record_page_table_read(large.address);
+        let (small, extended) = renderer.patch_page_table(5, 4, &[(1, &[200])]).unwrap();
+        assert!(!extended);
+        assert_ne!(large.address, small.address);
+        let as_bytes = |entries: &[u64]| {
+            entries
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let retired = &renderer.slot.retired_page_tables[0];
+        assert_eq!(retired.buffer.read_bytes(64), as_bytes(&initial));
+        assert_eq!(retired.dirty, [1..2, 4..8]);
+        assert!(renderer.patch_page_table(6, 8, &[]).is_err());
+        if usize::BITS > 32 {
+            assert!(renderer.patch_page_table(5, usize::MAX, &[]).is_err());
+        }
+        assert!(renderer.patch_page_table(5, 8, &[(7, &[1, 2])]).is_err());
+        assert_eq!(renderer.page_table_entries(), [11, 200, 33, 44]);
+        renderer.flush().unwrap();
+        // The recycled large table must clear the intervening truncated tail,
+        // keep the latest prefix changes, and write new entries from patches.
+        let (regrown, extended) = renderer.patch_page_table(5, 8, &[(6, &[91])]).unwrap();
+        assert!(!extended);
+        assert_eq!(large.address, regrown.address);
+        assert_eq!(
+            renderer.page_table.as_ref().unwrap().buffer.read_bytes(64),
+            as_bytes(&[11, 200, 33, 44, 0, 0, 91, 0])
+        );
+        renderer.flush().unwrap();
+
+        // Rebase without patches; on a return to the smaller allocation,
+        // bytes left from the old first page cannot become visible.
+        renderer
+            .set_page_table(19, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        renderer.flush().unwrap();
+        let (rebased, _) = renderer.patch_page_table(19, 4, &[]).unwrap();
+        assert_eq!(rebased.address, small.address);
+        assert_eq!(
+            renderer.page_table.as_ref().unwrap().buffer.read_bytes(32),
+            as_bytes(&[1, 2, 3, 4])
+        );
+        renderer.flush().unwrap();
+
+        // An extent outside the two-current-tables byte budget is discarded
+        // after completion, however recently it was used.
+        renderer.patch_page_table(19, 1, &[]).unwrap();
+        renderer.flush().unwrap();
+        assert!(renderer.free_page_tables.len() <= 2);
+        assert!(
+            renderer
+                .free_page_tables
+                .iter()
+                .map(|t| t.buffer.size)
+                .sum::<u64>()
+                <= 16
+        );
+        let (large_again, _) = renderer.patch_page_table(19, 8, &[]).unwrap();
+        assert_eq!(large_again.page_count, 8);
+        assert_eq!(
+            renderer.page_table.as_ref().unwrap().buffer.read_bytes(64),
+            as_bytes(&[1, 0, 0, 0, 0, 0, 0, 0])
+        );
     }
 
     #[test]
