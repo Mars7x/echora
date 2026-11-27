@@ -38,6 +38,12 @@ synthetic fixtures and runs without the game files.
   4×4 brightness reversals above 12/255 fell from 2.11% to 1.80% with SMAA.
   At native pixel scale, foreground reversals above 20/255 changed from
   0.17% to 0.25%. These short samples show mixed behavior.
+  In a six-present sharpening comparison at the same camera poses, three
+  rock landmarks aligned. Screening for motion alignment in both runs
+  left 89 foreground patches and 51,264 samples per run. Disabling
+  sharpening reduced brightness reversals above 20/255 from 203 to 23 in
+  those patches. The full images differed, including outside the measured
+  foreground.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
