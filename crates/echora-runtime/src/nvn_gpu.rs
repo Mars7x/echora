@@ -2353,13 +2353,12 @@ impl Nvn {
             return;
         }
         let mut object = self.objects[&texture].clone();
-        // A retained render target still contains the image of its physical
-        // allocation after the virtual address is mapped elsewhere.
+        // A retired image stays with its physical bytes when a virtual page
+        // is remapped or a physical pool handle is reused for another range.
         let backing = previous.or_else(|| {
             if !has_target {
                 return None;
             }
-            self.virtual_texture_address(texture)?;
             match self.texture_object_backing(texture)? {
                 TextureBacking::Linear((_, range)) => Some(range),
                 TextureBacking::Virtual { .. } => None,
@@ -16132,14 +16131,8 @@ mod target_tests {
         };
         let args = |x| Args { x, v: [0; 2] };
         let scalar = |value| args([value, 0, 0, 0]);
-        nvn.initialize(
-            1,
-            "MemoryPool",
-            BTreeMap::from([("Storage".into(), args([0x10000, 0x20_0000, 0, 0]))]),
-        )
-        .unwrap();
         nvn.initialize(5, "Device", BTreeMap::new()).unwrap();
-        let builder = BTreeMap::from([
+        let mut builder = BTreeMap::from([
             ("Device".into(), scalar(5)),
             ("Width".into(), scalar(512)),
             ("Height".into(), scalar(512)),
@@ -16147,6 +16140,7 @@ mod target_tests {
             ("Storage".into(), args([1, 0, 0, 0])),
         ]);
         nvn.initialize(2, "Texture", builder.clone()).unwrap();
+        builder.insert("Storage".into(), args([6, 0, 0, 0]));
         nvn.initialize(3, "Texture", builder.clone()).unwrap();
         write_shared(nvn.bags.at(4)).insert(
             4,
@@ -16163,6 +16157,26 @@ mod target_tests {
             memory: GuestMemory::Checked(&mut memory),
             counter: None,
         };
+        // Two pool handles cover the same physical bytes. Recycle only the
+        // one that originally supplied the finalized attachment.
+        let initialize_pool = |nvn: &mut Nvn, core: &mut Guest, pool, address| {
+            write_shared(nvn.bags.at(7)).insert(
+                7,
+                Bag {
+                    kind: "MemoryPoolBuilder".into(),
+                    props: BTreeMap::from([
+                        ("Device".into(), scalar(5)),
+                        ("Storage".into(), args([address, 0x20_0000, 0, 0])),
+                    ]),
+                },
+            );
+            core.cpu.regs[..2].copy_from_slice(&[pool, 7]);
+            assert!(nvn.call("nvnMemoryPoolInitialize", core).unwrap());
+            assert_eq!(core.cpu.regs[0], 1);
+        };
+        initialize_pool(&mut nvn, &mut core, 1, 0x10000);
+        initialize_pool(&mut nvn, &mut core, 6, 0x10000);
+        core.cpu.regs[0] = 2;
         nvn.gpu_clear_depth(&core, 2, Some(0.5), None).unwrap();
         assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
         let archive = retired_texture((0x10000, 52));
@@ -16182,6 +16196,19 @@ mod target_tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
+        core.cpu.regs[0] = 1;
+        assert!(nvn.call("nvnMemoryPoolFinalize", &mut core).unwrap());
+        let closed = nvn.texture_storage(archive);
+        initialize_pool(&mut nvn, &mut core, 1, 0x400_0000);
+        let mut new_desc = nvn.objects[&3].builder.clone();
+        new_desc.insert("Storage".into(), args([1, 0, 0, 0]));
+        nvn.initialize(8, "Texture", new_desc).unwrap();
+        nvn.refresh_target_index();
+        assert_eq!(nvn.resolve_target(8), None, "new pool inherited old texels");
+        assert_eq!(closed, Some(0x10000));
+        assert_eq!(nvn.texture_storage(archive), Some(0x10000));
+        assert!(matches!(nvn.texture_object_backing(archive),
+            Some(super::TextureBacking::Linear((0, range))) if range == (0x10000..0x110000)));
         let TextureSource::Target(key) = nvn.texture_source(&core, 3).unwrap() else {
             panic!("the alias must sample the retained target");
         };
