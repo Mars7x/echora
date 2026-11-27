@@ -2233,7 +2233,6 @@ impl Nvn {
         if depth.is_none() && stencil.is_none() {
             return Ok(());
         }
-        self.ensure_render_target(texture)?;
         let scissor = self.render.scissor;
         let level = if super::mip_targets() {
             self.render.depth_level
@@ -2241,6 +2240,15 @@ impl Nvn {
             0
         };
         let layer = self.render.depth_layer;
+        let attachment = self.resolve_depth_attachment(texture, level);
+        if attachment != texture {
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .stat("stat: depth clears through attachment aliases", 1);
+        }
+        let texture = attachment;
+        self.ensure_render_target(texture)?;
         let renderer = &self.gpu.as_ref().unwrap().renderer;
         let full_stencil = stencil
             .filter(|&(_, mask)| mask == u8::MAX)
@@ -4900,6 +4908,31 @@ impl Nvn {
             self.ensure_render_target(texture)?;
         }
         Ok((texture, level))
+    }
+
+    /// Depth tests and clears must see the same image when the guest makes
+    /// a second attachment object over the prepass's storage.
+    fn resolve_depth_attachment(&self, texture: u64, level: u32) -> u64 {
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        if renderer.target_info(texture).is_some() {
+            return texture;
+        }
+        let levels = self.texture_levels(texture);
+        let Some((alias, 0)) = self.resolve_target_with_levels(texture, levels, true) else {
+            return texture;
+        };
+        if renderer.target_info(alias).is_some_and(|target| {
+            echora_gpu::renderer::is_depth(target.format)
+                && level < target.levels
+                && self.texture_alias_layout_matches(texture, alias, target)
+                && self.texture_object_backing(texture).is_some_and(|backing| {
+                    self.texture_object_backing(alias).as_ref() == Some(&backing)
+                })
+        }) {
+            alias
+        } else {
+            texture
+        }
     }
 
     /// Check that both objects interpret their backing with the same shape,
@@ -12401,20 +12434,8 @@ impl Nvn {
         // same depth memory for its lit pass, testing EQUAL against what
         // the prepass wrote).
         let depth_level = if mips { self.render.depth_level } else { 0 };
-        let depth = (self.render.depth != 0).then(|| {
-            let texture = self.render.depth;
-            let renderer = &self.gpu.as_ref().unwrap().renderer;
-            if renderer.existing_target(texture).is_some() {
-                return texture;
-            }
-            self.target_sharing_storage(texture, false)
-                .filter(|&target| {
-                    renderer.existing_target(target).is_some_and(|target| {
-                        echora_gpu::renderer::is_depth(target.format) && depth_level < target.levels
-                    })
-                })
-                .unwrap_or(texture)
-        });
+        let depth = (self.render.depth != 0)
+            .then(|| self.resolve_depth_attachment(self.render.depth, depth_level));
         let bound_viewport = self.render.viewport();
         if let Some(texture) = depth.filter(|&texture| self.depth_traced(texture)) {
             eprintln!(
@@ -16838,6 +16859,39 @@ mod target_tests {
             let mut actual = vec![0; expected.len()];
             core.memory.read(output, &mut actual).unwrap();
             assert_eq!(actual, expected);
+        }
+
+        // The second texture object aliases the first image's depth/stencil
+        // storage. Clearing stencil through it must update that image and
+        // keep both its existing depth and the earlier stencil clear.
+        let alias = 4;
+        nvn.initialize(alias, "Texture", nvn.objects[&2].builder.clone())
+            .unwrap();
+        nvn.render.depth = alias;
+        nvn.render.scissor = Some([1, 0, 1, 1]);
+        nvn.execute_command(
+            &Command {
+                name: "nvnCommandBufferClearDepthStencil",
+                x: [0, 0, 7, 0xf, 0, 0, 0, 0],
+                v: [0; 8],
+                captured: Vec::new(),
+                states: Default::default(),
+            },
+            &mut core,
+        )
+        .unwrap();
+        let expected = [depths24[0] << 8 | 0x21, depths24[1] << 8 | 0x27]
+            .map(u32::to_le_bytes)
+            .concat();
+        let output = base + 0x2000;
+        for texture in [2, alias] {
+            assert!(
+                nvn.gpu_read_texels(&mut core, texture, transfer, output)
+                    .unwrap()
+            );
+            let mut actual = [0; 8];
+            core.memory.read(output, &mut actual).unwrap();
+            assert_eq!(actual.as_slice(), expected, "texture {texture}");
         }
     }
 
