@@ -2838,6 +2838,7 @@ impl Machine {
         self.core_threads[0] = Some(cores[0].current_thread_id);
         self.running[0] = Some(cores[0].current_thread_id);
         self.parallel = true;
+        let cpu_hooks = cpu_hook_addresses(&self.nvn);
         let placeholder = self.nvn.entries_only();
         let recorder = self.nvn.recorder();
         let thunks = std::sync::RwLock::new(self.nvn.thunk_names());
@@ -2848,6 +2849,7 @@ impl Machine {
             nvn,
             nvn_waiters: &crate::nvn::NVN_WAITERS,
             recorder,
+            cpu_hooks,
             thunks,
             stop: std::sync::atomic::AtomicBool::new(false),
             serial: crate::nvn::debug_var_os("ECHORA_SERIAL_GUEST")
@@ -2933,10 +2935,12 @@ impl Machine {
             shared.wake_replay();
             finished
         });
-        self.nvn = shared
+        let mut renderer = shared
             .nvn
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        merge_cpu_hook_counts(&mut self.nvn, &mut renderer);
+        self.nvn = renderer;
         self.parallel = false;
         self.running.fill(None);
         self.worker_core = None;
@@ -4916,12 +4920,44 @@ fn stop_seconds_passed() -> bool {
         .is_some_and(|at| std::time::Instant::now() >= at)
 }
 
+/// These hooks operate on checked guest memory and CPU registers. Running
+/// a decoder under the renderer lock also stalls independent GPU replay.
+fn cpu_hook_addresses(nvn: &crate::nvn::Nvn) -> Vec<u64> {
+    use crate::nvn::HostEntry::*;
+    let mut addresses: Vec<_> = nvn
+        .hook_addresses()
+        .filter(|&pc| {
+            matches!(
+                nvn.entry(pc),
+                Some(
+                    ZlibUncompress
+                        | ZstdDecompress
+                        | InflateFinishCall
+                        | ZstdFrames
+                        | ZstdStreamCall
+                        | AddonBranch { .. }
+                )
+            )
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses
+}
+
+/// The machine's entry table counts CPU hooks locally during parallel runs.
+fn merge_cpu_hook_counts(entries: &mut crate::nvn::Nvn, renderer: &mut crate::nvn::Nvn) {
+    for (name, calls) in std::mem::take(&mut entries.calls) {
+        *renderer.calls.entry(name).or_default() += calls;
+    }
+}
+
 /// What the workers of a parallel run share.
 struct Shared<'a> {
+    cpu_hooks: Vec<u64>,
     machine: std::sync::Mutex<&'a mut Machine>,
     /// The NVN state while workers run: an NVN call locks it alone (see
     /// `Worker::held_nvn_call`), and a boundary that needs it under the
-    /// machine lock (present, lookups, host functions) swaps it into the
+    /// machine lock (present and lookups) swaps it into the
     /// machine, whose `nvn` holds only the entry points meanwhile. Taken
     /// after the machine lock, never before it.
     nvn: std::sync::Mutex<crate::nvn::Nvn>,
@@ -5499,14 +5535,12 @@ impl Worker {
                 let yielded =
                     kind == 0x0b && (-2..=QUIET_SLEEP_NS).contains(&(self.core.cpu.regs[0] as i64));
                 let sleep_ns = self.core.cpu.regs[0] as i64;
-                let host_call = match &result {
-                    Err(Trap::MissingBlock { pc }) if machine.nvn.has_entry(*pc) => Some(*pc),
-                    _ => None,
-                };
+                let renderer_call = matches!(&result, Err(Trap::MissingBlock { pc })
+                    if shared.cpu_hooks.binary_search(pc).is_err() && machine.nvn.has_entry(*pc));
                 // Host calls (a failed held call among them) swap the NVN
                 // state in for the boundary.
                 self.swap_in(&mut machine);
-                let outcome = if host_call.is_some() {
+                let outcome = if renderer_call {
                     let mut nvn = shared.lock_nvn();
                     std::mem::swap(&mut machine.nvn, &mut *nvn);
                     let outcome = machine.boundary(result);
@@ -5519,12 +5553,14 @@ impl Worker {
                     // A lookup added entry points: the machine's table must
                     // know their thunks are host calls.
                     if nvn.thunk_count() != machine.nvn.thunk_count() {
+                        merge_cpu_hook_counts(&mut machine.nvn, &mut nvn);
                         machine.nvn = nvn.entries_only();
                         *shared
                             .thunks
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = nvn.thunk_names();
                     }
+                    machine.nvn.presented_frames = nvn.presented_frames;
                     outcome
                 } else {
                     machine.boundary(result)
@@ -5664,7 +5700,10 @@ impl Worker {
 
     /// Try the worker's NVN paths before taking the machine lock.
     fn try_nvn_call(&mut self, shared: &Shared, pc: u64) -> bool {
-        if self.held_failed.is_some() {
+        if self.held_failed.is_some()
+            || (crate::nvn::thunk_index(pc).is_none()
+                && shared.cpu_hooks.binary_search(&pc).is_ok())
+        {
             return false;
         }
         let generation = crate::nvn::debug_generation();
@@ -6096,6 +6135,31 @@ mod tests {
             assert_eq!(machine.core.cpu.regs[8], register_value);
             assert_eq!(machine.core.cpu.regs[30], return_address);
         }
+    }
+
+    #[test]
+    fn cpu_decoders_use_the_machine_table_and_preserve_report_counts() {
+        use crate::nvn::{HostEntry, Nvn};
+        let mut renderer = Nvn::default();
+        renderer.add_hook(0x1000, HostEntry::BootstrapLoader);
+        renderer.add_hook(0x2000, HostEntry::ZstdFrames);
+        renderer.add_hook(0x3000, HostEntry::ZstdStreamCall);
+        let present = renderer.thunk("nvnQueuePresentTexture").unwrap();
+        let hooks = cpu_hook_addresses(&renderer);
+        assert_eq!(hooks, [0x2000, 0x3000]);
+        assert!(hooks.binary_search(&present).is_err());
+
+        let mut entries = renderer.entries_only();
+        renderer.calls.insert("hle:zstd_frames".into(), 2);
+        renderer.calls.insert("nvnQueuePresentTexture".into(), 1);
+        entries.calls.insert("hle:zstd_frames".into(), 3);
+        merge_cpu_hook_counts(&mut entries, &mut renderer);
+        entries = renderer.entries_only();
+        entries.calls.insert("hle:zstd_frames".into(), 4);
+        merge_cpu_hook_counts(&mut entries, &mut renderer);
+        assert_eq!(renderer.calls["hle:zstd_frames"], 9);
+        assert_eq!(renderer.calls["nvnQueuePresentTexture"], 1);
+        assert!(entries.calls.is_empty());
     }
 
     /// Names decided once and asked again give the same answer as the
