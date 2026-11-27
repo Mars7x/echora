@@ -12431,11 +12431,13 @@ impl Nvn {
                     keys.split(',')
                         .any(|key| key == format!("{:016x}", keys_for_note[1]))
                 }),
-            depth_write: arg(depth_state, "DepthWriteEnable", 0).unwrap_or(0) != 0,
+            // Earlier command archives stored only the fields explicitly
+            // set after reset. Use the guest's reset values for absent fields.
+            depth_write: arg(depth_state, "DepthWriteEnable", 0).unwrap_or(1) != 0,
             // ECHORA_GPU_EQUAL_AS_LEQUAL=<fragment key>[,...] (debugging):
             // those programs' EQUAL depth tests as LESS_OR_EQUAL (tells a
             // depth that differs by rounding from one never written).
-            depth_compare: match compare_op(arg(depth_state, "DepthFunc", 0).unwrap_or(8)) {
+            depth_compare: match compare_op(arg(depth_state, "DepthFunc", 0).unwrap_or(2)) {
                 vk::CompareOp::EQUAL
                     if draw_var(switches, "ECHORA_GPU_EQUAL_AS_LEQUAL").is_ok_and(|keys| {
                         keys.split(',')
