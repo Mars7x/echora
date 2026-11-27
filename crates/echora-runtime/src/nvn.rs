@@ -7467,8 +7467,12 @@ impl Nvn {
             .create(true)
             .append(true)
             .open(path)
+            && let Ok(mut encoded) = serde_json::to_vec(&line)
         {
-            let _ = writeln!(file, "{line}");
+            // JSON formatting writes individual fields and punctuation.
+            // Stage a whole line so tracing each draw needs one append.
+            encoded.push(b'\n');
+            let _ = file.write_all(&encoded);
         }
     }
 
