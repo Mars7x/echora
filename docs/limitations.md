@@ -289,6 +289,12 @@ synthetic fixtures and runs without the game files.
   count fell by about 3% and page-table allocations rose from 19 to 129.
   Peak resident memory for the full runs rose from 13,343 to 13,854 MiB.
   The trial was kept local.
+- Reading texture-builder storage properties through the shared builder
+  state avoided 80,805 calls under the NVN lock in a 900-present saved-forest
+  run. Aggregate guest NVN lock wait fell from 85.5 to 82.1 seconds.
+  The matched pair averaged 8.82 and 9.05 FPS across presents 4,200–5,100
+  and peaked at 13,639 and 13,780 MiB resident. Both runs reached the same
+  forest checkpoints and preserved the cloned save.
 - The console runs the game at 60 frames per second. A Radeon run with
   the candidate 12 translation and current renderer processed 9,660 movie
   pictures at 71.1 pictures/s. In the forest, presents 10,500–10,700

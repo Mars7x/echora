@@ -2292,6 +2292,7 @@ pub(crate) enum RecordedCall<'a> {
     Management(&'a str),
     SyncWait,
     Registry,
+    TextureBuilderQuery,
     Property {
         kind: &'static str,
         rest: &'a str,
@@ -2322,6 +2323,17 @@ impl<'a> RecordedCall<'a> {
             return Some(Self::Registry);
         }
         let (kind, rest) = split_name(name)?;
+        if kind == "TextureBuilder"
+            && matches!(
+                rest,
+                "GetStorageClass"
+                    | "GetZCullStorageSize"
+                    | "GetStorageSize"
+                    | "GetStorageAlignment"
+            )
+        {
+            return Some(Self::TextureBuilderQuery);
+        }
         front_bag(kind, rest).then_some(Self::Property { kind, rest })
     }
 }
@@ -2428,6 +2440,21 @@ impl Recorder {
         if matches!(call, RecordedCall::Registry) {
             call_watch(name, core);
             return registry_call(&self.registry, &self.bags, name, core);
+        }
+        if matches!(call, RecordedCall::TextureBuilderQuery) {
+            let address = core.cpu.regs[0];
+            let result = {
+                let bags = read_shared(self.bags.at(address));
+                bag_in(&bags, address, "TextureBuilder")
+                    .and_then(|bag| texture_builder_result(name, &bag.props))
+            };
+            let Ok(value) = result else {
+                // The locked call reports invalid builder and format errors.
+                return Ok(false);
+            };
+            call_watch(name, core);
+            core.cpu.regs[0] = value;
+            return Ok(true);
         }
         let RecordedCall::Property { kind, rest } = call else {
             return Ok(false);
@@ -3713,50 +3740,23 @@ impl Nvn {
                 core.cpu.regs[0] = texture.builder.get("Samples").map_or(0, |value| value.x[0]);
                 return Ok(true);
             }
-            // nvnTextureBuilderGetStorageClass / nvnTextureGetStorageClass:
-            // the application stores the class as a u16 in its texture info
-            // (main+0xc2ce4c) and nothing nearby interprets it. Host textures
-            // have one storage class, answered as 1. Provisional.
-            "nvnTextureBuilderGetStorageClass" | "nvnTextureGetStorageClass" => {
-                if name.starts_with("nvnTextureBuilder") {
-                    self.bag(this, "TextureBuilder").map_err(invalid)?;
-                } else {
-                    self.object(this, "Texture").map_err(invalid)?;
-                }
+            "nvnTextureGetStorageClass" => {
+                self.object(this, "Texture").map_err(invalid)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
-            // nvnTextureBuilderGetZCullStorageSize (builder) -> size: the
-            // memory that saves and restores the described depth target's
-            // culling state; the application keeps it beside device
-            // integer 54, the alignment of that memory (main+0x244db4).
-            // The host renderer keeps no depth culling state: 0 bytes.
-            // Provisional.
-            "nvnTextureBuilderGetZCullStorageSize" => {
-                self.bag(this, "TextureBuilder").map_err(invalid)?;
-                core.cpu.regs[0] = 0;
+            "nvnTextureBuilderGetStorageClass"
+            | "nvnTextureBuilderGetZCullStorageSize"
+            | "nvnTextureBuilderGetStorageSize"
+            | "nvnTextureBuilderGetStorageAlignment"
+            => {
+                let props = self.bag(this, "TextureBuilder").map_err(invalid)?;
+                core.cpu.regs[0] = texture_builder_result(&name, &props).map_err(stop)?;
                 return Ok(true);
             }
-            // nvnTextureBuilderGetStorageSize / GetStorageAlignment (builder)
-            // and nvnTextureGetStorageSize (texture): the block-linear size of
-            // the described texture (see nvn_format).
-            "nvnTextureBuilderGetStorageSize"
-            | "nvnTextureBuilderGetStorageAlignment"
-            | "nvnTextureGetStorageSize" => {
-                let props = if name.starts_with("nvnTextureBuilder") {
-                    self.bag(this, "TextureBuilder").map_err(invalid)?
-                } else {
-                    self.object(this, "Texture")
-                        .map_err(invalid)?
-                        .builder
-                        .clone()
-                };
-                let (size, alignment) = texture_storage(&props).map_err(stop)?;
-                core.cpu.regs[0] = if name.ends_with("Alignment") {
-                    alignment
-                } else {
-                    size
-                };
+            "nvnTextureGetStorageSize" => {
+                let texture = self.object(this, "Texture").map_err(invalid)?;
+                core.cpu.regs[0] = texture_storage(&texture.builder).map_err(stop)?.0;
                 return Ok(true);
             }
             // nvnSamplerInitialize(NVNsampler*, const NVNsamplerBuilder*) ->
@@ -8196,6 +8196,20 @@ pub(crate) fn texture_layout_layers(
     crate::nvn_format::texture_layers(info, width, height, depth, layers, levels, flags, packaged)
 }
 
+fn texture_builder_result(name: &str, props: &BTreeMap<String, Args>) -> Result<u64, String> {
+    match name {
+        // The host currently exposes one storage class and no separate
+        // allocation for the guest's depth culling state.
+        "nvnTextureBuilderGetStorageClass" => Ok(1),
+        "nvnTextureBuilderGetZCullStorageSize" => Ok(0),
+        "nvnTextureBuilderGetStorageSize" => texture_storage(props).map(|(size, _)| size),
+        "nvnTextureBuilderGetStorageAlignment" => {
+            texture_storage(props).map(|(_, alignment)| alignment)
+        }
+        _ => unreachable!("only texture builder storage queries use this path"),
+    }
+}
+
 fn texture_storage(props: &BTreeMap<String, Args>) -> Result<(u64, u64), String> {
     let get = |key: &str| props.get(key).map(|value| value.x[0] as u32);
     let format = get("Format").ok_or("texture format was never set")?;
@@ -10750,6 +10764,84 @@ mod tests {
             RecordedCall::classify("nvnSyncWait"),
             Some(RecordedCall::SyncWait)
         ));
+    }
+
+    #[test]
+    fn recorder_texture_storage_queries_follow_builder_changes() {
+        let mut nvn = Nvn::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let recorder = nvn.recorder();
+        let builder = 0x1000;
+        let size = "nvnTextureBuilderGetStorageSize";
+        core.cpu.regs[0] = builder;
+        assert!(!recorder.front(size, &mut core).unwrap());
+        assert_eq!(core.cpu.regs[0], builder);
+
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureBuilderSetDefaults",
+            &[builder],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureBuilderSetTarget",
+            &[builder, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureBuilderSetHeight",
+            &[builder, 64],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureBuilderSetFormat",
+            &[builder, 37],
+        );
+
+        let mut sizes = Vec::new();
+        for width in [64, 1024] {
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnTextureBuilderSetWidth",
+                &[builder, width],
+            );
+            for name in [
+                size,
+                "nvnTextureBuilderGetStorageAlignment",
+                "nvnTextureBuilderGetStorageClass",
+                "nvnTextureBuilderGetZCullStorageSize",
+            ] {
+                let locked = call(&mut nvn, &mut core, name, &[builder]);
+                core.cpu.regs[0] = builder;
+                assert!(recorder.front(name, &mut core).unwrap());
+                assert_eq!(core.cpu.regs[0], locked, "{name}");
+                if name == size {
+                    sizes.push(locked);
+                }
+            }
+        }
+        assert!(sizes[0] < sizes[1]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnTextureBuilderSetFormat",
+            &[builder, u32::MAX as u64],
+        );
+        core.cpu.regs[0] = builder;
+        assert!(!recorder.front(size, &mut core).unwrap());
+        assert_eq!(core.cpu.regs[0], builder);
+        assert!(nvn.call(size, &mut core).is_err());
     }
 
     #[test]
