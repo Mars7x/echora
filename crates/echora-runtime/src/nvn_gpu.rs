@@ -1732,6 +1732,23 @@ fn stencil_op(value: u64) -> vk::StencilOp {
     }
 }
 
+pub(super) fn channel_write_mask(mask: &super::Args) -> vk::ColorComponentFlags {
+    // The fifth setter argument (alpha) occupies V1 in archived commands.
+    let [_, r, g, b] = mask.x;
+    let mut flags = vk::ColorComponentFlags::empty();
+    for (value, component) in [
+        (r, vk::ColorComponentFlags::R),
+        (g, vk::ColorComponentFlags::G),
+        (b, vk::ColorComponentFlags::B),
+        (mask.v[1], vk::ColorComponentFlags::A),
+    ] {
+        if value as u8 != 0 {
+            flags |= component;
+        }
+    }
+    flags
+}
+
 /// NVN blend factors: GL order from 1 (inferred; the game's UI blends with
 /// 5/6, source alpha over one minus source alpha).
 fn blend_factor(value: u64) -> Option<vk::BlendFactor> {
@@ -12461,23 +12478,7 @@ impl Nvn {
                 blend.alpha.2 = blend_op(equation.x[1]);
             }
             if let Some(mask) = mask_state.get(mask_key) {
-                let mut flags = vk::ColorComponentFlags::empty();
-                // r, g, b in X2..X4; alpha (X5) recorded in v[1]. A
-                // G-buffer pass binds one texture as targets 2 and 4
-                // and masks target 4 off: its alpha writes overwrote
-                // target 2's material alpha.
-                let alpha = mask.v[1];
-                for (enabled, flag) in [
-                    (mask.x[1], vk::ColorComponentFlags::R),
-                    (mask.x[2], vk::ColorComponentFlags::G),
-                    (mask.x[3], vk::ColorComponentFlags::B),
-                    (alpha, vk::ColorComponentFlags::A),
-                ] {
-                    if enabled & 0xff != 0 {
-                        flags |= flag;
-                    }
-                }
-                blend.write_mask = flags;
+                blend.write_mask = channel_write_mask(mask);
             }
         }
         let blends = &blends[..bound];

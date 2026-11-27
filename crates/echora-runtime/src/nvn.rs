@@ -8237,10 +8237,9 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
 /// state, as on the console.
-const TAGGED_STATES: [&str; 6] = [
+const TAGGED_STATES: [&str; 5] = [
     "ColorState",
     "BlendState",
-    "ChannelMaskState",
     "PolygonState",
     "DepthStencilState",
     "MultisampleState",
@@ -8414,15 +8413,41 @@ fn snapshot_vertex_states(
         });
     }
     if count == 0 {
+        command.states = StateSnapshots::default();
         return Ok(());
     }
     let bytes = &mut bytes[..count * stride];
     core.memory.read(command.x[2], bytes)?;
+    // A captured forest frame reused fewer than 50 layouts across over a
+    // thousand draws. Share immutable snapshots on the recording worker.
+    // Always read the guest bytes first: the same address can be rewritten.
+    type Snapshots = std::cell::RefCell<FastMap<Vec<u8>, StateSnapshots>>;
+    thread_local! {
+        static ATTRIBUTES: Snapshots = Snapshots::default();
+        static STREAMS: Snapshots = Snapshots::default();
+    }
+    let cache = if attribute { &ATTRIBUTES } else { &STREAMS };
+    command.states = cache.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(states) = cache.get(&*bytes) {
+            return states.clone();
+        }
+        let states = decode_vertex_states(bytes, attribute, stride);
+        if cache.len() == 128 {
+            cache.clear();
+        }
+        cache.insert(bytes.to_vec(), states.clone());
+        states
+    });
+    Ok(())
+}
+
+fn decode_vertex_states(bytes: &[u8], attribute: bool, stride: usize) -> StateSnapshots {
     let args = |first: u32, second: u32| Args {
         x: [u64::from(first), u64::from(second), 0, 0],
         ..Args::default()
     };
-    command.states = bytes
+    bytes
         .chunks_exact(stride)
         .enumerate()
         .map(|(index, element)| {
@@ -8446,8 +8471,7 @@ fn snapshot_vertex_states(
             props
         })
         .collect::<Vec<_>>()
-        .into();
-    Ok(())
+        .into()
 }
 
 fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(), Trap> {
@@ -8463,6 +8487,10 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
     }
     let base = command.x[1];
     if base == 0 {
+        return Ok(());
+    }
+    if kind == "ChannelMaskState" {
+        command.states = channel_mask_snapshot(core.memory.read_u32(base)?);
         return Ok(());
     }
     // A single tagged state: what the bound structure's bytes hold; an
@@ -8617,6 +8645,67 @@ fn stencil_face_property<'a>(
     })
 }
 
+/// One nibble per color target, ordered RGBA. Keep the same per-target
+/// property shape as archived binds, including the fifth setter argument
+/// (alpha) in V1. Frequently bound masks can share their immutable snapshot.
+fn channel_mask_snapshot(word: u32) -> StateSnapshots {
+    thread_local! {
+        static MASKS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 16]> =
+            const { std::cell::RefCell::new([const { None }; 16]) };
+    }
+    MASKS.with_borrow_mut(|masks| {
+        let slot = &mut masks[(word.wrapping_mul(0x9e37_79b9) >> 28) as usize];
+        if let Some((known, snapshot)) = slot
+            && *known == word
+        {
+            return snapshot.clone();
+        }
+        let mut properties = BTreeMap::from([("@Offset".into(), Args::default())]);
+        for index in 0..8 {
+            let mask = u64::from(word >> (index * 4));
+            properties.insert(
+                format!("ChannelMask/{index}"),
+                Args {
+                    x: [index, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1],
+                    v: [0, (mask >> 3) & 1],
+                },
+            );
+        }
+        let snapshot: StateSnapshots = vec![properties].into();
+        *slot = Some((word, snapshot.clone()));
+        snapshot
+    })
+}
+
+fn channel_mask_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
+    let [state, target, r, g, b, a, ..] = core.cpu.regs;
+    // The SDK uses 32-bit variable shifts by W1 * 4.
+    let shift = (target as u32 & 7) * 4;
+    match rest {
+        "SetDefaults" => core.memory.write_u32(state, u32::MAX)?,
+        "SetChannelMask" => {
+            let mask = [r, g, b, a]
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (i, value)| {
+                    mask | (u32::from(value as u8 != 0) << i)
+                });
+            let word = core.memory.read_u32(state)?;
+            core.memory
+                .write_u32(state, (word & !(15 << shift)) | (mask << shift))?;
+        }
+        "GetChannelMask" => {
+            let mask = core.memory.read_u32(state)? >> shift;
+            // Read once before the four one-byte outputs, which may alias.
+            for (i, pointer) in [r, g, b, a].into_iter().enumerate() {
+                core.memory.write(pointer, &[((mask >> i) & 1) as u8])?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn attrib_format(word: u32) -> u32 {
     (word >> 21) & 0x3ff
 }
@@ -8682,8 +8771,12 @@ fn bag_call(
     args: Args,
     x: [u64; 31],
 ) -> Result<bool, Trap> {
-    if matches!(kind, "VertexAttribState" | "VertexStreamState") {
-        let handled = vertex_state_call(core, kind, rest)?;
+    let native = match kind {
+        "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
+        "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
+        _ => None,
+    };
+    if let Some(handled) = native {
         if handled && rest.starts_with("Set") {
             // This address may previously have held a different kind of builder.
             write_shared(bags.at(this)).remove(&this);
@@ -8778,16 +8871,8 @@ fn bag_call(
                 }
                 return Ok(true);
             }
-            // Per-target setters (SetBlendEnable(state, index, enable),
-            // SetChannelMask(state, index, r, g, b, a)) also keep each
-            // index's latest call.
-            if matches!(property, "BlendEnable" | "ChannelMask") {
-                let mut args = args;
-                // The mask's alpha flag is the fifth argument (X5),
-                // kept where integer setters leave V1 unused.
-                if property == "ChannelMask" {
-                    args.v[1] = x[5];
-                }
+            // SetBlendEnable(state, index, enable) also keeps each index's latest call.
+            if property == "BlendEnable" {
                 bag.set(&format!("{property}/{}", args.x[0]), args);
             }
             let mut args = args;
@@ -10341,6 +10426,120 @@ mod tests {
     }
 
     #[test]
+    fn native_channel_masks_follow_guest_bytes_and_replay_each_rgba_target() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "channel mask")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let recorder = nvn.recorder();
+        let (buffer, state, copy, outputs) = (0x1080, 0x1100, 0x1ffc, 0x1180);
+
+        // Defaults clear any stale builder at this address and touch four bytes.
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnBufferBuilderSetDefaults",
+            &[state],
+        );
+        guest
+            .memory
+            .write_u64(state, 0x1234_5678_0000_0000)
+            .unwrap();
+        guest.cpu.regs[0] = state;
+        assert!(
+            recorder
+                .front("nvnChannelMaskStateSetDefaults", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0x1234_5678_ffff_ffff);
+        assert_eq!(nvn.bags.len(), 0);
+
+        // Native W-register shifts select target 7. Only the low byte of
+        // each NVNboolean affects the setter. Hand-built state supplies the
+        // other targets without ever calling their setters.
+        guest.memory.write_u32(state, 0x8241_0de7).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnChannelMaskStateSetChannelMask",
+            &[state, 0x1_0000_000f, 0x100, 2, 0x200, 0x180],
+        );
+        let packed = guest.memory.read_u32(state).unwrap();
+        assert_eq!(packed, 0xa241_0de7);
+        guest.memory.write_u32(copy, packed).unwrap();
+
+        // R aliases the state and overwrites the source nibble for target
+        // 1. The other three results come from the word originally loaded.
+        guest.memory.write_u64(outputs, u64::MAX).unwrap();
+        guest.cpu.regs[..6].copy_from_slice(&[state, 1, state, outputs, outputs + 2, outputs + 4]);
+        assert!(
+            recorder
+                .front("nvnChannelMaskStateGetChannelMask", &mut guest)
+                .unwrap()
+        );
+        assert_eq!(guest.memory.read_u32(state).unwrap(), packed & !0xff);
+        assert_eq!(
+            guest.memory.read_u64(outputs).unwrap(),
+            0xffff_ff01_ff01_ff01
+        );
+
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        guest.cpu.regs[..2].copy_from_slice(&[buffer, copy]);
+        assert!(
+            recorder
+                .record("nvnCommandBufferBindChannelMaskState", &mut guest)
+                .unwrap()
+        );
+        guest.memory.write_u32(copy, 0).unwrap();
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferBindChannelMaskState",
+            &[buffer, copy],
+        );
+        let handle = call(
+            &mut nvn,
+            &mut guest,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let archived = ArchivedList::pack(&nvn.use_command_list(handle).unwrap()).unpack();
+        assert_eq!(archived.len(), 2);
+        for (bind, word) in archived.iter().zip([packed, 0]) {
+            nvn.execute(bind, &mut guest).unwrap();
+            let props = nvn.render.properties("BindChannelMaskState");
+            for target in 0..8 {
+                let mask = &props[&format!("ChannelMask/{target}")];
+                assert_eq!(
+                    gpu::channel_write_mask(mask).as_raw(),
+                    (word >> (target * 4)) & 15
+                );
+            }
+        }
+        // Old setter snapshots store alpha in V1, with arbitrary values
+        // outside each argument's low byte and no packed mask.
+        let old = Args {
+            x: [4, 0x100, 0x80, 256],
+            v: [u64::MAX, 0x180],
+        };
+        assert_eq!(gpu::channel_write_mask(&old).as_raw(), 0b1010);
+    }
+
+    #[test]
     fn native_vertex_state_setters_and_getters_follow_the_guest_bytes() {
         let mut memory = Memory::new(1 << 39);
         memory
@@ -10471,6 +10670,44 @@ mod tests {
             0xabcdef12
         );
         assert_eq!(nvn.bags.len(), 0);
+    }
+
+    #[test]
+    fn equal_vertex_arrays_share_snapshots_across_guest_addresses() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "vertex arrays")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let packed = u64::from((9u32 << 21) | 0x40);
+        guest.memory.write_u64(0x1000, packed).unwrap();
+        guest.memory.write_u64(0x1008, packed).unwrap();
+        let mut bind = Command {
+            name: "nvnCommandBufferBindVertexAttribState",
+            x: [0, 2, 0x1000, 0, 0, 0, 0, 0],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        snapshot_vertex_states(&guest, &mut bind, true).unwrap();
+        let first = bind.states.clone();
+        bind.x[2] = 0x1008;
+        snapshot_vertex_states(&guest, &mut bind, true).unwrap();
+        assert!(first.ptr_eq(&bind.states));
+        bind.x[1] = 1;
+        snapshot_vertex_states(&guest, &mut bind, false).unwrap();
+        assert_eq!(bind.states.len(), 1);
+        assert!(bind.states[0].contains_key("Stride"));
+        guest.memory.write_u32(0x1008, 0).unwrap();
+        bind.x[1] = 2;
+        snapshot_vertex_states(&guest, &mut bind, true).unwrap();
+        assert!(!bind.states[0].contains_key("Format"));
+        assert_eq!(first[0]["Format"].x[0], 9);
     }
 
     #[test]
