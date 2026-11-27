@@ -180,6 +180,10 @@ synthetic fixtures and runs without the game files.
   the NVN lock fell from 28.64 to 24.59 seconds. Both runs exited cleanly
   and reached the outdoor title at the same checkpoints. This pair shows
   a small throughput difference across builds with several changes.
+  At `8b9a219`, the same outdoor window averaged 8.58 FPS. Cumulative
+  render-target index time dropped from 2.27 to 1.14 seconds, and
+  full rebuilds fell from 1,518 to zero. The run exited cleanly at
+  present 4,700 and the cloned save digest matched.
   A private trial used the same executable for two guarded runs with
   plain and losslessly filtered archives. At present 6,200 the filter
   reduced retained payloads from 1,812 to 1,003 MiB. Peak process RSS
