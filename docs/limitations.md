@@ -28,6 +28,11 @@ synthetic fixtures and runs without the game files.
   than 20/255 across three frames. None did in the matching compressed
   console footage. No 4×4 block in either patch showed a reversal above
   12/255 after averaging its pixels.
+  In another nine-frame sample, the dark foreground edge also appeared
+  in the reference video. A broad-leaf clump on the lower bank was visible
+  in the reference and missing in Echora at two camera positions. The
+  adjacent rock aligned in both comparisons. The affected draw is under
+  investigation.
   The missing floor has yet to be reproduced in these frames. Unimplemented
   operations can stop the run and produce a report.
 - The reserved zero texture in a guest texture pool samples as transparent
@@ -95,6 +100,12 @@ synthetic fixtures and runs without the game files.
   Six-second CPU samples in both runs attributed 6.1–6.8% of process
   user-mode cycles to one translated guest search function. Those samples
   measure CPU execution across threads, separately from GPU frame time.
+  In a further experiment the compiler optimized that one region more
+  aggressively. The matched control and candidate measured 12.38 and
+  12.56 FPS respectively over 3,000 presents. A single pair overlaps
+  earlier run-to-run variation. The candidate continued through present
+  8,200 with a peak resident size of 12,026 MiB and averaged 11.68 FPS
+  over its final 2,000 presents.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
