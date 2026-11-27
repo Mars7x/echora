@@ -196,13 +196,18 @@ impl Renderer {
             }
             if descriptor.kind() == DescriptorKind::StorageBuffer {
                 if let Some(&(buffer, offset, range)) = dispatch.storage_in_place.get(&binding) {
+                    if range == 0 {
+                        return Err(format!(
+                            "empty shared storage for compute binding {binding}"
+                        ));
+                    }
                     writes.push((
                         binding,
                         vk::DescriptorType::STORAGE_BUFFER,
                         [vk::DescriptorBufferInfo {
                             buffer,
                             offset,
-                            range: range.max(16).next_multiple_of(16),
+                            range,
                         }],
                     ));
                     continue;
@@ -220,7 +225,11 @@ impl Renderer {
                 other => return Err(format!("{other:?} bindings are not modeled in compute")),
             };
             let bytes = bytes.unwrap_or(&[0; 16]);
-            let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
+            let (buffer, offset, range) = if kind == vk::DescriptorType::STORAGE_BUFFER {
+                self.ring_upload_storage(bytes)?
+            } else {
+                self.ring_upload_padded(bytes)?
+            };
             // Only buffers the shader writes come back (flags bit 0).
             if kind == vk::DescriptorType::STORAGE_BUFFER && descriptor.flags & 1 != 0 {
                 storage.push((binding, offset, bytes.len()));
@@ -435,6 +444,63 @@ mod tests {
     use crate::draw::tests::{spirv, translated};
     use crate::shader::{Descriptor, Stage};
     use crate::vulkan::Gpu;
+
+    #[test]
+    fn storage_array_length_uses_the_bound_bytes_for_shared_and_copied_buffers() {
+        let Ok(gpu) = Gpu::new() else { return };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let code = spirv(
+            "@group(0) @binding(0) var<storage, read> words: array<u32>;
+             @group(0) @binding(1) var<storage, read_write> result: u32;
+             @compute @workgroup_size(1) fn main() { result = arrayLength(&words); }",
+            naga::ShaderStage::Compute,
+        );
+        let descriptors = [0, 1].map(|binding| Descriptor {
+            kind: DescriptorKind::StorageBuffer as u32,
+            binding,
+            count: 1,
+            flags: binding,
+            ..Default::default()
+        });
+        let program = renderer
+            .create_program(vec![translated(Stage::Compute, code, descriptors.into())])
+            .unwrap();
+        let (buffer, _) = renderer.resident_buffer(1, 64).unwrap();
+        let mut dispatch = Dispatch {
+            program: &program,
+            groups: [1; 3],
+            storage: HashMap::from([(1, vec![0; 4])]),
+            storage_in_place: HashMap::new(),
+            uniforms: HashMap::new(),
+            textures: HashMap::new(),
+            images: HashMap::new(),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: Default::default(),
+        };
+        for shared in [false, true] {
+            for words in [1_u32, 3, 4, 5] {
+                let length = words * 4;
+                if shared {
+                    dispatch
+                        .storage_in_place
+                        .insert(0, (buffer, 0, u64::from(length)));
+                } else {
+                    dispatch.storage.insert(0, vec![0; length as usize]);
+                }
+                assert_eq!(
+                    renderer.dispatch(&dispatch).unwrap()[&1],
+                    words.to_le_bytes(),
+                    "shared {shared}, bytes {length}"
+                );
+            }
+        }
+        renderer.destroy_program(program).unwrap();
+    }
 
     #[test]
     fn compute_texture_reads_match_the_view_numeric_type() {

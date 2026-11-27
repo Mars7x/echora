@@ -2365,6 +2365,21 @@ impl Renderer {
         Ok((buffer, offset, range))
     }
 
+    /// A storage array's length comes from its descriptor range. Keep the
+    /// upload's zero-filled padding outside the bounds the shader sees.
+    pub(crate) fn ring_upload_storage(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(vk::Buffer, u64, u64), String> {
+        let (buffer, offset, padded) = self.ring_upload_padded(bytes)?;
+        let range = if bytes.is_empty() {
+            padded
+        } else {
+            bytes.len() as u64
+        };
+        Ok((buffer, offset, range))
+    }
+
     /// Make room, before recording one draw or dispatch, for `bytes` of
     /// ring uploads (alignment included) and one descriptor set holding
     /// `descriptors` of each pooled type, flushing first if either would

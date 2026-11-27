@@ -1471,12 +1471,18 @@ impl Renderer {
                         let plan = buffer_plans.next().expect("planned with the sizes");
                         let (buffer, offset, range) =
                             if let BufferPlan::InPlace(buffer, offset, length) = plan {
-                                (buffer, offset, length.max(16).next_multiple_of(16))
+                                if length == 0 {
+                                    return Err(format!(
+                                        "empty shared storage for stage {stage_index} binding {}",
+                                        descriptor.binding
+                                    ));
+                                }
+                                (buffer, offset, length)
                             } else {
                                 let BufferPlan::Bytes(bytes) = plan else {
                                     unreachable!("storage is in place or copied");
                                 };
-                                let (buffer, offset, range) = self.ring_upload_padded(bytes)?;
+                                let (buffer, offset, range) = self.ring_upload_storage(bytes)?;
                                 // Only buffers the stage writes come back
                                 // (flags bit 0).
                                 if descriptor.flags & 1 != 0 {
