@@ -631,8 +631,13 @@ impl PackedSpans {
 
 struct GeneratedTextureUpload<'a> {
     size: usize,
-    fill: &'a mut dyn FnMut(u64, &mut [u8]) -> Result<(), String>,
+    row_alignment: Option<u32>,
+    fill: &'a mut FillUploadBands<'a>,
 }
+
+/// A packed upload region and its first destination row within the original mip.
+pub type UploadBand = (crate::draw::UploadRegion, u32);
+type FillUploadBands<'a> = dyn FnMut(&[UploadBand], &mut [u8]) -> Result<(), String> + 'a;
 
 pub struct Renderer {
     /// The submission slot being recorded: its command buffer, fence,
@@ -1197,9 +1202,10 @@ fn upload_copies(
 /// Split tightly packed 2D color planes into ring-sized bands. Each tuple
 /// retains the destination row as well as the source region's byte offset.
 fn split_large_upload_rows(
-    regions: &mut Vec<(crate::draw::UploadRegion, u32)>,
+    regions: &mut Vec<UploadBand>,
     size: u64,
     format: vk::Format,
+    row_alignment: u32,
 ) {
     let texel_bytes = u64::from(format_bytes(format));
     if !texel_bytes.is_power_of_two() {
@@ -1216,8 +1222,7 @@ fn split_large_upload_rows(
         {
             continue;
         }
-        // Preserve the 16-byte staging alignment of subsequent region offsets.
-        let rows_per_band = ((RING_SIZE / row_bytes) & !15) as u32;
+        let rows_per_band = upload_band_rows(row_bytes, row_alignment);
         if rows_per_band == 0 {
             continue;
         }
@@ -1235,6 +1240,15 @@ fn split_large_upload_rows(
             }),
         );
     }
+}
+
+/// Keep the source block rows whole and the following staging offsets aligned.
+fn upload_band_rows(row_bytes: u64, row_alignment: u32) -> u32 {
+    let group = 16 * u64::from(row_alignment);
+    if row_bytes == 0 || group == 0 {
+        return 0;
+    }
+    (RING_SIZE / row_bytes / group * group) as u32
 }
 
 impl Renderer {
@@ -2904,6 +2918,24 @@ impl Renderer {
             && !self.uploads.contains_key(&key)
     }
 
+    /// A tightly packed 2D color mip can also stream when only a band of
+    /// source-block rows fits the ring. The widest mip sets the row limit.
+    pub fn can_generate_upload_bands(
+        &self,
+        key: u64,
+        size: usize,
+        [width, height]: [u32; 2],
+        format: vk::Format,
+        row_alignment: u32,
+    ) -> bool {
+        let bytes = u64::from(format_bytes(format));
+        let rows = u64::from(height).min(16 * u64::from(row_alignment));
+        let batch = (u64::from(width) * bytes).saturating_mul(rows);
+        bytes.is_power_of_two()
+            && batch != 0
+            && self.can_generate_upload(key, size, usize::try_from(batch).unwrap_or(usize::MAX))
+    }
+
     /// A first upload, with source bytes generated into successive ring
     /// chunks. A chunk always holds complete subresources at their offsets.
     pub fn upload_generated(
@@ -2916,6 +2948,26 @@ impl Renderer {
             source,
             Some(GeneratedTextureUpload {
                 size,
+                row_alignment: None,
+                fill: &mut |bands, output| fill(bands[0].0.offset, output),
+            }),
+        )
+    }
+
+    /// Generate complete layers and aligned bands of larger 2D color mips
+    /// directly in the staging ring. Band offsets refer to the original layout.
+    pub fn upload_generated_bands(
+        &mut self,
+        source: &crate::draw::TextureSource,
+        size: usize,
+        row_alignment: u32,
+        mut fill: impl FnMut(&[UploadBand], &mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.upload_contents(
+            source,
+            Some(GeneratedTextureUpload {
+                size,
+                row_alignment: Some(row_alignment),
                 fill: &mut fill,
             }),
         )
@@ -3009,8 +3061,12 @@ impl Renderer {
         // the end.
         let mut by_offset: Vec<_> = levels.iter().map(|region| (*region, 0)).collect();
         by_offset.sort_by_key(|(region, _)| region.offset);
-        if generated.is_none() && size as u64 > RING_SIZE {
-            split_large_upload_rows(&mut by_offset, size as u64, *format);
+        if size as u64 > RING_SIZE
+            && let Some(alignment) = generated
+                .as_ref()
+                .map_or(Some(1), |upload| upload.row_alignment)
+        {
+            split_large_upload_rows(&mut by_offset, size as u64, *format, alignment);
         }
         if generated.is_some()
             && (by_offset
@@ -3174,7 +3230,9 @@ impl Renderer {
                     }
                     let first = by_offset[start].0.offset;
                     let (ring, at) = if let Some(generated) = generated.as_mut() {
-                        self.ring_upload_with(bytes, 16, |output| (generated.fill)(first, output))?
+                        self.ring_upload_with(bytes, 16, |output| {
+                            (generated.fill)(&by_offset[start..end], output)
+                        })?
                     } else {
                         self.ring_upload(&texels[first as usize..(first + bytes) as usize], 16)?
                     };

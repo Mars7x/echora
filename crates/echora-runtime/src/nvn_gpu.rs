@@ -5283,15 +5283,23 @@ impl Nvn {
                 total.checked_add(stride.checked_mul(layers as usize)?)
             })
             .ok_or("texture upload size overflow")?;
-        let stream = decode_astc
-            && layers > 1
+        let stream = depth == 1
+            && copied.is_none()
+            && (decode_astc || (!astc && info.block_width == 1 && info.block_height == 1))
             && super::debug_var_os("ECHORA_TEXTURE_DUMP").is_none()
             && super::debug_var_os("ECHORA_GPU_TEXTURE_DUMP").is_none()
-            && self.gpu.as_ref().unwrap().renderer.can_generate_upload(
-                texture,
-                upload_bytes,
-                layer_bytes([width, height, depth]).unwrap(),
-            );
+            && self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .renderer
+                .can_generate_upload_bands(
+                    texture,
+                    upload_bytes,
+                    [width, height],
+                    vk_format,
+                    info.block_height,
+                );
         let mut texels = Vec::new();
         if !stream {
             texels
@@ -5302,125 +5310,138 @@ impl Nvn {
         let mips: Vec<_> =
             crate::nvn_format::block_linear_mips(info, [width, height, depth], layout, level_count)
                 .collect();
-        let pack_layers =
-            |level: u32, first_layer: usize, output: &mut [u8]| -> Result<(), String> {
-                let [level_width, level_height, level_depth] = extent_at(level);
-                let (columns, rows) = (
-                    level_width.div_ceil(info.block_width),
-                    level_height.div_ceil(info.block_height),
-                );
-                let mip = &mips[level as usize];
-                let level_offset = mip.offset;
-                let level_shape = mip.shape;
-                let row_bytes = columns as usize * block;
-                let slice_bytes = row_bytes * rows as usize;
-                let gather_layer = |layer: usize, data: &mut [u8]| {
-                    let layer_base = (first_layer + layer) as u64 * layer_stride + level_offset;
-                    if let Some(rows) = copied.as_ref().filter(|rows| rows.len() == data.len()) {
-                        data.copy_from_slice(rows);
-                        return;
-                    }
-                    for z in 0..level_depth {
-                        for row in 0..rows {
-                            let from = z as usize * slice_bytes + row as usize * row_bytes;
-                            let line = &mut data[from..from + row_bytes];
-                            if stride != 0 {
-                                copy_block(line, u64::from(row) * stride);
-                                continue;
-                            }
-                            // Blocks dividing 16 bytes: the row's 16-byte runs.
-                            if 16 % block == 0 {
-                                for (start, offset) in crate::nvn_format::block_linear_row_runs(
-                                    info,
-                                    level_width,
-                                    level_height,
-                                    level_shape,
-                                    row,
-                                    z,
-                                ) {
-                                    let start = start as usize;
-                                    let end = (start + 16).min(row_bytes);
-                                    copy_block(&mut line[start..end], layer_base + offset);
-                                }
-                                continue;
-                            }
-                            // Copy complete blocks at consecutive storage addresses.
-                            let mut column = 0;
-                            while column < columns {
-                                let run = crate::nvn_format::block_linear_run(info, column)
-                                    .min(columns - column);
-                                let offset = crate::nvn_format::block_linear_offset_in(
-                                    info,
-                                    level_width,
-                                    level_height,
-                                    level_shape,
-                                    column,
-                                    row,
-                                    z,
-                                );
-                                copy_block(
-                                    &mut line[column as usize * block..][..run as usize * block],
-                                    layer_base + offset,
-                                );
-                                column += run;
-                            }
+        let pack_layers = |(region, first_y): echora_gpu::renderer::UploadBand,
+                           output: &mut [u8]|
+         -> Result<(), String> {
+            let [level_width, level_height, level_depth] = extent_at(region.level);
+            let height = region.height;
+            let (columns, rows) = (
+                level_width.div_ceil(info.block_width),
+                height.div_ceil(info.block_height),
+            );
+            let first_block_row = first_y / info.block_height;
+            let mip = &mips[region.level as usize];
+            let level_offset = mip.offset;
+            let level_shape = mip.shape;
+            let row_bytes = columns as usize * block;
+            let slice_bytes = row_bytes * rows as usize;
+            let gather_layer = |layer: usize, data: &mut [u8]| {
+                let layer_base =
+                    (u64::from(region.layer) + layer as u64) * layer_stride + level_offset;
+                if let Some(rows) = copied.as_ref().filter(|rows| rows.len() == data.len()) {
+                    data.copy_from_slice(rows);
+                    return;
+                }
+                for z in 0..level_depth {
+                    for row in 0..rows {
+                        let from = z as usize * slice_bytes + row as usize * row_bytes;
+                        let line = &mut data[from..from + row_bytes];
+                        let row = first_block_row + row;
+                        if stride != 0 {
+                            copy_block(line, u64::from(row) * stride);
+                            continue;
                         }
-                    }
-                };
-                let length = layer_bytes([level_width, level_height, level_depth])
-                    .expect("the size of each mip was checked");
-                let upload_stride = length.next_multiple_of(upload_alignment);
-                if decode_astc {
-                    crate::nvn_format::decode_astc_layers(
-                        output,
-                        [level_width, level_height, level_depth],
-                        info,
-                        gather_layer,
-                    )
-                    .map_err(|error| format!("ASTC decode: {error}"))?;
-                } else if combined_depth_stencil {
-                    let samples = length / 5;
-                    let mut packed = vec![0; samples * block];
-                    for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
-                        gather_layer(layer, &mut packed);
-                        let (depth, stencil) = slice[..length].split_at_mut(samples * 4);
-                        for ((packed, depth), stencil) in packed
-                            .chunks_exact(block)
-                            .zip(depth.as_chunks_mut::<4>().0)
-                            .zip(stencil)
-                        {
-                            if block == 4 {
-                                // NVN DEPTH24_STENCIL8 uses NVIDIA Z24S8:
-                                // low-byte stencil, high 24-bit UNORM depth.
-                                let word = u32::from_le_bytes(packed.try_into().unwrap());
-                                let depth32 = (word >> 8) as f32 / 16_777_215.0;
-                                *depth = depth32.to_le_bytes();
-                                *stencil = word as u8;
-                            } else {
-                                // ZF32_X24S8: float depth, low byte of
-                                // the next word for stencil, then padding.
-                                depth.copy_from_slice(&packed[..4]);
-                                *stencil = packed[4];
+                        // Blocks dividing 16 bytes: the row's 16-byte runs.
+                        if 16 % block == 0 {
+                            for (start, offset) in crate::nvn_format::block_linear_row_runs(
+                                info,
+                                level_width,
+                                level_height,
+                                level_shape,
+                                row,
+                                z,
+                            ) {
+                                let start = start as usize;
+                                let end = (start + 16).min(row_bytes);
+                                copy_block(&mut line[start..end], layer_base + offset);
                             }
+                            continue;
                         }
-                    }
-                } else {
-                    for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
-                        gather_layer(layer, &mut slice[..length]);
+                        // Copy complete blocks at consecutive storage addresses.
+                        let mut column = 0;
+                        while column < columns {
+                            let run = crate::nvn_format::block_linear_run(info, column)
+                                .min(columns - column);
+                            let offset = crate::nvn_format::block_linear_offset_in(
+                                info,
+                                level_width,
+                                level_height,
+                                level_shape,
+                                column,
+                                row,
+                                z,
+                            );
+                            copy_block(
+                                &mut line[column as usize * block..][..run as usize * block],
+                                layer_base + offset,
+                            );
+                            column += run;
+                        }
                     }
                 }
-                Ok(())
             };
+            let length = layer_bytes([level_width, height, level_depth])
+                .expect("the size of each mip was checked");
+            let upload_stride = length.next_multiple_of(upload_alignment);
+            if decode_astc {
+                crate::nvn_format::decode_astc_layers(
+                    output,
+                    [level_width, height, level_depth],
+                    info,
+                    gather_layer,
+                )
+                .map_err(|error| format!("ASTC decode: {error}"))?;
+            } else if combined_depth_stencil {
+                let samples = length / 5;
+                let mut packed = vec![0; samples * block];
+                for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
+                    gather_layer(layer, &mut packed);
+                    let (depth, stencil) = slice[..length].split_at_mut(samples * 4);
+                    for ((packed, depth), stencil) in packed
+                        .chunks_exact(block)
+                        .zip(depth.as_chunks_mut::<4>().0)
+                        .zip(stencil)
+                    {
+                        if block == 4 {
+                            // NVN DEPTH24_STENCIL8 uses NVIDIA Z24S8:
+                            // low-byte stencil, high 24-bit UNORM depth.
+                            let word = u32::from_le_bytes(packed.try_into().unwrap());
+                            let depth32 = (word >> 8) as f32 / 16_777_215.0;
+                            *depth = depth32.to_le_bytes();
+                            *stencil = word as u8;
+                        } else {
+                            // ZF32_X24S8: float depth, low byte of
+                            // the next word for stencil, then padding.
+                            depth.copy_from_slice(&packed[..4]);
+                            *stencil = packed[4];
+                        }
+                    }
+                }
+            } else {
+                for (layer, slice) in output.chunks_exact_mut(upload_stride).enumerate() {
+                    gather_layer(layer, &mut slice[..length]);
+                }
+            }
+            Ok(())
+        };
         let mut offset = 0;
         for level in 0..level_count {
             let [level_width, level_height, level_depth] = extent_at(level);
             let length = layer_bytes([level_width, level_height, level_depth])
                 .expect("the size of each mip was checked");
             let upload_stride = length.next_multiple_of(upload_alignment);
+            let region = UploadRegion {
+                level,
+                layer: 0,
+                width: level_width,
+                height: level_height,
+                depth: level_depth,
+                offset: offset as u64,
+            };
             if !stream {
                 texels.resize(offset + upload_stride * layers as usize, 0);
                 let output = &mut texels[offset..];
-                pack_layers(level, 0, output)?;
+                pack_layers((region, 0), output)?;
                 let upload = &output[..length];
                 // ECHORA_GPU_TEXTURE_DUMP=<dir> (debugging): the base level
                 // of large 4-byte 2D textures, as last uploaded.
@@ -5454,12 +5475,9 @@ impl Nvn {
                 }
             }
             levels.extend((0..layers).map(|layer| UploadRegion {
-                level,
                 layer,
-                width: level_width,
-                height: level_height,
-                depth: level_depth,
                 offset: (offset + layer as usize * upload_stride) as u64,
+                ..region
             }));
             offset += upload_stride * layers as usize;
         }
@@ -5517,7 +5535,6 @@ impl Nvn {
                 )
             })
         });
-        let levels: Arc<[UploadRegion]> = levels.into();
         let source = TextureSource::Upload {
             key: texture,
             generation,
@@ -5526,35 +5543,39 @@ impl Nvn {
             shape,
             format: vk_format,
             texels: Arc::new(texels),
-            levels: levels.clone(),
+            levels: levels.into(),
         };
         let backend = self.gpu.as_mut().unwrap();
         if stream {
-            backend
-                .renderer
-                .upload_generated(&source, upload_bytes, |first, output| {
-                    let end = first + output.len() as u64;
-                    let start = levels.partition_point(|region| region.offset < first);
-                    let limit = levels.partition_point(|region| region.offset < end);
-                    let mut index = start;
-                    while index < limit {
-                        let region = levels[index];
-                        let count =
-                            levels[index..limit].partition_point(|next| next.level == region.level);
-                        let next_offset = levels
-                            .get(index + count)
-                            .map_or(upload_bytes as u64, |next| next.offset);
+            backend.renderer.upload_generated_bands(
+                &source,
+                upload_bytes,
+                info.block_height,
+                |bands, output| {
+                    let first = bands[0].0.offset;
+                    let mut index = 0;
+                    while index < bands.len() {
+                        let (region, y) = bands[index];
+                        // Complete layers of one mip share decoder workers. A
+                        // partial layer uses the same row workers on its band.
+                        let count = bands[index..]
+                            .iter()
+                            .take_while(|(next, next_y)| {
+                                next.level == region.level
+                                    && *next_y == y
+                                    && next.height == region.height
+                            })
+                            .count();
                         let start = (region.offset - first) as usize;
-                        let finish = (next_offset - first) as usize;
-                        pack_layers(
-                            region.level,
-                            region.layer as usize,
-                            &mut output[start..finish],
-                        )?;
+                        let finish = bands
+                            .get(index + count)
+                            .map_or(output.len(), |(next, _)| (next.offset - first) as usize);
+                        pack_layers((region, y), &mut output[start..finish])?;
                         index += count;
                     }
                     Ok(())
-                })?;
+                },
+            )?;
             backend.stat("stat: streamed texture upload bytes", upload_bytes as u64);
         }
         if compressed_astc.is_some() {
@@ -14539,6 +14560,134 @@ mod target_tests {
         };
         assert_ne!(updated, generation);
         assert_eq!(texels[offset as usize..][..4], rgba);
+    }
+
+    #[test]
+    fn large_single_layer_uploads_generate_each_row_band_in_the_ring() {
+        use crate::nvn_format;
+        use echora_gpu::draw::{ImageShape, TextureSource};
+
+        let (width, height) = (4096u32, 4101u32);
+        let points = [(9, 0), (15, 4079), (30, 4080), (45, 4096), (55, height - 1)];
+        for format in [37, 123] {
+            // Linear RGBA8 and block-linear ASTC 5×5.
+            let Some((mut nvn, mut memory, base, texture)) =
+                texture_cache_fixture_of_size(0x24, width.into(), height.into())
+            else {
+                return;
+            };
+            let info = nvn_format::info(format).unwrap();
+            let astc = info.block_height > 1;
+            let levels = if astc { 2 } else { 1 };
+            let layout = nvn_format::texture_layers(info, width, height, 1, 1, levels, 0, Some(0));
+            if astc {
+                let renderer = &nvn.gpu.as_ref().unwrap().renderer;
+                if renderer.supports_astc_upload(
+                    super::astc_vk_format(format).unwrap(),
+                    ImageShape::D2 { layers: 1 },
+                    width,
+                    height,
+                    levels,
+                ) {
+                    continue; // This host samples ASTC directly.
+                }
+                let props = &mut nvn.objects.get_mut(&texture).unwrap().builder;
+                props.remove("Stride");
+                props.get_mut("Format").unwrap().x[0] = format.into();
+                props.insert(
+                    "Levels".into(),
+                    Args {
+                        x: [levels.into(), 0, 0, 0],
+                        ..Default::default()
+                    },
+                );
+                props.insert(
+                    "PackagedTextureLayout".into(),
+                    Args {
+                        x: [1, 0, 0, 0],
+                        ..Default::default()
+                    },
+                );
+                // A valid opaque constant-color block at every tiled address.
+                let raw_size =
+                    nvn_format::block_linear_size(info, width, height, 1, layout, levels).0;
+                let mut block = [0xff; 16];
+                block[..2].copy_from_slice(&[0xfc, 0xfd]);
+                memory
+                    .write(base, &block.repeat(raw_size as usize / 16))
+                    .unwrap();
+            }
+            for (index, &(x, y)) in points.iter().enumerate() {
+                let channel = 17 + 23 * index as u8;
+                if astc {
+                    let at = nvn_format::block_linear_offset(
+                        info,
+                        width,
+                        height,
+                        1,
+                        layout,
+                        x / info.block_width,
+                        y / info.block_height,
+                        0,
+                    );
+                    memory.write(base + at + 8, &[channel; 8]).unwrap();
+                } else {
+                    memory
+                        .write(base + u64::from(y * width + x) * 4, &[channel; 4])
+                        .unwrap();
+                }
+            }
+            let mut cpu = Cpu::default();
+            let guest = Guest {
+                cpu: &mut cpu,
+                memory: GuestMemory::Checked(&mut memory),
+                counter: None,
+            };
+            let source = nvn.guest_texture(&guest, texture).unwrap();
+            let TextureSource::Upload {
+                texels,
+                generation,
+                format,
+                ..
+            } = &source
+            else {
+                panic!("expected an upload")
+            };
+            assert!(
+                texels.is_empty(),
+                "generated rows should already be on the GPU"
+            );
+            let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+            assert!(renderer.has_upload(texture, *generation));
+            renderer
+                .guest_sized_target(
+                    7,
+                    width,
+                    height,
+                    ImageShape::D2 { layers: 1 },
+                    *format,
+                    levels,
+                )
+                .unwrap();
+            renderer.initialize_target(7, &source).unwrap();
+            if astc {
+                assert_eq!(
+                    renderer
+                        .read_target_plane_bytes(7, 1, 0, 4, [0, 0, 1, 1])
+                        .unwrap(),
+                    [255; 4]
+                );
+            }
+            for (index, &(x, y)) in points.iter().enumerate() {
+                let expected = [17 + 23 * index as u8; 4];
+                assert_eq!(
+                    renderer
+                        .read_target_plane_bytes(7, 0, 0, 4, [x, y, 1, 1])
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

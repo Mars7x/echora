@@ -71,9 +71,9 @@ What doesn't work yet:
   image archives after their last use, and preserves untouched blocks when
   drawing or clearing part of a compressed texture. Large packed color
   textures can upload in bands through the existing staging ring. This
-  path avoids a separate staging allocation for the 192 MiB texture seen
-  in the early forest. The change in peak memory during gameplay still
-  needs measurement.
+  path also decodes oversized guest mip levels in bands. A readback test
+  checks raw and compressed images across band boundaries and through the
+  final partial row. The change in peak gameplay memory still needs measurement.
 - Sustained 60 FPS. The first 3D scene runs at about 23 FPS by default and
   about 26 FPS with the opt-in code generation options. See the
   [performance notes](docs/limitations.md#performance) for the test scope.
