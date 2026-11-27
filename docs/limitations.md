@@ -17,7 +17,8 @@ automated test covers it).
   samples. In another live capture the same pixel chose the positive Z
   cubemap face in 16 successive samples, at mip levels 0.39–0.40. The
   cubemap returned more red than green each time. The final water color
-  still differs from the matching console footage. Six consecutive 1440p captures of the opening forest (presents
+  still differs from the matching console footage. Six consecutive 1440p
+  captures of the opening forest (presents
   10,496–10,501) showed no black frame. After compensating for camera
   motion, no matched 40×40-pixel patch on the four interior frames had a
   brightness pulse above 12/255 relative to both neighbors. The check
@@ -83,8 +84,8 @@ automated test covers it).
 - Blending with two source colours (NVN's SRC1 factors) is not wired up in
   the renderer: such a target is drawn unblended, with a note. No program
   has asked for it so far.
-- A sampler's border colour is mapped to the nearest of Vulkan's built-in
-  ones (transparent black, opaque black, opaque white).
+- Samplers support transparent black, opaque black and opaque white borders
+  for floating-point and integer textures. Other colours use an approximation.
 
 ## Sound
 
@@ -105,11 +106,16 @@ automated test covers it).
 
 ## Performance
 
-- The console runs the game at 60 frames per second. The opening movie
-  runs at about 73 pictures per second in Echora. In the first 3D scene
+- The console runs the game at 60 frames per second. A November 26 Radeon
+  run processed 9,600 opening movie pictures at 66.0 pictures/s. With
+  screenshots disabled, forest presents 10,500–10,700 took 12.5 seconds
+  (16.0 FPS). The run used the fixed-resolution opening, native render
+  scale and audio. It exited at the planned cutoff with zero backend draw
+  errors. A headless present measures throughput before window scanout.
+- In an earlier translation benchmark of the first 3D scene
   (the Great Deku Tree, presents 10,500 to 10,700 of a scripted run from a
   new game, Ryzen 7 5800X3D, Radeon RX 9070 XT, Mesa 26.2.7), the default
-  translation runs at about 23.4 frames per second, and a translation with
+  translation ran at about 23.4 frames per second, and a translation with
   the opt-in structured-function and floating-point group options on the
   148 hottest regions at about 26.3 (November 2026). Earlier route tests at
   2560×1440 measured about 11 FPS on a saved forest route. Camera position,
