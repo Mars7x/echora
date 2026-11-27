@@ -15,8 +15,13 @@ automated test covers it).
   A traced water pixel in the opening forest retained more than 99.99% of
   its base color at the blend before the volume passes in twelve live
   samples. The final water color still differs from the matching console
-  footage. Temporal stability also needs verification. Unimplemented
-  operations can stop the run and produce a report.
+  footage. Six consecutive 1440p captures of the opening forest (presents
+  10,496–10,501) showed no black frame. After compensating for camera
+  motion, no matched 40×40-pixel patch on the four interior frames had a
+  brightness pulse above 12/255 relative to both neighbors. The check
+  covered about 96% of the measured tiles in that shot. Smaller flicker
+  and later scenes remain open. Unimplemented operations can stop the run
+  and produce a report.
 - Sampled views inherit the texture’s channel mapping until the guest sets
   an explicit mapping on the view. Rebinding a bindless texture slot clears
   image views left by the previous texture’s shape or numeric type. A Vulkan

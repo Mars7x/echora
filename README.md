@@ -212,8 +212,10 @@ texel through a single frame while transferring only that texel to the CPU.
 A matched capture of the fairy beside the wooden sign now shows the pale
 core seen on console. A replay of its two shaders traced the earlier red
 output to a vertex component the producer never wrote. In a separate forest
-capture, both the depth and color passes for the missing leaves received
-386 workgroups. The contents of their vegetation list still need checking.
+capture, both vegetation passes received 386 workgroups. A second live
+capture checked the lists themselves. The depth and color passes received
+the same 430 group IDs in the same order, covering 102,644 candidates.
+The marked slope still shows less leaf cover than the console.
 Speed work continues after that.
 
 ## Building
