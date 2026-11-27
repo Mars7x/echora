@@ -31,8 +31,10 @@ synthetic fixtures and runs without the game files.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
-  adjacent rock aligned in both comparisons. The affected draw is under
-  investigation.
+  adjacent rock aligned in both comparisons. In one capture the paired
+  foliage depth and material draws each emitted 48,415 triangles. Both
+  covered nearby leaves, but none of their triangles covered the center
+  of the missing clump. Other vegetation draws remain under investigation.
   The missing floor has yet to be reproduced in these frames. Unimplemented
   operations can stop the run and produce a report.
 - The reserved zero texture in a guest texture pool samples as transparent
@@ -106,6 +108,13 @@ synthetic fixtures and runs without the game files.
   earlier run-to-run variation. The candidate continued through present
   8,200 with a peak resident size of 12,026 MiB and averaged 11.68 FPS
   over its final 2,000 presents.
+- A later build with renderer lock, GPU page-table and shader comparison
+  changes averaged 13.11 FPS over saved-game presents 3,200–6,200 against
+  12.38 FPS in the matched control. Peak resident memory was 12,488 MiB
+  and 12,270 MiB respectively. Over opening forest presents 10,400–10,500,
+  the same builds averaged 26.3 and 23.8 FPS. Both comparisons used the
+  same translated guest libraries on Radeon. These single pairs do not
+  isolate the effect of any one change.
 - Mesh and task pipelines (`DrawMeshTasks`), occlusion queries and
   conditional rendering run on the GPU (`VK_EXT_mesh_shader`,
   `VK_EXT_conditional_rendering`), but have not yet been checked against the
