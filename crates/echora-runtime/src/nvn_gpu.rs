@@ -12459,7 +12459,7 @@ impl Nvn {
         {
             // SetBlendEnable(state, index, enable): each index's latest.
             if let Some(enable) = color_state.get(enable_key) {
-                blend.enable = enable.x[1] != 0 && !no_blend;
+                blend.enable = enable.x[1] as u8 != 0 && !no_blend;
             }
             let blend_state = self.render.properties(state_key);
             if let Some(func) = blend_state.get("BlendFunc") {

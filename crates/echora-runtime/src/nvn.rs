@@ -8237,8 +8237,7 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
 /// state, as on the console.
-const TAGGED_STATES: [&str; 5] = [
-    "ColorState",
+const TAGGED_STATES: [&str; 4] = [
     "BlendState",
     "PolygonState",
     "DepthStencilState",
@@ -8489,8 +8488,9 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
     if base == 0 {
         return Ok(());
     }
-    if kind == "ChannelMaskState" {
-        command.states = channel_mask_snapshot(core.memory.read_u32(base)?);
+    if matches!(kind, "ColorState" | "ChannelMaskState") {
+        command.states =
+            packed_color_snapshot(core.memory.read_u32(base)?, kind == "ChannelMaskState");
         return Ok(());
     }
     // A single tagged state: what the bound structure's bytes hold; an
@@ -8645,31 +8645,58 @@ fn stencil_face_property<'a>(
     })
 }
 
-/// One nibble per color target, ordered RGBA. Keep the same per-target
-/// property shape as archived binds, including the fifth setter argument
-/// (alpha) in V1. Frequently bound masks can share their immutable snapshot.
-fn channel_mask_snapshot(word: u32) -> StateSnapshots {
+/// Color and channel-mask binds use one native word each. Keep the property
+/// names archived commands use, and share the decoded snapshot across binds.
+fn packed_color_snapshot(word: u32, channel_mask: bool) -> StateSnapshots {
     thread_local! {
-        static MASKS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 16]> =
-            const { std::cell::RefCell::new([const { None }; 16]) };
+        static SNAPSHOTS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 32]> =
+            const { std::cell::RefCell::new([const { None }; 32]) };
     }
-    MASKS.with_borrow_mut(|masks| {
-        let slot = &mut masks[(word.wrapping_mul(0x9e37_79b9) >> 28) as usize];
+    SNAPSHOTS.with_borrow_mut(|entries| {
+        let index = (word.wrapping_mul(0x9e37_79b9) >> 28) as usize;
+        let slot = &mut entries[16 * usize::from(channel_mask) + index];
         if let Some((known, snapshot)) = slot
             && *known == word
         {
             return snapshot.clone();
         }
         let mut properties = BTreeMap::from([("@Offset".into(), Args::default())]);
-        for index in 0..8 {
-            let mask = u64::from(word >> (index * 4));
-            properties.insert(
-                format!("ChannelMask/{index}"),
-                Args {
-                    x: [index, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1],
-                    v: [0, (mask >> 3) & 1],
-                },
-            );
+        if channel_mask {
+            for index in 0..8 {
+                let mask = u64::from(word >> (index * 4));
+                // The fifth argument (alpha) is in V1 in archived binds.
+                properties.insert(
+                    format!("ChannelMask/{index}"),
+                    Args {
+                        x: [index, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1],
+                        v: [0, (mask >> 3) & 1],
+                    },
+                );
+            }
+        } else {
+            for (name, value) in [
+                ("LogicOp", (word >> 16) & 255),
+                ("AlphaTest", (word >> 24) & 15),
+            ] {
+                properties.insert(
+                    name.into(),
+                    Args {
+                        x: [u64::from(value), 0, 0, 0],
+                        ..Args::default()
+                    },
+                );
+            }
+            for target in 0..8 {
+                if word & (1 << (8 + target)) != 0 {
+                    properties.insert(
+                        format!("BlendEnable/{target}"),
+                        Args {
+                            x: [target, 1, 0, 0],
+                            ..Args::default()
+                        },
+                    );
+                }
+            }
         }
         let snapshot: StateSnapshots = vec![properties].into();
         *slot = Some((word, snapshot.clone()));
@@ -8700,6 +8727,46 @@ fn channel_mask_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
             for (i, pointer) in [r, g, b, a].into_iter().enumerate() {
                 core.memory.write(pointer, &[((mask >> i) & 1) as u8])?;
             }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn color_state_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
+    let [state, value, enable, ..] = core.cpu.regs;
+    let value = value as u32;
+    let read_byte = |offset| -> Result<u32, Trap> {
+        let mut byte = [0];
+        core.memory.read(state.wrapping_add(offset), &mut byte)?;
+        Ok(u32::from(byte[0]))
+    };
+    match rest {
+        // COPY logic operation, ALWAYS alpha test, blending disabled.
+        "SetDefaults" => core.memory.write_u32(state, 0x0803_0000)?,
+        "GetBlendEnable" => core.cpu.regs[0] = u64::from(read_byte(1)?.wrapping_shr(value) & 1),
+        "GetLogicOp" => core.cpu.regs[0] = u64::from(read_byte(2)?),
+        "GetAlphaTest" => core.cpu.regs[0] = u64::from(read_byte(3)? & 15),
+        "SetBlendEnable" => {
+            let word = core.memory.read_u32(state)?;
+            let bit = 1u32.wrapping_shl(value);
+            let previous = (word >> 8) & 255;
+            let enabled = if enable as u8 != 0 { bit } else { 0 };
+            let blend = (previous & !bit) | enabled;
+            core.memory
+                .write_u32(state, (word & !0xff00) | (blend << 8))?;
+        }
+        // The native stores shift their whole W1 argument, preserving the
+        // effects of high input bits on adjacent bits of the guest word.
+        "SetLogicOp" => {
+            let word = core.memory.read_u32(state)?;
+            core.memory
+                .write_u32(state, (word & 0xff00_ffff) | (value << 16))?;
+        }
+        "SetAlphaTest" => {
+            let word = core.memory.read_u32(state)?;
+            core.memory
+                .write_u32(state, (word & 0xf0ff_ffff) | (value << 24))?;
         }
         _ => return Ok(false),
     }
@@ -8774,6 +8841,7 @@ fn bag_call(
     let native = match kind {
         "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
         "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
+        "ColorState" => Some(color_state_call(core, rest)?),
         _ => None,
     };
     if let Some(handled) = native {
@@ -8870,10 +8938,6 @@ fn bag_call(
                     );
                 }
                 return Ok(true);
-            }
-            // SetBlendEnable(state, index, enable) also keeps each index's latest call.
-            if property == "BlendEnable" {
-                bag.set(&format!("{property}/{}", args.x[0]), args);
             }
             let mut args = args;
             // SetPackagedTextureLayout(builder, const
@@ -10423,6 +10487,164 @@ mod tests {
         assert_eq!(call(&mut nvn, &mut core, "nvnSyncWait", &[sync, 0]), 0);
         assert_eq!(nvn.gpu.as_ref().unwrap().renderer.flushes, 1);
         assert_eq!(nvn.sync_timeouts[&sync], 1);
+    }
+
+    #[test]
+    fn native_color_state_preserves_guest_fields_and_records_the_bound_word() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "color state")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: Some(0),
+        };
+        let mut nvn = Nvn::default();
+        let rec = nvn.recorder();
+        let (buffer, state, copy) = (0x1020, 0x1100, 0x1ffc);
+        // A builder's device previously leaked into a color state reusing its address.
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnBufferBuilderSetDevice",
+            &[state, 0x1900],
+        );
+        core.memory.write_u64(state, u64::MAX).unwrap();
+        core.cpu.regs[0] = state;
+        assert!(rec.front("nvnColorStateSetDefaults", &mut core).unwrap());
+        assert_eq!(core.memory.read_u64(state).unwrap(), 0xffff_ffff_0803_0000);
+        assert_eq!(nvn.bags.len(), 0);
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnColorStateGetLogicOp", &[state]),
+            3
+        );
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnColorStateGetAlphaTest", &[state]),
+            8
+        );
+
+        core.memory.write_u32(state, 0xaab1_2066).unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnColorStateSetAlphaTest",
+            &[state, 0x54],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnColorStateSetLogicOp",
+            &[state, 0x211],
+        );
+        assert_eq!(core.memory.read_u32(state).unwrap(), 0xf611_2066);
+        // W1 shift modulo 32, W2 interpreted as NVNboolean. An overflowing
+        // true target bit spills into the logic op just as the SDK OR does.
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnColorStateSetBlendEnable",
+            &[state, 9, 1],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnColorStateSetBlendEnable",
+            &[state, 0x1_0000_0022, 0x180],
+        );
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnColorStateSetBlendEnable",
+            &[state, 5, 0x100],
+        );
+        assert_eq!(core.memory.read_u32(state).unwrap(), 0xf613_0466);
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnColorStateGetBlendEnable",
+                &[state, 5]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnColorStateGetBlendEnable",
+                &[state, 34]
+            ),
+            1
+        );
+        assert_eq!(
+            call(
+                &mut nvn,
+                &mut core,
+                "nvnColorStateGetBlendEnable",
+                &[state, 8]
+            ),
+            0
+        );
+        // Each getter reads just its field byte. Here only that byte is mapped.
+        core.memory.write(0x1000, &[0xe5]).unwrap();
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnColorStateGetLogicOp", &[0xffe]),
+            0xe5
+        );
+        assert_eq!(
+            call(&mut nvn, &mut core, "nvnColorStateGetAlphaTest", &[0xffd]),
+            5
+        );
+
+        // A guest copy and raw edit, followed by mutation after recording.
+        // Bind and replay use all eight enables and both scalar properties.
+        let mut raw = [0; 4];
+        core.memory.read(state, &mut raw).unwrap();
+        core.memory.write(copy, &raw).unwrap();
+        core.memory.write(copy + 1, &[0xa5]).unwrap();
+        nvn.initialize(buffer, "CommandBuffer", Default::default())
+            .unwrap();
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBeginRecording",
+            &[buffer],
+        );
+        core.cpu.regs[..2].copy_from_slice(&[buffer, copy]);
+        assert!(
+            rec.record("nvnCommandBufferBindColorState", &mut core)
+                .unwrap()
+        );
+        call(&mut nvn, &mut core, "nvnColorStateSetDefaults", &[copy]);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferBindColorState",
+            &[buffer, copy],
+        );
+        let handle = call(
+            &mut nvn,
+            &mut core,
+            "nvnCommandBufferEndRecording",
+            &[buffer],
+        );
+        let archived = ArchivedList::pack(&nvn.use_command_list(handle).unwrap()).unpack();
+        assert_eq!(archived.len(), 2);
+        for (bind, (blend, logic, alpha)) in archived.iter().zip([(0xa5, 0x13, 6), (0, 3, 8)]) {
+            nvn.execute(bind, &mut core).unwrap();
+            let props = nvn.render.properties("BindColorState");
+            assert!(!props.contains_key("Device"));
+            assert_eq!(props["LogicOp"].x[0], logic);
+            assert_eq!(props["AlphaTest"].x[0], alpha);
+            for target in 0..8 {
+                let enabled = props
+                    .get(&format!("BlendEnable/{target}"))
+                    .map_or(0, |args| args.x[1]);
+                assert_eq!(enabled, (blend >> target) & 1);
+            }
+        }
     }
 
     #[test]
