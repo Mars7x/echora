@@ -7041,6 +7041,8 @@ impl Nvn {
             gpu::TextureBacking::Linear((_, range)) => Some(range.start),
             gpu::TextureBacking::Virtual { .. } => None,
         };
+        let whole_level = (rx, ry, rz, rd) == (0, 0, 0, 1) && (rw, rh) == (width, height);
+        let single_sample = get("Samples").unwrap_or(1) <= 1;
         // A copy into the whole of a single 2D block-linear level (a movie
         // picture every present): tiled in memory with the rows' 16-byte
         // runs, then written back at once, instead of a guest write per run.
@@ -7052,8 +7054,7 @@ impl Nvn {
             && matches!(target, 1 | 7)
             && layers == 1
             && depth == 1
-            && (rx, ry, rz, rd) == (0, 0, 0, 1)
-            && (rw, rh) == (width, height)
+            && whole_level
             && bytes != 0
             && 16 % bytes == 0
             && linear.row_stride == row_size
@@ -7092,12 +7093,19 @@ impl Nvn {
             // Only a matching layout is fully overwritten in that case.
             if target == 1
                 && levels == 1
-                && get("Samples").unwrap_or(1) <= 1
+                && single_sample
                 && level_size == size
                 && let gpu::TextureBacking::Linear((0, range)) = &backing
             {
                 let padded = (packed_size != level_size).then_some(texture_object);
                 self.discard_overwritten_targets(range, padded);
+            } else if single_sample
+                && bw == 1
+                && bh == 1
+                && let Some(key) = self.rendered_texel_destination(texture_object, 0, 0, 1)
+            {
+                self.write_rendered_texel_rows((key, 0, 0), [0, 0, width, height], &linear)
+                    .map_err(TexelError::Stop)?;
             }
             // A single-level texture's upload can take these rows as they
             // are while its storage stays as written here.
@@ -7108,6 +7116,23 @@ impl Nvn {
             });
             return Ok(copied);
         }
+        let replace_pitch_backing = target == 1
+            && levels == 1
+            && whole_level
+            && single_sample
+            && stride == row_size
+            && row_size.checked_mul(u64::from(rows)) == Some(size);
+        let rendered = if to_texture
+            && base.is_some()
+            && !replace_pitch_backing
+            && single_sample
+            && bw == 1
+            && bh == 1
+        {
+            self.rendered_texel_destination(texture_object, level, rz, rd)
+        } else {
+            None
+        };
         if base.is_none() {
             for (_, range) in backing.pieces() {
                 self.resolve_storage(core, Some(range.clone()))
@@ -7116,6 +7141,7 @@ impl Nvn {
         }
         let mut line = vec![0u8; row_size as usize];
         let mut written = Vec::new();
+        let mut rendered_rows = Vec::new();
         // Move `length` bytes between the CPU line at `start` and texture
         // storage at `offset`, in the copy's direction.
         let mut transfer = |core: &mut Guest, line: &mut [u8], offset: u64| {
@@ -7195,7 +7221,21 @@ impl Nvn {
                             column += run;
                         }
                     }
-                    if !to_texture {
+                    if let Some(key) = rendered {
+                        // Upload the rows actually read from the source,
+                        // preserving all untouched pixels in the GPU image.
+                        rendered_rows.extend_from_slice(&line);
+                        if rendered_rows.len() >= 1 << 20 || row + 1 == rows {
+                            let count = (rendered_rows.len() / line.len()) as u32;
+                            self.write_rendered_texel_rows(
+                                (key, level, rz + slice),
+                                [rx, ry + row + 1 - count, rw, count],
+                                &rendered_rows,
+                            )
+                            .map_err(TexelError::Stop)?;
+                            rendered_rows.clear();
+                        }
+                    } else if !to_texture {
                         core.memory.write(from, &line).map_err(TexelError::Trap)?;
                     }
                 }
@@ -7211,12 +7251,7 @@ impl Nvn {
         // no longer override these bytes when another texture aliases them.
         if result.is_ok()
             && to_texture
-            && target == 1
-            && levels == 1
-            && (rx, ry, rz, rd) == (0, 0, 0, 1)
-            && (rw, rh) == (width, height)
-            && stride == row_size
-            && row_size.checked_mul(u64::from(rows)) == Some(size)
+            && replace_pitch_backing
             && let gpu::TextureBacking::Linear((0, range)) = &backing
         {
             self.discard_overwritten_targets(range, None);

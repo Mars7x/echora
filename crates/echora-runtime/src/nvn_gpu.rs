@@ -2494,6 +2494,48 @@ impl Nvn {
 
     /// Copy the GPU's latest texels for a rendered texture. Return false when
     /// the texture's bytes are in guest memory.
+    /// Find the image already carrying this texture's rendered contents.
+    pub(super) fn rendered_texel_destination(
+        &self,
+        texture: u64,
+        level: u32,
+        first_plane: u32,
+        planes: u32,
+    ) -> Option<u64> {
+        let (key, base) =
+            self.resolve_target_with_levels(texture, self.texture_levels(texture), true)?;
+        let target = self.gpu.as_ref()?.renderer.target_info(key)?;
+        if base != 0
+            || level >= target.levels
+            || !target.scale.is_one()
+            || echora_gpu::renderer::is_depth(target.format)
+            || self.target_shape(texture).ok() != Some((target.width, target.height, target.format))
+            || !self.texture_alias_layout_matches(texture, key, target)
+        {
+            return None;
+        }
+        let available = match target.shape {
+            ImageShape::D3 { depth } => (depth >> level).max(1),
+            shape => shape.layers(),
+        };
+        (first_plane.checked_add(planes)? <= available).then_some(key)
+    }
+
+    pub(super) fn write_rendered_texel_rows(
+        &mut self,
+        (key, level, plane): (u64, u32, u32),
+        rectangle: [u32; 4],
+        rows: &[u8],
+    ) -> Result<(), String> {
+        let backend = self.gpu.as_mut().unwrap();
+        backend.renderer.restore_archived_target(key)?;
+        backend
+            .renderer
+            .write_target_plane_bytes(key, (level, plane), rectangle, rows)?;
+        backend.stat("stat: rendered texture writes", 1);
+        Ok(())
+    }
+
     pub(super) fn gpu_read_texels(
         &mut self,
         core: &mut Guest,
@@ -16263,6 +16305,83 @@ mod target_tests {
             let mut byte = [0];
             core.memory.read(base + padding, &mut byte).unwrap();
             assert_eq!(byte, [0x7b]);
+        }
+    }
+
+    #[test]
+    fn partial_texel_write_updates_rendered_pixels_through_an_alias() {
+        for pitch_linear in [true, false] {
+            check_partial_texel_write_through_an_alias(pitch_linear);
+        }
+    }
+
+    fn check_partial_texel_write_through_an_alias(pitch_linear: bool) {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Some((mut nvn, mut memory, _, texture)) = texture_cache_fixture_of_size(0x24, 64, 16)
+        else {
+            return;
+        };
+        if !pitch_linear {
+            nvn.objects
+                .get_mut(&texture)
+                .unwrap()
+                .builder
+                .remove("Stride");
+        }
+        let alias = 3;
+        nvn.initialize(alias, "Texture", nvn.objects[&texture].builder.clone())
+            .unwrap();
+        let region = 0x20_0000;
+        let input = region + 64;
+        let output = region + 4096;
+        memory
+            .map(region, 8192, READ | WRITE, STATE_NORMAL, "texel transfer")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .set_resolution_scale(super::Scale::ONE);
+        let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+        nvn.gpu_clear_color(&core, (texture, 0, 0), red, None, 15, 0)
+            .unwrap();
+        let patch = [0x23, 0x45, 0x67, 0xff];
+        core.memory.write(input, &patch.repeat(7 * 4)).unwrap();
+        let mut transfer = |texture, region_values: [u32; 6], address, name| {
+            for (index, value) in region_values.into_iter().enumerate() {
+                core.memory
+                    .write(region + index as u64 * 4, &value.to_le_bytes())
+                    .unwrap();
+            }
+            core.cpu.regs[..4].copy_from_slice(&[texture, 0, region, address]);
+            assert!(nvn.call(name, &mut core).unwrap());
+        };
+        transfer(alias, [5, 3, 0, 7, 4, 1], input, "nvnTextureWriteTexels");
+        transfer(
+            texture,
+            [0, 0, 0, 64, 16, 1],
+            output,
+            "nvnTextureReadTexels",
+        );
+        let mut actual = [0; 4096];
+        core.memory.read(output, &mut actual).unwrap();
+        for y in 0..16 {
+            for x in 0..64 {
+                let pixel = (y * 64 + x) * 4;
+                let expected = if (5..12).contains(&x) && (3..7).contains(&y) {
+                    patch
+                } else {
+                    [255, 0, 0, 255]
+                };
+                assert_eq!(actual[pixel..pixel + 4], expected, "texel ({x}, {y})");
+            }
         }
     }
 

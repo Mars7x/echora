@@ -8714,6 +8714,134 @@ impl Renderer {
         self.read_target_plane_bytes(key, 0, 0, texel_bytes, [x, y, width, height])
     }
 
+    /// Replace a rectangle of an unscaled color target with tightly packed
+    /// texels. The other pixels in the target keep their rendered contents.
+    pub fn write_target_plane_bytes(
+        &mut self,
+        key: u64,
+        (level, plane): (u32, u32),
+        [x, y, width, height]: [u32; 4],
+        texels: &[u8],
+    ) -> Result<(), String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        let texel_bytes = format_bytes(target.format);
+        let (layer, slice, planes) = match target.shape {
+            ImageShape::D3 { depth } if level < target.levels => {
+                (0, plane, (depth >> level).max(1))
+            }
+            shape => (plane, 0, shape.layers()),
+        };
+        if !target.scale.is_one()
+            || texel_bytes == 0
+            || level >= target.levels
+            || plane >= planes
+            || x.checked_add(width)
+                .is_none_or(|end| end > (target.width >> level).max(1))
+            || y.checked_add(height)
+                .is_none_or(|end| end > (target.height >> level).max(1))
+        {
+            return Err("unsupported target texel write".into());
+        }
+        let row_bytes = width as usize * texel_bytes as usize;
+        if texels.len() != row_bytes * height as usize {
+            return Err("target texel write does not contain the complete rectangle".into());
+        }
+        if texels.is_empty() {
+            return Ok(());
+        }
+        self.transition(key, vk::ImageLayout::GENERAL)?;
+        let image = self.targets[&key].image;
+        let aspect_mask = vk::ImageAspectFlags::COLOR;
+        let subresource = vk::ImageSubresourceLayers {
+            aspect_mask,
+            mip_level: level,
+            base_array_layer: layer,
+            layer_count: 1,
+        };
+        let barrier = |src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask,
+                    base_mip_level: level,
+                    level_count: 1,
+                    base_array_layer: layer,
+                    layer_count: 1,
+                })
+        };
+        let full = vk::PipelineStageFlags::ALL_COMMANDS;
+        let transfer = vk::PipelineStageFlags::TRANSFER;
+        let read_write = vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
+        let transfer_write = vk::AccessFlags::TRANSFER_WRITE;
+        let commands = self.commands()?;
+        // SAFETY: prior reads and writes of this live subresource are ordered
+        // before the buffer copies, including reads from earlier submissions.
+        unsafe {
+            self.device().cmd_pipeline_barrier(
+                commands,
+                full,
+                transfer,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(read_write, transfer_write)],
+            );
+        }
+        let rows_per_copy = (RING_SIZE as usize / row_bytes).max(1);
+        let mut row = y;
+        for bytes in texels.chunks(rows_per_copy * row_bytes) {
+            let rows = (bytes.len() / row_bytes) as u32;
+            let (ring, offset) = self.ring_upload(bytes, u64::from(texel_bytes) * 4)?;
+            let commands = self.commands()?;
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(subresource)
+                .image_offset(vk::Offset3D {
+                    x: x as i32,
+                    y: row as i32,
+                    z: slice as i32,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height: rows,
+                    depth: 1,
+                });
+            // SAFETY: the ring holds the complete rows and the region is
+            // within the selected subresource and in GENERAL layout.
+            unsafe {
+                self.device().cmd_copy_buffer_to_image(
+                    commands,
+                    ring,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &[copy],
+                );
+            }
+            row += rows;
+        }
+        let commands = self.commands()?;
+        // SAFETY: publish the transferred region before later image uses.
+        unsafe {
+            self.device().cmd_pipeline_barrier(
+                commands,
+                transfer,
+                full,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(transfer_write, read_write)],
+            );
+        }
+        self.defined(key);
+        Ok(())
+    }
+
     /// A rectangle of a mip level's array layer or 3D slice, in the
     /// guest's texel grid, with no buffer padding between rows.
     pub fn read_target_plane_bytes(
