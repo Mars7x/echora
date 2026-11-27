@@ -7570,19 +7570,14 @@ impl Renderer {
             base_array_layer,
             layer_count: 1,
         };
-        let regions: Vec<_> = transfer_aspects(aspect(source_target.format))
-            .map(|aspect_mask| {
-                vk::ImageBlit::default()
-                    .src_subresource(subresource(aspect_mask, source_level, source_layer))
-                    .src_offsets(corners(source))
-                    .dst_subresource(subresource(
-                        aspect_mask,
-                        destination_level,
-                        destination_layer,
-                    ))
-                    .dst_offsets(corners(destination))
-            })
-            .collect();
+        // Equal depth tests can follow an unscaled copy of the prepass.
+        // Transfer its texels directly without introducing blit sampling.
+        let is_2d = |shape| matches!(shape, ImageShape::D2 { .. } | ImageShape::Cube { .. });
+        let exact_depth_copy = is_depth(source_target.format)
+            && is_2d(source_target.shape)
+            && is_2d(destination_target.shape)
+            && source[2..] == destination[2..]
+            && output_filter.is_none();
         let filter = output_filter.unwrap_or_else(|| {
             if is_depth(source_target.format)
                 || integer_format(source_target.format)
@@ -7644,15 +7639,58 @@ impl Renderer {
                 &[],
                 &before,
             );
-            device.cmd_blit_image(
-                commands,
-                source_target.image,
-                vk::ImageLayout::GENERAL,
-                destination_target.image,
-                vk::ImageLayout::GENERAL,
-                &regions,
-                filter,
-            );
+            let aspects = transfer_aspects(aspect(source_target.format));
+            if exact_depth_copy {
+                let regions: Vec<_> = aspects
+                    .map(|aspect_mask| {
+                        vk::ImageCopy::default()
+                            .src_subresource(subresource(aspect_mask, source_level, source_layer))
+                            .src_offset(corners(source)[0])
+                            .dst_subresource(subresource(
+                                aspect_mask,
+                                destination_level,
+                                destination_layer,
+                            ))
+                            .dst_offset(corners(destination)[0])
+                            .extent(vk::Extent3D {
+                                width: source[2] as u32,
+                                height: source[3] as u32,
+                                depth: 1,
+                            })
+                    })
+                    .collect();
+                device.cmd_copy_image(
+                    commands,
+                    source_target.image,
+                    vk::ImageLayout::GENERAL,
+                    destination_target.image,
+                    vk::ImageLayout::GENERAL,
+                    &regions,
+                );
+            } else {
+                let regions: Vec<_> = aspects
+                    .map(|aspect_mask| {
+                        vk::ImageBlit::default()
+                            .src_subresource(subresource(aspect_mask, source_level, source_layer))
+                            .src_offsets(corners(source))
+                            .dst_subresource(subresource(
+                                aspect_mask,
+                                destination_level,
+                                destination_layer,
+                            ))
+                            .dst_offsets(corners(destination))
+                    })
+                    .collect();
+                device.cmd_blit_image(
+                    commands,
+                    source_target.image,
+                    vk::ImageLayout::GENERAL,
+                    destination_target.image,
+                    vk::ImageLayout::GENERAL,
+                    &regions,
+                    filter,
+                );
+            }
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -7664,6 +7702,9 @@ impl Renderer {
             );
         };
         self.stat("stat: barriers in copy_target", 2);
+        if exact_depth_copy {
+            self.stat("stat: direct depth target copies", 1);
+        }
         self.defined(to);
         Ok(())
     }
@@ -10920,6 +10961,24 @@ mod tests {
                 );
             }
         }
+
+        // The same format and extent use a direct copy across layers. Both
+        // aspects move together and the adjacent destination texel stays.
+        renderer
+            .copy_target_level((9, 0, 1), [0, 0, 1, 1], (9, 0, 0), [1, 0, 1, 1])
+            .unwrap();
+        let expected: Vec<_> = [0.125_f32, 0.375]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .chain([9, 72])
+            .collect();
+        assert_eq!(
+            renderer
+                .read_target_depth_stencil_plane_bytes(9, 0, 0, [0, 0, 2, 1])
+                .unwrap(),
+            expected
+        );
+        assert_eq!(renderer.take_stats()["stat: direct depth target copies"], 1);
     }
 
     #[test]
