@@ -50,6 +50,10 @@ synthetic fixtures and runs without the game files.
   five consecutive frames. In a 96×64 patch matched to the same console
   frame, green pixels rose from 0.85% to 30.75%. The console measured
   78.91%. The restored leaves still render visibly darker.
+  At that camera pose, 100 matched leaf-interior pixels had median
+  display luma 22.1 in Echora and 49.1 in the console footage on an
+  8-bit scale. The sampled bark, roots, and haze differed by at most
+  four luma levels.
   The missing floor has yet to be reproduced in these frames. Unimplemented
   operations can stop the run and produce a report.
 - The fairy beside the forest sign had a saturated red core in a player
@@ -165,6 +169,11 @@ synthetic fixtures and runs without the game files.
   3,800 to 1,952 MiB at present 6,200. Restoring 416 archives took
   1.39 seconds of cumulative host time across the full run, including
   1.09 seconds in decompression.
+  A run at `7dd318b` with an archive inventory written after the final
+  present averaged 8.34 FPS in that window and peaked at 13,558 MiB.
+  All 2,210 retained archives at present 6,200 had storage addresses
+  inside the live guest heap. Their 1,928 distinct compressed payloads
+  occupied 2,004 MiB.
 - Releasing CPU copies after their texture uploads reached the GPU reduced
   retained CPU texels from 138 to 5 MiB at saved-room presents 3,200 and
   6,100. With native blend state and corrected primitive restart, the room
