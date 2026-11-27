@@ -6871,8 +6871,9 @@ impl Nvn {
                         "stat: dispatch microseconds",
                         start.elapsed().as_micros() as u64,
                     );
-                    if let Some(fatal) =
-                        self.gpu().and_then(|backend| backend.renderer.fatal.take())
+                    if let Some(fatal) = self
+                        .gpu()
+                        .and_then(|backend| backend.renderer.fatal.clone())
                     {
                         return Err(stop(fatal));
                     }
@@ -6892,8 +6893,9 @@ impl Nvn {
                         "stat: draw microseconds",
                         start.elapsed().as_micros() as u64,
                     );
-                    if let Some(fatal) =
-                        self.gpu().and_then(|backend| backend.renderer.fatal.take())
+                    if let Some(fatal) = self
+                        .gpu()
+                        .and_then(|backend| backend.renderer.fatal.clone())
                     {
                         return Err(stop(fatal));
                     }

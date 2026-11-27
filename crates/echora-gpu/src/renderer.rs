@@ -1511,6 +1511,9 @@ impl Renderer {
 
     /// The command buffer, for recording inside the open rendering pass.
     pub(crate) fn recording_commands(&mut self) -> Result<vk::CommandBuffer, String> {
+        if let Some(error) = &self.fatal {
+            return Err(error.clone());
+        }
         self.full_barrier_recorded = false;
         if !self.recording {
             let begin = vk::CommandBufferBeginInfo::default()
@@ -1521,7 +1524,8 @@ impl Renderer {
                 self.device()
                     .begin_command_buffer(self.slot.commands, &begin)
             }
-            .map_err(vk_error("vkBeginCommandBuffer"))?;
+            .map_err(vk_error("vkBeginCommandBuffer"))
+            .inspect_err(|error| self.note_command_failure(error))?;
             self.recording = true;
             self.slot.signal_host_wait = false;
             if let Some(timer) = self.timer.as_mut() {
@@ -3888,6 +3892,7 @@ impl Renderer {
             // SAFETY: the fence is live and the submit call has returned.
             unsafe { device.get_fence_status(fence) }
         })
+        .inspect_err(|error| self.note_command_failure(error))
     }
 
     fn poll_completed_fences(
@@ -3991,6 +3996,11 @@ impl Renderer {
 
     /// End and submit the current slot's command buffer.
     fn submit_current(&mut self, signal: Option<vk::Semaphore>) -> Result<(), String> {
+        self.end_and_submit_current(signal)
+            .inspect_err(|error| self.note_command_failure(error))
+    }
+
+    fn end_and_submit_current(&mut self, signal: Option<vk::Semaphore>) -> Result<(), String> {
         self.end_pass();
         self.end_condition();
         self.occlusion_before_submit(self.slot.commands);
@@ -4165,6 +4175,17 @@ impl Renderer {
     /// Wait for the current slot's submission, then free what it retired,
     /// collect its deferred reads and make the slot ready to record.
     fn finish_current(&mut self, fence_signaled: bool) -> Result<(), String> {
+        self.retire_current(fence_signaled)
+            .inspect_err(|error| self.note_command_failure(error))
+    }
+
+    fn note_command_failure(&mut self, error: &str) {
+        // Later draws cannot safely reuse a slot after a command-buffer,
+        // submission or fence error. Keep the first error for the caller.
+        self.fatal.get_or_insert_with(|| error.to_owned());
+    }
+
+    fn retire_current(&mut self, fence_signaled: bool) -> Result<(), String> {
         if !self.slot.in_flight {
             return Ok(());
         }
@@ -9603,6 +9624,27 @@ mod tests {
         });
         assert_eq!(progress.failure().as_deref(), Some("submission failed"));
         assert!(!progress.returned(2));
+    }
+
+    #[test]
+    fn failed_submission_stops_further_command_recording() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        renderer.recording_commands().unwrap();
+        let Some(submitter) = &renderer.submitter else {
+            return;
+        };
+        submitter.progress.finish(Err("submission failed".into()));
+
+        assert_eq!(renderer.flush_async(), Err("submission failed".into()));
+        assert!(!renderer.recording);
+        assert_eq!(renderer.fatal.as_deref(), Some("submission failed"));
+        assert_eq!(
+            renderer.recording_commands(),
+            Err("submission failed".into())
+        );
+        assert!(!renderer.recording);
     }
 
     #[test]
