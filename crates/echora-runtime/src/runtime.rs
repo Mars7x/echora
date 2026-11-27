@@ -412,9 +412,13 @@ impl Machine {
         let mut core = Core::new(memory.view());
         core.max_steps = max_steps;
         core.current_thread_id = current_thread_id;
+        let mut nvn = crate::nvn::Nvn::default();
+        nvn.present_limit = crate::nvn::debug_var("ECHORA_STOP_PRESENT")
+            .ok()
+            .and_then(|value| value.parse().ok());
         Self {
             core,
-            nvn: Default::default(),
+            nvn,
             memory,
             layout,
             heap_size: 0,
@@ -3224,11 +3228,7 @@ impl Machine {
                 self.publish_controller()?;
                 // ECHORA_STOP_PRESENT=N: end the run (with its report) at
                 // present N, so two runs measure the frames between them.
-                if crate::nvn::debug_var("ECHORA_STOP_PRESENT")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .is_some_and(|stop| self.nvn.presented_frames >= stop)
-                {
+                if self.nvn.present_limit_reached() {
                     self.process_exit_requested = true;
                     self.process_exit_reason = Some("host_stop_request");
                 }

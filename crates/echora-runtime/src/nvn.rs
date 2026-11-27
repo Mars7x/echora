@@ -706,6 +706,9 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// Stop requests count completed presents, including those replay queued.
+    #[serde(skip)]
+    pub(crate) present_limit: Option<u64>,
     #[serde(skip)]
     window_timing: FastMap<u64, WindowTiming>,
     /// Draws into each target since the last present (the capture log
@@ -4254,6 +4257,11 @@ impl Nvn {
                     self.drain_queues(core)?;
                     self.present_lap("stat: present us draining queues", &mut since);
                 }
+                // Finishing the previous queued present can reach the limit
+                // during this call. Let the machine stop before queuing another.
+                if self.present_limit_reached() {
+                    return Ok(true);
+                }
                 let window = self.object(x[1], "Window").map_err(invalid)?;
                 let index = x[2] as u32;
                 let texture = window
@@ -4823,6 +4831,11 @@ impl Nvn {
     /// (`QueueItem::Present`).
     pub fn present_queued_mode() -> bool {
         Self::replay_thread() && debug_var_os("ECHORA_PRESENT_NOW").is_none()
+    }
+
+    pub(crate) fn present_limit_reached(&self) -> bool {
+        self.present_limit
+            .is_some_and(|limit| self.presented_frames >= limit)
     }
 
     /// With a replay thread, before an invalidate: the GPU submission its
@@ -14444,6 +14457,13 @@ mod tests {
                 .texels
                 .iter()
                 .all(|texel| *texel == [0.5, 0.25, 1.0, 1.0])
+        );
+        nvn.present_limit = Some(1);
+        call(
+            &mut nvn,
+            &mut core,
+            "nvnQueuePresentTexture",
+            &[queue, window, 0],
         );
         call(
             &mut nvn,
