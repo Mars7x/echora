@@ -52,6 +52,15 @@ synthetic fixtures and runs without the game files.
   game's strength, 12.2 with zero strength, and 9.0 in compressed console
   footage. The test isolates sharpening for one frame. The compressed
   footage provides a reference for detail levels across those patches.
+  A later native-1440p run matched six earlier Echora captures by the
+  camera projection rather than by present number. It completed at
+  present 10,650 with the cloned save unchanged. Across 88 foreground
+  patches accepted in both sequences, motion-aligned brightness reversals
+  above 20/255 numbered 176 earlier and 173 in the current capture out of
+  50,688 samples per take. Neither sequence shows a whole-frame blackout.
+  At the matched pose the current foreground is still darker than the
+  compressed console reference in several patches; these six frames do
+  not establish that the reported flicker or lighting mismatch is fixed.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
