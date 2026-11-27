@@ -559,7 +559,7 @@ pub enum Op {
         d: Reg,
         index: Reg,
         bank: u8,
-        offset: u16,
+        offset: i16,
         size: u8,
         mode: u8,
     },
@@ -1736,7 +1736,7 @@ fn decode_op(word: Word, opcode: u16) -> Option<Op> {
                 d,
                 index: word.reg(24),
                 bank: word.bits(54, 5) as u8,
-                offset: word.bits(38, 16) as u16,
+                offset: word.bits(38, 16) as i16,
                 size: word.bits(73, 3) as u8,
                 mode: word.bits(78, 2) as u8,
             });

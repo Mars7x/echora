@@ -3081,7 +3081,7 @@ impl Emitter {
                     *used = BANK_SIZE;
                 }
                 let base = self.read_register(base.0);
-                let offset = self.constant(u32::from(offset));
+                let offset = self.constant(i32::from(offset) as u32);
                 let address = self.value(op::I_ADD, self.u32, &[base, offset]);
                 let (three, not_three) = (self.constant(3), self.constant(!3));
                 let aligned = self.value(op::BITWISE_AND, self.u32, &[address, not_three]);

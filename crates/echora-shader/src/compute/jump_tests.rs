@@ -99,6 +99,16 @@ fn program() -> Vec<Instruction> {
 }
 
 #[test]
+fn negative_indexed_displacements_do_not_alias_upper_bank_jump_tables() {
+    let mut code = program();
+    let Op::Ldc { offset, .. } = &mut code[3].op else {
+        unreachable!()
+    };
+    *offset = -16;
+    assert!(JumpTables::analyze(&code).is_none());
+}
+
+#[test]
 fn structured_and_dispatched_switches_agree_for_divergent_lanes() {
     let code = program();
     let constants: Vec<_> = [80u32, 112, 144, 0]

@@ -231,7 +231,7 @@ fn bounded(code: &[Instruction], index: usize, target: Src) -> Option<Site> {
     if upper >= 64 {
         return None;
     }
-    let start = usize::from(offset);
+    let start = usize::try_from(offset).ok()?;
     let end = start + (upper as usize + 1) * 4;
     if end > 0x10000 {
         return None;

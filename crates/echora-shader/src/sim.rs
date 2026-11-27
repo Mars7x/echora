@@ -11410,6 +11410,63 @@ mod tests {
     }
 
     #[test]
+    fn indexed_constant_loads_add_signed_byte_displacements() {
+        let load = |opcode, dest, base, offset: i16, size| {
+            word(&[
+                (0, 12, opcode),
+                (16, 8, dest),
+                (24, 8, base),
+                (38, 16, u128::from(offset as u16)),
+                (54, 5, 4),
+                (73, 3, size),
+            ])
+        };
+        let raw = [
+            mov(0, 0x801e),
+            load(0xb82, 1, 0, -30, 2),      // LDC.U16 at 0x8000
+            load(0xb82, 2, 0, 1, 0),        // LDC.U8 at 0x801f
+            load(0xb82, 3, 0, i16::MIN, 2), // LDC.U16 at 0x1e
+            load(0xb82, 5, 255, -4, 4),     // RZ - 4 is outside the bank
+            word(&[(0, 12, 0x3c2), (16, 6, 4), (24, 8, 0)]), // R2UR UR4, R0
+            load(0xabb, 6, 4, -30, 4),      // indexed ULDC
+            word(&[(0, 12, 0xc02), (16, 8, 6), (32, 6, 6), (72, 4, 15)]),
+            word(&[
+                (0, 12, 0xab9),
+                (16, 6, 7),
+                (38, 16, 0xfffc),
+                (54, 5, 4),
+                (73, 3, 4),
+            ]),
+            word(&[(0, 12, 0xc02), (16, 8, 7), (32, 6, 7), (72, 4, 15)]),
+            EXIT,
+        ];
+        let code: Vec<_> = raw.into_iter().map(decode).collect();
+        let (translated, regs, _) =
+            translate_with_registers(&code, &Layout::workgroup([1, 1, 1])).unwrap();
+        let binding = translated
+            .descriptors
+            .iter()
+            .find(|d| d.index == 4)
+            .unwrap()
+            .binding;
+        let mut bytes = vec![0u8; 0x10000];
+        bytes[0x8000..0x8004].copy_from_slice(&0x1122_abcfu32.to_le_bytes());
+        bytes[0x801f] = 0x31;
+        bytes[0x1e..0x20].copy_from_slice(&0xa234u16.to_le_bytes());
+        bytes[0xfffc..].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let report = Machine::new(&translated.spirv).simulate(&Inputs {
+            uniforms: [((0, binding), bytes)].into(),
+            ..Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let read = |reg| report.invocations[0][&regs[&reg]][0] as u32;
+        assert_eq!(
+            [read(1), read(2), read(3), read(5), read(6), read(7)],
+            [0xabcf, 0x31, 0xa234, 0, 0x1122_abcf, 0xdead_beef]
+        );
+    }
+
+    #[test]
     fn the_uniform_words_read_are_reported() {
         // MOV R0, c[0x3][0x10]
         let read = word(&[
