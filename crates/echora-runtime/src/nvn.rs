@@ -732,6 +732,9 @@ pub struct Nvn {
     /// changes that (see `pump_queues`).
     #[serde(skip)]
     pending: BTreeMap<u64, std::collections::VecDeque<QueueItem>>,
+    /// Reusable snapshot of queue keys while a pass mutates pending work.
+    #[serde(skip)]
+    replay_queue_keys: Vec<u64>,
     /// Each queue's GPU state (render targets, viewports, bound programs and
     /// resources) while another queue's runs: a queue's commands see only
     /// the state its own commands set, as on the console, however the host
@@ -4607,12 +4610,21 @@ impl Nvn {
     /// at a wait that does not hold, and work another queue runs (a
     /// SignalEvent, a fence) may let it continue.
     fn pump_queues(&mut self, core: &mut Guest) -> Result<(), Trap> {
+        let mut queues = std::mem::take(&mut self.replay_queue_keys);
+        let result = self.pump_queue_snapshot(core, &mut queues);
+        queues.clear();
+        self.replay_queue_keys = queues;
+        result
+    }
+
+    fn pump_queue_snapshot(&mut self, core: &mut Guest, queues: &mut Vec<u64>) -> Result<(), Trap> {
         self.replay_paused = false;
         self.replay_waiting_on_inputs = None;
         loop {
             let mut progressed = false;
-            let queues: Vec<u64> = self.pending.keys().copied().collect();
-            for queue in queues {
+            queues.clear();
+            queues.extend(self.pending.keys().copied());
+            for &queue in queues.iter() {
                 progressed |= self.run_queue(queue, core, false)?;
                 if self.replay_paused {
                     return Ok(());
@@ -5373,6 +5385,17 @@ impl Nvn {
         let mut progressed = false;
         let mut replayed_list: Option<std::sync::Arc<Vec<Command>>> = None;
         loop {
+            let Some(work) = self.pending.get_mut(&queue) else {
+                return Ok(progressed);
+            };
+            let Some(item) = work.front_mut() else {
+                return Ok(progressed);
+            };
+            // Retiring a consumed list leaves no command to hand to another worker.
+            if matches!(item, QueueItem::List { commands, next, .. } if *next >= commands.len()) {
+                work.pop_front();
+                continue;
+            }
             // A replay in pieces (`replay_budget`) stops here when its piece
             // is done; `resume_replay` goes on from this item.
             // Once it has run a quarter of its commands it also stops when
@@ -5392,23 +5415,12 @@ impl Nvn {
                 }
                 *budget -= 1;
             }
-            let Some(item) = self
-                .pending
-                .get_mut(&queue)
-                .and_then(|work| work.front_mut())
-            else {
-                return Ok(progressed);
-            };
             match item {
                 QueueItem::List {
                     commands,
                     next,
                     descriptor_epoch,
                 } => {
-                    if commands.get(*next).is_none() {
-                        self.pending.get_mut(&queue).unwrap().pop_front();
-                        continue;
-                    }
                     // Keep a single reference while replaying this list,
                     // including across calls that mutate NVN state.
                     if replayed_list
@@ -13271,6 +13283,53 @@ mod tests {
         assert_eq!(nvn.depth_mode(), 1);
         nvn.switch_render_queue(0x3000, &mut guest).unwrap();
         assert_eq!(nvn.depth_mode(), 0);
+    }
+
+    #[test]
+    fn replay_budget_counts_commands_across_empty_and_finished_lists() {
+        let mut cpu = Cpu::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let list = |left: Option<u64>| QueueItem::List {
+            commands: std::sync::Arc::new(
+                left.into_iter()
+                    .map(|x| Command {
+                        name: "nvnCommandBufferSetScissor",
+                        x: [0, x, 2, 3, 4, 0, 0, 0],
+                        v: [0; 8],
+                        captured: Vec::new(),
+                        states: Default::default(),
+                    })
+                    .collect(),
+            ),
+            next: 0,
+            descriptor_epoch: 0,
+        };
+        nvn.pending.insert(
+            1,
+            [
+                list(None),
+                list(Some(11)),
+                list(None),
+                list(Some(22)),
+                list(None),
+            ]
+            .into(),
+        );
+        nvn.replay_budget = Some(1);
+        nvn.pump_queues(&mut guest).unwrap();
+        assert_eq!(nvn.render.scissor, Some([11, 2, 3, 4]));
+        assert!(nvn.replay_paused());
+        nvn.replay_budget = Some(1);
+        nvn.pump_queues(&mut guest).unwrap();
+        assert_eq!(nvn.render.scissor, Some([22, 2, 3, 4]));
+        assert!(!nvn.replay_paused());
+        assert!(nvn.pending.is_empty());
     }
 
     #[test]
