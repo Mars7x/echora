@@ -8209,7 +8209,7 @@ fn read_region(core: &Guest, address: u64) -> Result<[u32; 6], Trap> {
 /// contents go with the structure's bytes, so a copy (the game keeps
 /// prebuilt states and copies them into its pass objects) binds the same
 /// state, as on the console.
-const TAGGED_STATES: [&str; 3] = ["BlendState", "DepthStencilState", "MultisampleState"];
+const TAGGED_STATES: [&str; 2] = ["BlendState", "MultisampleState"];
 
 /// The contents of tagged state structures by tag, including the snapshot
 /// shared by recorded Bind commands.
@@ -8459,10 +8459,15 @@ fn snapshot_states(bags: &Bags, core: &Guest, command: &mut Command) -> Result<(
         "ColorState" => Some(PackedState::Color),
         "ChannelMaskState" => Some(PackedState::ChannelMask),
         "PolygonState" => Some(PackedState::Polygon),
+        "DepthStencilState" => Some(PackedState::DepthStencil),
         _ => None,
     };
     if let Some(kind) = packed {
-        command.states = packed_state_snapshot(core.memory.read_u32(base)?, kind);
+        let bits = match kind {
+            PackedState::DepthStencil => core.memory.read_u64(base)?,
+            _ => u64::from(core.memory.read_u32(base)?),
+        };
+        command.states = packed_state_snapshot(bits, kind);
         return Ok(());
     }
     // A single tagged state: what the bound structure's bytes hold; an
@@ -8622,6 +8627,7 @@ enum PackedState {
     Color,
     ChannelMask,
     Polygon,
+    DepthStencil,
 }
 
 // PolygonState's four byte word, as read by its getters and BindPolygonState.
@@ -8632,18 +8638,20 @@ const POLYGON_FIELDS: [(&str, u32, u32); 4] = [
     ("PolygonOffsetEnables", 15, 15),
 ];
 
-/// Share decoded single-word states across binds, retaining the property
+/// Share decoded guest states across binds, retaining the property
 /// names older archived commands use.
-fn packed_state_snapshot(word: u32, kind: PackedState) -> StateSnapshots {
+fn packed_state_snapshot(bits: u64, kind: PackedState) -> StateSnapshots {
     thread_local! {
-        static SNAPSHOTS: std::cell::RefCell<[Option<(u32, StateSnapshots)>; 48]> =
-            const { std::cell::RefCell::new([const { None }; 48]) };
+        static SNAPSHOTS: std::cell::RefCell<[Option<(u64, StateSnapshots)>; 64]> =
+            const { std::cell::RefCell::new([const { None }; 64]) };
     }
     SNAPSHOTS.with_borrow_mut(|entries| {
-        let index = (word.wrapping_mul(0x9e37_79b9) >> 28) as usize;
+        let word = bits as u32;
+        let upper = (bits >> 32) as u32;
+        let index = ((word ^ upper).wrapping_mul(0x9e37_79b9) >> 28) as usize;
         let slot = &mut entries[16 * kind as usize + index];
         if let Some((known, snapshot)) = slot
-            && *known == word
+            && *known == bits
         {
             return snapshot.clone();
         }
@@ -8687,6 +8695,34 @@ fn packed_state_snapshot(word: u32, kind: PackedState) -> StateSnapshots {
                     }
                 }
             }
+            PackedState::DepthStencil => {
+                for (name, shift, mask) in DEPTH_FIELDS {
+                    properties.insert(
+                        name.into(),
+                        Args {
+                            x: [u64::from((word >> shift) & mask), 0, 0, 0],
+                            ..Args::default()
+                        },
+                    );
+                }
+                for (face, shift) in [(1, 0), (2, 16)] {
+                    let side = u64::from(upper >> shift);
+                    properties.insert(
+                        format!("StencilFunc/{face}"),
+                        Args {
+                            x: [face, side & 15, 0, 0],
+                            ..Args::default()
+                        },
+                    );
+                    properties.insert(
+                        format!("StencilOp/{face}"),
+                        Args {
+                            x: [face, (side >> 4) & 15, (side >> 12) & 15, (side >> 8) & 15],
+                            ..Args::default()
+                        },
+                    );
+                }
+            }
             PackedState::Polygon => {
                 for (property, shift, mask) in POLYGON_FIELDS {
                     let value = (word >> shift) & mask;
@@ -8701,9 +8737,91 @@ fn packed_state_snapshot(word: u32, kind: PackedState) -> StateSnapshots {
             }
         }
         let snapshot: StateSnapshots = vec![properties].into();
-        *slot = Some((word, snapshot.clone()));
+        *slot = Some((bits, snapshot.clone()));
         snapshot
     })
+}
+
+const DEPTH_FIELDS: [(&str, u32, u32); 4] = [
+    ("DepthTestEnable", 0, 1),
+    ("DepthWriteEnable", 1, 1),
+    ("StencilTestEnable", 2, 1),
+    ("DepthFunc", 4, 15),
+];
+
+fn depth_stencil_state_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
+    let [state, face_or_value, a, b, c, ..] = core.cpu.regs;
+    let stencil = state.wrapping_add(4);
+    let value = face_or_value as u32;
+    let shift = if value == 2 { 16 } else { 0 };
+    match rest {
+        "SetDefaults" => core.memory.write_u64(state, 0x1118_1118_0000_0022)?,
+        "GetStencilFunc" => {
+            core.cpu.regs[0] = u64::from((core.memory.read_u32(stencil)? >> shift) & 15)
+        }
+        "GetStencilOp" => {
+            // The guest loads the word again between outputs, which may alias it.
+            for (out, field) in [(a, 4), (b, 12), (c, 8)] {
+                let op = (core.memory.read_u32(stencil)? >> (shift + field)) & 15;
+                core.memory.write_u32(out, op)?;
+            }
+        }
+        "SetStencilFunc" | "SetStencilOp" => {
+            for (face, shift) in [(1, 0), (2, 16)] {
+                if value & face == 0 {
+                    continue;
+                }
+                let word = core.memory.read_u32(stencil)?;
+                let (mask, fields) = if rest == "SetStencilFunc" {
+                    (15, a as u32)
+                } else {
+                    // Mirror the guest's field writes including bits above the
+                    // valid enum range. Both faces retain their compare field.
+                    let fail = if face == 1 {
+                        ((a as u32) << 4) & 0xffff_00ff
+                    } else {
+                        ((a as u32) & 15) << 4
+                    };
+                    (0xfff0, fail | ((b as u32) << 12) | ((c as u32) << 8))
+                };
+                core.memory
+                    .write_u32(stencil, (word & !(mask << shift)) | (fields << shift))?;
+            }
+        }
+        _ => {
+            let Some((set, property)) = rest
+                .strip_prefix("Set")
+                .map(|s| (true, s))
+                .or_else(|| rest.strip_prefix("Get").map(|s| (false, s)))
+            else {
+                return Ok(false);
+            };
+            let Some((_, shift, mask)) = DEPTH_FIELDS.into_iter().find(|field| field.0 == property)
+            else {
+                return Ok(false);
+            };
+            if set {
+                let word = core.memory.read_u32(state)?;
+                let field = if mask == 1 {
+                    u32::from(value as u8 != 0)
+                } else {
+                    value
+                };
+                core.memory
+                    .write_u32(state, (word & !(mask << shift)) | (field << shift))?;
+            } else {
+                let word = if mask == 1 {
+                    let mut byte = [0];
+                    core.memory.read(state, &mut byte)?;
+                    u32::from(byte[0])
+                } else {
+                    core.memory.read_u32(state)?
+                };
+                core.cpu.regs[0] = u64::from((word >> shift) & mask);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn polygon_state_call(core: &mut Guest, rest: &str) -> Result<bool, Trap> {
@@ -8871,6 +8989,7 @@ fn bag_call(
         "VertexAttribState" | "VertexStreamState" => Some(vertex_state_call(core, kind, rest)?),
         "ChannelMaskState" => Some(channel_mask_call(core, rest)?),
         "ColorState" => Some(color_state_call(core, rest)?),
+        "DepthStencilState" => Some(depth_stencil_state_call(core, rest)?),
         "PolygonState" => Some(polygon_state_call(core, rest)?),
         _ => None,
     };
@@ -9010,17 +9129,7 @@ fn bag_call(
                     0
                 };
             }
-            if kind == "DepthStencilState"
-                && let Some(keys) = stencil_property_keys(property)
-            {
-                for (face, key) in keys.into_iter().enumerate() {
-                    if args.x[0] & (1 << face) != 0 {
-                        bag.set(key, args);
-                    }
-                }
-            } else {
-                bag.set(property, args);
-            }
+            bag.set(property, args);
             let tag = bag.tag.or_else(|| {
                 state_transition(before, property, args, x[5], || state_tag(kind, &bag.props))
             });
@@ -9044,27 +9153,6 @@ fn bag_call(
                     .ok_or_else(|| invalid(format!("no {kind} at {this:#x}")))?
                     .props
             };
-            if kind == "DepthStencilState" && stencil_property_keys(property).is_some() {
-                // FRONT_AND_BACK (3) reads the front face's setting (a
-                // setter with it wrote both faces the same).
-                let face = match x[1] as u32 {
-                    1 | 3 => 0,
-                    2 => 1,
-                    face => return Err(invalid(format!("invalid stencil face {face}"))),
-                };
-                let value = stencil_face_property(props, property, face);
-                if property == "StencilFunc" {
-                    core.cpu.regs[0] = value.map_or(8, |value| value.x[1]);
-                } else {
-                    let ops = value.map_or([1; 3], |value| [value.x[1], value.x[2], value.x[3]]);
-                    for (address, op) in x[2..5].iter().copied().zip(ops) {
-                        if address != 0 {
-                            core.memory.write_u32(address, op as u32)?;
-                        }
-                    }
-                }
-                return Ok(true);
-            }
             let Some(value) = props.get(property) else {
                 return Err(stop(format!("{property} was never set")));
             };
@@ -10431,38 +10519,35 @@ mod tests {
     fn seen_state_tags_stay_in_the_shared_table() {
         let mut props = BTreeMap::new();
         props.insert(
-            "DepthFunc".to_string(),
+            "Samples".to_string(),
             Args {
                 x: [0x6a17, 0, 0, 0],
                 v: [0; 2],
             },
         );
-        let first = state_tag("DepthStencilState", &props).unwrap();
-        assert_eq!(state_tag("DepthStencilState", &props), Some(first));
+        let first = state_tag("MultisampleState", &props).unwrap();
+        assert_eq!(state_tag("MultisampleState", &props), Some(first));
         let elsewhere = std::thread::spawn({
             let props = props.clone();
-            move || state_tag("DepthStencilState", &props)
+            move || state_tag("MultisampleState", &props)
         })
         .join()
         .unwrap();
         assert_eq!(elsewhere, Some(first));
         let tags = STATE_TAGS.read().unwrap();
         let state = tags.as_ref().unwrap().get(&first).unwrap();
-        assert_eq!(state.kind, "DepthStencilState");
-        assert_eq!(state.snapshot[0]["DepthFunc"].x[0], 0x6a17);
+        assert_eq!(state.kind, "MultisampleState");
+        assert_eq!(state.snapshot[0]["Samples"].x[0], 0x6a17);
         assert_eq!(state_tag("Unknown", &props), None);
     }
 
     #[test]
-    fn colliding_state_tags_keep_both_depth_write_settings() {
-        let kind = "DepthStencilState";
-        let states = [
-            (0x1100, 0, 0xb4ec_e790_3f8e_7b4a),
-            (0x1200, 1, 0x6992_a69f_d7b8_3e02),
-        ];
+    fn colliding_state_tags_keep_both_alpha_to_coverage_settings() {
+        let kind = "MultisampleState";
+        let states = [(0x1100, 0, 183_095), (0x1200, 1, 4_039)];
         let hashes = states.map(|(_, enabled, unused)| {
             let props = BTreeMap::from([(
-                "DepthWriteEnable".into(),
+                "AlphaToCoverageEnable".into(),
                 Args {
                     x: [enabled, unused, 0, 0],
                     v: [0; 2],
@@ -10487,7 +10572,7 @@ mod tests {
             call(
                 &mut nvn,
                 &mut guest,
-                "nvnDepthStencilStateSetDepthWriteEnable",
+                "nvnMultisampleStateSetAlphaToCoverageEnable",
                 &[address, enabled, unused, 0, 0],
             );
         }
@@ -10502,7 +10587,7 @@ mod tests {
                 call(
                     &mut nvn,
                     &mut guest,
-                    "nvnDepthStencilStateGetDepthWriteEnable",
+                    "nvnMultisampleStateGetAlphaToCoverageEnable",
                     &[0x1300]
                 ),
                 enabled
@@ -11208,11 +11293,11 @@ mod tests {
         // The same properties reached in other orders and again after a
         // detour: each structure's tag is the one its properties have.
         let sequences: [(u64, &[(&str, u64)]); 3] = [
-            (0x1100, &[("DepthFunc", 3), ("DepthWriteEnable", 1)]),
-            (0x1200, &[("DepthWriteEnable", 1), ("DepthFunc", 3)]),
+            (0x1100, &[("Samples", 3), ("AlphaToCoverageEnable", 1)]),
+            (0x1200, &[("AlphaToCoverageEnable", 1), ("Samples", 3)]),
             (
                 0x1300,
-                &[("DepthFunc", 5), ("DepthWriteEnable", 1), ("DepthFunc", 3)],
+                &[("Samples", 5), ("AlphaToCoverageEnable", 1), ("Samples", 3)],
             ),
         ];
         for _ in 0..2 {
@@ -11220,20 +11305,20 @@ mod tests {
                 call(
                     &mut nvn,
                     &mut guest,
-                    "nvnDepthStencilStateSetDefaults",
+                    "nvnMultisampleStateSetDefaults",
                     &[address],
                 );
                 for (property, value) in setters {
                     call(
                         &mut nvn,
                         &mut guest,
-                        &format!("nvnDepthStencilStateSet{property}"),
+                        &format!("nvnMultisampleStateSet{property}"),
                         &[address, *value],
                     );
                     let props = read_shared(nvn.bags.at(address))[&address].props.clone();
                     assert_eq!(
                         Some(guest.memory.read_u32(address).unwrap()),
-                        state_tag("DepthStencilState", &props)
+                        state_tag("MultisampleState", &props)
                     );
                 }
             }
@@ -11241,6 +11326,64 @@ mod tests {
             assert_eq!(tags[0], tags[1]);
             assert_eq!(tags[0], tags[2]);
         }
+    }
+
+    #[test]
+    fn bound_depth_stencil_state_uses_guest_bytes_for_both_faces() {
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(0x1000, 0x1000, READ | WRITE, STATE_NORMAL, "state")
+            .unwrap();
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let mut nvn = Nvn::default();
+        let state = 0x1100;
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDepthStencilStateSetDefaults",
+            &[state],
+        );
+        assert_eq!(guest.memory.read_u64(state).unwrap(), 0x1118_1118_0000_0022);
+        // A prebuilt structure, including different front and back operations.
+        guest
+            .memory
+            .write_u64(state, 0x5678_1234_0000_0077)
+            .unwrap();
+        let mut bind = Command {
+            name: "nvnCommandBufferBindDepthStencilState",
+            x: [0; 8],
+            v: [0; 8],
+            captured: Vec::new(),
+            states: StateSnapshots::default(),
+        };
+        bind.x[1] = state;
+        snapshot_states(&nvn.bags, &guest, &mut bind).unwrap();
+        let props = &bind.states[0];
+        for name in ["DepthTestEnable", "DepthWriteEnable", "StencilTestEnable"] {
+            assert_eq!(props[name].x[0], 1);
+        }
+        assert_eq!(props["DepthFunc"].x[0], 7);
+        assert_eq!(props["StencilFunc/1"].x[1], 4);
+        assert_eq!(props["StencilFunc/2"].x[1], 8);
+        assert_eq!(props["StencilOp/1"].x, [1, 3, 1, 2]);
+        assert_eq!(props["StencilOp/2"].x, [2, 7, 5, 6]);
+        // The first result overwrites the stencil word. Subsequent reads observe it.
+        call(
+            &mut nvn,
+            &mut guest,
+            "nvnDepthStencilStateGetStencilOp",
+            &[state, 2, state + 4, 0x1200, 0x1204],
+        );
+        assert_eq!(guest.memory.read_u32(state + 4).unwrap(), 7);
+        assert_eq!(guest.memory.read_u32(0x1200).unwrap(), 0);
+        assert_eq!(guest.memory.read_u32(0x1204).unwrap(), 0);
+        // The recorded command still owns the original values.
+        assert_eq!(bind.states[0]["StencilOp/2"].x, [2, 7, 5, 6]);
     }
 
     #[test]
