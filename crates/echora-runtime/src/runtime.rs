@@ -6047,6 +6047,9 @@ impl Worker {
             && (settle || !thread)
             && (!queued_present || nvn.present_pending())
         {
+            if shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
             let counter = self.core.physical_counter_ticks();
             let mut guest = crate::nvn::Guest {
                 cpu: &mut self.core.cpu,
@@ -6111,6 +6114,11 @@ impl Worker {
                 // forest makes ~55 such waits per frame on thread 1).
                 let mut pause = 10;
                 loop {
+                    // A stopped run must join this worker even when the
+                    // submission never completes.
+                    if shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return false;
+                    }
                     match nvn.submission_done(serial, marker) {
                         Ok(true) => break,
                         Ok(false) => {
@@ -6149,6 +6157,9 @@ impl Worker {
         // threads' calls are not held up by the whole replay (with
         // ECHORA_ASYNC_REPLAY the caller goes on and later calls run it).
         while made && nvn.replay_paused() && !crate::nvn::Nvn::replay_async() {
+            if shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+                return false;
+            }
             let waiting_on_inputs = nvn.replay_waiting_on_inputs();
             let let_go = std::time::Instant::now();
             parking_lot::MutexGuard::unlock_fair(nvn);
@@ -6307,6 +6318,61 @@ fn rearm_lowered_dispatch_limit(core: &Core) {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_worker_leaves_a_pending_gpu_sync_wait() {
+        use crate::nvn::{HostEntry, Nvn};
+        use std::sync::{Condvar, Mutex, RwLock, atomic::AtomicBool};
+
+        let sync = 0x2000;
+        let entry = 0x3000;
+        let mut nvn = Nvn::default();
+        if !Nvn::replay_thread() || !nvn.create_pending_sync_for_test(sync) {
+            return;
+        }
+        let (serial, marker) = nvn.sync_wait_serial(sync).unwrap().unwrap();
+        assert!(!nvn.submission_done(serial, marker).unwrap());
+        nvn.add_hook(entry, HostEntry::Proc("nvnSyncWait"));
+        let mut machine = Machine::new(Layout::default(), 100);
+        let mut core = Core::new(machine.memory.view());
+        core.cpu.regs[..2].copy_from_slice(&[sync, u64::MAX]);
+        let recorder = nvn.recorder();
+        let shared = Shared {
+            cpu_hooks: Vec::new(),
+            zstd_streams: None,
+            machine: Mutex::new(&mut machine),
+            nvn: parking_lot::Mutex::new(nvn),
+            nvn_waiters: &crate::nvn::NVN_WAITERS,
+            recorder,
+            thunks: RwLock::default(),
+            exclusive: None,
+            world: None,
+            wake: Vec::new(),
+            stop: AtomicBool::new(true),
+            serial: None,
+            replay_wake: (Mutex::new(false), Condvar::new()),
+            replay_failed: Mutex::new(None),
+        };
+        let mut worker = Worker {
+            core,
+            synced: 0,
+            active: true,
+            index: 0,
+            held_failed: None,
+            nvn_call_path: None,
+            lock_free_calls: 0,
+            recorded_calls: 0,
+            nvn_thunks: Vec::new(),
+            nvn_lock_micros: [0; 2],
+            quiet_yields_until: None,
+            lock_free_yields: 0,
+            quiet_run: 0,
+        };
+        assert!(!worker.held_nvn_call(&shared, entry));
+        assert!(worker.held_failed.is_none());
+        assert_eq!(worker.core.cpu.regs[0], sync);
+        assert!(!shared.nvn.lock().submission_done(serial, marker).unwrap());
+    }
 
     #[test]
     fn fixed_resolution_addon_can_preserve_or_force_the_guest_branch() {

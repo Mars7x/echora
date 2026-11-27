@@ -4869,6 +4869,31 @@ impl Nvn {
         Ok(Some((serial, marker)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn create_pending_sync_for_test(&mut self, sync: u64) -> bool {
+        let Ok(Some(backend)) = gpu::Backend::create(None) else {
+            return false;
+        };
+        self.gpu = Some(backend);
+        self.gpu_checked = true;
+        assert!(self.initialize(sync, "Sync", BTreeMap::new()).is_ok());
+        self.signal_sync(sync, Args::default());
+        // An outstanding serial without a submitted batch leaves the fence
+        // pending indefinitely, without stalling a Vulkan device.
+        self.objects
+            .get_mut(&sync)
+            .expect("test sync")
+            .state
+            .insert(
+                "GpuSerial".into(),
+                Args {
+                    x: [1, 0, 0, 0],
+                    ..Default::default()
+                },
+            );
+        true
+    }
+
     /// Whether submission `serial` has finished (noting finished ones).
     pub fn submission_done(&mut self, serial: u64, marker: u64) -> Result<bool, Trap> {
         if self.gpu_marker_done(marker) {
