@@ -2352,7 +2352,10 @@ impl Nvn {
 
     /// A whole remap leaves rendered texels with the previous physical
     /// allocation, available to other textures over that allocation.
-    pub(super) fn move_remapped_targets(&mut self, targets: Vec<(u64, std::ops::Range<u64>)>) {
+    pub(super) fn move_remapped_targets(
+        &mut self,
+        targets: Vec<(u64, std::ops::Range<u64>)>,
+    ) -> Result<(), String> {
         for (texture, previous) in targets {
             let new = match self.texture_object_backing(texture) {
                 None => None,
@@ -2373,8 +2376,9 @@ impl Nvn {
             };
             let previous_identity = (previous.start, format);
             self.retain_texture_object(texture, previous_identity, Some(previous));
-            self.gpu_move_texture(texture, previous_identity, new.map(|base| (base, format)));
+            self.gpu_move_texture(texture, previous_identity, new.map(|base| (base, format)))?;
         }
+        Ok(())
     }
 
     /// Retain a texture's description alongside the image that holds its rendered texels.
@@ -2463,7 +2467,7 @@ impl Nvn {
         texture: u64,
         previous: (u64, u64),
         identity: Option<(u64, u64)>,
-    ) {
+    ) -> Result<(), String> {
         self.texture_epoch += 1;
         self.binding_evictions.push((
             texture,
@@ -2509,10 +2513,15 @@ impl Nvn {
                     None => Ok(()),
                 });
             if let Err(error) = result {
-                backend.note(format!("moving a reused texture's target: {error}"));
+                // The guest has already changed the object or its backing.
+                // A failed move leaves no valid image binding for that state.
+                let message = format!("moving a reused texture's target: {error}");
+                renderer.fatal.get_or_insert_with(|| message.clone());
+                return Err(message);
             }
             backend.stat("stat: targets moved with their memory", 1);
         }
+        Ok(())
     }
 
     /// Copy the GPU's latest texels for a rendered texture. Return false when
@@ -16505,17 +16514,20 @@ mod target_tests {
         let image = renderer.existing_target(archive).unwrap();
         assert_eq!(image.extent(0), (512, 512));
         assert_eq!(image.levels, 1);
-        assert_eq!(
-            renderer.queue_target_archive(archive).unwrap(),
-            echora_gpu::renderer::ArchiveRequest::Queued
-        );
-        renderer.flush().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while renderer.existing_target(archive).is_some() {
-            assert!(std::time::Instant::now() < deadline);
-            renderer.finish_target_archives().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let archive_target = |renderer: &mut echora_gpu::renderer::Renderer, key| {
+            assert_eq!(
+                renderer.queue_target_archive(key).unwrap(),
+                echora_gpu::renderer::ArchiveRequest::Queued
+            );
+            renderer.flush().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while renderer.existing_target(key).is_some() {
+                assert!(std::time::Instant::now() < deadline);
+                renderer.finish_target_archives().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        archive_target(renderer, archive);
 
         core.cpu.regs[0] = 1;
         assert!(nvn.call("nvnMemoryPoolFinalize", &mut core).unwrap());
@@ -16563,6 +16575,27 @@ mod target_tests {
             renderer.read_target_bytes(2, 4).unwrap(),
             0.5_f32.to_le_bytes().repeat(512 * 512)
         );
+
+        core.cpu.regs[0] = 2;
+        assert!(nvn.call("nvnTextureFinalize", &mut core).unwrap());
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        archive_target(renderer, key);
+        let injected_error = "injected texture restore failure";
+        renderer.fatal = Some(injected_error.into());
+
+        core.cpu.regs[..2].copy_from_slice(&[2, 4]);
+        let error = nvn.call("nvnTextureInitialize", &mut core).unwrap_err();
+        assert!(matches!(
+            error,
+            echora_guest::Trap::UnsupportedService { message, .. }
+                if message.contains("moving a reused texture's target")
+                    && message.contains(injected_error)
+        ));
+        let renderer = &mut nvn.gpu.as_mut().unwrap().renderer;
+        assert!(renderer.target_info(key).is_some());
+        assert!(renderer.existing_target(key).is_none());
+        assert!(renderer.existing_target(2).is_none());
+        assert_eq!(renderer.fatal.as_deref(), Some(injected_error));
     }
 
     #[test]

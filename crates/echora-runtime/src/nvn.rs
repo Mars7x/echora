@@ -3514,7 +3514,7 @@ impl Nvn {
                         );
                     }
                 }
-                self.move_remapped_targets(old_targets);
+                self.move_remapped_targets(old_targets).map_err(stop)?;
                 core.cpu.regs[0] = 1;
                 return Ok(true);
             }
@@ -4193,7 +4193,8 @@ impl Nvn {
                 if let Some(previous) =
                     previous.filter(|previous| finalized.is_some() || Some(*previous) != identity)
                 {
-                    self.gpu_move_texture(this, previous, identity);
+                    self.gpu_move_texture(this, previous, identity)
+                        .map_err(stop)?;
                 }
                 core.cpu.regs[0] = 1;
                 return Ok(true);
@@ -4211,7 +4212,7 @@ impl Nvn {
                 if let Some(identity) = self.texture_identity(this) {
                     self.finalized_storage.insert(this, identity);
                     self.retain_texture_object(this, identity, None);
-                    self.gpu_move_texture(this, identity, None);
+                    self.gpu_move_texture(this, identity, None).map_err(stop)?;
                 }
                 if kind == "Texture" {
                     self.gpu_forget_texture(this);
