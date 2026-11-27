@@ -7962,13 +7962,17 @@ impl Nvn {
         let mut scratch = std::mem::take(&mut self.binding_eviction_scratch);
         let BindingEvictionScratch { keys, bases } = &mut scratch;
         for &key in targets {
-            keys.insert(key);
-            if let Some(base) = self.texture_storage(key) {
-                bases.push(base);
+            if keys.insert(key) {
+                if let Some(base) = self.texture_storage(key) {
+                    bases.push(base);
+                }
+                self.binding_target_alias_bases(key, bases);
             }
         }
         for &(texture, storages) in &self.binding_evictions {
-            keys.insert(texture);
+            if keys.insert(texture) {
+                self.binding_target_alias_bases(texture, bases);
+            }
             bases.extend(storages.into_iter().filter(|base| *base != 0));
         }
         self.binding_evictions.clear();
@@ -8005,6 +8009,30 @@ impl Nvn {
         keys.clear();
         bases.clear();
         self.binding_eviction_scratch = scratch;
+    }
+
+    /// A sampled texture can name a render target's mip rather than its
+    /// base address. Include both the last indexed locations and current
+    /// ones when a target is created, resized, moved or reinitialized.
+    fn binding_target_alias_bases(&self, key: u64, bases: &mut Vec<u64>) {
+        let Some(backend) = self.gpu.as_ref() else {
+            return;
+        };
+        if let Some((base, levels)) = backend.target_index.by_target.get(&key) {
+            bases.push(*base);
+            bases.extend(levels);
+        }
+        if let Some(target) = backend
+            .renderer
+            .target_info(key)
+            .filter(|target| target.levels > 1)
+            && let Some(base) = self.texture_storage(key)
+        {
+            bases.extend(
+                self.target_level_addresses(key, target, base)
+                    .map(|(address, _)| address),
+            );
+        }
     }
 
     /// Drop the memoized bindings (every queue's) that `stale` selects;
@@ -18502,6 +18530,93 @@ mod pool_tests {
             present: 0,
             texture,
         }
+    }
+
+    #[test]
+    fn a_new_render_target_evicts_cached_uploads_of_its_mip_aliases() {
+        use echora_guest::memory::{Memory, READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(backend)) = Backend::create(None) else {
+            return;
+        };
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10_0000;
+        let args = |x| Args {
+            x,
+            ..Default::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x10000, 0, 0]))]),
+        )
+        .unwrap();
+        let texture = |size, levels, offset| {
+            BTreeMap::from([
+                ("Width".into(), scalar(size)),
+                ("Height".into(), scalar(size)),
+                ("Levels".into(), scalar(levels)),
+                ("Format".into(), scalar(37)),
+                ("Storage".into(), args([1, offset, 0, 0])),
+            ])
+        };
+        let parent = texture(16, 4, 0);
+        let format = crate::nvn_format::info(37).unwrap();
+        let layout = crate::nvn::texture_layout_layers(&parent, format, [16, 16, 1], 1, 4);
+        let mip = crate::nvn_format::block_linear_mips(format, [16, 16, 1], layout, 4)
+            .nth(1)
+            .unwrap();
+        nvn.initialize(2, "Texture", parent).unwrap();
+        nvn.initialize(3, "Texture", texture(8, 1, mip.offset))
+            .unwrap();
+        nvn.initialize(4, "Texture", texture(8, 1, 0x8000)).unwrap();
+        nvn.evict_bindings();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x10000, READ | WRITE, STATE_NORMAL, "mip aliases")
+            .unwrap();
+        let mut cpu = echora_guest::cpu::Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        for key in [3, 4] {
+            let (source, backing) = nvn.resolve_sampled_texture(&mut guest, key).unwrap();
+            assert!(matches!(source, TextureSource::Upload { .. }));
+            nvn.remember_binding(key, key, source, Sampler::default(), backing);
+        }
+        // A later pass renders through the larger texture object rather
+        // than the separate object used to sample level one.
+        nvn.ensure_render_target(2).unwrap();
+        nvn.gpu
+            .as_mut()
+            .unwrap()
+            .renderer
+            .clear_color(2, None, vk::ClearColorValue { float32: [0.5; 4] })
+            .unwrap();
+        assert!(matches!(
+            nvn.texture_source_resolved(&guest, 3).unwrap(),
+            TextureSource::TargetView {
+                key: 2,
+                base_level: 1,
+                ..
+            }
+        ));
+        nvn.evict_bindings();
+        assert!(
+            nvn.memoized_binding(3).is_none(),
+            "obsolete mip upload survived"
+        );
+        assert!(
+            nvn.memoized_binding(4).is_some(),
+            "unrelated upload was evicted"
+        );
     }
 
     #[test]

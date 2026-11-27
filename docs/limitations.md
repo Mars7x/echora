@@ -99,6 +99,13 @@ synthetic fixtures and runs without the game files.
   draw or dispatch retains the sampler settings visible to that submission.
   A queue released by an explicit guest wait can see registrations made
   while it was blocked.
+  A render target's creation, move or recreation evicts cached sampled
+  bindings at its mip addresses as well as at its base. A GPU-enabled
+  regression creates a mip-alias upload first and verifies that it resolves
+  to the new render target instead, while an unrelated upload remains cached.
+  The corrected Radeon run reached present 6,032 at native 1440p, exited
+  normally and preserved the cloned save. The effect on the reported
+  forest flicker has not been isolated.
 - Min/max filtering uses the host's Vulkan sampler reduction support. On
   Mesa 25.2.8 llvmpipe, a test sampling 0.75 and 0.125 in adjacent mip
   levels at LOD 0.5 returned 0.4375 for both minimum and maximum reduction.
