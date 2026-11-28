@@ -307,6 +307,13 @@ enum QueueItem {
     Present { texture: u64 },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReplayInputWait {
+    pub(crate) submission: echora_gpu::renderer::SubmissionWait,
+    /// The input and whether its dependency has a known written range.
+    pub(crate) timeline_kind: &'static str,
+}
+
 #[derive(Debug)]
 struct CommandList {
     commands: std::sync::Arc<Vec<Command>>,
@@ -751,7 +758,7 @@ pub struct Nvn {
     render: RenderState,
     pub presented_frames: u64,
     /// Elapsed microseconds from the first guest present, for cadence reports.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip)]
     present_timestamps_us: Vec<u64>,
     #[serde(skip)]
     first_timed_present: Option<std::time::Instant>,
@@ -871,7 +878,7 @@ pub struct Nvn {
     #[serde(skip)]
     replay_paused: bool,
     #[serde(skip)]
-    replay_waiting_on_inputs: Option<echora_gpu::renderer::SubmissionWait>,
+    replay_waiting_on_inputs: Option<ReplayInputWait>,
     /// `program_memo` for mesh draws, by program handle in each graphics slot.
     #[serde(skip)]
     mesh_program_memo: (
@@ -5315,7 +5322,7 @@ impl Nvn {
         self.replay_paused
     }
 
-    pub(crate) fn replay_waiting_on_inputs(&self) -> Option<echora_gpu::renderer::SubmissionWait> {
+    pub(crate) fn replay_waiting_on_inputs(&self) -> Option<ReplayInputWait> {
         self.replay_waiting_on_inputs.clone()
     }
 
@@ -8201,7 +8208,7 @@ impl Nvn {
     pub fn report(&self) -> serde_json::Value {
         let objects = self.objects.len() + read_shared(&self.command_buffers).len();
         let lists = self.lists.lock();
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "model": "host_nvn_entry_points",
             "objects": objects,
             "devices": self.objects.values().filter(|o| o.kind == "Device").collect::<Vec<_>>(),
@@ -8234,7 +8241,11 @@ impl Nvn {
                     backend.renderer.descaled,
                 ]
             }),
-        })
+        });
+        if !self.present_timestamps_us.is_empty() {
+            report["present_timestamps_us"] = serde_json::json!(self.present_timestamps_us);
+        }
+        report
     }
 }
 
@@ -14592,14 +14603,14 @@ mod tests {
     #[test]
     fn present_timestamps_are_relative_and_optional_in_the_report() {
         let mut nvn = Nvn::default();
-        let json = serde_json::to_value(&nvn).unwrap();
+        let json = nvn.report();
         assert!(json.get("present_timestamps_us").is_none());
         let first = std::time::Instant::now();
         for micros in [0, 16_667, 38_420] {
             nvn.presented_frames += 1;
             nvn.note_present_time(first + std::time::Duration::from_micros(micros));
         }
-        let json = serde_json::to_value(&nvn).unwrap();
+        let json = nvn.report();
         assert_eq!(json["presented_frames"], 3);
         assert_eq!(
             json["present_timestamps_us"],

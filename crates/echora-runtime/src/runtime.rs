@@ -5405,7 +5405,8 @@ fn settle_replay(nvn: &mut crate::nvn::Nvn, guest: &mut crate::nvn::Guest) -> Re
     while nvn.replay_paused() {
         nvn.resume_replay(guest)?;
         if let Some(wait) = nvn.replay_waiting_on_inputs() {
-            wait.wait(std::time::Duration::from_millis(1))
+            wait.submission
+                .wait(std::time::Duration::from_millis(1))
                 .map_err(|message| Trap::InvalidState { message })?;
         }
     }
@@ -5413,20 +5414,17 @@ fn settle_replay(nvn: &mut crate::nvn::Nvn, guest: &mut crate::nvn::Guest) -> Re
 }
 
 /// Leave the NVN lock available while the GPU produces the command's input.
-fn wait_for_replay_inputs(
-    wait: echora_gpu::renderer::SubmissionWait,
-    thread: u64,
-) -> Result<(), String> {
+fn wait_for_replay_inputs(wait: crate::nvn::ReplayInputWait, thread: u64) -> Result<(), String> {
     let started = crate::timeline::on().then(std::time::Instant::now);
     // Recheck the queue regularly, including if the submitter stops.
-    let result = wait.wait(std::time::Duration::from_millis(1)).map(|_| ());
+    let result = wait
+        .submission
+        .wait(std::time::Duration::from_millis(1))
+        .map(|_| ());
     if let Some(started) = started {
-        crate::timeline::span(
-            thread,
-            "replay-input-wait",
-            started,
-            std::time::Instant::now(),
-        );
+        let finished = std::time::Instant::now();
+        crate::timeline::span(thread, "replay-input-wait", started, finished);
+        crate::timeline::span(thread, wait.timeline_kind, started, finished);
     }
     result
 }

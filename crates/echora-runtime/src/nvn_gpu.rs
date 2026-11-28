@@ -29,7 +29,9 @@ use echora_gpu::shader::{self, DescriptorKind, MeshParameters, Parameters, Stage
 #[path = "nvn_indices.rs"]
 mod index_assembly;
 
-use super::{Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, StateSnapshots};
+use super::{
+    Command, Guest, Image, MAX_COLOR_TARGETS, Nvn, PagePool, ReplayInputWait, StateSnapshots,
+};
 
 /// Reuse the allocation of the binding tables filled for each draw.
 #[derive(Debug, Default)]
@@ -8344,8 +8346,9 @@ impl Nvn {
         &mut self,
         core: &Guest,
         command: &Command,
-    ) -> Result<Option<echora_gpu::renderer::SubmissionWait>, String> {
-        let (serial, stat) = if command.name == "nvnCommandBufferSetRenderEnableConditional" {
+    ) -> Result<Option<ReplayInputWait>, String> {
+        let condition = command.name == "nvnCommandBufferSetRenderEnableConditional";
+        let (serial, stat) = if condition {
             if super::debug_var_os("ECHORA_OCCLUSION_ASSUME_VISIBLE").is_some() {
                 return Ok(None);
             }
@@ -8392,11 +8395,20 @@ impl Nvn {
         if serial <= backend.renderer.completed_serial() {
             return Ok(None);
         }
-        let wait = backend.renderer.submission_wait(serial)?;
-        if wait.is_some() {
-            backend.stat(stat, 1);
-        }
-        Ok(wait)
+        let Some(submission) = backend.renderer.submission_wait(serial)? else {
+            return Ok(None);
+        };
+        let timeline_kind = match (condition, backend.has_pending_bounded_write(serial)) {
+            (true, true) => "replay-counter-wait-bounded",
+            (true, false) => "replay-counter-wait-unbounded",
+            (false, true) => "replay-uniform-wait-bounded",
+            (false, false) => "replay-uniform-wait-unbounded",
+        };
+        backend.stat(stat, 1);
+        Ok(Some(ReplayInputWait {
+            submission,
+            timeline_kind,
+        }))
     }
 
     /// Make a mapped rendering input current before comparing it on the
@@ -20651,7 +20663,7 @@ mod replay_input_wait_tests {
             );
         }
         let draw = command("nvnCommandBufferDrawArrays", [0, 0, 0, 3, 0, 0, 0, 0]);
-        assert_replay_input_wait(nvn, draw, serial);
+        assert_replay_input_wait(nvn, draw, serial, "replay-uniform-wait-bounded");
     }
 
     #[test]
@@ -20666,15 +20678,16 @@ mod replay_input_wait_tests {
         // The first operand is a GPU query. The condition setup checks the
         // second operand on the CPU before using the GPU predicate.
         backend.samples_reports.insert(gpu_address);
+        backend.record_page_table_write(serial, None);
         let condition = command(
             "nvnCommandBufferSetRenderEnableConditional",
             [0, 1, gpu_address, 0, 0, 0, 0, 0],
         );
-        assert_replay_input_wait(nvn, condition, serial);
+        assert_replay_input_wait(nvn, condition, serial, "replay-counter-wait-unbounded");
     }
 
     #[allow(unsafe_code)]
-    fn assert_replay_input_wait(mut nvn: Nvn, command: Command, serial: u64) {
+    fn assert_replay_input_wait(mut nvn: Nvn, command: Command, serial: u64, timeline_kind: &str) {
         if !Nvn::replay_thread()
             || !nvn
                 .gpu
@@ -20746,7 +20759,7 @@ mod replay_input_wait_tests {
             let deferred = nvn.run_queue_work(5, &mut core, false);
             let early = nvn
                 .replay_waiting_on_inputs()
-                .map(|wait| wait.wait(Duration::ZERO));
+                .map(|wait| wait.submission.wait(Duration::ZERO));
             let _ = done.send(());
             (deferred, early, timer.join().unwrap())
         });
@@ -20766,7 +20779,8 @@ mod replay_input_wait_tests {
         ));
         assert!(!early.unwrap().unwrap());
         let wait = nvn.replay_waiting_on_inputs().unwrap();
-        assert!(wait.wait(Duration::ZERO).unwrap());
+        assert_eq!(wait.timeline_kind, timeline_kind);
+        assert!(wait.submission.wait(Duration::ZERO).unwrap());
         assert!(
             nvn.defer_replay_input_reads(&core, &command)
                 .unwrap()
