@@ -143,9 +143,27 @@ mod unix {
             text.push('\n');
             // How many mappings the process holds (a failed mmap leaves
             // libraries with pointers to nothing).
-            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-                let _ = writeln!(text, "  mappings {}", maps.lines().count());
-            }
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+            let _ = writeln!(text, "  mappings {}", maps.lines().count());
+            // The mapping holding an address (its line in /proc/self/maps).
+            let mapping = |at: usize| {
+                maps.lines().find(|line| {
+                    line.split_once(' ')
+                        .and_then(|(range, _)| range.split_once('-'))
+                        .and_then(|(start, end)| {
+                            Some((
+                                usize::from_str_radix(start, 16).ok()?,
+                                usize::from_str_radix(end, 16).ok()?,
+                            ))
+                        })
+                        .is_some_and(|(start, end)| (start..end).contains(&at))
+                })
+            };
+            let _ = writeln!(
+                text,
+                "  address in {}",
+                mapping(address).unwrap_or("no mapping")
+            );
             // The general registers, for what the faulting instruction used.
             // SAFETY: as above.
             let registers = unsafe { (*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
@@ -180,8 +198,13 @@ mod unix {
             // overwritten). process_vm_readv reports an unreadable address
             // instead of faulting again.
             for (name, register) in names {
-                let at = registers[register as usize] as usize;
-                let mut words = [0u64; 6];
+                let value = registers[register as usize] as usize;
+                if let Some(line) = mapping(value) {
+                    let _ = writeln!(text, "  {name} in {line}");
+                }
+                // Sixteen words before the address and sixteen from it.
+                let at = value.wrapping_sub(128);
+                let mut words = [0u64; 32];
                 let local = libc::iovec {
                     iov_base: words.as_mut_ptr().cast(),
                     iov_len: std::mem::size_of_val(&words),
@@ -195,11 +218,13 @@ mod unix {
                 let read =
                     unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
                 if read == std::mem::size_of_val(&words) as isize {
-                    let _ = write!(text, "  [{name}]");
-                    for word in words {
-                        let _ = write!(text, " {word:016x}");
+                    for (row, chunk) in words.chunks(4).enumerate() {
+                        let _ = write!(text, "  [{name}{:+#x}]", row as isize * 32 - 128);
+                        for word in chunk {
+                            let _ = write!(text, " {word:016x}");
+                        }
+                        text.push('\n');
                     }
-                    text.push('\n');
                 }
             }
             // SAFETY: write(2) with a valid buffer.
