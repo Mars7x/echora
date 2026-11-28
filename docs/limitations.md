@@ -36,7 +36,23 @@ synthetic fixtures and runs without the game files.
   Its flow map has no flow flags in the window around the camera.
   Simulating the first program on the CPU from its dumped inputs
   reproduced the GPU's output within half-float rounding (4.9×10⁻⁶).
-  The cause of the surface difference is still open. Six consecutive 1440p
+  The cause of the surface difference is still open. The simulation follows
+  the player rather than the camera. The water's linear-depth input
+  converts depth with a near plane of 1 and a far plane of 25,000, which
+  puts the traced water pixel 2.08 units from the camera. Its single normal
+  map is ASTC decoded on the CPU, and the water animates between frames.
+  Between presents 10,350 and 10,699, matched to console footage
+  262.8–274.5 s, Echora's upper frame matched the console within about
+  2 levels. The middle of the frame was 3–7 levels darker with a slope
+  near 1 (ours = ref − c), as expected if mid-distance fog adds less
+  light. The bottom band was 9–18% darker in proportion, a lighting
+  difference. The CPU simulator reproduced the froxel fog passes from
+  their dumped inputs: light injection, its filter and scattering with
+  temporal history. Volume means agreed within 1% and most texels
+  exactly. The differences that remain come from approximate sampler
+  states in the simulation. The fog arithmetic is translated faithfully,
+  so the mid-distance gap lies in its inputs (light lists, density
+  uniforms, shadows) or in the scene lighting. Six consecutive 1440p
   captures of the opening forest (presents
   10,496–10,501) showed no black frame. After compensating for camera
   motion, no matched 40×40-pixel patch on the four interior frames had a
