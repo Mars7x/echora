@@ -321,6 +321,15 @@ synthetic fixtures and runs without the game files.
   projected texture coordinate pairs and the captured matrices agreed
   with the rasterized locations within 0.012 pixels. These checks do not
   establish that the console chooses the same material inputs.
+  At the same opening camera pose in two guarded runs, two dark foreground
+  pixels were traced to separate material draws before fog. The traced
+  fragment colors matched the packed HDR attachment within one representable
+  step per channel. Both draws used a cloud-shadow scale of 0 and a leaf
+  scale of 1, yielding visibility of 0.0631 and 0.0894. For the latter draw,
+  projecting the sampled coordinates back to the screen agreed within
+  0.021 pixels, and a bilinear lookup into the previously verified leaf
+  texture agreed with the shader within 0.000015. The remainder of the
+  lighting path still needs comparison with the console.
 - Blending with two source colours (NVN's SRC1 factors) is not wired up in
   the renderer: such a target is drawn unblended, with a note. No program
   has asked for it so far.
