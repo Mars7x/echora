@@ -86,6 +86,16 @@ synthetic fixtures and runs without the game files.
   (257–262 s). Across 4,448 frames, two 20-pixel thumbnail tiles changed
   brightness by more than 20 levels relative to both motion-aligned
   neighbors. The reported black frames have not been reproduced.
+  A windowed run on a private headless compositor queued all 6,047
+  presents. It rebuilt the swapchain only for two window size changes at
+  startup, with no skipped or out-of-date presents. It stayed on the Load
+  menu because scripted input then applied only without a window. With
+  the saved route driven in the window, a run presented at 60 per second
+  through the menus. Near present 1,900 the GPU raised a page fault in
+  shader data reads, and two rings timed out and were reset. Then RADV
+  faulted while iterating a hash set in its command state that held a
+  device-address-like pointer. A GPU fault like this, which the kernel
+  recovers, can show as black frames.
   Recomputing both images' display luma with the same BT.709 coefficients
   after expanding the reference's limited-range video gave median gaps of
   7.36 and 7.51 levels on an 8-bit scale at the foreground rock and center

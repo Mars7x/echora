@@ -3302,7 +3302,8 @@ impl Machine {
     /// Once per presented frame, the window's keyboard state becomes a
     /// controller sample in the hid shared memory (see crate::hid).
     /// Publish one controller sample per present: the window's keyboard,
-    /// or without a window, ECHORA_AUTO_PRESS=N holds a button for 6
+    /// or ECHORA_AUTO_PRESS=N (with or without a window: scripted runs
+    /// can be checked in a window too) holds a button for 6
     /// samples (ECHORA_AUTO_HOLD) every N (for headless runs through
     /// menus): the next one of
     /// ECHORA_AUTO_KEYS (comma-separated names such as A,UP,A), then A,
@@ -3312,7 +3313,8 @@ impl Machine {
         let Some(base) = self.hid_mapping else {
             return Ok(());
         };
-        let buttons = if let Some(window) = crate::window::shared() {
+        let scripted = std::env::var_os("ECHORA_AUTO_PRESS").is_some();
+        let buttons = if let Some(window) = crate::window::shared().filter(|_| !scripted) {
             // The keyboard and any gamepads (ECHORA_GAMEPAD=0 ignores
             // them); an analog stick off centre wins over the keys.
             let keys = window.buttons.load(std::sync::atomic::Ordering::Relaxed);

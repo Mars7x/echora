@@ -463,6 +463,16 @@ impl Renderer {
         let retry = presenter.acquisition.is_some();
         if !retry {
             if presenter.stale || changed {
+                self.stat(
+                    if presenter.srgb != srgb && presenter.swapchain != vk::SwapchainKHR::null() {
+                        "stat: swapchain rebuilds for a presented encoding change"
+                    } else if presenter.requested != size {
+                        "stat: swapchain rebuilds for a window size change"
+                    } else {
+                        "stat: swapchain rebuilds for a stale swapchain"
+                    },
+                    1,
+                );
                 presenter.srgb = srgb;
                 presenter.stale = true;
                 self.flush()?;
@@ -573,8 +583,14 @@ impl Renderer {
             ready.pending = present_was_queued(presented);
         }
         match presented {
-            Ok(suboptimal) => presenter.stale |= suboptimal,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => presenter.stale = true,
+            Ok(suboptimal) => {
+                self.stat("stat: window presents queued", 1);
+                presenter.stale |= suboptimal;
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.stat("stat: window presents out of date", 1);
+                presenter.stale = true;
+            }
             Err(error) => return Err(format!("vkQueuePresentKHR: {error}")),
         }
         Ok(())

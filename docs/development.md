@@ -79,7 +79,7 @@ read.
 | `ECHORA_WINDOW=1`, `ECHORA_AUDIO=1` | Show the game in a window, and play its sound. |
 | `ECHORA_STOP_PRESENT=N` | End the run, with its report, at presented frame N. |
 | `ECHORA_WALL_SECONDS=N` | End an idle run after N host seconds, so the report shows what every thread waits on. |
-| `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Without a window, press the listed buttons in turn, one every N frames. Use `STICK_L_UP`, `STICK_L_DOWN`, `STICK_L_LEFT` or `STICK_L_RIGHT` to move and `NONE` for an idle interval. |
+| `ECHORA_AUTO_PRESS=N`, `ECHORA_AUTO_KEYS=A,PLUS,...` | Press the listed buttons in turn, one every N frames. The script replaces the keyboard and gamepads, so a windowed run (`ECHORA_WINDOW=1`) can follow the same route. Use `STICK_L_UP`, `STICK_L_DOWN`, `STICK_L_LEFT` or `STICK_L_RIGHT` to move and `NONE` for an idle interval. |
 | `ECHORA_GPU=0` | Run without the GPU backend. |
 | `ECHORA_ALLOW_OLD_RADV=1` | Run on a Mesa RADV driver older than 26.1.4, which Echora otherwise refuses at start: those versions hang the GPU on the game's task shader draws, and after the kernel resets the GPU every later run hangs until a reboot. For debugging the driver only. |
 | `ECHORA_UNBOUNDED_WRITE_WAITS=1` | CPU reads of guest memory wait for every pending shader store through the GPU page table, not only for the dispatches whose analysed write ranges overlap the read. For checking whether a stale read comes from those ranges. |
@@ -167,7 +167,7 @@ Draw counts varied from 201,301 to 208,081 across the four runs.
 |---|---|
 | `ECHORA_CAPTURE_EVERY=N` | Save the first and every N-th presented frame as PNGs in `run-<time>-frames/` beside the report (`0` turns it off). |
 | `ECHORA_CAPTURE_PRESENTS=10400,10499,10500,10501` | Save only these live presents. This overrides periodic capture and can collect multiple camera positions or adjacent frames in one run. |
-| `ECHORA_CAPTURE_ASYNC=file` | Append every presented frame from `ECHORA_CAPTURE_FROM` on to the file as a small RGBA8 thumbnail (`ECHORA_CAPTURE_ASYNC_SIZE=WxH`, default `320x180`), each after a 16-byte header: the present number (u64) and the width and height (u32, little-endian). The GPU copies each frame in order with its work and the bytes are written once it finishes, so no capture waits for the GPU. Use it to look for black or flickering frames that depend on timing; the PNG captures above wait for each frame. |
+| `ECHORA_CAPTURE_ASYNC=file` | Append every presented frame from `ECHORA_CAPTURE_FROM` on to the file as a small RGBA8 thumbnail (`ECHORA_CAPTURE_ASYNC_SIZE=WxH`, default `320x180`), each after a 16-byte header: the present number (u64) and the width and height (u32, little-endian). The GPU copies each frame in order with its work and the bytes are written once it finishes, so no capture waits for the GPU. Use it to look for black or flickering frames that depend on timing; the PNG captures above wait for each frame. A windowed run also counts its queued and out-of-date window presents and its swapchain rebuilds by cause in the report's `gpu_notes`. |
 | `ECHORA_GPU_DUMP=dir`, `ECHORA_GPU_DUMP_FROM=N` | Every 300th present, write each colour target as an image, starting at present N. |
 | `ECHORA_DRAW_LOG=file`, `ECHORA_DRAW_LOG_FROM=N` | Append a JSON line for every draw, with its targets, to the file, starting at present N. |
 
