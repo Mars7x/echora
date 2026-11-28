@@ -61,6 +61,10 @@ synthetic fixtures and runs without the game files.
   At the matched pose the current foreground is still darker than the
   compressed console reference in several patches; these six frames do
   not establish that the reported flicker or lighting mismatch is fixed.
+  Recomputing both images' display luma with the same BT.709 coefficients
+  after expanding the reference's limited-range video gave median gaps of
+  7.36 and 7.51 levels on an 8-bit scale at the foreground rock and center
+  bank. The left rock differed by 2.07 levels.
   In another nine-frame sample, the dark foreground edge also appeared
   in the reference video. A broad-leaf clump on the lower bank was visible
   in the reference and missing in Echora at two camera positions. The
@@ -354,6 +358,15 @@ synthetic fixtures and runs without the game files.
   still needs direct measurement.
 
 ## Performance
+
+- A targeted Radeon timestamp run at 1440p measured both source cubemaps
+  and the subsequent ambient cubemap update during the opening. Across
+  199 frames with a complete set of output-face timestamps, the combined
+  draw intervals covered a median of 0.574 ms after merging overlaps and
+  peaked at 0.819 ms. The final update alone had a median of 0.158 ms.
+  The same run measured 18.9 and 20.0 FPS over the last two 100-present
+  intervals ending at present 10,500. The timings apply to these probe
+  draws and exclude the rest of the frame's work.
 
 - Coalescing equivalent adjacent GPU-to-guest-file mappings reduced
   physical write-projection walks from 2,030 to 1,992 spans per query
