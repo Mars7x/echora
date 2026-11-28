@@ -8806,6 +8806,36 @@ impl Renderer {
         Ok(self.defer_ring_read(offset, size as usize))
     }
 
+    /// Queue a read of target `key` scaled to `width`×`height` RGBA8 texels
+    /// (an sRGB target keeps its encoded values). The token is answered by
+    /// `take_reads` once the GPU has passed this point; nothing waits for it.
+    pub fn queue_thumbnail_read(
+        &mut self,
+        key: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, String> {
+        let target = self.targets.get(&key).ok_or("no such target")?;
+        if is_depth(target.format) {
+            return Err("cannot take a thumbnail of a depth target".into());
+        }
+        let format = if is_srgb(target.format) {
+            vk::Format::R8G8B8A8_SRGB
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let source = [0, 0, target.width as i32, target.height as i32];
+        self.target(THUMBNAIL_KEY, width, height, format)?;
+        self.blit_target_level(
+            (key, 0, 0),
+            source,
+            (THUMBNAIL_KEY, 0, 0),
+            [0, 0, width as i32, height as i32],
+            Some(vk::Filter::LINEAR),
+        )?;
+        self.queue_target_archive_read(THUMBNAIL_KEY)
+    }
+
     pub fn restore_target_archive(&mut self, key: u64, bytes: &[u8]) -> Result<(), String> {
         let (copy, size) = self.archive_copy(key)?;
         if bytes.len() as u64 != size {
@@ -11883,6 +11913,38 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_reads_scale_frames_without_waiting() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let key = 12;
+        renderer
+            .target(key, 4, 2, vk::Format::R8G8B8A8_UNORM)
+            .unwrap();
+        // Left half red, right half blue: each thumbnail texel averages one half.
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let row = [red, red, blue, blue].concat();
+        renderer
+            .restore_target_archive(key, &[row.clone(), row].concat())
+            .unwrap();
+        let token = renderer.queue_thumbnail_read(key, 2, 1).unwrap();
+        // Submitted without waiting; the read arrives once the GPU finished.
+        renderer.submit_frame().unwrap();
+        let mut reads = renderer.take_reads(&[token]);
+        for _ in 0..1000 {
+            if !reads.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            renderer.poll_completed().unwrap();
+            reads = renderer.take_reads(&[token]);
+        }
+        assert_eq!(reads[&token], [red, blue].concat());
+        assert!(renderer.queue_thumbnail_read(99, 2, 1).is_err());
+    }
+
+    #[test]
     fn float_texel_buffer_shaders_report_unsupported_integer_views() {
         let Some(mut renderer) = renderer() else {
             return;
@@ -12694,6 +12756,10 @@ pub(crate) fn format_bytes(format: vk::Format) -> u32 {
 /// centred (letterboxed or pillarboxed).
 /// Keys from here up are the renderer's own staging targets (never scaled).
 const STAGING_KEYS: u64 = u64::MAX - 0x10;
+/// The staging target `queue_thumbnail_read` scales presented frames into
+/// (after the present staging target, the readback one and eight block
+/// attachments).
+const THUMBNAIL_KEY: u64 = STAGING_KEYS + 10;
 
 /// How a presented frame fills the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

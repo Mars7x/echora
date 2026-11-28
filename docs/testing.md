@@ -32,7 +32,9 @@ with a counted symbol table.
 
 Shader translation is checked offline against the stages a run dumps
 (`ECHORA_SHADER_DIR`): `cargo run -p echora-shader --example survey -- DIR`
-translates each one with the Rust translator and ranks what it refuses, and
+translates each one with the Rust translator and ranks what it refuses
+(`SURVEY_KEYS=KEY,...` with `SURVEY_SPV_DIR=DIR` also writes those programs'
+SPIR-V there for `spirv-dis`), and
 `shader-check --compare` in `echora-gpu` also compiles them on the host's
 Vulkan driver. `translate-dump` and plain `shader-check` need a plugin.
 

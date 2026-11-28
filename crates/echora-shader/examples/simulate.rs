@@ -68,7 +68,8 @@
 //! pages or watched writes. Otherwise each workgroup's report lists
 //! where its invocations ended and which guest EXIT (byte offset) each
 //! took. `--registers=N,M` prints those invocations' registers (R, P, UR,
-//! UP) as they ended. Each
+//! UP) as they ended. `--write-images=DIR` writes every bound image as the
+//! run left it, in the dump's `image-SET-BINDING` format. Each
 //! `watch=START..END` argument (hex addresses, or a `watch START END` line
 //! in dispatch.txt) lists every store and atomic into that range, guest
 //! (through the page table) or device: the invocation, the instruction
@@ -351,6 +352,10 @@ fn main() {
         });
     let independent = arguments.iter().any(|argument| argument == "--independent");
     let quiet = arguments.iter().any(|argument| argument == "--quiet");
+    let image_output = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--write-images="))
+        .map(std::path::PathBuf::from);
     // Invocations whose final registers to print.
     let shown: Vec<usize> = arguments
         .iter()
@@ -652,6 +657,28 @@ fn main() {
         if !independent {
             inputs.memory = report.memory;
             inputs.images = report.images;
+        }
+    }
+    // --write-images=DIR: the images as the run left them, in the dump's
+    // `image-SET-BINDING` format (after every workgroup in sequence).
+    if let Some(directory) = &image_output {
+        std::fs::create_dir_all(directory).expect("create the image directory");
+        for (&(set, binding), image) in &inputs.images {
+            let name = format!("image-{set}-{binding}");
+            let header = format!(
+                "{} {} {} {}\n",
+                image.width, image.height, image.depth, image.layers
+            );
+            std::fs::write(directory.join(format!("{name}.txt")), header)
+                .expect("write an image header");
+            let bytes: Vec<u8> = image
+                .texels
+                .to_vec()
+                .iter()
+                .flatten()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            std::fs::write(directory.join(format!("{name}.bin")), bytes).expect("write an image");
         }
     }
     for (address, (first, last, count)) in &words {

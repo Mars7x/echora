@@ -165,6 +165,7 @@ Draw counts varied from 201,301 to 208,081 across the four runs.
 |---|---|
 | `ECHORA_CAPTURE_EVERY=N` | Save the first and every N-th presented frame as PNGs in `run-<time>-frames/` beside the report (`0` turns it off). |
 | `ECHORA_CAPTURE_PRESENTS=10400,10499,10500,10501` | Save only these live presents. This overrides periodic capture and can collect multiple camera positions or adjacent frames in one run. |
+| `ECHORA_CAPTURE_ASYNC=file` | Append every presented frame from `ECHORA_CAPTURE_FROM` on to the file as a small RGBA8 thumbnail (`ECHORA_CAPTURE_ASYNC_SIZE=WxH`, default `320x180`), each after a 16-byte header: the present number (u64) and the width and height (u32, little-endian). The GPU copies each frame in order with its work and the bytes are written once it finishes, so no capture waits for the GPU. Use it to look for black or flickering frames that depend on timing; the PNG captures above wait for each frame. |
 | `ECHORA_GPU_DUMP=dir`, `ECHORA_GPU_DUMP_FROM=N` | Every 300th present, write each colour target as an image, starting at present N. |
 | `ECHORA_DRAW_LOG=file`, `ECHORA_DRAW_LOG_FROM=N` | Append a JSON line for every draw, with its targets, to the file, starting at present N. |
 

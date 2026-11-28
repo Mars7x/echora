@@ -156,6 +156,16 @@ fn main() {
                         "{key}: {} SPIR-V words; .DNZ: {fmul} FMUL as fmulz, {ffma} FFMA as ffmaz, {kept} with a select",
                         program.spirv.len()
                     );
+                    // SURVEY_SPV_DIR=DIR: also write the module as <key>.spv.
+                    if let Some(directory) = std::env::var_os("SURVEY_SPV_DIR") {
+                        let bytes: Vec<u8> = program
+                            .spirv
+                            .iter()
+                            .flat_map(|word| word.to_le_bytes())
+                            .collect();
+                        let path = std::path::Path::new(&directory).join(format!("{key}.spv"));
+                        std::fs::write(&path, bytes).expect("write SPIR-V");
+                    }
                 }
                 txq_inferred += program_needs.txq_views.0;
                 txq_fallback += program_needs.txq_views.1;

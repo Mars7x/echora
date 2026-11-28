@@ -4791,6 +4791,7 @@ impl Nvn {
         if self.gpu().is_some() {
             self.gpu_present_window(texture).map_err(stop)?;
             self.present_lap("stat: present us window", &mut since);
+            self.gpu_capture_thumbnail(texture).map_err(stop)?;
             // A frame's work is submitted by its present, windowed or
             // not: headless runs otherwise gathered hundreds of
             // frames into one GPU job, which the kernel's 10 s job

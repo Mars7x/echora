@@ -21,7 +21,22 @@ synthetic fixtures and runs without the game files.
   samples. In another live capture the same pixel chose the positive Z
   cubemap face in 16 successive samples, at mip levels 0.39–0.40. The
   cubemap returned more red than green each time. The final water color
-  still differs from the matching console footage. Six consecutive 1440p
+  still differs from the matching console footage. At present 10,400,
+  matched to console footage at 264.13 s, 128-pixel patches
+  aligned individually agreed within 2.1 display-luma levels where their
+  structure matched. Horizontal bands of the lower frame agreed within
+  about 3 levels, with Echora slightly bluer over the water. Tracing one
+  water pixel through all 1,123 passes found no step where fog, blending,
+  the packed HDR target, resolve, tone mapping or sRGB output shifts
+  brightness. The visible difference is in the surface itself. The console
+  shows warm reflected patches and broad refraction wobble, and Echora
+  shows white highlights and fine ripples. The water's ripple
+  simulation, a chain of three compute programs, was nearly flat:
+  0.8% of its 256×256 cells were nonzero, with velocities up to 0.0019.
+  Its flow map has no flow flags in the window around the camera.
+  Simulating the first program on the CPU from its dumped inputs
+  reproduced the GPU's output within half-float rounding (4.9×10⁻⁶).
+  The cause of the surface difference is still open. Six consecutive 1440p
   captures of the opening forest (presents
   10,496–10,501) showed no black frame. After compensating for camera
   motion, no matched 40×40-pixel patch on the four interior frames had a
@@ -61,6 +76,16 @@ synthetic fixtures and runs without the game files.
   At the matched pose the current foreground is still darker than the
   compressed console reference in several patches; these six frames do
   not establish that the reported flicker or lighting mismatch is fixed.
+  PNG captures wait for the GPU, which can hide timing-dependent flicker.
+  `ECHORA_CAPTURE_ASYNC` records every present as a thumbnail without
+  waiting. Native 1440p Radeon runs recorded presents 3,000–6,047 on the
+  saved route and 9,300–10,699 in the opening. Every black frame
+  belonged to a smooth fade: two in the saved route, lasting 11 and 79
+  presents, and one in the opening, lasting 334 presents. The console
+  footage has the same opening fade and about five seconds of black
+  (257–262 s). Across 4,448 frames, two 20-pixel thumbnail tiles changed
+  brightness by more than 20 levels relative to both motion-aligned
+  neighbors. The reported black frames have not been reproduced.
   Recomputing both images' display luma with the same BT.709 coefficients
   after expanding the reference's limited-range video gave median gaps of
   7.36 and 7.51 levels on an 8-bit scale at the foreground rock and center

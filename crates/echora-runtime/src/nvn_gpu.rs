@@ -477,6 +477,9 @@ pub struct Backend {
     probed: u32,
     /// Per-pixel last observations for ECHORA_GPU_PIXEL_WATCH.
     watched_pixels: PixelWatchHistory,
+    /// ECHORA_CAPTURE_ASYNC (debugging): (present, renderer read token) of
+    /// each presented frame's queued thumbnail, oldest first.
+    thumbnail_reads: VecDeque<(u64, u64)>,
     /// The window swapchain (ECHORA_WINDOW), once created; None after a
     /// failure, which is noted and not retried.
     presenter: Option<Result<Presenter, ()>>,
@@ -851,6 +854,7 @@ impl Backend {
             traced: 0,
             probed: 0,
             watched_pixels: PixelWatchHistory::default(),
+            thumbnail_reads: VecDeque::new(),
             presenter: None,
             textures: HashMap::default(),
             pending_texel_releases: Default::default(),
@@ -6455,6 +6459,72 @@ impl Nvn {
             .as_ref()
             .and_then(|backend| backend.presenter.as_ref())
             .is_some_and(Result::is_ok)
+    }
+
+    /// ECHORA_CAPTURE_ASYNC=<file> (debugging): every presented frame from
+    /// present ECHORA_CAPTURE_FROM on, scaled to ECHORA_CAPTURE_ASYNC_SIZE
+    /// (`WxH`, default 320x180) RGBA8, appended to the file as a 16-byte
+    /// header (present, width, height as little-endian u64, u32, u32) and
+    /// its texels. The GPU copies each frame in order with the frame's work
+    /// and the bytes are written once it has finished: unlike
+    /// ECHORA_CAPTURE_PRESENTS, nothing waits for the GPU, so frames that
+    /// depend on timing between the guest and the GPU are kept as shown.
+    pub(super) fn gpu_capture_thumbnail(&mut self, texture: u64) -> Result<(), String> {
+        let Some(path) = super::debug_var_os("ECHORA_CAPTURE_ASYNC") else {
+            return Ok(());
+        };
+        let (width, height) = super::debug_var("ECHORA_CAPTURE_ASYNC_SIZE")
+            .ok()
+            .and_then(|size| {
+                let (width, height) = size.split_once('x')?;
+                Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+            })
+            .filter(|&(width, height)| width > 0 && height > 0)
+            .unwrap_or((320, 180));
+        let from = super::debug_var("ECHORA_CAPTURE_FROM")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let present = self.presented_frames;
+        let backend = self.gpu.as_mut().unwrap();
+        if present >= from && backend.renderer.existing_target(texture).is_some() {
+            let token = backend
+                .renderer
+                .queue_thumbnail_read(texture, width, height)?;
+            backend.thumbnail_reads.push_back((present, token));
+        }
+        backend.renderer.poll_completed()?;
+        let tokens: Vec<u64> = backend
+            .thumbnail_reads
+            .iter()
+            .map(|&(_, token)| token)
+            .collect();
+        let mut reads = backend.renderer.take_reads(&tokens);
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("ECHORA_CAPTURE_ASYNC: {error}"))?;
+        // In present order: a later read may finish first only when an
+        // earlier one is still waiting, so stop at the first missing one.
+        while let Some(&(present, token)) = backend.thumbnail_reads.front() {
+            let Some(bytes) = reads.remove(&token) else {
+                break;
+            };
+            backend.thumbnail_reads.pop_front();
+            let mut header = Vec::with_capacity(16);
+            header.extend_from_slice(&present.to_le_bytes());
+            header.extend_from_slice(&width.to_le_bytes());
+            header.extend_from_slice(&height.to_le_bytes());
+            use std::io::Write;
+            file.write_all(&header)
+                .and_then(|()| file.write_all(&bytes))
+                .map_err(|error| format!("ECHORA_CAPTURE_ASYNC: {error}"))?;
+        }
+        Ok(())
     }
 
     pub(super) fn gpu_present_window(&mut self, texture: u64) -> Result<bool, String> {
