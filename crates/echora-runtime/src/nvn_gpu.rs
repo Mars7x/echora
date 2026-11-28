@@ -76,6 +76,7 @@ pub struct PageBuild {
     pools: HashMap<PagePool, (PoolShareVersion, bool)>,
     run_hints: std::cell::OnceCell<writer_ranges::PageRunHints>,
     shared_mapping: std::cell::OnceCell<Option<Vec<writer_ranges::SharedPages>>>,
+    file_page_index: std::cell::OnceCell<Option<Arc<writer_ranges::FilePageIndex>>>,
     /// Virtual write ranges projected through `shared_mapping`, kept with
     /// it (the forest's culling passes project the same ranges, ~870 file
     /// ranges each, every frame: their sorting was ~4% of the replay
@@ -593,13 +594,20 @@ struct SharedRange {
 /// projected again if its page table receives new entries.
 struct BoundedWrites {
     shared: Vec<SharedRange>,
+    indexed: Vec<IndexedWrites>,
     virtual_ranges: Vec<std::ops::Range<u64>>,
+}
+
+struct IndexedWrites {
+    index: Arc<writer_ranges::FilePageIndex>,
+    ranges: Vec<std::ops::Range<u64>>,
 }
 
 impl From<Vec<SharedRange>> for BoundedWrites {
     fn from(shared: Vec<SharedRange>) -> Self {
         Self {
             shared,
+            indexed: Vec::new(),
             virtual_ranges: Vec::new(),
         }
     }
@@ -889,6 +897,9 @@ impl Backend {
         self.page_table_wrote_after_signal = true;
         self.page_table_write_serial = serial;
         if let Some(mut writes) = bounded {
+            if !writes.indexed.is_empty() {
+                self.stat("stat: writes recorded with a file page index", 1);
+            }
             let done = self.renderer.completed_serial();
             self.discard_shared_writes_through(done);
             if serial > self.unbounded_write_serial
@@ -899,6 +910,19 @@ impl Backend {
                 {
                     if !writes.shared.is_empty() && previous.shared != writes.shared {
                         extend_shared_writes(&mut previous.shared, writes.shared);
+                    }
+                    for update in writes.indexed {
+                        if let Some(same) = previous
+                            .indexed
+                            .iter_mut()
+                            .find(|old| Arc::ptr_eq(&old.index, &update.index))
+                        {
+                            for range in update.ranges {
+                                add_range(&mut same.ranges, range);
+                            }
+                        } else {
+                            previous.indexed.push(update);
+                        }
                     }
                     for range in writes.virtual_ranges {
                         add_range(&mut previous.virtual_ranges, range);
@@ -1017,7 +1041,24 @@ impl Backend {
         built: &PageBuild,
         ranges: &[std::ops::Range<u64>],
     ) -> Option<Vec<SharedRange>> {
-        let mapping = built
+        let mapping = self.shared_page_mapping(built)?;
+        Some(
+            writer_ranges::project_writes(mapping, ranges, &self.projection_counts)?
+                .into_iter()
+                .map(|range| SharedRange {
+                    file: range.file,
+                    start: range.bytes.start,
+                    end: range.bytes.end,
+                })
+                .collect(),
+        )
+    }
+
+    fn shared_page_mapping<'a>(
+        &self,
+        built: &'a PageBuild,
+    ) -> Option<&'a [writer_ranges::SharedPages]> {
+        built
             .shared_mapping
             .get_or_init(|| {
                 use echora_shader_abi::{PAGE_SHIFT, PAGE_SIZE};
@@ -1041,17 +1082,7 @@ impl Backend {
                     imports,
                 )
             })
-            .as_ref()?;
-        Some(
-            writer_ranges::project_writes(mapping, ranges, &self.projection_counts)?
-                .into_iter()
-                .map(|range| SharedRange {
-                    file: range.file,
-                    start: range.bytes.start,
-                    end: range.bytes.end,
-                })
-                .collect(),
-        )
+            .as_deref()
     }
 
     fn discard_shared_writes_through(&mut self, serial: u64) {
@@ -1081,6 +1112,11 @@ impl Backend {
                     .shared
                     .get(first)
                     .is_some_and(|span| range.overlaps(*span))
+                    || written.indexed.iter().any(|writes| {
+                        writes
+                            .index
+                            .intersects(range.file, range.start..range.end, &writes.ranges)
+                    })
             })
             .map_or(minimum, |(serial, _)| *serial)
     }
@@ -9151,6 +9187,7 @@ impl Nvn {
                 pools: built_pools,
                 run_hints,
                 shared_mapping: std::cell::OnceCell::new(),
+                file_page_index: Default::default(),
                 projections: Default::default(),
             },
             modified.as_deref(),
@@ -10515,8 +10552,27 @@ impl Nvn {
             return None;
         }
         merge_ranges(&mut virtual_ranges);
+        let built = backend.page_build.as_ref()?;
+        let mapping = backend.shared_page_mapping(built)?;
+        if writer_ranges::FilePageIndex::benefits_from_lookup(mapping, &virtual_ranges)
+            && let Some(index) = built
+                .file_page_index
+                .get_or_init(|| writer_ranges::FilePageIndex::new(mapping).map(Arc::new))
+                .as_ref()
+        {
+            let indexed = vec![IndexedWrites {
+                index: index.clone(),
+                ranges: virtual_ranges.clone(),
+            }];
+            return Some(BoundedWrites {
+                shared: Vec::new(),
+                indexed,
+                virtual_ranges,
+            });
+        }
         Some(BoundedWrites {
             shared: backend.project_shared_writes(&virtual_ranges)?,
+            indexed: Vec::new(),
             virtual_ranges,
         })
     }
@@ -18564,6 +18620,7 @@ mod pool_tests {
                 pools: Default::default(),
                 run_hints: Default::default(),
                 shared_mapping: std::cell::OnceCell::from(mapping),
+                file_page_index: Default::default(),
                 projections: Default::default(),
             }
         };
@@ -18575,13 +18632,22 @@ mod pool_tests {
             start,
             end: start + 8,
         };
+        let original = backend.page_build.as_ref().unwrap();
+        let mapping = backend.shared_page_mapping(original).unwrap();
+        let index = Arc::new(super::writer_ranges::FilePageIndex::new(mapping).unwrap());
+        let ranges: Vec<_> = std::iter::once(initial..initial + page + 8).collect();
         backend.record_page_table_write(
             1,
             Some(super::BoundedWrites {
-                shared: vec![touches(0)],
-                virtual_ranges: std::iter::once(initial..initial + page + 8).collect(),
+                shared: Vec::new(),
+                indexed: vec![super::IndexedWrites {
+                    index,
+                    ranges: ranges.clone(),
+                }],
+                virtual_ranges: ranges,
             }),
         );
+        assert_eq!(backend.shared_write_serial(touches(0)), 1);
         let unchanged = backend
             .set_page_table((0, 1), entries(&[address, 0, 0]), None)
             .unwrap();
@@ -18614,6 +18680,7 @@ mod pool_tests {
             2,
             Some(super::BoundedWrites {
                 shared: vec![touches(64)],
+                indexed: Vec::new(),
                 virtual_ranges: std::iter::once(initial + page..initial + page + 128).collect(),
             }),
         );

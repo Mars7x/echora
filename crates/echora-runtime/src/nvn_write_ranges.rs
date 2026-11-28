@@ -26,6 +26,77 @@ pub struct FileRange {
     pub bytes: Range<u64>,
 }
 
+/// A page table snapshot indexed by backing file offsets. A file range can
+/// map to several virtual addresses, including aliases from other pools.
+pub(super) struct FilePageIndex(Vec<FilePageSpan>);
+
+struct FilePageSpan {
+    file: i32,
+    bytes: Range<u64>,
+    max_end: u64,
+    gpu_start: u64,
+}
+
+impl FilePageIndex {
+    /// Broad writes are expensive to expand and sort into file ranges.
+    /// Keep the forward projection for smaller writes and multi-range plans.
+    pub(super) fn benefits_from_lookup(mapping: &[SharedPages], writes: &[Range<u64>]) -> bool {
+        let [write] = writes else {
+            return false;
+        };
+        let first = mapping.partition_point(|span| span.max_gpu_end <= write.start);
+        let last = mapping.partition_point(|span| span.gpu.start < write.end);
+        last.saturating_sub(first) >= 512
+    }
+
+    pub(super) fn new(mapping: &[SharedPages]) -> Option<Self> {
+        let mut spans = Vec::with_capacity(mapping.len());
+        for span in mapping {
+            let end = span.offset.checked_add(span.gpu.end - span.gpu.start)?;
+            spans.push(FilePageSpan {
+                file: span.file,
+                bytes: span.offset..end,
+                max_end: 0,
+                gpu_start: span.gpu.start,
+            });
+        }
+        spans.sort_unstable_by_key(|span| (span.file, span.bytes.start));
+        let mut previous = None;
+        let mut max_end = 0;
+        for span in &mut spans {
+            if previous != Some(span.file) {
+                max_end = 0;
+                previous = Some(span.file);
+            }
+            max_end = max_end.max(span.bytes.end);
+            span.max_end = max_end;
+        }
+        Some(Self(spans))
+    }
+
+    /// Check whether any mapping of these file bytes overlaps the sorted,
+    /// disjoint virtual ranges the submission can write.
+    pub(super) fn intersects(&self, file: i32, bytes: Range<u64>, writes: &[Range<u64>]) -> bool {
+        let first = self
+            .0
+            .partition_point(|span| (span.file, span.max_end) <= (file, bytes.start));
+        self.0[first..]
+            .iter()
+            .take_while(|span| span.file == file && span.bytes.start < bytes.end)
+            .any(|span| {
+                let lo = bytes.start.max(span.bytes.start);
+                let hi = bytes.end.min(span.bytes.end);
+                if lo >= hi {
+                    return false;
+                }
+                let start = span.gpu_start + (lo - span.bytes.start);
+                let end = span.gpu_start + (hi - span.bytes.start);
+                let first = writes.partition_point(|write| write.end <= start);
+                writes.get(first).is_some_and(|write| write.start < end)
+            })
+    }
+}
+
 /// Length of the first run of holes or consecutive device pages in each
 /// block. A page-table patch only invalidates the blocks it touches.
 pub(super) struct PageRunHints(Vec<u16>);
@@ -419,6 +490,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn file_page_lookup_preserves_gaps_overlaps_and_aliases() {
+        let imports = vec![
+            ImportedSpan {
+                device: 400..480,
+                file: 1,
+                offset: 1000,
+            },
+            ImportedSpan {
+                device: 420..440,
+                file: 1,
+                offset: 1005,
+            },
+            ImportedSpan {
+                device: 800..860,
+                file: 1,
+                offset: 1010,
+            },
+            ImportedSpan {
+                device: 800..860,
+                file: 2,
+                offset: 1000,
+            },
+        ];
+        let mapping =
+            project_table(100, 20, &[400, 420, 440, 460, 0, 800, 820, 840], imports).unwrap();
+        let writes = [115..122, 141..145, 190..220, 230..247];
+        let expected = project_writes(&mapping, &writes, &Default::default()).unwrap();
+        let index = FilePageIndex::new(&mapping).unwrap();
+        for file in 0..=3 {
+            for start in 990..1090 {
+                for size in [1, 2, 8, 64] {
+                    let bytes = start..start + size;
+                    assert_eq!(
+                        index.intersects(file, bytes.clone(), &writes),
+                        expected.iter().any(|range| {
+                            range.file == file
+                                && range.bytes.start < bytes.end
+                                && bytes.start < range.bytes.end
+                        }),
+                        "file {file} range {bytes:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
