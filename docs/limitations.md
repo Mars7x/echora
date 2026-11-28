@@ -359,6 +359,15 @@ synthetic fixtures and runs without the game files.
 
 ## Performance
 
+- A 1440p saved-route profile attributed 26,734 of 81,875 Vulkan
+  submissions to replay input dependencies and 13,225 to early submissions
+  after writes that a CPU consumer might need. Letting sync polls use known
+  fence results while threaded replay is active reduced locked sync calls
+  from 9,245 to 9,004 in one matched pair. The outdoor averages were 8.69
+  and 8.85 FPS, while the median 100-present interval was 7.94 FPS in both.
+  The candidate issued more draws and submissions. Both runs reached
+  present 6,032 with intact cloned saves and no kernel graphics errors.
+
 - A targeted Radeon timestamp run at 1440p measured both source cubemaps
   and the subsequent ambient cubemap update during the opening. Across
   199 frames with a complete set of output-face timestamps, the combined

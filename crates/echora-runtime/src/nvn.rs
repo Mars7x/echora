@@ -2458,9 +2458,7 @@ impl Recorder {
         call: RecordedCall<'_>,
         core: &mut Guest,
     ) -> Result<bool, Trap> {
-        if matches!(name, "nvnSyncWait" | "nvnEventGetValue")
-            && read_shared(&self.registry).replay_pending
-        {
+        if name == "nvnEventGetValue" && read_shared(&self.registry).replay_pending {
             return Ok(false);
         }
         // A zero-timeout poll of a sync no fence has signaled yet times out
@@ -2470,6 +2468,11 @@ impl Recorder {
         if matches!(call, RecordedCall::SyncWait) {
             let x = core.cpu.regs;
             let registry = read_shared(&self.registry);
+            // Inline replay advances on locked calls. The replay worker
+            // can advance independently while a poll uses a published result.
+            if registry.replay_pending && !Nvn::replay_thread() {
+                return Ok(false);
+            }
             if x[1] == 0 && registry.unsignaled.contains(&x[0]) {
                 drop(registry);
                 call_watch(name, core);
@@ -11012,6 +11015,49 @@ mod tests {
         core.cpu.regs[..args.len()].copy_from_slice(args);
         assert!(nvn.call(name, core).unwrap(), "{name} is not implemented");
         core.cpu.regs[0]
+    }
+
+    #[test]
+    fn sync_polls_can_return_while_an_independent_replay_is_pending() {
+        if !Nvn::replay_thread() {
+            return;
+        }
+        let mut nvn = Nvn::default();
+        let mut memory = Memory::new(1 << 39);
+        let mut cpu = Cpu::default();
+        let mut guest = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let recorder = nvn.recorder();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let unfenced = 0x1000;
+        let finished = 0x2000;
+        let in_flight = 0x3000;
+        for sync in [unfenced, finished, in_flight] {
+            nvn.initialize(sync, "Sync", BTreeMap::new()).unwrap();
+        }
+        {
+            let mut registry = write_shared(&nvn.registry);
+            registry.replay_pending = true;
+            registry.completed = Some(completed);
+            registry.unsignaled.insert(unfenced);
+            registry.signaled.extend([(finished, 5), (in_flight, 6)]);
+        }
+        for (sync, timeout, result) in [(unfenced, 0, 2), (finished, 0, 0), (finished, u64::MAX, 0)]
+        {
+            guest.cpu.regs[..2].copy_from_slice(&[sync, timeout]);
+            assert!(recorder.front("nvnSyncWait", &mut guest).unwrap());
+            assert_eq!(guest.cpu.regs[0], result);
+        }
+        for (sync, timeout) in [(unfenced, 1000), (in_flight, 0), (in_flight, u64::MAX)] {
+            guest.cpu.regs[..2].copy_from_slice(&[sync, timeout]);
+            assert!(!recorder.front("nvnSyncWait", &mut guest).unwrap());
+        }
+        write_shared(&nvn.registry).resolve_pending = true;
+        guest.cpu.regs[..2].copy_from_slice(&[finished, 0]);
+        assert!(!recorder.front("nvnSyncWait", &mut guest).unwrap());
     }
 
     #[test]
