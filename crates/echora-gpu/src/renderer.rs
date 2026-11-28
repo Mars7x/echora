@@ -7510,8 +7510,8 @@ impl Renderer {
         self.copy_target_level((from, 0, 0), source, (to, 0, 0), destination)
     }
 
-    /// Copy between selected mip levels and layers, with rectangles in
-    /// their guest texel grids.
+    /// Copy between selected mip levels and array layers or volume slices,
+    /// with rectangles in their guest texel grids.
     pub fn copy_target_level(
         &mut self,
         from: (u64, u32, u32),
@@ -7533,16 +7533,23 @@ impl Renderer {
         if (from, source_level, source_layer) == (to, destination_level, destination_layer) {
             return Err("copy within one render target subresource".into());
         }
-        let bounds = |key, level, layer| -> Result<[i32; 4], String> {
+        let plane_bounds = |key: u64, level: u32, plane: u32| -> Result<_, String> {
             let target = self.targets.get(&key).ok_or("no such copy target")?;
-            if level >= target.levels || layer >= target.shape.layers() {
-                return Err("texture copy layer or mip level is outside the render target".into());
+            if level >= target.levels {
+                return Err("texture copy mip level is outside the render target".into());
             }
+            let (layer, z) = match target.shape {
+                ImageShape::D3 { depth } if plane < (depth >> level).max(1) => (0, plane as i32),
+                shape if plane < shape.layers() => (plane, 0),
+                _ => return Err("texture copy plane is outside the render target".into()),
+            };
             let (width, height) = target.extent(level);
-            Ok([0, 0, width as i32, height as i32])
+            Ok(([0, 0, width as i32, height as i32], layer, z))
         };
-        let source_bounds = bounds(from, source_level, source_layer)?;
-        let destination_bounds = bounds(to, destination_level, destination_layer)?;
+        let (source_bounds, source_layer, source_z) =
+            plane_bounds(from, source_level, source_layer)?;
+        let (destination_bounds, destination_layer, destination_z) =
+            plane_bounds(to, destination_level, destination_layer)?;
         let source = clip(self.targets[&from].scaled(source), source_bounds);
         let destination = clip(self.targets[&to].scaled(destination), destination_bounds);
         if source[2] <= 0 || source[3] <= 0 || destination[2] <= 0 || destination[3] <= 0 {
@@ -7552,24 +7559,18 @@ impl Renderer {
         self.transition(to, vk::ImageLayout::GENERAL)?;
         let commands = self.commands()?;
         let (source_target, destination_target) = (&self.targets[&from], &self.targets[&to]);
-        if (matches!(source_target.shape, ImageShape::D3 { .. })
-            || matches!(destination_target.shape, ImageShape::D3 { .. }))
-            && (source_layer != 0 || destination_layer != 0)
-        {
-            return Err("texture copy between an array layer and volume".into());
-        }
         if aspect(source_target.format) != aspect(destination_target.format)
             || (is_depth(source_target.format) && source_target.format != destination_target.format)
         {
             return Err("texture copy between incompatible depth or stencil formats".into());
         }
-        let corners = |[x, y, width, height]: [i32; 4]| {
+        let corners = |[x, y, width, height]: [i32; 4], z| {
             [
-                vk::Offset3D { x, y, z: 0 },
+                vk::Offset3D { x, y, z },
                 vk::Offset3D {
                     x: x + width,
                     y: y + height,
-                    z: 1,
+                    z: z + 1,
                 },
             ]
         };
@@ -7587,6 +7588,20 @@ impl Renderer {
             && is_2d(destination_target.shape)
             && source[2..] == destination[2..]
             && output_filter.is_none();
+        // A slice uses a Z offset for a 3D image and a base array layer
+        // for a 2D array. Vulkan supports both in a direct, unscaled copy.
+        let volume = matches!(source_target.shape, ImageShape::D3 { .. })
+            || matches!(destination_target.shape, ImageShape::D3 { .. });
+        let exact_volume_copy = volume
+            && !matches!(source_target.shape, ImageShape::D1 { .. })
+            && !matches!(destination_target.shape, ImageShape::D1 { .. })
+            && source_target.format == destination_target.format
+            && single_plane_bytes(source_target.format) != 0
+            && source[2..] == destination[2..]
+            && output_filter.is_none();
+        if volume && !exact_volume_copy && (source_layer != 0 || destination_layer != 0) {
+            return Err("blit between a volume and a nonzero array layer".into());
+        }
         let filter = output_filter.unwrap_or_else(|| {
             if is_depth(source_target.format)
                 || integer_format(source_target.format)
@@ -7649,18 +7664,18 @@ impl Renderer {
                 &before,
             );
             let aspects = transfer_aspects(aspect(source_target.format));
-            if exact_depth_copy {
+            if exact_depth_copy || exact_volume_copy {
                 let regions: Vec<_> = aspects
                     .map(|aspect_mask| {
                         vk::ImageCopy::default()
                             .src_subresource(subresource(aspect_mask, source_level, source_layer))
-                            .src_offset(corners(source)[0])
+                            .src_offset(corners(source, source_z)[0])
                             .dst_subresource(subresource(
                                 aspect_mask,
                                 destination_level,
                                 destination_layer,
                             ))
-                            .dst_offset(corners(destination)[0])
+                            .dst_offset(corners(destination, destination_z)[0])
                             .extent(vk::Extent3D {
                                 width: source[2] as u32,
                                 height: source[3] as u32,
@@ -7681,13 +7696,13 @@ impl Renderer {
                     .map(|aspect_mask| {
                         vk::ImageBlit::default()
                             .src_subresource(subresource(aspect_mask, source_level, source_layer))
-                            .src_offsets(corners(source))
+                            .src_offsets(corners(source, source_z))
                             .dst_subresource(subresource(
                                 aspect_mask,
                                 destination_level,
                                 destination_layer,
                             ))
-                            .dst_offsets(corners(destination))
+                            .dst_offsets(corners(destination, destination_z))
                     })
                     .collect();
                 device.cmd_blit_image(
@@ -11446,6 +11461,68 @@ mod tests {
         renderer.volume_as_layers(1, 2, 4, 4, 2, format).unwrap();
         renderer.volume_as_layers(1, 2, 4, 4, 2, format).unwrap();
         assert_eq!(renderer.read_target_bytes(2, 4).unwrap(), vec![0; 64]);
+    }
+
+    #[test]
+    fn copies_between_volume_slices_and_array_layers_use_the_requested_planes() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        for (key, shape) in [
+            (1, ImageShape::D3 { depth: 4 }),
+            (2, ImageShape::D2 { layers: 2 }),
+        ] {
+            renderer.shaped_target(key, 4, 4, shape, format, 1).unwrap();
+            renderer.zero_target(key).unwrap();
+        }
+        let rectangle = [0, 0, 4, 4];
+        let texel = [15, 88, 122, 255];
+        let filled_plane = texel.repeat(16);
+        renderer
+            .write_target_plane_bytes(1, (0, 1), [0, 0, 4, 4], &filled_plane)
+            .unwrap();
+
+        for (source, destination) in [
+            ((1, 0, 1), (1, 0, 2)),
+            ((1, 0, 2), (2, 0, 1)),
+            ((2, 0, 1), (1, 0, 0)),
+        ] {
+            renderer
+                .copy_target_level(source, rectangle, destination, rectangle)
+                .unwrap();
+        }
+        for (key, plane) in [(1, 0), (1, 1), (1, 2), (2, 1)] {
+            assert_eq!(
+                renderer
+                    .read_target_plane_bytes(key, 0, plane, 4, [0, 0, 4, 4])
+                    .unwrap(),
+                filled_plane
+            );
+        }
+        assert_eq!(
+            renderer
+                .read_target_plane_bytes(2, 0, 0, 4, [0, 0, 4, 4])
+                .unwrap(),
+            [0; 64]
+        );
+
+        renderer
+            .copy_target_level((1, 0, 2), rectangle, (1, 0, 3), [0, 0, 2, 2])
+            .unwrap();
+        let scaled = renderer
+            .read_target_plane_bytes(1, 0, 3, 4, [0, 0, 4, 4])
+            .unwrap();
+        for (index, pixel) in scaled.chunks_exact(4).enumerate() {
+            assert_eq!(
+                pixel,
+                if index / 4 < 2 && index % 4 < 2 {
+                    texel
+                } else {
+                    [0; 4]
+                }
+            );
+        }
     }
 
     #[test]
