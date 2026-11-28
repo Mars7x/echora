@@ -1301,7 +1301,7 @@ impl Backend {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GraphicsProgramKey {
     stages: [usize; 3],
-    // The fetch ABI encodes vertex formats in bits 0 through 12.
+    // Format and alignment for each vertex input.
     vertex_formats: [u16; 32],
     traced: bool,
 }
@@ -11211,11 +11211,17 @@ impl Nvn {
         &mut self,
         program: &BoundProgram,
         typed_stages: Option<&[Arc<Translated>]>,
+        vertex_fetch: &[echora_shader_abi::VertexAttribute],
     ) -> Result<(GraphicsProgramKey, GraphicsProgramKey), String> {
         let keys = program.keys;
         // The translation identity includes the vertex input types, mesh
         // control state and any outputs the previous stage provides.
         let mut built = program.pipeline;
+        for (format, source) in built.vertex_formats.iter_mut().zip(vertex_fetch) {
+            if *format != 0 && u32::from(*format) == source.format && source.aligned_components() {
+                *format |= echora_shader_abi::VERTEX_FORMAT_ALIGNED;
+            }
+        }
         if let Some(stages) = typed_stages {
             for (identity, stage) in built.stages.iter_mut().zip(stages) {
                 *identity = Arc::as_ptr(stage) as usize;
@@ -11981,7 +11987,6 @@ impl Nvn {
             stage_variants,
         )?;
         let variants = (!stage_variants.is_empty()).then_some(stage_variants.as_slice());
-        let (built, traced_variant) = self.ensure_graphics_program(&program, variants)?;
         let stages = variants.unwrap_or(&program.stages);
 
         let tail_started = timing.then(std::time::Instant::now);
@@ -12160,6 +12165,8 @@ impl Nvn {
                 format: vk_format,
             });
         }
+        let (built, traced_variant) =
+            self.ensure_graphics_program(&program, variants, &vertex_fetch)?;
         // The draw itself (a mesh pipeline's output is triangles).
         let mode = if mesh_draw { 4 } else { command.x[1] };
         // Quads (mode 7, GL order): drawn as two triangles each.

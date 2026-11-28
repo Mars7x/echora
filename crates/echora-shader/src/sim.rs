@@ -9290,11 +9290,11 @@ mod tests {
 
     #[test]
     fn vertex_pulling_decodes_every_format_as_the_abi_defines() {
-        use echora_shader_abi::VERTEX_FORMAT_SPEC_BASE;
         use echora_shader_abi::{
             PAGE_SHIFT, PUSH_PAGE_TABLE_OFFSET, PUSH_VERTEX_FETCH_OFFSET, Stage, VertexAttribute,
             VertexFormat, VertexLayout as L, VertexNumeric as N,
         };
+        use echora_shader_abi::{VERTEX_FORMAT_ALIGNED, VERTEX_FORMAT_SPEC_BASE};
         // ALD R0..R3, a[0x80]: location 0's four words.
         let ald = word(&[
             (0, 12, 0x321),
@@ -9310,19 +9310,18 @@ mod tests {
             ..Layout::workgroup([1, 1, 1])
         };
         let (translated, registers, _) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(crate::spirv::tests::validate(&translated.spirv), None);
         let machine = Machine::new(&translated.spirv);
-        // Guest page 0x10 (vertex data) at device 0x3000_0000; the page
-        // table at 0x2000_0000; the attribute table at 0x4000_0000.
+        // Consecutive guest pages are mapped to separate device regions.
         let (page_table, page, table) = (0x2000_0000u64, 0x3000_0000u64, 0x4000_0000u64);
+        let next_page = page + 0x20000;
         let guest = 0x10u64 << PAGE_SHIFT;
-        let data: Vec<u8> = (0..4096u32)
+        let data: Vec<u8> = (0..8192u32)
             .map(|n| (n.wrapping_mul(0x9e) ^ n >> 3) as u8)
             .collect();
         let stride = 24u32;
         let vertex = 5u32;
         // The CPU decode of the ABI's rules.
-        let element = &data[(vertex * stride) as usize..];
-        let word_at = |at: usize| u32::from_le_bytes(element[at..at + 4].try_into().unwrap());
         let half = |bits: u32| f16_to_f32(bits as u16);
         let small = |raw: u32, mantissa: u32| -> f32 {
             let (e, m) = (raw >> mantissa, raw & ((1 << mantissa) - 1));
@@ -9332,7 +9331,8 @@ mod tests {
                 _ => f32::from_bits((e + 112) << 23 | m << (23 - mantissa)),
             }
         };
-        let expected = |format: VertexFormat| -> [u32; 4] {
+        let expected = |format: VertexFormat, element: &[u8]| -> [u32; 4] {
+            let word_at = |at: usize| u32::from_le_bytes(element[at..at + 4].try_into().unwrap());
             let integer = format.integer();
             let mut out = [0, 0, 0, if integer { 1 } else { 1.0f32.to_bits() }];
             for c in 0..format.components as usize {
@@ -9405,7 +9405,7 @@ mod tests {
                 numeric,
                 bgra,
             };
-            let attribute = VertexAttribute {
+            let mut attribute = VertexAttribute {
                 address: guest,
                 stride,
                 divisor: 0,
@@ -9420,36 +9420,64 @@ mod tests {
             let at = PUSH_PAGE_TABLE_OFFSET as usize;
             push[at..at + 8].copy_from_slice(&page_table.to_le_bytes());
             push[at + 8..at + 12].copy_from_slice(&0x10u32.to_le_bytes());
-            push[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+            push[at + 12..at + 16].copy_from_slice(&2u32.to_le_bytes());
             let mut inputs = Inputs {
                 workgroup_count: [1, 1, 1],
                 push,
                 builtins: HashMap::from([(42, vec![u64::from(vertex)]), (43, vec![0])]),
                 memory: BTreeMap::from([
-                    (page_table, page.to_le_bytes().to_vec()),
-                    (page, data.clone()),
+                    (page_table, [page, next_page].map(u64::to_le_bytes).concat()),
+                    (page, data[..4096].to_vec()),
+                    (next_page, data[4096..].to_vec()),
                     (table, attribute.to_bytes().to_vec()),
                 ]),
                 ..Inputs::default()
             };
-            for preferred in [0, format.encode()] {
+            let original = (vertex * stride) as usize;
+            let both = [page, next_page];
+            for (at, pages, stream_stride) in [
+                (original, both, stride),
+                (original + 1, both, stride),
+                (original + 3, both, stride),
+                (original + 3, both, stride - 1),
+                (4092, both, stride),
+                (4093, both, stride),
+                (4094, both, stride),
+                (4093, [page, 0], stride),
+                (4093, [0, next_page], stride),
+            ] {
+                attribute.stride = stream_stride;
+                attribute.address = guest + (at - (vertex * stream_stride) as usize) as u64;
+                inputs.memory.insert(table, attribute.to_bytes().to_vec());
                 inputs
-                    .specialization
-                    .insert(VERTEX_FORMAT_SPEC_BASE, preferred);
-                let report = machine.simulate(&inputs);
-                assert!(
-                    report.problems.is_empty(),
-                    "{format:?}: {:?}",
-                    report.problems
-                );
-                let got: Vec<u32> = (0..4u8)
-                    .map(|n| report.invocations[0][&registers[&n]][0] as u32)
-                    .collect();
-                assert_eq!(
-                    got,
-                    expected(format),
-                    "{format:?} specialization {preferred}"
-                );
+                    .memory
+                    .insert(page_table, pages.map(u64::to_le_bytes).concat());
+                let element: [u8; 16] = std::array::from_fn(|i| {
+                    let pos = at + i;
+                    if pages[pos / 4096] == 0 { 0 } else { data[pos] }
+                });
+                let specialized = attribute
+                    .aligned_components()
+                    .then_some(format.encode() | u32::from(VERTEX_FORMAT_ALIGNED));
+                for preferred in [0, format.encode()].into_iter().chain(specialized) {
+                    inputs
+                        .specialization
+                        .insert(VERTEX_FORMAT_SPEC_BASE, preferred);
+                    let report = machine.simulate(&inputs);
+                    assert!(
+                        report.problems.is_empty(),
+                        "{format:?} at {at}: {:?}",
+                        report.problems
+                    );
+                    let got: Vec<u32> = (0..4u8)
+                        .map(|n| report.invocations[0][&registers[&n]][0] as u32)
+                        .collect();
+                    assert_eq!(
+                        got,
+                        expected(format, &element),
+                        "{format:?} at {at} with pages {pages:x?}, specialization {preferred}"
+                    );
+                }
             }
             inputs
                 .memory
@@ -9492,7 +9520,7 @@ mod tests {
             builtins: HashMap::from([(42, vec![9]), (43, vec![7])]),
             memory: BTreeMap::from([
                 (page_table, page.to_le_bytes().to_vec()),
-                (page, data.clone()),
+                (page, data[..4096].to_vec()),
                 (table, attribute.to_bytes().to_vec()),
             ]),
             ..Inputs::default()

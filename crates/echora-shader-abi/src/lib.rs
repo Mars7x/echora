@@ -440,6 +440,9 @@ pub const TEXTURE_POOL_CAPACITY_SPEC_ID: u32 = 31;
 pub const INTEGER_FORMAT_SPEC_BASE: u32 = 32;
 /// The first specialization constant id for vertex formats, followed by the other locations.
 pub const VERTEX_FORMAT_SPEC_BASE: u32 = 0x1_0000;
+/// The vertex format specialization can omit cross-word loads when the
+/// stream address and stride are multiples of the component alignment.
+pub const VERTEX_FORMAT_ALIGNED: u16 = 1 << 13;
 pub const TEXTURE_INDEX_MASK: u32 = 0xf_ffff;
 pub const SAMPLER_INDEX_SHIFT: u32 = 20;
 /// Entries per texture array, which the renderer gives programs as
@@ -554,6 +557,18 @@ pub struct VertexAttribute {
     /// Bytes readable from `address` (the bound stream's size past it).
     pub size: u32,
     pub reserved: [u32; 2],
+}
+
+impl VertexAttribute {
+    pub fn aligned_components(&self) -> bool {
+        let alignment = match (self.format >> 4) & 0xf {
+            0 => 1,
+            1 => 2,
+            2..=4 => 4,
+            _ => return false,
+        };
+        (self.address | u64::from(self.stride)).is_multiple_of(alignment)
+    }
 }
 
 /// How the bytes of one vertex element decode. Encoded as bits 0..3

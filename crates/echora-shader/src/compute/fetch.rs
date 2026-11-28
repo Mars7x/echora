@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 
 use echora_shader_abi::{
-    PUSH_VERTEX_FETCH, SpecConstant, SpecMeaning, Stage, Unsupported, VERTEX_FORMAT_SPEC_BASE,
+    PAGE_SIZE, PUSH_VERTEX_FETCH, SpecConstant, SpecMeaning, Stage, Unsupported,
+    VERTEX_FORMAT_ALIGNED, VERTEX_FORMAT_SPEC_BASE,
 };
 
 use super::{Emitter, unsupported};
@@ -183,6 +184,9 @@ impl Emitter {
                 let known = e.value(op::I_NOT_EQUAL, e.bool, &[preferred_format, zero]);
                 let format = e.pick(known, preferred_format, format);
                 let components = e.value(op::BITWISE_AND, e.u32, &[format, seven]);
+                let flag = e.constant(u32::from(VERTEX_FORMAT_ALIGNED));
+                let alignment = e.value(op::BITWISE_AND, e.u32, &[preferred_format, flag]);
+                let aligned_components = e.value(op::I_NOT_EQUAL, e.bool, &[alignment, zero]);
                 let decoded = e.decode_element(
                     address,
                     stride,
@@ -191,6 +195,7 @@ impl Emitter {
                     size,
                     components,
                     base_instance,
+                    aligned_components,
                 );
                 e.function.emit(op::STORE, &[result, decoded]);
                 Ok(())
@@ -199,11 +204,36 @@ impl Emitter {
         self.value(op::LOAD, uvec4, &[result])
     }
 
-    /// The word at guest address `va` (4-aligned), or 0 where `condition`
-    /// fails or the page is unmapped.
-    fn guest_word(&mut self, va: u32, condition: u32) -> u32 {
+    /// The device address of the guest page, or zero if it cannot be read.
+    fn vertex_page(&mut self, address: u32, needed: Option<u32>) -> u32 {
+        let u64 = self.u64();
+        let pointer = self.module.pointer(storage::FUNCTION, u64);
+        let zero = self.constant64(0);
+        let result = self
+            .function
+            .variable(&mut self.module, pointer, Some(zero));
+        let _ = self.mapped(address, needed, |e, device| {
+            e.function.emit(op::STORE, &[result, device]);
+            Ok(())
+        });
+        self.value(op::LOAD, u64, &[result])
+    }
+
+    /// Read an aligned word within or just after an element's first page.
+    fn vertex_word(&mut self, pages: [u32; 2], offset: u32, wanted: u32) -> u32 {
+        let u64 = self.u64();
+        let page_size = self.constant(PAGE_SIZE as u32);
+        let mask = self.constant(PAGE_SIZE as u32 - 1);
+        let second = self.value(op::U_GREATER_THAN_EQUAL, self.bool, &[offset, page_size]);
+        let page = self.value(op::SELECT, u64, &[second, pages[1], pages[0]]);
+        let zero = self.constant64(0);
+        let mapped = self.value(op::I_NOT_EQUAL, self.bool, &[page, zero]);
+        let readable = self.value(op::LOGICAL_AND, self.bool, &[wanted, mapped]);
         let result = self.result_variables(1)[0];
-        let _ = self.mapped(va, Some(condition), |e, device| {
+        let _ = self.when(readable, |e| {
+            let within = e.value(op::BITWISE_AND, e.u32, &[offset, mask]);
+            let within = e.widen(within, false);
+            let device = e.value(op::I_ADD, u64, &[page, within]);
             let pointer = e.module.pointer(storage::PHYSICAL_STORAGE_BUFFER, e.u32);
             let pointer = e.value(op::CONVERT_U_TO_PTR, pointer, &[device]);
             let word = e.value(op::LOAD, e.u32, &[pointer, ALIGNED, 4]);
@@ -211,6 +241,45 @@ impl Emitter {
             Ok(())
         });
         self.value(op::LOAD, self.u32, &[result])
+    }
+
+    /// Read up to four bytes starting at a vertex component's address.
+    /// A component can straddle two words in either resolved guest page.
+    fn component_word(
+        &mut self,
+        pages: [u32; 2],
+        offset: u32,
+        bytes: u32,
+        wanted: u32,
+        aligned_components: u32,
+    ) -> u32 {
+        let not_three = self.constant(!3);
+        let aligned = self.value(op::BITWISE_AND, self.u32, &[offset, not_three]);
+        let three = self.constant(3);
+        let four = self.constant(4);
+        let full_word = self.value(op::I_EQUAL, self.bool, &[bytes, four]);
+        let aligned_word = self.value(op::LOGICAL_AND, self.bool, &[aligned_components, full_word]);
+        let lane = self.value(op::BITWISE_AND, self.u32, &[offset, three]);
+        let zero = self.constant(0);
+        let lane = self.pick(aligned_word, zero, lane);
+        let end = self.value(op::I_ADD, self.u32, &[lane, bytes]);
+        let crosses = self.value(op::U_GREATER_THAN, self.bool, &[end, four]);
+        let can_cross = self.value(op::LOGICAL_NOT, self.bool, &[aligned_components]);
+        let crosses = self.value(op::LOGICAL_AND, self.bool, &[can_cross, crosses]);
+        let read_next = self.value(op::LOGICAL_AND, self.bool, &[wanted, crosses]);
+        let next = self.value(op::I_ADD, self.u32, &[aligned, four]);
+        let head = self.vertex_word(pages, aligned, wanted);
+        let tail = self.vertex_word(pages, next, read_next);
+        let eight = self.constant(8);
+        let shift = self.value(op::I_MUL, self.u32, &[lane, eight]);
+        let head = self.value(op::SHIFT_RIGHT_LOGICAL, self.u32, &[head, shift]);
+        // Mask the shift for lane 0. The second word is zero in that case.
+        let thirty_two = self.constant(32);
+        let complement = self.value(op::I_SUB, self.u32, &[thirty_two, shift]);
+        let mask = self.constant(31);
+        let complement = self.value(op::BITWISE_AND, self.u32, &[complement, mask]);
+        let tail = self.value(op::SHIFT_LEFT_LOGICAL, self.u32, &[tail, complement]);
+        self.value(op::BITWISE_OR, self.u32, &[head, tail])
     }
 
     /// `a == b` for u32 values, `b` a constant.
@@ -234,6 +303,7 @@ impl Emitter {
         size: u32,
         components: u32,
         base_instance: u32,
+        aligned_components: u32,
     ) -> u32 {
         let u64 = self.u64();
         let (four, eight, fifteen) = (self.constant(4), self.constant(8), self.constant(15));
@@ -270,6 +340,23 @@ impl Emitter {
         let (c1, c2, c4) = (self.constant(1), self.constant(2), self.constant(4));
         let bytes = self.pick(is16, c2, c4);
         let bytes = self.pick(is8, c1, bytes);
+        // Every element fits in at most two guest pages. Keep both device
+        // addresses for its components instead of re-reading the page table.
+        let mask = self.constant64(!(PAGE_SIZE - 1));
+        let page = self.value(op::BITWISE_AND, u64, &[base, mask]);
+        let in_page = self.value(op::I_SUB, u64, &[base, page]);
+        let in_page = self.value(op::U_CONVERT, self.u32, &[in_page]);
+        let length = self.value(op::I_MUL, self.u32, &[components, bytes]);
+        let length = self.pick(packed, c4, length);
+        let limit = self.value(op::I_ADD, self.u32, &[in_page, length]);
+        let page_size = self.constant(PAGE_SIZE as u32);
+        let two_pages = self.value(op::U_GREATER_THAN, self.bool, &[limit, page_size]);
+        let next = self.constant64(PAGE_SIZE);
+        let next = self.value(op::I_ADD, u64, &[page, next]);
+        let pages = [
+            self.vertex_page(page, None),
+            self.vertex_page(next, Some(two_pages)),
+        ];
         let integer = {
             let uint = self.equals(numeric, UINT);
             let sint = self.equals(numeric, SINT);
@@ -289,7 +376,7 @@ impl Emitter {
             let offset = self.value(op::I_MUL, self.u32, &[index, bytes]);
             let offset = self.pick(packed, zero, offset);
             let offset64 = self.widen(offset, false);
-            let va = self.value(op::I_ADD, u64, &[base, offset64]);
+            let position = self.value(op::I_ADD, self.u32, &[in_page, offset]);
             // Inside the stream: the component's last byte below `size`.
             let read = self.pick(packed, c4, bytes);
             let read64 = self.widen(read, false);
@@ -298,17 +385,11 @@ impl Emitter {
             let inside = self.value(op::U_LESS_THAN_EQUAL, self.bool, &[end, size]);
             let present = self.value(op::U_LESS_THAN, self.bool, &[index, components]);
             let wanted = self.value(op::LOGICAL_AND, self.bool, &[inside, present]);
-            let not_three = self.constant64(!3);
-            let aligned = self.value(op::BITWISE_AND, u64, &[va, not_three]);
-            let word = self.guest_word(aligned, wanted);
-            let low = self.value(op::U_CONVERT, self.u32, &[va]);
-            let three = self.constant(3);
-            let lane = self.value(op::BITWISE_AND, self.u32, &[low, three]);
-            let byte_shift = self.value(op::I_MUL, self.u32, &[lane, eight]);
+            let word = self.component_word(pages, position, read, wanted, aligned_components);
             let shift_a = self.constant(packed_shift);
             let shift_b = self.constant(packed_shift_b);
             let packed_shift = self.pick(is111110, shift_b, shift_a);
-            let shift = self.pick(packed, packed_shift, byte_shift);
+            let shift = self.pick(packed, packed_shift, zero);
             let bits_a = self.constant(packed_bits_a);
             let bits_b = self.constant(packed_bits_b);
             let packed_bits = self.pick(is111110, bits_b, bits_a);

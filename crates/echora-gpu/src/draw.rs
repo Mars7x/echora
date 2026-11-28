@@ -2554,6 +2554,24 @@ pub(crate) mod tests {
         draw.indices = saved_indices;
         draw.blends = &blend;
 
+        let keep_destination = (
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+        );
+        let masked = [Blend {
+            enable: true,
+            color: keep_destination,
+            alpha: keep_destination,
+            write_mask: vk::ColorComponentFlags::G,
+        }];
+        let add = (vk::BlendFactor::ONE, vk::BlendFactor::ONE, vk::BlendOp::ADD);
+        let additive = [Blend {
+            enable: true,
+            color: add,
+            alpha: add,
+            ..Blend::default()
+        }];
         if renderer.gpu.logic_op {
             renderer
                 .clear_color(
@@ -2564,29 +2582,11 @@ pub(crate) mod tests {
                     },
                 )
                 .unwrap();
-            let keep_destination = (
-                vk::BlendFactor::ZERO,
-                vk::BlendFactor::ONE,
-                vk::BlendOp::ADD,
-            );
-            let masked = [Blend {
-                enable: true,
-                color: keep_destination,
-                alpha: keep_destination,
-                write_mask: vk::ColorComponentFlags::G,
-            }];
             draw.fixed.logic_op = Some(vk::LogicOp::XOR);
             draw.fixed.scissor = [0, 0, 1, 4];
             draw.blends = &masked;
             renderer.draw(&draw).unwrap();
 
-            let add = (vk::BlendFactor::ONE, vk::BlendFactor::ONE, vk::BlendOp::ADD);
-            let additive = [Blend {
-                enable: true,
-                color: add,
-                alpha: add,
-                ..Blend::default()
-            }];
             draw.fixed.logic_op = None;
             draw.fixed.scissor = [1, 0, 1, 4];
             draw.uniforms = &red;
@@ -2601,8 +2601,148 @@ pub(crate) mod tests {
             );
         }
 
+        draw.blends = &blend;
+        draw.uniforms = &blue;
+        if renderer.gpu.buffer_device_address {
+            verify_pulled_vertex_positions(&mut renderer, draw);
+        }
         renderer.destroy_program(partial).unwrap();
         renderer.destroy_program(alternate).unwrap();
+        renderer.destroy_program(program).unwrap();
+    }
+
+    fn verify_pulled_vertex_positions(renderer: &mut Renderer, draw: Draw<'_>) {
+        use echora_shader::compute::Layout;
+        use echora_shader::decode::{Instruction, Op, Pred, Reg};
+        use echora_shader_abi::{
+            PAGE_SHIFT, PAGE_SIZE, VERTEX_FORMAT_ALIGNED, VERTEX_FORMAT_SPEC_BASE, VertexFormat,
+            VertexLayout, VertexNumeric,
+        };
+
+        let vertex = echora_shader::compute::translate(
+            &[
+                Instruction {
+                    raw: 0,
+                    guard: Pred::TRUE,
+                    op: Op::Ald {
+                        d: Reg(0),
+                        offset: Reg::ZERO,
+                        vertex: Reg::ZERO,
+                        address: 0x80,
+                        count: 4,
+                        patch: false,
+                        output: false,
+                    },
+                    uniform: false,
+                },
+                Instruction {
+                    raw: 0,
+                    guard: Pred::TRUE,
+                    op: Op::Ast {
+                        data: Reg(0),
+                        offset: Reg::ZERO,
+                        vertex: Reg::ZERO,
+                        address: 0x70,
+                        count: 4,
+                        patch: false,
+                    },
+                    uniform: false,
+                },
+                echora_shader::decode(0x94d | 7 << 12 | 7 << 87),
+            ],
+            &Layout {
+                stage: Stage::Vertex,
+                ..Layout::workgroup([1, 1, 1])
+            },
+        )
+        .unwrap();
+        let program = renderer
+            .create_program(vec![Arc::new(vertex), draw.program.stages[1].clone()])
+            .unwrap();
+        let positions = [
+            [-1.0f32, -1.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0, 1.0],
+            [-1.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ];
+        let bytes = positions
+            .as_flattened()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut pages = [100, 101].map(|key| {
+            let (buffer, _) = renderer.resident_buffer(key, PAGE_SIZE).unwrap();
+            (renderer.buffer_address(buffer).unwrap(), key)
+        });
+        pages.sort_unstable_by_key(|&(address, _)| std::cmp::Reverse(address));
+        let guest = 0x20 << PAGE_SHIFT;
+        let page_table = renderer
+            .set_page_table(0x20, &pages.map(|(address, _)| address))
+            .unwrap()
+            .0;
+        let aligned = 128;
+        let crosses_page = PAGE_SIZE as usize - 3;
+        let mut first = [0; PAGE_SIZE as usize];
+        let mut second = [0; PAGE_SIZE as usize];
+        first[crosses_page..].copy_from_slice(&bytes[..3]);
+        second[..bytes.len() - 3].copy_from_slice(&bytes[3..]);
+        second[aligned..aligned + bytes.len()].copy_from_slice(&bytes);
+        renderer.upload_resident(pages[0].1, 0, &first).unwrap();
+        renderer.upload_resident(pages[1].1, 0, &second).unwrap();
+        let mut draw = Draw {
+            program: &program,
+            fixed: Fixed {
+                scissor: [0, 0, 4, 4],
+                ..draw.fixed
+            },
+            attributes: Vec::new(),
+            streams: Vec::new(),
+            indices: Indices::None,
+            count: 4,
+            first: 0,
+            page_table,
+            vertex_fetch: vec![echora_shader_abi::VertexAttribute {
+                address: guest + PAGE_SIZE + aligned as u64,
+                stride: 16,
+                format: VertexFormat {
+                    components: 4,
+                    layout: VertexLayout::Bits32,
+                    numeric: VertexNumeric::Float,
+                    bgra: false,
+                }
+                .encode(),
+                size: bytes.len() as u32,
+                ..Default::default()
+            }],
+            ..draw
+        };
+        let render = |renderer: &mut Renderer, draw: &Draw| {
+            renderer
+                .clear_color(7, None, vk::ClearColorValue { float32: [0.0; 4] })
+                .unwrap();
+            renderer.draw(draw).unwrap();
+            renderer.read_target(7).unwrap()
+        };
+        let specialization = [vec![(
+            VERTEX_FORMAT_SPEC_BASE,
+            draw.vertex_fetch[0].format | u32::from(VERTEX_FORMAT_ALIGNED),
+        )]];
+        let aligned_program = renderer
+            .create_program_specialized(program.stages.clone(), &specialization)
+            .unwrap();
+        draw.program = &aligned_program;
+        let aligned_pixels = render(renderer, &draw);
+        assert_eq!(
+            aligned_pixels
+                .iter()
+                .filter(|value| value[3] == 1.0)
+                .count(),
+            8
+        );
+        draw.program = &program;
+        draw.vertex_fetch[0].address = guest + crosses_page as u64;
+        assert_eq!(render(renderer, &draw), aligned_pixels);
+        renderer.destroy_program(aligned_program).unwrap();
         renderer.destroy_program(program).unwrap();
     }
 }
