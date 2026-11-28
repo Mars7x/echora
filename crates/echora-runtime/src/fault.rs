@@ -175,6 +175,33 @@ mod unix {
                     registers[register as usize] as u64
                 );
             }
+            // The first words each register points to, where readable (a
+            // structure a library read its pointer from: freed or
+            // overwritten). process_vm_readv reports an unreadable address
+            // instead of faulting again.
+            for (name, register) in names {
+                let at = registers[register as usize] as usize;
+                let mut words = [0u64; 6];
+                let local = libc::iovec {
+                    iov_base: words.as_mut_ptr().cast(),
+                    iov_len: std::mem::size_of_val(&words),
+                };
+                let remote = libc::iovec {
+                    iov_base: at as *mut libc::c_void,
+                    iov_len: std::mem::size_of_val(&words),
+                };
+                // SAFETY: reads our own memory into `words`; a bad
+                // address fails the call.
+                let read =
+                    unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+                if read == std::mem::size_of_val(&words) as isize {
+                    let _ = write!(text, "  [{name}]");
+                    for word in words {
+                        let _ = write!(text, " {word:016x}");
+                    }
+                    text.push('\n');
+                }
+            }
             // SAFETY: write(2) with a valid buffer.
             unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
         }
