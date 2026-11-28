@@ -219,6 +219,19 @@ synthetic fixtures and runs without the game files.
   resident memory reached 15,078 MiB shortly after present 6,100. The test
   watchdog terminated the process at its 14,336 MiB limit. Its junction
   temperature was 38°C. The earlier black-screen failure remains open.
+- The intermittent Radeon crash near opening presents 13,600–14,300, and on
+  saved-game loads near present 2,600, came from RADV on GFX12 (Mesa 26.2.7
+  and 26.3.1). After each internal copy, clear or fill, the driver binds
+  the bound compute shader object again. Each bind adds its registers to a
+  fixed list of 256 entries that only a dispatch empties. About two dozen such
+  operations between two dispatches overran the list into driver memory.
+  Fault reports show the overwritten words as register and value pairs. The
+  renderer now unbinds the compute shader after each dispatch. A Radeon test
+  records 4,096 buffer fills between two dispatches. It crashed in both runs
+  with the shader left bound and passed in both runs with the fix.
+  A guarded opening run reached present 12,000 before the fix. Resident memory then grew by
+  about 0.9 MB/s. Most of it, 6.4 GB, was the guest's own shared memory.
+  Command lists, uploads and retained render target archives levelled off.
 - Large single-plane depth textures stream through the upload ring. On a
   saved Kokiri Forest route, the 12,288×12,288 D16 shadow texture used
   bounded transfers for all 288 MiB. After this and the texture-cache
