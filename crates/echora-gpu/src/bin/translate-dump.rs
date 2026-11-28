@@ -65,10 +65,23 @@ fn main() {
                 primitive_header: None,
             }
         };
-        let parameters = Parameters {
+        let mut parameters = Parameters {
             mesh: (sizes != 0).then(|| mesh(false)),
             ..parameters
         };
+        // A compute program's control section gives its workgroup size and
+        // shared memory at +0x58..+0x64, as the runtime reads them.
+        if !matches!(kind, 1..=5)
+            && let (Some(x), Some(y), Some(z)) = (
+                control_word(path, 0x58),
+                control_word(path, 0x5c),
+                control_word(path, 0x60),
+            )
+            && [x, y, z].iter().all(|size| (1..=1024).contains(size))
+        {
+            parameters.workgroup_size = [x, y, z];
+            parameters.shared_memory_size = control_word(path, 0x64).unwrap_or(0xc000);
+        }
         // ECHORA_SHADER_TRANSLATOR=rust: the Rust translator's program, as
         // the renderer uses it, instead of the plugin's.
         if std::env::var("ECHORA_SHADER_TRANSLATOR").as_deref() == Ok("rust") {
