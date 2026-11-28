@@ -6613,8 +6613,8 @@ impl Nvn {
         if source_planes == 0 || destination_planes == 0 {
             return Ok(());
         }
-        if source_planes != 1 || destination_planes != 1 {
-            return Err("texture copy of multiple planes".into());
+        if source_planes != destination_planes {
+            return Err("texture copy has different source and destination plane counts".into());
         }
         // A view or another texture object may name a region of an existing
         // target. Rendered mips keep their own level in that target.
@@ -6639,32 +6639,54 @@ impl Nvn {
             );
         }
         self.ensure_render_target(to)?;
-        if self
-            .gpu
-            .as_ref()
-            .unwrap()
-            .renderer
-            .partial_write_needs_initialization(
-                to,
-                destination_level,
-                destination_layer,
-                Some(destination),
-            )
-        {
+        let renderer = &self.gpu.as_ref().unwrap().renderer;
+        if source_planes > 1 {
+            let fits = |key: u64, level: u32, first: u32| {
+                renderer.target_info(key).is_some_and(|target| {
+                    level < target.levels
+                        && first.checked_add(source_planes).is_some_and(|end| {
+                            end <= (target.shape.depth() >> level).max(target.shape.layers())
+                        })
+                })
+            };
+            if !fits(from, source_level, source_layer)
+                || !fits(to, destination_level, destination_layer)
+            {
+                return Err("texture copy plane range is outside the render target".into());
+            }
+        }
+        if renderer.partial_write_needs_initialization(
+            to,
+            destination_level,
+            destination_layer,
+            Some(destination),
+        ) {
             self.initialize_new_targets(core);
         }
         let traced = (self.depth_traced(command.x[1]) || self.depth_traced(command.x[4]))
+            && source_planes == 1
             && source_layer == 0
             && destination_layer == 0;
         let present = self.presented_frames;
         let renderer = &mut self.gpu.as_mut().unwrap().renderer;
         renderer.restore_archived_target(from)?;
-        renderer.copy_target_level(
-            (from, source_level, source_layer),
-            source,
-            (to, destination_level, destination_layer),
-            destination,
-        )?;
+        // When destinations overlap later source planes, read the higher
+        // planes first so no copy observes an earlier destination write.
+        let reverse =
+            from == to && source_level == destination_level && destination_layer > source_layer;
+        for index in 0..source_planes {
+            let offset = if reverse {
+                source_planes - 1 - index
+            } else {
+                index
+            };
+            renderer.copy_target_level(
+                (from, source_level, source_layer + offset),
+                source,
+                (to, destination_level, destination_layer + offset),
+                destination,
+            )?;
+        }
         // A traced copy: both ends read back after it, and how many texels
         // differ (a depth copy a later EQUAL test relies on must be exact).
         if traced {
@@ -17174,7 +17196,7 @@ mod target_tests {
     }
 
     #[test]
-    fn color_clears_preserve_other_slices_of_a_volume() {
+    fn color_clears_and_copies_preserve_other_slices_of_a_volume() {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 
         let Ok(Some(mut backend)) = Backend::create(None) else {
@@ -17276,6 +17298,27 @@ mod target_tests {
                 red.to_le_bytes().repeat(8),
                 "slice {z}"
             );
+        }
+
+        // An overlapping copy must read the original lower slices.
+        let mut copy = Command {
+            name: "nvnCommandBufferCopyTextureToTexture",
+            x: [0, 2, 0, 0, 2, 0, 0, 0],
+            v: [0; 8],
+            captured: vec![0, 0, 0, 4, 2, 2, 0, 0, 1, 4, 2, 2, 0, 0, 0, 0],
+            states: Default::default(),
+        };
+        nvn.execute_command(&copy, &mut core).unwrap();
+        let expected = [0.75_f32, 0.75, 1.0, 0.5];
+        for (z, red) in expected.into_iter().enumerate() {
+            assert_eq!(read(&mut nvn, z as u32), red.to_le_bytes().repeat(8));
+        }
+
+        // A copy that would cross the final slice leaves the volume intact.
+        copy.captured[8] = 3;
+        assert!(nvn.gpu_copy_texture(&core, &copy).is_err());
+        for (z, red) in expected.into_iter().enumerate() {
+            assert_eq!(read(&mut nvn, z as u32), red.to_le_bytes().repeat(8));
         }
     }
 
