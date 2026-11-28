@@ -381,6 +381,18 @@ synthetic fixtures and runs without the game files.
   isolated 2160p Wayland run, the mixer and host recording stayed aligned
   across sampled movie and forest audio. Display-to-speaker synchronization
   still needs direct measurement.
+- The renderer's 5 ms frames, the guest's system counter and the window's
+  60 Hz present pacing all follow the host's monotonic clock, so the game
+  keeps its own sound and picture together when frames run slow, as on the
+  console. The host queue toward PipeWire is kept short: samples leave the
+  audio thread as soon as they are mixed, and samples still queued after a
+  stall, when the device has already played silence in their place, are
+  dropped instead of delaying all later sound. Before this, each stall
+  added its length to the delay for the rest of the session (80 to 170 ms
+  after the first 40 seconds of the saved forest route and the opening).
+  With `ECHORA_AUDIO_STATS` the queued delay stays near 20 ms. Headless runs
+  have no display pacing, so the movie's pictures there advance faster than
+  its sound; with a window they advance at 60 per second.
 
 ## Performance
 

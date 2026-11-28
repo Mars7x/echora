@@ -21,7 +21,7 @@
 | `echora-shader-abi` | The push-constant block's field offsets, the descriptor layout and vertex formats. |
 | `echora-av1` | Header elements on hand-written bitstreams, and every picture checked against rav1d ([AV1 decoding](av1-decode.md#tests)). |
 | `echora-input` | evdev capability words, button mapping by position (with the xpad north/west swap), triggers, hats and sticks within the circle. |
-| `echora-audio` | Volume scaling and clamping; a bounded queue that plays silence on underrun. |
+| `echora-audio` | Volume scaling and clamping; a bounded queue that plays silence on underrun; a stall's backlog is dropped while steady playback keeps every sample. |
 
 Ignored tests, run with `ECHORA_TEST_NUP` set, open the real archive, verify
 every ExeFS file, and check that NUP and directory inputs produce the same

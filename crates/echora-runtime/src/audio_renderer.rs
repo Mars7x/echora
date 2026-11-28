@@ -732,6 +732,9 @@ pub struct Renderer {
     pub output_channels: u32,
     /// Frames in which any voice was mixed.
     pub mixed_frames: u64,
+    /// The host stream for the device sink and its channel count, opened
+    /// when the sink first produces samples (None inside: no host audio).
+    pub host: Option<Option<(std::sync::mpsc::Sender<Vec<u8>>, u32)>>,
 }
 
 impl Renderer {
@@ -762,6 +765,7 @@ impl Renderer {
             output: Vec::new(),
             output_channels: 0,
             mixed_frames: 0,
+            host: None,
         }
     }
 

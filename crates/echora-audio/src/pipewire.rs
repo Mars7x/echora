@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -34,7 +33,7 @@ impl Playback {
     pub(super) fn start(
         rate: u32,
         channels: u32,
-        samples: Arc<Mutex<VecDeque<i16>>>,
+        samples: Arc<Mutex<super::Queue>>,
     ) -> Result<Self, String> {
         let format = audio_format(rate, channels)?;
         let (shutdown, stop) = pw::channel::channel();
@@ -113,7 +112,7 @@ struct Session {
 /// waits, ends playback.
 fn run_playback(
     format: AudioInfoRaw,
-    samples: Arc<Mutex<VecDeque<i16>>>,
+    samples: Arc<Mutex<super::Queue>>,
     mut stop: pw::channel::Receiver<()>,
     stopping: mpsc::Receiver<()>,
     ready: Ready,
@@ -191,7 +190,7 @@ type StreamResult = Result<(), Box<dyn std::error::Error>>;
 /// shutdown receiver for the next stream.
 fn run_stream(
     format: AudioInfoRaw,
-    samples: &Arc<Mutex<VecDeque<i16>>>,
+    samples: &Arc<Mutex<super::Queue>>,
     stop: pw::channel::Receiver<()>,
     session: &Rc<RefCell<Session>>,
     ready: &Rc<RefCell<Option<Ready>>>,
@@ -214,7 +213,7 @@ fn run_stream(
 fn stream_until_lost(
     mainloop: &pw::main_loop::MainLoopRc,
     format: AudioInfoRaw,
-    samples: &Arc<Mutex<VecDeque<i16>>>,
+    samples: &Arc<Mutex<super::Queue>>,
     session: &Rc<RefCell<Session>>,
     ready: &Rc<RefCell<Option<Ready>>>,
     retry: bool,

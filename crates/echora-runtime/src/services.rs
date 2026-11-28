@@ -1083,9 +1083,6 @@ pub struct Services {
     /// The audio thread renders the renderers' frames: the wait scans
     /// leave them to it (`advance_audio`, `next_audio_deadline`).
     audio_thread: bool,
-    /// Each renderer's host stream, opened when its device sink first
-    /// produces samples (None inside: no host audio).
-    audio_renderer_hosts: BTreeMap<usize, Option<(std::sync::mpsc::Sender<Vec<u8>>, u32)>>,
     /// The hardware Opus decoders opened so far, by `OpusDecoder::id`.
     opus_decoders: Vec<crate::opus::Decoder>,
     /// IAudioDevice output volume auto-tune setting (commands 19/20).
@@ -1273,7 +1270,6 @@ impl Default for Services {
             audio_outs: Vec::new(),
             audio_renderers: Vec::new(),
             audio_thread: false,
-            audio_renderer_hosts: BTreeMap::new(),
             opus_decoders: Vec::new(),
             audio_volume_auto_tune: false,
             audio_device_volumes: BTreeMap::new(),
@@ -1462,6 +1458,69 @@ fn downmix_to_stereo(samples: &[i16]) -> Vec<i16> {
         }
     }
     stereo
+}
+
+/// Send what `renderer` mixed for its device sink to the host, opening its
+/// host stream on the first samples. The audio thread calls this holding
+/// only the renderer's lock, so a busy machine lock cannot hold back the
+/// samples past their time.
+pub(crate) fn play_output(renderer: &mut crate::audio_renderer::Renderer) {
+    let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
+    let output: Vec<i16> = renderer.drain_output().collect();
+    let samples = output.as_slice();
+    if samples.is_empty() || channels == 0 {
+        return;
+    }
+    // ECHORA_AUDIO_DUMP=<file> (debugging): the device sink's samples
+    // as they were mixed (interleaved 16-bit little endian), appended
+    // to the file; `<file>.txt` holds the rate and channel count.
+    if let Some(path) = crate::nvn::debug_var_os("ECHORA_AUDIO_DUMP") {
+        use std::io::Write;
+        let path = std::path::Path::new(path);
+        let note = path.with_extension("txt");
+        if !note.exists() {
+            let _ = std::fs::write(&note, format!("rate {rate} channels {channels}\n"));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let bytes: Vec<u8> = samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect();
+            let _ = file.write_all(&bytes);
+        }
+    }
+    // The device's own channel count where the host can play it;
+    // else six channels are mixed down to two, as the console does for
+    // a stereo output.
+    let host = renderer.host.get_or_insert_with(|| {
+        crate::audio::open(rate, channels)
+            .map(|host| (host, channels))
+            .or_else(|| {
+                (channels == 6)
+                    .then(|| crate::audio::open(rate, 2))
+                    .flatten()
+                    .map(|host| (host, 2))
+            })
+    });
+    if let Some((host, host_channels)) = host {
+        let stereo;
+        let samples = if *host_channels == 2 && channels == 6 {
+            stereo = downmix_to_stereo(samples);
+            &stereo
+        } else {
+            samples
+        };
+        let mut pcm: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        crate::audio::apply_volume(&mut pcm, crate::settings::master_volume());
+        let _ = host.send(pcm);
+    }
 }
 
 /// An audio renderer and its lock (`Services::audio_renderers`).
@@ -6249,76 +6308,18 @@ impl Services {
         );
     }
 
-    /// After the audio thread rendered frames of renderer `id`: its event
-    /// is signaled and its samples go to the device. Returns whether an
-    /// event was signaled.
+    /// After the audio thread rendered frames of renderer `id` (and sent
+    /// their samples to the device): its event is signaled. Returns whether
+    /// an event was signaled.
     pub(crate) fn renderer_frames_rendered(&mut self, id: usize) -> bool {
         if id >= self.audio_renderers.len() {
             return false;
         }
-        let signaled = self.signal_renderer_frame(id);
-        self.play_renderer(id);
-        signaled
+        self.signal_renderer_frame(id)
     }
 
     fn play_renderer(&mut self, id: usize) {
-        let mut renderer = lock_renderer(&self.audio_renderers[id].0);
-        let (rate, channels) = (renderer.parameters.sample_rate, renderer.output_channels);
-        let output = renderer.drain_output();
-        let samples = output.as_slice();
-        if samples.is_empty() || channels == 0 {
-            return;
-        }
-        // ECHORA_AUDIO_DUMP=<file> (debugging): the device sink's samples
-        // as they were mixed (interleaved 16-bit little endian), appended
-        // to the file; `<file>.txt` holds the rate and channel count.
-        if let Some(path) = crate::nvn::debug_var_os("ECHORA_AUDIO_DUMP") {
-            use std::io::Write;
-            let path = std::path::Path::new(path);
-            let note = path.with_extension("txt");
-            if !note.exists() {
-                let _ = std::fs::write(&note, format!("rate {rate} channels {channels}\n"));
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let bytes: Vec<u8> = samples
-                    .iter()
-                    .flat_map(|sample| sample.to_le_bytes())
-                    .collect();
-                let _ = file.write_all(&bytes);
-            }
-        }
-        // The device's own channel count where the host can play it;
-        // else six channels are mixed down to two, as the console does for
-        // a stereo output.
-        let host = self.audio_renderer_hosts.entry(id).or_insert_with(|| {
-            crate::audio::open(rate, channels)
-                .map(|host| (host, channels))
-                .or_else(|| {
-                    (channels == 6)
-                        .then(|| crate::audio::open(rate, 2))
-                        .flatten()
-                        .map(|host| (host, 2))
-                })
-        });
-        if let Some((host, host_channels)) = host {
-            let stereo;
-            let samples = if *host_channels == 2 && channels == 6 {
-                stereo = downmix_to_stereo(samples);
-                &stereo
-            } else {
-                samples
-            };
-            let mut pcm: Vec<u8> = samples
-                .iter()
-                .flat_map(|sample| sample.to_le_bytes())
-                .collect();
-            crate::audio::apply_volume(&mut pcm, crate::settings::master_volume());
-            let _ = host.send(pcm);
-        }
+        play_output(&mut lock_renderer(&self.audio_renderers[id].0));
     }
 
     /// When the next audio-out buffer finishes, if any is playing.

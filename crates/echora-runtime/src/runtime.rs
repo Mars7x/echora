@@ -5190,8 +5190,8 @@ impl crate::hle::ZstdMemory for ZstdMachineMemory<'_, '_> {
 /// it was 4 to 9% of each thread of the frame's chain plus their waits.
 /// Guest memory is read through a flat view, as guest threads read it. The
 /// machine lock is taken only to pick up the renderers and afterwards to
-/// signal the frame's event, hand the samples to the device and wake
-/// parked workers.
+/// signal the frame's event and wake parked workers; the samples go to the
+/// device before that.
 fn audio_thread(shared: &Shared) {
     // How long to sleep with nothing due: a renderer made or started
     // meanwhile is picked up within this.
@@ -5228,9 +5228,14 @@ fn audio_thread(shared: &Shared) {
         let started = std::time::Instant::now();
         rendered.clear();
         rendered.extend(renderers.iter().enumerate().filter_map(|(id, renderer)| {
-            crate::services::lock_renderer(renderer)
+            let mut renderer = crate::services::lock_renderer(renderer);
+            // The samples go to the device now, not after the machine
+            // lock: a frame held back behind a busy lock would play late,
+            // after the device ran out and played silence.
+            renderer
                 .advance(started, Some(&view))
-                .then_some(id)
+                .then(|| crate::services::play_output(&mut renderer))
+                .map(|()| id)
         }));
         crate::timeline::span(0, "audio", started, std::time::Instant::now());
         if rendered.is_empty() {
