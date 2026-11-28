@@ -8723,9 +8723,16 @@ impl Nvn {
             return Ok(());
         }
 
-        let mut ids = Vec::new();
-        for (base, ranges) in &batches {
-            ids.extend(backend.renderer.read_resident_ranges(*base, ranges)?);
+        let mut range_count = 0;
+        let mut tokens = Vec::new();
+        let mut reads = Vec::with_capacity(batches.len());
+        for (base, ranges) in batches {
+            let reads_for_pool = backend
+                .renderer
+                .read_packed_resident_ranges(base, &ranges)?;
+            tokens.extend(reads_for_pool.iter().map(|&(token, _)| token));
+            range_count += ranges.len() as u64;
+            reads.push((base, ranges, reads_for_pool));
         }
         let started = std::time::Instant::now();
         backend.renderer.flush()?;
@@ -8741,26 +8748,32 @@ impl Nvn {
         );
         // Only these: pending dispatch and draw results stay for
         // `resolve_copies`.
-        let mut completed = backend.renderer.take_reads(&ids);
-        backend.stat("stat: resident ranges copied back", ids.len() as u64);
+        let mut completed = backend.renderer.take_reads(&tokens);
+        backend.stat("stat: resident ranges copied back", range_count);
+        backend.stat("stat: resident readback batches", tokens.len() as u64);
         // Which call site asked (`#[track_caller]` up the resolve chain).
         backend.stat(caller_stat(std::panic::Location::caller()), 1);
-        let mut ids = ids.into_iter();
         let mut changed = Vec::new();
         let result = (|| {
-            for (base, ranges) in batches {
-                for (offset, _) in ranges {
-                    let token = ids.next().ok_or("resident read token missing")?;
+            for (base, ranges, reads) in reads {
+                for (token, indices) in reads {
                     let bytes = completed
                         .remove(&token)
                         .ok_or_else(|| format!("resident read {token} never completed"))?;
-                    let start = base + offset;
-                    core.memory
-                        .write(start, &bytes)
-                        .map_err(|trap| format!("resident write-back: {trap:?}"))?;
-                    let written = start..start + bytes.len() as u64;
-                    if backend.mark_texture_bytes_changed(&written) {
-                        changed.push(written);
+                    let mut remaining = bytes.as_slice();
+                    for &(offset, length) in &ranges[indices] {
+                        let (data, rest) = remaining
+                            .split_at_checked(length as usize)
+                            .ok_or("resident readback is shorter than its ranges")?;
+                        remaining = rest;
+                        let start = base + offset;
+                        core.memory
+                            .write(start, data)
+                            .map_err(|trap| format!("resident write-back: {trap:?}"))?;
+                        let written = start..start + length;
+                        if backend.mark_texture_bytes_changed(&written) {
+                            changed.push(written);
+                        }
                     }
                 }
                 // Keep this pool's ranges pending until every selected write

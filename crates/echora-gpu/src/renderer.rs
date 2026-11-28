@@ -2245,12 +2245,56 @@ impl Renderer {
         key: u64,
         ranges: &[(u64, u64)],
     ) -> Result<Vec<u64>, String> {
-        let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
-        let ranges: Vec<(u64, u64)> = ranges
-            .iter()
-            .map(|&(at, length)| (at, length.min(size.saturating_sub(at))))
-            .collect();
         let mut tokens = Vec::with_capacity(ranges.len());
+        self.record_resident_reads(key, ranges, true, |renderer, base, _, _, batch| {
+            let mut offset = base;
+            for &(_, length) in batch {
+                tokens.push(renderer.defer_ring_read(offset, length as usize));
+                offset += length;
+            }
+        })?;
+        Ok(tokens)
+    }
+
+    /// Read the requested ranges into tightly packed batches. Each token's
+    /// bytes are the concatenation of the lengths at its input indices.
+    pub fn read_packed_resident_ranges(
+        &mut self,
+        key: u64,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<(u64, std::ops::Range<usize>)>, String> {
+        let mut tokens = Vec::new();
+        self.record_resident_reads(key, ranges, false, |renderer, base, total, first, batch| {
+            let token = renderer.defer_ring_read(base, total as usize);
+            tokens.push((token, first..first + batch.len()));
+        })?;
+        Ok(tokens)
+    }
+
+    fn record_resident_reads(
+        &mut self,
+        key: u64,
+        ranges: &[(u64, u64)],
+        clip: bool,
+        mut read: impl FnMut(&mut Self, u64, u64, usize, &[(u64, u64)]),
+    ) -> Result<(), String> {
+        let &(buffer, _, size) = self.resident.get(&key).ok_or("no such resident buffer")?;
+        let clipped;
+        let ranges = if clip {
+            clipped = ranges
+                .iter()
+                .map(|&(at, length)| (at, length.min(size.saturating_sub(at))))
+                .collect::<Vec<_>>();
+            clipped.as_slice()
+        } else {
+            if ranges
+                .iter()
+                .any(|&(at, length)| at > size || length > size - at)
+            {
+                return Err("resident read outside its buffer".into());
+            }
+            ranges
+        };
         let mut first = 0;
         while first < ranges.len() {
             // As many ranges as one ring allocation holds (allocating them
@@ -2258,11 +2302,14 @@ impl Renderer {
             let mut total = 0u64;
             let mut last = first;
             while last < ranges.len() {
-                let next = total.next_multiple_of(16) + ranges[last].1;
-                if next > RING_SIZE && last > first {
+                let length = ranges[last].1;
+                if length > RING_SIZE {
+                    return Err(format!("{length}-byte read exceeds the ring"));
+                }
+                if total + length > RING_SIZE {
                     break;
                 }
-                total = next;
+                total += length;
                 last += 1;
             }
             let (target, base) = self.ring_alloc(total, 16)?;
@@ -2276,7 +2323,6 @@ impl Renderer {
             let mut copies = Vec::with_capacity(last - first);
             let mut offset = base;
             for &(at, length) in &ranges[first..last] {
-                offset = offset.next_multiple_of(16);
                 if length != 0 {
                     copies.push(vk::BufferCopy {
                         src_offset: at,
@@ -2284,7 +2330,6 @@ impl Renderer {
                         size: length,
                     });
                 }
-                tokens.push(self.defer_ring_read(offset, length as usize));
                 offset += length;
             }
             if !copies.is_empty() {
@@ -2307,9 +2352,10 @@ impl Renderer {
                     device.cmd_copy_buffer(commands, buffer, target, &copies);
                 }
             }
+            read(self, base, total, first, &ranges[first..last]);
             first = last;
         }
-        Ok(tokens)
+        Ok(())
     }
 
     /// Room for `size` bytes in the ring (flushing when it is full).
@@ -10059,6 +10105,35 @@ mod tests {
         let stats = renderer.take_stats();
         assert_eq!(stats["stat: barriers in read_resident"], 1);
         assert_eq!(stats["stat: barriers in submit_current"], 1);
+    }
+
+    #[test]
+    fn packed_resident_reads_preserve_byte_ranges_and_other_tokens() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let bytes: Vec<u8> = (0..32).collect();
+        renderer.resident_buffer(1, 32).unwrap();
+        renderer.upload_resident(1, 0, &bytes).unwrap();
+        let other = renderer.read_resident(1, 16, 4).unwrap();
+        assert!(
+            renderer
+                .read_packed_resident_ranges(1, &[(0, 2), (30, 3)])
+                .is_err()
+        );
+        let packed = renderer
+            .read_packed_resident_ranges(1, &[(7, 3), (32, 0), (2, 5), (7, 3)])
+            .unwrap();
+        assert_eq!(packed.len(), 1);
+        let (token, indices) = &packed[0];
+        assert_eq!(*indices, 0..4);
+        renderer.flush().unwrap();
+        let mut reads = renderer.take_reads(&[*token]);
+        assert_eq!(
+            reads.remove(token).unwrap(),
+            [&bytes[7..10], &bytes[2..7], &bytes[7..10]].concat()
+        );
+        assert_eq!(renderer.take_reads(&[other])[&other], bytes[16..20]);
     }
 
     #[test]
