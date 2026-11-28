@@ -6066,8 +6066,8 @@ impl Nvn {
             }
             // ClearTexture(cmd, view, region, color, mask): the view's level,
             // the region's rectangle (not the scissor, which limits draws)
-            // and, in an array or cube, its layers z..z+depth after the
-            // view's base layer.
+            // and its planes z..z+depth in a volume, array or cube, after
+            // the view's base layer.
             "nvnCommandBufferClearTexture" => {
                 let texture = command.x[1];
                 self.object(texture, "Texture").map_err(stop)?;
@@ -6089,8 +6089,8 @@ impl Nvn {
                         .ok()
                         .and_then(|object| object.builder.get("Target"))
                         .map_or(1, |value| value.x[0]);
-                    let layered = matches!(target, 4 | 6 | 8 | 9);
-                    let layers = if layered {
+                    let multi_plane = matches!(target, 2 | 4 | 6 | 8 | 9);
+                    let layers = if multi_plane {
                         let (z, depth) = (region[2] as u32, (region[5] as u32).max(1));
                         layer + z..layer + z + depth
                     } else {

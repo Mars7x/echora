@@ -17174,6 +17174,112 @@ mod target_tests {
     }
 
     #[test]
+    fn color_clears_preserve_other_slices_of_a_volume() {
+        use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
+
+        let Ok(Some(mut backend)) = Backend::create(None) else {
+            return;
+        };
+        backend
+            .renderer
+            .set_resolution_scale(echora_gpu::renderer::Scale::ONE);
+        let mut nvn = Nvn {
+            gpu: Some(backend),
+            gpu_checked: true,
+            ..Nvn::default()
+        };
+        let base = 0x10000;
+        let args = |x| Args {
+            x,
+            ..Args::default()
+        };
+        let scalar = |value| args([value, 0, 0, 0]);
+        nvn.initialize(
+            1,
+            "MemoryPool",
+            BTreeMap::from([("Storage".into(), args([base, 0x1000, 0, 0]))]),
+        )
+        .unwrap();
+        nvn.initialize(
+            2,
+            "Texture",
+            BTreeMap::from([
+                ("Target".into(), scalar(2)),
+                ("Width".into(), scalar(4)),
+                ("Height".into(), scalar(2)),
+                ("Depth".into(), scalar(4)),
+                ("Format".into(), scalar(10)),
+                ("Storage".into(), args([1, 0, 0, 0])),
+            ]),
+        )
+        .unwrap();
+        let mut memory = Memory::new(1 << 39);
+        memory
+            .map(base, 0x1000, READ | WRITE, STATE_NORMAL, "color volume")
+            .unwrap();
+        let format = crate::nvn_format::info(10).unwrap();
+        for z in 0..4 {
+            for y in 0..2 {
+                for x in 0..4 {
+                    let offset =
+                        crate::nvn_format::block_linear_offset(format, 4, 2, 4, 1, x, y, z);
+                    memory
+                        .write_u32(base + offset, ((z + 1) as f32 / 8.0).to_bits())
+                        .unwrap();
+                }
+            }
+        }
+        let mut cpu = Cpu::default();
+        let mut core = Guest {
+            cpu: &mut cpu,
+            memory: GuestMemory::Checked(&mut memory),
+            counter: None,
+        };
+        let clear = |red: f32, z, depth| Command {
+            name: "nvnCommandBufferClearTexture",
+            x: [0, 2, 0, 0, 0, 0xf, 0, 0],
+            v: [0; 8],
+            captured: vec![
+                u64::from(red.to_bits()),
+                0,
+                0,
+                0,
+                0,
+                0,
+                z,
+                4,
+                2,
+                depth,
+                0,
+                0,
+                0,
+            ],
+            states: Default::default(),
+        };
+        let read = |nvn: &mut Nvn, z| {
+            nvn.gpu
+                .as_mut()
+                .unwrap()
+                .renderer
+                .read_target_plane_bytes(2, 0, z, 4, [0, 0, 4, 2])
+                .unwrap()
+        };
+
+        nvn.execute_command(&clear(0.75, 0, 1), &mut core).unwrap();
+        assert_eq!(read(&mut nvn, 0), 0.75_f32.to_le_bytes().repeat(8));
+        assert_eq!(read(&mut nvn, 3), 0.5_f32.to_le_bytes().repeat(8));
+
+        nvn.execute_command(&clear(1.0, 1, 2), &mut core).unwrap();
+        for (z, red) in [0.75_f32, 1.0, 1.0, 0.5].into_iter().enumerate() {
+            assert_eq!(
+                read(&mut nvn, z as u32),
+                red.to_le_bytes().repeat(8),
+                "slice {z}"
+            );
+        }
+    }
+
+    #[test]
     fn partial_texture_copies_keep_untouched_guest_texels() {
         use echora_guest::memory::{READ, STATE_NORMAL, WRITE};
 

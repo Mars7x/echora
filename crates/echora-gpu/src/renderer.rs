@@ -6473,6 +6473,7 @@ impl Renderer {
             || layer != 0
             || target.levels > 1
             || target.shape.layers() > 1
+            || target.shape.depth() > 1
             || rect.is_some_and(|rect| {
                 let (width, height) = target.extent(level);
                 let whole = [0, 0, width as i32, height as i32];
@@ -7763,11 +7764,12 @@ impl Renderer {
         if bc_block_bytes(target.format).is_some() {
             return Err("clearing a compressed image requires a compatible block view".into());
         }
-        if level >= target.levels || layer >= target.shape.layers() {
+        let depth = target.shape.depth().checked_shr(level).unwrap_or(0).max(1);
+        let planes = depth.max(target.shape.layers());
+        if level >= target.levels || layer >= planes {
             return Err(format!(
-                "level {level} layer {layer} of a {}-level {}-layer target",
-                target.levels,
-                target.shape.layers()
+                "level {level} plane {layer} of a {}-level target with {planes} planes at this level",
+                target.levels
             ));
         }
         let (whole_width, whole_height) = target.extent(level);
@@ -7798,7 +7800,9 @@ impl Renderer {
                 },
             );
         }
-        if [x, y, width, height] == whole && self.condition.is_none() && !reinterpret {
+        // A transfer clear covers the entire depth of a volume mip.
+        if [x, y, width, height] == whole && depth == 1 && self.condition.is_none() && !reinterpret
+        {
             self.transition(key, vk::ImageLayout::GENERAL)?;
             self.order_target(key)?;
             let commands = self.commands()?;
