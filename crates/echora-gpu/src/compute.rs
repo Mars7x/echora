@@ -463,6 +463,18 @@ impl Renderer {
                     device.cmd_dispatch(commands, x, y, z);
                 }
             }
+            // Leave no compute shader object bound. RADV re-binds the
+            // bound one after each of its internal copy, clear and fill
+            // operations, and on GFX12 every such bind appends the shader's
+            // registers to a fixed 256-entry list that only a dispatch
+            // empties. Enough of those operations between two dispatches
+            // overflow it into the driver's command stream (Mesa 26.2/26.3).
+            // Every dispatch binds its own program first.
+            objects.cmd_bind_shaders(
+                commands,
+                &[vk::ShaderStageFlags::COMPUTE],
+                &[vk::ShaderEXT::null()],
+            );
             device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1533,6 +1545,83 @@ mod tests {
         assert_eq!(
             renderer.read_target_bytes(target, 4).unwrap(),
             15_u32.to_le_bytes()
+        );
+        renderer.destroy_program(program).unwrap();
+    }
+
+    #[test]
+    fn many_driver_fills_between_dispatches_leave_recording_intact() {
+        // RADV (Mesa 26.2/26.3, GFX12) overflowed its 256-entry register
+        // list, and the command stream after it, when a compute shader
+        // object stayed bound across many of its internal fill operations.
+        let Ok(gpu) = Gpu::new() else {
+            return;
+        };
+        if gpu.shader_objects().is_err() {
+            return;
+        }
+        let mut renderer = Renderer::new(gpu).unwrap();
+        let code = spirv(
+            "@group(0) @binding(0) var<uniform> value: vec4<u32>;
+            @group(0) @binding(1) var image: texture_storage_2d<r32uint, write>;
+            @compute @workgroup_size(1) fn main() { textureStore(image, vec2<i32>(0), value); }",
+            naga::ShaderStage::Compute,
+        );
+        let program = renderer
+            .create_program(vec![translated(
+                Stage::Compute,
+                code,
+                vec![
+                    Descriptor {
+                        kind: DescriptorKind::UniformBuffer as u32,
+                        binding: 0,
+                        count: 1,
+                        index: 3,
+                        ..Default::default()
+                    },
+                    Descriptor {
+                        kind: DescriptorKind::Image as u32,
+                        binding: 1,
+                        count: 1,
+                        ..Default::default()
+                    },
+                ],
+            )])
+            .unwrap();
+        let target = 1;
+        renderer.target(target, 1, 1, vk::Format::R32_UINT).unwrap();
+        renderer.resident_buffer(2, 64).unwrap();
+        let mut dispatch = Dispatch {
+            program: &program,
+            groups: [1; 3],
+            uniforms: HashMap::from([(0, vec![3; 16])]),
+            storage: HashMap::new(),
+            storage_in_place: HashMap::new(),
+            textures: HashMap::new(),
+            images: HashMap::from([(
+                1,
+                StorageImage {
+                    target,
+                    ..Default::default()
+                },
+            )]),
+            image_formats: HashMap::new(),
+            indirect: None,
+            page_table: Default::default(),
+            pool: Default::default(),
+        };
+        renderer.dispatch_deferred(&dispatch).unwrap();
+        for value in 0..4096 {
+            renderer.fill_resident(2, 0, 64, value).unwrap();
+        }
+        dispatch.uniforms.get_mut(&0).unwrap().fill(5);
+        renderer.dispatch_deferred(&dispatch).unwrap();
+        assert_eq!(renderer.read_target_bytes(target, 4).unwrap(), [5; 4]);
+        let token = renderer.read_resident(2, 60, 4).unwrap();
+        renderer.flush().unwrap();
+        assert_eq!(
+            renderer.take_reads(&[token])[&token],
+            4095_u32.to_le_bytes()
         );
         renderer.destroy_program(program).unwrap();
     }
