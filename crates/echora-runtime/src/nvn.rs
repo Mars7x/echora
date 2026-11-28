@@ -750,6 +750,11 @@ pub struct Nvn {
     #[serde(skip)]
     render: RenderState,
     pub presented_frames: u64,
+    /// Elapsed microseconds from the first guest present, for cadence reports.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    present_timestamps_us: Vec<u64>,
+    #[serde(skip)]
+    first_timed_present: Option<std::time::Instant>,
     /// Stop requests count completed presents, including those replay queued.
     #[serde(skip)]
     pub(crate) present_limit: Option<u64>,
@@ -4736,6 +4741,12 @@ impl Nvn {
         self.presented_frames += 1;
         self.release_present_upload_texels();
         crate::timeline::present(self.presented_frames);
+        static RECORD_PRESENTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *RECORD_PRESENTS.get_or_init(|| {
+            std::env::var_os("ECHORA_PRESENT_INTERVALS").is_some_and(|value| value == "1")
+        }) {
+            self.note_present_time(std::time::Instant::now());
+        }
         self.arm_call_watch();
         // ECHORA_PRESENT_RATE=N: every N presents, the count, the
         // seconds since the first present and the rate over those N.
@@ -4882,6 +4893,12 @@ impl Nvn {
                 .map_err(|error| invalid(format!("write {}: {error}", path.display())))?;
         }
         Ok(true)
+    }
+
+    fn note_present_time(&mut self, now: std::time::Instant) {
+        let first = *self.first_timed_present.get_or_insert(now);
+        self.present_timestamps_us
+            .push(now.saturating_duration_since(first).as_micros() as u64);
     }
 
     /// With a replay thread: presents are queued behind the frame's work
@@ -14570,6 +14587,24 @@ mod tests {
             &[builder, 0x1000],
         );
         assert_eq!(call(&mut nvn, &mut core, getter, &[builder]), 0x1_5000);
+    }
+
+    #[test]
+    fn present_timestamps_are_relative_and_optional_in_the_report() {
+        let mut nvn = Nvn::default();
+        let json = serde_json::to_value(&nvn).unwrap();
+        assert!(json.get("present_timestamps_us").is_none());
+        let first = std::time::Instant::now();
+        for micros in [0, 16_667, 38_420] {
+            nvn.presented_frames += 1;
+            nvn.note_present_time(first + std::time::Duration::from_micros(micros));
+        }
+        let json = serde_json::to_value(&nvn).unwrap();
+        assert_eq!(json["presented_frames"], 3);
+        assert_eq!(
+            json["present_timestamps_us"],
+            serde_json::json!([0, 16667, 38420])
+        );
     }
 
     #[test]
