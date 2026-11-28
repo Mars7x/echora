@@ -4050,9 +4050,16 @@ impl Renderer {
     }
 
     fn end_and_submit_current(&mut self, signal: Option<vk::Semaphore>) -> Result<(), String> {
+        self.time_span("submit: end pass", true);
         self.end_pass();
+        self.time_span("submit: end pass", false);
+        self.time_span("submit: end condition", true);
         self.end_condition();
+        self.time_span("submit: end condition", false);
+        self.time_span("submit: occlusion", true);
         self.occlusion_before_submit(self.slot.commands);
+        self.time_span("submit: occlusion", false);
+        self.time_span("submit: host barrier", true);
         // Make pending ring reads and shader writes to mapped trace buffers
         // visible to the host once this submission completes.
         if !self.slot.pending_reads.is_empty() || !self.debug_buffers.is_empty() {
@@ -4076,6 +4083,7 @@ impl Renderer {
                 );
             }
         }
+        self.time_span("submit: host barrier", false);
         self.recording = false;
         self.graphics.reset();
         self.flushes += 1;
@@ -5949,6 +5957,25 @@ impl Renderer {
         );
     }
 
+    /// Debugging (ECHORA_GPU_TIME=items): time recorded work other than a
+    /// draw or dispatch under `key`, from `start` to its end (work inside
+    /// an item already timed counts as part of that item).
+    pub(crate) fn time_span(&mut self, key: &str, start: bool) {
+        if let Some(timer) = self.timer.as_mut()
+            && timer.timing_items()
+        {
+            timer.item(
+                &self.gpu.device,
+                self.slot.commands,
+                self.slot.fence,
+                key,
+                key,
+                None,
+                start,
+            );
+        }
+    }
+
     /// Restart the timing report's totals (ECHORA_PROFILE_FROM).
     pub fn restart_timing(&mut self) {
         if let Some(timer) = self.timer.as_mut() {
@@ -7170,6 +7197,7 @@ impl Renderer {
             self.target_changes += 1;
             self.changed_targets.push(key);
         }
+        self.time_span("transition", true);
         // SAFETY: recording; the image is live.
         unsafe {
             *self
@@ -7186,6 +7214,7 @@ impl Renderer {
                 &[barrier],
             )
         };
+        self.time_span("transition", false);
         Ok(())
     }
 
@@ -7251,6 +7280,7 @@ impl Renderer {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        self.time_span("memory_barrier", true);
         // SAFETY: recording outside rendering.
         unsafe {
             *self
@@ -7267,6 +7297,7 @@ impl Renderer {
                 &[],
             )
         };
+        self.time_span("memory_barrier", false);
         self.full_barrier_recorded = true;
         self.written.clear();
         self.hazard_barriers += 1;

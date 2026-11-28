@@ -26,6 +26,8 @@ struct ItemTimes {
     names: [Vec<String>; crate::renderer::SLOTS],
     /// Whether an item is open (started, not ended) in each slot.
     open: [bool; crate::renderer::SLOTS],
+    /// Items started inside the open one in each slot: timed as part of it.
+    nested: [u32; crate::renderer::SLOTS],
     totals: std::collections::HashMap<String, (f64, u64)>,
     /// Each slot's item keys for the report, parallel to `names`.
     keys: [Vec<String>; crate::renderer::SLOTS],
@@ -151,6 +153,7 @@ impl GpuTimer {
                 pool,
                 names: std::array::from_fn(|_| Vec::new()),
                 open: [false; crate::renderer::SLOTS],
+                nested: [0; crate::renderer::SLOTS],
                 totals: std::collections::HashMap::new(),
                 keys: std::array::from_fn(|_| Vec::new()),
                 report: std::collections::HashMap::new(),
@@ -195,7 +198,11 @@ impl GpuTimer {
         };
         let index = items.names[slot].len() as u32;
         if start {
-            if index >= ITEMS || items.open[slot] {
+            if items.open[slot] {
+                items.nested[slot] += 1;
+                return;
+            }
+            if index >= ITEMS {
                 return;
             }
             items.names[slot].push(name.to_owned());
@@ -208,6 +215,9 @@ impl GpuTimer {
             }
             items.open[slot] = true;
         } else if !items.open[slot] {
+            return;
+        } else if items.nested[slot] > 0 {
+            items.nested[slot] -= 1;
             return;
         } else {
             items.open[slot] = false;
@@ -250,6 +260,7 @@ impl GpuTimer {
             items.names[slot].clear();
             items.keys[slot].clear();
             items.open[slot] = false;
+            items.nested[slot] = 0;
             // SAFETY: recording, outside any rendering pass.
             unsafe {
                 device.cmd_reset_query_pool(
