@@ -573,8 +573,16 @@ plain structured code, so the output aims for that:
   Ramsey's "Beyond Relooper" over the dominator tree (exits to outer
   constructs pass a target through each merge); the block dispatcher (a
   switch inside one loop) is kept for irreducible graphs and computed
-  branches (BRX, RET);
-- native subgroup operations for SHFL, VOTE and friends;
+  branches (BRX, RET). A compute program's small leaf routines are copied
+  into each call site first, so their RET becomes a branch: whether RET
+  reads a copy of the caller's link or the register the caller set
+  shortly before CALL, for one routine or several, with unreachable copies
+  of a routine left out. On the saved forest route this took a
+  5,211-instruction compute program from 3.0 to 0.08 ms of GPU time per
+  frame;
+- native subgroup operations for SHFL, VOTE and friends; a butterfly
+  SHFL by a constant lane across the whole warp is SPIR-V's XOR shuffle,
+  which RADV performs as a lane swizzle instead of an LDS permute;
 - fp16 types where the source works on halves;
 - PhysicalStorageBuffer pointers through the page table;
 - cooperative matrices for HMMA, with a subgroup fallback;

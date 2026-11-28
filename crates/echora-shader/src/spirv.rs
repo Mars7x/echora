@@ -154,6 +154,7 @@ pub mod op {
     pub const GROUP_NON_UNIFORM_BROADCAST_FIRST: u16 = 338;
     pub const GROUP_NON_UNIFORM_BALLOT: u16 = 339;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_XOR: u16 = 346;
     pub const GROUP_NON_UNIFORM_I_ADD: u16 = 349;
     pub const GROUP_NON_UNIFORM_S_MIN: u16 = 353;
     pub const GROUP_NON_UNIFORM_U_MIN: u16 = 354;

@@ -2704,11 +2704,14 @@ impl Machine {
                 }
                 same((0..4).map(|w| (mask >> (32 * w)) as u32 as u64).collect())
             }
-            op::GROUP_NON_UNIFORM_SHUFFLE => members
+            op::GROUP_NON_UNIFORM_SHUFFLE | op::GROUP_NON_UNIFORM_SHUFFLE_XOR => members
                 .iter()
                 .enumerate()
                 .map(|(k, &n)| {
-                    let lane = input(&invocations[n], 4)[0] as usize;
+                    let mut lane = input(&invocations[n], 4)[0] as usize;
+                    if opcode == op::GROUP_NON_UNIFORM_SHUFFLE_XOR {
+                        lane ^= n - first;
+                    }
                     match members.iter().find(|&&m| m == first + lane) {
                         Some(&source) => {
                             undefined[k] = invocations[source].tainted.contains(&operands[3])

@@ -2194,6 +2194,26 @@ impl Emitter {
                 self.module
                     .capability(capability::GROUP_NON_UNIFORM_SHUFFLE);
                 let value = self.read_register(a.0);
+                // A butterfly by a constant lane mask across the whole warp
+                // (clamp 31, no segment) always stays in range: the native
+                // XOR shuffle, which drivers can do without a lane index.
+                if mode == 3
+                    && let (Src::Imm(mask), Src::Imm(clamp)) = (lane, c)
+                    && clamp & 0x1f == 0x1f
+                    && clamp >> 8 & 0x1f == 0
+                {
+                    let subgroup = self.constant(SCOPE_SUBGROUP);
+                    let mask = self.constant(mask & 0x1f);
+                    let shuffled = self.value(
+                        op::GROUP_NON_UNIFORM_SHUFFLE_XOR,
+                        self.u32,
+                        &[subgroup, value, mask],
+                    );
+                    self.write_register(d.0, shuffled);
+                    let yes = self.module.bool_constant(true);
+                    self.write_predicate(p, yes);
+                    return Ok(());
+                }
                 let b = self.source(index, lane)?;
                 let c = self.source(index, c)?;
                 let me = self.special_register(index, 0)?;
@@ -3921,6 +3941,61 @@ mod tests {
         };
         let translated = translate(&code, &layout).unwrap();
         assert!(validate(&translated.spirv).is_none());
+    }
+
+    #[test]
+    fn whole_warp_butterflies_use_the_xor_shuffle() {
+        use crate::decode::Reg;
+        let shuffle = |d, p, c| Op::Shfl {
+            d: Reg(d),
+            p,
+            a: Reg(1),
+            lane: Src::Imm(0x25),
+            c: Src::Imm(c),
+            mode: 3,
+        };
+        let code = [
+            Op::S2r {
+                d: Reg(1),
+                special: 0,
+            },
+            shuffle(2, 0, 0x1f),
+            // In 8-lane segments the general shuffle remains.
+            shuffle(3, 1, 0x181f),
+            Op::Exit {
+                condition: crate::decode::Pred::TRUE,
+            },
+        ]
+        .map(|op| Instruction { op, ..decode(EXIT) });
+        let layout = Layout::workgroup([32, 1, 1]);
+        let (translated, registers, predicates) = translate_with_registers(&code, &layout).unwrap();
+        assert_eq!(validate(&translated.spirv), None);
+        let opcodes = |wanted: u16| {
+            let (mut at, mut count) = (5, 0);
+            while let Some(&head) = translated.spirv.get(at) {
+                count += usize::from(head as u16 == wanted);
+                at += (head >> 16) as usize;
+            }
+            count
+        };
+        assert_eq!(opcodes(op::GROUP_NON_UNIFORM_SHUFFLE_XOR), 1);
+        assert_eq!(opcodes(op::GROUP_NON_UNIFORM_SHUFFLE), 1);
+        let report = crate::sim::Machine::new(&translated.spirv).simulate(&crate::sim::Inputs {
+            workgroup_count: [1, 1, 1],
+            ..crate::sim::Inputs::default()
+        });
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        for (me, lane) in report.invocations.iter().enumerate() {
+            let me = me as u64;
+            assert_eq!(lane[&registers[&2]][0], me ^ 5);
+            assert_eq!(lane[&predicates[&0]][0], 1);
+            // Segment 0x18: lanes stay within their 8-lane segment.
+            let j = me ^ 5;
+            let max = (me & 0x18) | 0x7;
+            let (value, inside) = if j <= max { (j, 1) } else { (me, 0) };
+            assert_eq!(lane[&registers[&3]][0], value);
+            assert_eq!(lane[&predicates[&1]][0], inside);
+        }
     }
 
     fn translated(words: &[u128]) -> Result<Translated, Unsupported> {
