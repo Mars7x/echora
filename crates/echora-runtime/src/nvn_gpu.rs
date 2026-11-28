@@ -1925,6 +1925,7 @@ impl Nvn {
         if let Some(backend) = self.gpu.as_mut() {
             backend.notes.retain(|name, _| !name.starts_with("stat: "));
             backend.stats.clear();
+            backend.renderer.restart_timing();
             backend.projection_counts.set([0; 4]);
             backend.shared_guest_index.get_mut().walks.set([0; 2]);
         }

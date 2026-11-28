@@ -5926,22 +5926,34 @@ impl Renderer {
         if !timer.timing_items() {
             return;
         }
-        let name = self
-            .labels
-            .last()
-            .map(|label| {
-                let words: Vec<&str> = label.split_whitespace().collect();
-                // "present N dispatch HASH ..." or "present N draw A/B ...".
-                words.get(2..4).map_or(label.clone(), |kind| kind.join(" "))
-            })
-            .unwrap_or_default();
+        let label = self.labels.last().map_or("", String::as_str);
+        let words: Vec<&str> = label.split_whitespace().collect();
+        // "present N dispatch HASH ..." or "present N draw A/B ...".
+        let name = words
+            .get(2..4)
+            .map_or(label.to_owned(), |kind| kind.join(" "));
+        let key = if start {
+            item_key(label)
+        } else {
+            String::new()
+        };
+        let present = words.get(1).and_then(|word| word.parse().ok());
         timer.item(
             &self.gpu.device,
             self.slot.commands,
             self.slot.fence,
             &name,
+            &key,
+            present,
             start,
         );
+    }
+
+    /// Restart the timing report's totals (ECHORA_PROFILE_FROM).
+    pub fn restart_timing(&mut self) {
+        if let Some(timer) = self.timer.as_mut() {
+            timer.restart();
+        }
     }
 
     /// Debugging: name a piece of work in the current submission.
@@ -9718,6 +9730,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timing_keys_drop_frame_varying_words() {
+        assert_eq!(
+            item_key(
+                "present 7 draw 00aa/00bb count 6 instances 1 colors [1f] depth Some(2) reads [x y]"
+            ),
+            "draw 00aa/00bb colors [1f] depth Some(2)"
+        );
+        assert_eq!(
+            item_key("present 7 dispatch 00cc groups [1, 2, 3] reads [] writes []"),
+            "dispatch 00cc"
+        );
+    }
+
+    #[test]
     fn opaque_integer_borders_use_integer_component_words() {
         assert_eq!(
             border_color([0, 0, 0, 1], true),
@@ -13320,4 +13346,27 @@ mod submission_timeline_tests {
         drop(renderer);
         assert!(wait.wait(Duration::ZERO).unwrap());
     }
+}
+
+/// The timing report's key for a draw or dispatch label: its kind, shaders
+/// and targets, without the present, counts and sources that vary between
+/// frames.
+fn item_key(label: &str) -> String {
+    let mut words = label.split_whitespace().skip(2);
+    let mut key = Vec::new();
+    while let Some(word) = words.next() {
+        match word {
+            "dispatch" => {
+                return words
+                    .next()
+                    .map_or(word.into(), |hash| format!("{word} {hash}"));
+            }
+            "count" | "instances" => {
+                words.next();
+            }
+            "reads" => break,
+            _ => key.push(word),
+        }
+    }
+    key.join(" ")
 }

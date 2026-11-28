@@ -3,6 +3,11 @@
 //! elapsed time covered by submissions, against wall time and CPU waits.
 //! ECHORA_GPU_TIME=items adds a ranking of draw and dispatch intervals,
 //! which may overlap and include time waiting for earlier commands.
+//! It also attributes to each item the time from the previous item's end
+//! to its own end, which does not overlap and sums to the batch time.
+//! `ECHORA_GPU_TIME_REPORT=file` writes every key's totals there, by
+//! draw shaders and targets or dispatch program, since the last restart
+//! (ECHORA_PROFILE_FROM).
 
 use ash::vk;
 use std::collections::BTreeMap;
@@ -22,6 +27,36 @@ struct ItemTimes {
     /// Whether an item is open (started, not ended) in each slot.
     open: [bool; crate::renderer::SLOTS],
     totals: std::collections::HashMap<String, (f64, u64)>,
+    /// Each slot's item keys for the report, parallel to `names`.
+    keys: [Vec<String>; crate::renderer::SLOTS],
+    /// By key since the last restart: overlapping and non-overlapping
+    /// nanoseconds, and items.
+    report: std::collections::HashMap<String, [f64; 3]>,
+    /// The first and last present numbers in the report's item labels.
+    presents: Option<(u64, u64)>,
+    report_path: Option<std::path::PathBuf>,
+}
+
+impl ItemTimes {
+    /// Write the report's totals (ECHORA_GPU_TIME_REPORT).
+    fn write_report(&self) {
+        if let Some(path) = &self.report_path {
+            let mut ranked: Vec<_> = self.report.iter().collect();
+            ranked.sort_by(|a, b| b.1[1].total_cmp(&a.1[1]));
+            let mut text = format!(
+                "# presents {:?}\nexclusive_ms\toverlapping_ms\titems\tkey\n",
+                self.presents
+            );
+            for (key, [overlapping, exclusive, count]) in ranked {
+                text += &format!(
+                    "{:.3}\t{:.3}\t{count}\t{key}\n",
+                    exclusive / 1e6,
+                    overlapping / 1e6
+                );
+            }
+            let _ = std::fs::write(path, text);
+        }
+    }
 }
 
 struct BatchTimes {
@@ -117,6 +152,10 @@ impl GpuTimer {
                 names: std::array::from_fn(|_| Vec::new()),
                 open: [false; crate::renderer::SLOTS],
                 totals: std::collections::HashMap::new(),
+                keys: std::array::from_fn(|_| Vec::new()),
+                report: std::collections::HashMap::new(),
+                presents: None,
+                report_path: std::env::var_os("ECHORA_GPU_TIME_REPORT").map(Into::into),
             });
         Some(Self {
             pool,
@@ -135,14 +174,16 @@ impl GpuTimer {
     }
 
     /// Start (`start`) or end the timing of one draw or dispatch named
-    /// `name` (ignored when ending). Outside a rendering pass, or inside
-    /// one: timestamps may be written in either.
+    /// `name`, reported under `key` (both ignored when ending). Outside a
+    /// rendering pass, or inside one: timestamps may be written in either.
     pub(crate) fn item(
         &mut self,
         device: &ash::Device,
         commands: vk::CommandBuffer,
         fence: vk::Fence,
         name: &str,
+        key: &str,
+        present: Option<u64>,
         start: bool,
     ) {
         let Some(first) = self.first_query(fence) else {
@@ -158,6 +199,13 @@ impl GpuTimer {
                 return;
             }
             items.names[slot].push(name.to_owned());
+            items.keys[slot].push(key.to_owned());
+            if let Some(present) = present {
+                items.presents =
+                    Some(items.presents.map_or((present, present), |(first, last)| {
+                        (first.min(present), last.max(present))
+                    }));
+            }
             items.open[slot] = true;
         } else if !items.open[slot] {
             return;
@@ -200,6 +248,7 @@ impl GpuTimer {
         if let Some(items) = self.items.as_mut() {
             let slot = (first / 2) as usize;
             items.names[slot].clear();
+            items.keys[slot].clear();
             items.open[slot] = false;
             // SAFETY: recording, outside any rendering pass.
             unsafe {
@@ -265,8 +314,10 @@ impl GpuTimer {
         if let Some(items) = self.items.as_mut() {
             let slot = (first / 2) as usize;
             let names = std::mem::take(&mut items.names[slot]);
+            let keys = std::mem::take(&mut items.keys[slot]);
             // An item left open (its end not recorded) is not counted.
             let complete = names.len() - usize::from(items.open[slot]);
+            let batch = read.ok().map(|()| ticks);
             if complete > 0 {
                 let mut ticks = vec![0u64; complete * 2];
                 // SAFETY: the batch the fence covers wrote these queries.
@@ -279,18 +330,45 @@ impl GpuTimer {
                     )
                 };
                 if read.is_ok() {
-                    for (name, pair) in names.iter().zip(ticks.chunks_exact(2)) {
+                    let mask = self.batches.mask;
+                    // The previous end, from the batch's start.
+                    let mut previous = batch.map(|batch| batch[0]);
+                    for ((name, key), pair) in names.iter().zip(&keys).zip(ticks.chunks_exact(2)) {
                         let total = items.totals.entry(name.clone()).or_default();
-                        let duration = pair[1].wrapping_sub(pair[0]) & self.batches.mask;
+                        let duration = pair[1].wrapping_sub(pair[0]) & mask;
                         total.0 += duration as f64 * self.period;
                         total.1 += 1;
+                        let since =
+                            previous.map_or(0, |previous| exclusive_ticks(previous, pair[1], mask));
+                        let entry = items.report.entry(key.clone()).or_default();
+                        entry[0] += duration as f64 * self.period;
+                        entry[1] += since as f64 * self.period;
+                        entry[2] += 1.0;
+                        previous = Some(previous.map_or(pair[1], |previous| {
+                            if since > 0 { pair[1] } else { previous }
+                        }));
+                    }
+                    if let (Some(batch), Some(previous)) = (batch, previous) {
+                        let tail = exclusive_ticks(previous, batch[1], mask);
+                        let entry = items.report.entry("after items".into()).or_default();
+                        entry[1] += tail as f64 * self.period;
+                        entry[2] += 1.0;
                     }
                 }
+            } else if let Some(batch) = batch {
+                let entry = items
+                    .report
+                    .entry("batch without items".into())
+                    .or_default();
+                entry[1] +=
+                    (batch[1].wrapping_sub(batch[0]) & self.batches.mask) as f64 * self.period;
+                entry[2] += 1.0;
             }
         }
         let elapsed = self.since.elapsed();
         if elapsed >= REPORT_EVERY {
             if let Some(items) = self.items.as_mut() {
+                items.write_report();
                 let mut ranked: Vec<_> = items.totals.drain().collect();
                 ranked.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
                 let top: Vec<String> = ranked
@@ -313,8 +391,19 @@ impl GpuTimer {
         }
     }
 
+    /// Restart the report's totals (ECHORA_PROFILE_FROM).
+    pub(crate) fn restart(&mut self) {
+        if let Some(items) = self.items.as_mut() {
+            items.report.clear();
+            items.presents = None;
+        }
+    }
+
     pub(crate) fn destroy(&self, device: &ash::Device) {
         // SAFETY: no submission using the pool is pending (Drop flushed).
+        if let Some(items) = &self.items {
+            items.write_report();
+        }
         unsafe {
             device.destroy_query_pool(self.pool, None);
             if let Some(items) = &self.items {
@@ -324,9 +413,23 @@ impl GpuTimer {
     }
 }
 
+/// Ticks from `previous` to `end` when `end` is later, else 0 (an item can
+/// finish before the previous one on a counter that may wrap).
+fn exclusive_ticks(previous: u64, end: u64, mask: u64) -> u64 {
+    let advance = end.wrapping_sub(previous) & mask;
+    if advance > mask / 2 { 0 } else { advance }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BatchTimes;
+    use super::{BatchTimes, exclusive_ticks};
+
+    #[test]
+    fn exclusive_ticks_ignore_items_ending_earlier() {
+        assert_eq!(exclusive_ticks(10, 15, 255), 5);
+        assert_eq!(exclusive_ticks(250, 4, 255), 10);
+        assert_eq!(exclusive_ticks(15, 10, 255), 0);
+    }
 
     #[test]
     fn batch_time_follows_queue_order_across_a_timestamp_wrap() {
